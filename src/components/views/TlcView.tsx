@@ -24,6 +24,8 @@ import {
   tlcHalf,
   tlcFront,
   tlcRfCsv,
+  createDefaultLaneConfig,
+  createDemoTlcDataSet,
 } from '../../engine';
 import {
   TlcSet,
@@ -33,6 +35,7 @@ import {
   TlcDensitogramData,
 } from '../../types';
 import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
+import { TlcFullPlateView } from './TlcFullPlateView';
 
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
@@ -259,7 +262,7 @@ interface TlcWellCellProps {
   onOpenModal: (wellIndex: number) => void;
 }
 
-const TlcWellCell: React.FC<TlcWellCellProps> = ({
+const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
   wellIndex,
   run,
   plate,
@@ -279,9 +282,9 @@ const TlcWellCell: React.FC<TlcWellCellProps> = ({
 
   useEffect(() => {
     if (canvasRef.current && panels.length > 0) {
-      drawLanePanels(canvasRef.current, panels, zoom, filters, markSpots);
+      drawLanePanels(canvasRef.current, panels, zoom, undefined, markSpots);
     }
-  }, [panels, zoom, filters, markSpots]);
+  }, [panels, zoom, markSpots]);
 
   const nf = (v: any, d = 1) =>
     Number.isFinite(+v) ? (+v).toLocaleString('en-US', { maximumFractionDigits: d }) : '-';
@@ -290,6 +293,13 @@ const TlcWellCell: React.FC<TlcWellCellProps> = ({
 
   // Primary panel spots for summary label below cell
   const primarySpots = panels[0]?.spots;
+
+  const cssFilter =
+    filters.invert || filters.brightness !== 100 || filters.contrast !== 100
+      ? `brightness(${filters.brightness}%) contrast(${filters.contrast}%) ${
+          filters.invert ? 'invert(1)' : ''
+        }`
+      : undefined;
 
   return (
     <button
@@ -305,7 +315,10 @@ const TlcWellCell: React.FC<TlcWellCellProps> = ({
       </div>
 
       {panels.length > 0 ? (
-        <canvas ref={canvasRef} style={{ display: 'block', margin: '4px auto' }} />
+        <canvas
+          ref={canvasRef}
+          style={{ display: 'block', margin: '4px auto', filter: cssFilter }}
+        />
       ) : (
         <div className="tcempty">{hasCfg ? 'no image' : 'no lane'}</div>
       )}
@@ -357,7 +370,7 @@ const TlcWellCell: React.FC<TlcWellCellProps> = ({
       )}
     </button>
   );
-};
+});
 
 export const TlcView: React.FC = () => {
   const { run, toast, tlcSets: sets, setTlcSets: setSets, activeTlcStatus } = useApp();
@@ -373,6 +386,10 @@ export const TlcView: React.FC = () => {
     White: true,
     UV366: true,
   });
+
+  // Display Mode: 54-Well Sliced Grid vs Full Plate Photograph Overview
+  const [viewMode, setViewMode] = useState<'grid' | 'full-plate'>('grid');
+  const [fullPlateChannel, setFullPlateChannel] = useState<TlcChannelKey>('UV254');
 
   // Sampling Corridor Core Fraction: default 35% to stop edge spillover
   const [coreFraction, setCoreFraction] = useState<number>(0.35);
@@ -487,10 +504,10 @@ export const TlcView: React.FC = () => {
     const newImgs: Record<string, TlcImageEntry> = { ...currentSet.imgs };
 
     for (const f of files) {
-      const key = tlcKeyOf(f.name, currentSet);
+      let key = tlcKeyOf(f.name, currentSet);
       if (!key) {
-        toast(`${f.name}: specify channel ('254', 'White', or '366') in filename.`);
-        continue;
+        // Fallback: assign to first unoccupied channel, or default to UV254
+        key = !newImgs.UV254 ? 'UV254' : !newImgs.UV366 ? 'UV366' : !newImgs.White ? 'White' : 'UV254';
       }
       try {
         const bmp = await createImageBitmap(f);
@@ -509,17 +526,83 @@ export const TlcView: React.FC = () => {
     if (loadedCount > 0) {
       setSets((prev) => {
         const next = [...prev];
+        const s = next[cur];
+        let cfg = s.cfg;
+        let cfgName = s.cfgName;
+        // Auto-assign standard 54-lane grid if no lane configuration has been uploaded yet!
+        if (!cfg) {
+          const frameW = s.frameW || LANE_FRAME_WIDTH;
+          cfg = createDefaultLaneConfig(frameW, 'two-tier');
+          cfgName = 'Standard 6×9 Grid (Auto)';
+        }
         next[cur] = {
-          ...next[cur],
+          ...s,
+          cfg,
+          cfgName,
           imgs: newImgs,
           prof: {},
           frontAuto: {},
         };
         return next;
       });
-      toast(`Loaded ${loadedCount} image${loadedCount === 1 ? '' : 's'}.`);
+      setShow((prev) => ({ ...prev, UV254: true, UV366: true, White: true }));
+      toast(`Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}. Standard 54-lane grid activated.`);
     }
     e.target.value = '';
+  };
+
+  // Apply Default Standard 54-Lane 6x9 Grid
+  const handleApplyDefaultGrid = () => {
+    const frameW = currentSet.frameW || LANE_FRAME_WIDTH;
+    const cfg = createDefaultLaneConfig(frameW, 'two-tier');
+    setSets((prev) => {
+      const next = [...prev];
+      next[cur] = {
+        ...next[cur],
+        cfg,
+        cfgName: 'Standard 6×9 Grid (54 Lanes)',
+        prof: {},
+        frontAuto: {},
+      };
+      return next;
+    });
+    toast('Applied standard 54-lane TLC grid (27 + 27 two-tier layout).');
+  };
+
+  // Load Synthetic Demo TLC Plate (UV 254 nm & 365 nm)
+  const handleLoadDemoTlc = async () => {
+    try {
+      toast('Generating realistic demonstration TLC plate…');
+      const demo = await createDemoTlcDataSet();
+      const uv254Bmp = await createImageBitmap(demo.uv254Blob);
+      const uv366Bmp = await createImageBitmap(demo.uv366Blob);
+
+      // Persist to IndexedDB
+      await putTlcImage(currentSet.uid, 'UV254', 'demo_plate_UV254.png', demo.uv254Blob);
+      await putTlcImage(currentSet.uid, 'UV366', 'demo_plate_UV366.png', demo.uv366Blob);
+
+      setSets((prev) => {
+        const next = [...prev];
+        next[cur] = {
+          ...next[cur],
+          cfg: demo.config,
+          cfgName: demo.configName,
+          frameW: 2400,
+          imgs: {
+            UV254: { name: 'demo_plate_UV254.png', bmp: uv254Bmp },
+            UV366: { name: 'demo_plate_UV366.png', bmp: uv366Bmp },
+          },
+          prof: {},
+          frontAuto: {},
+        };
+        return next;
+      });
+      setShow((prev) => ({ ...prev, UV254: true, UV366: true }));
+      setFullPlateChannel('UV254');
+      toast('Loaded sample TLC plate (UV 254 nm & 365 nm) with 54-lane grid!');
+    } catch (err: any) {
+      toast('Could not generate demo TLC plate: ' + (err.message || err));
+    }
   };
 
   // Add new TLC Set
@@ -604,6 +687,14 @@ export const TlcView: React.FC = () => {
     const t = tlcLane(inspectWell, 'column');
     return getPanelsForLane(t);
   }, [inspectWell, getPanelsForLane]);
+
+  // Memoized panels for all 54 wells in the plate grid
+  const allPanels = useMemo(() => {
+    return Array.from({ length: 54 }, (_, wellIndex) => {
+      const laneId = tlcLane(wellIndex, 'column');
+      return getPanelsForLane(laneId);
+    });
+  }, [getPanelsForLane]);
 
   // Exact vertical height of the enlarged TLC lane canvas (1:1 pixel scale)
   const inspectHeight = useMemo(() => {
@@ -867,8 +958,17 @@ export const TlcView: React.FC = () => {
 
           <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
 
+          <button
+            type="button"
+            className="btn"
+            onClick={handleApplyDefaultGrid}
+            title="Auto-apply standard 54-lane two-tier TLC grid (27 + 27 lanes) without needing a custom CSV file"
+          >
+            Auto 6×9 Grid
+          </button>
+
           <button type="button" className="btn" onClick={() => fileCsvRef.current?.click()}>
-            {hasConfig ? 'Replace Lane CSV' : 'Choose Lane CSV'}
+            {hasConfig ? 'Replace Lane CSV' : 'Custom Lane CSV'}
           </button>
           <input
             ref={fileCsvRef}
@@ -878,8 +978,8 @@ export const TlcView: React.FC = () => {
             onChange={handleLoadCsv}
           />
 
-          <button type="button" className="btn" onClick={() => fileImgRef.current?.click()}>
-            {hasImages ? 'Add / Replace Images' : 'Choose Plate Images'}
+          <button type="button" className="btn pri" onClick={() => fileImgRef.current?.click()}>
+            {hasImages ? 'Add / Replace Plate Photos' : 'Upload Plate Photos'}
           </button>
           <input
             ref={fileImgRef}
@@ -890,19 +990,61 @@ export const TlcView: React.FC = () => {
             onChange={handleLoadImages}
           />
 
-          <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
-            <span>Zoom:</span>
-            <input
-              type="range"
-              min="0.25"
-              max="0.85"
-              step="0.05"
-              value={zoom}
-              onChange={(e) => setZoom(parseFloat(e.target.value))}
-              aria-label="Zoom scale"
-            />
-            <span className="mono" style={{ fontSize: '11px' }}>{Math.round(zoom * 100)}%</span>
-          </label>
+          <button
+            type="button"
+            className="btn"
+            onClick={handleLoadDemoTlc}
+            title="Generate and display sample UV 254 nm and 365 nm TLC plate images with spots and densitograms"
+            style={{ background: 'rgba(16, 185, 129, 0.15)', borderColor: '#10b981', color: '#10b981', fontWeight: 600 }}
+          >
+            🧪 Try Demo Plate
+          </button>
+
+          <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
+
+          {/* View Mode Switcher */}
+          <div
+            style={{
+              display: 'inline-flex',
+              background: 'var(--soft)',
+              padding: '2px',
+              borderRadius: '6px',
+              border: '1px solid var(--line)',
+            }}
+          >
+            <button
+              type="button"
+              className={`btn sm ${viewMode === 'grid' ? 'pri' : ''}`}
+              onClick={() => setViewMode('grid')}
+              style={{ fontSize: '11px', padding: '3px 8px' }}
+            >
+              🔲 54-Well Sliced Grid
+            </button>
+            <button
+              type="button"
+              className={`btn sm ${viewMode === 'full-plate' ? 'pri' : ''}`}
+              onClick={() => setViewMode('full-plate')}
+              style={{ fontSize: '11px', padding: '3px 8px' }}
+            >
+              📷 Full Plate Photo
+            </button>
+          </div>
+
+          {viewMode === 'grid' && (
+            <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+              <span>Zoom:</span>
+              <input
+                type="range"
+                min="0.25"
+                max="0.85"
+                step="0.05"
+                value={zoom}
+                onChange={(e) => setZoom(parseFloat(e.target.value))}
+                aria-label="Zoom scale"
+              />
+              <span className="mono" style={{ fontSize: '11px' }}>{Math.round(zoom * 100)}%</span>
+            </label>
+          )}
 
           <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', cursor: 'pointer' }}>
             <input
@@ -1145,20 +1287,90 @@ export const TlcView: React.FC = () => {
         </details>
       </div>
 
-      {/* 6x9 Plate Grid View */}
-      <div className="tlcwrap" style={{ overflowX: 'auto', paddingBottom: '16px' }}>
-        <div
-          className="tlcgrid"
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(9, minmax(100px, 1fr))',
-            gap: '8px',
-          }}
-        >
-          {Array.from({ length: 54 }, (_, wellIndex) => {
-            const laneId = tlcLane(wellIndex, 'column');
-            const panels = getPanelsForLane(laneId);
-            return (
+      {/* View Mode: Full Plate Photo vs 54-Well Sliced Grid */}
+      {viewMode === 'full-plate' ? (
+        <div style={{ marginBottom: '16px' }}>
+          {/* Channel selector for Full Plate view */}
+          <div
+            style={{
+              display: 'flex',
+              gap: '6px',
+              justifyContent: 'center',
+              marginBottom: '12px',
+              alignItems: 'center',
+            }}
+          >
+            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--mut)' }}>Plate Channel:</span>
+            {TLC_KEYS.map((k) => (
+              <button
+                key={k}
+                type="button"
+                className={`btn sm ${fullPlateChannel === k ? 'pri' : ''}`}
+                onClick={() => setFullPlateChannel(k)}
+                disabled={!currentSet.imgs[k]}
+                style={{ fontSize: '11px', padding: '4px 10px' }}
+              >
+                {TLC_LABEL[k]} {currentSet.imgs[k] ? '✓' : '(empty)'}
+              </button>
+            ))}
+          </div>
+
+          <TlcFullPlateView
+            currentSet={currentSet}
+            activeChannel={fullPlateChannel}
+            onSelectChannel={setFullPlateChannel}
+            filters={filters}
+            onOpenWellModal={(w) => {
+              setInspectWell(w);
+              setPinnedMarkers([]);
+              setHoverRf(null);
+              setHoverY(null);
+              setHoverSpot(null);
+            }}
+            run={run}
+            plate={plate}
+          />
+        </div>
+      ) : (
+        /* 6x9 Plate Grid View */
+        <div className="tlcwrap" style={{ overflowX: 'auto', paddingBottom: '16px' }}>
+          {!hasImages && (
+            <div
+              style={{
+                textAlign: 'center',
+                padding: '32px 16px',
+                background: 'var(--soft)',
+                borderRadius: '8px',
+                border: '1px dashed var(--line)',
+                marginBottom: '16px',
+              }}
+            >
+              <div style={{ fontSize: '28px', marginBottom: '8px' }}>📷</div>
+              <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>
+                No Plate Photographs Loaded
+              </div>
+              <div style={{ fontSize: '12px', color: 'var(--mut)', maxWidth: '520px', margin: '0 auto 12px' }}>
+                Upload your laboratory TLC plate photographs using the <b>Upload Plate Photos</b> button, or test the live densitometer with realistic synthetic data below.
+              </div>
+              <button
+                type="button"
+                className="btn pri sm"
+                onClick={handleLoadDemoTlc}
+              >
+                🧪 Try Demo TLC Plate
+              </button>
+            </div>
+          )}
+
+          <div
+            className="tlcgrid"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(9, minmax(100px, 1fr))',
+              gap: '8px',
+            }}
+          >
+            {allPanels.map((panels, wellIndex) => (
               <TlcWellCell
                 key={wellIndex}
                 wellIndex={wellIndex}
@@ -1177,10 +1389,10 @@ export const TlcView: React.FC = () => {
                   setHoverSpot(null);
                 }}
               />
-            );
-          })}
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Enlarged Inspection Modal with Pixel-Matched Parallel 1D Densitometer */}
       {inspectWell !== null && (

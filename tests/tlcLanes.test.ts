@@ -14,6 +14,8 @@ import {
   findSpots,
   extractDensitogram,
   computeLaneRowIntensity,
+  createDefaultLaneConfig,
+  createDefaultLaneCsvText,
 } from '../src/engine/tlcLanes';
 import { buildRun } from '../src/engine/dilution';
 import { exampleState, dataFor } from '../src/context/runPayload';
@@ -57,6 +59,23 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     expect(res.lanes[0].x0).toBe(320);
     expect(res.lanes[0].zeroRf).toBe(150);
     expect(res.hasZeroRf).toBe(true);
+  });
+
+  it('generates standard 54-lane default configs (two-tier and single-tier)', () => {
+    const twoTier = createDefaultLaneConfig(3280, 'two-tier');
+    expect(twoTier.lanes.length).toBe(54);
+    expect(twoTier.hasZeroRf).toBe(true);
+    expect(twoTier.lanes[0].x0).toBeLessThan(twoTier.lanes[26].x0);
+    expect(twoTier.lanes[27].x0).toBeLessThan(twoTier.lanes[53].x0);
+
+    const singleTier = createDefaultLaneConfig(3280, 'single-tier');
+    expect(singleTier.lanes.length).toBe(54);
+    expect(singleTier.lanes[0].x0).toBeLessThan(singleTier.lanes[53].x0);
+
+    const csvText = createDefaultLaneCsvText('two-tier');
+    expect(csvText).toContain('id,x0,y0,length,width');
+    const parsed = parseLaneConfig(csvText);
+    expect(parsed.lanes.length).toBe(54);
   });
 
   it('generates tlcLaneRows and tlcLaneCsv from run', () => {

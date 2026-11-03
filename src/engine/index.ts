@@ -21,6 +21,7 @@ export * from './presets';
 export * from './dilutionTier';
 export * from './tlcLanes';
 export * from './barcode';
+export * from './demoTlc';
 
 import * as constants from './constants';
 import * as combinations from './combinations';

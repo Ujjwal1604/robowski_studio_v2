@@ -68,6 +68,88 @@ export function parseLaneConfig(text: string): TlcLaneConfig {
   };
 }
 
+export function createDefaultLaneConfig(
+  frameWidth: number = LANE_FRAME_WIDTH,
+  layout: 'two-tier' | 'single-tier' = 'two-tier'
+): TlcLaneConfig {
+  const lanes: TlcLane[] = [];
+  const total = 54;
+
+  if (layout === 'single-tier') {
+    const leftMargin = Math.round(frameWidth * 0.06);
+    const rightMargin = Math.round(frameWidth * 0.94);
+    const step = (rightMargin - leftMargin) / (total - 1);
+    const laneWidth = Math.max(20, Math.round(step * 0.65));
+    const laneLength = 1200;
+    const y0 = 2100;
+
+    for (let i = 0; i < total; i++) {
+      lanes.push({
+        id: i,
+        x0: Math.round(leftMargin + i * step),
+        y0,
+        length: laneLength,
+        width: laneWidth,
+        angle: 0,
+        spotRadius: 16,
+        zeroRf: 120,
+      });
+    }
+  } else {
+    // Standard Two-Tier HTS TLC layout: 27 lanes in lower tier (0..26), 27 lanes in upper tier (27..53)
+    const perTier = 27;
+    const leftMargin = Math.round(frameWidth * 0.08);
+    const rightMargin = Math.round(frameWidth * 0.92);
+    const step = (rightMargin - leftMargin) / (perTier - 1);
+    const laneWidth = Math.max(24, Math.round(step * 0.6));
+
+    // Lower tier: Lanes 0 to 26
+    for (let i = 0; i < perTier; i++) {
+      lanes.push({
+        id: i,
+        x0: Math.round(leftMargin + i * step),
+        y0: 2150,
+        length: 980,
+        width: laneWidth,
+        angle: 0,
+        spotRadius: 16,
+        zeroRf: 120,
+      });
+    }
+
+    // Upper tier: Lanes 27 to 53
+    for (let i = perTier; i < total; i++) {
+      lanes.push({
+        id: i,
+        x0: Math.round(leftMargin + (i - perTier) * step),
+        y0: 1050,
+        length: 980,
+        width: laneWidth,
+        angle: 0,
+        spotRadius: 16,
+        zeroRf: 120,
+      });
+    }
+  }
+
+  return {
+    lanes,
+    hasZeroRf: true,
+    warnings: [],
+  };
+}
+
+export function createDefaultLaneCsvText(layout: 'two-tier' | 'single-tier' = 'two-tier'): string {
+  const cfg = createDefaultLaneConfig(LANE_FRAME_WIDTH, layout);
+  const rows = [
+    'id,x0,y0,length,width,direction_angle,spot_radius_px,px_location_of_zero_rf',
+    ...cfg.lanes.map(
+      (l) => `${l.id},${l.x0},${l.y0},${l.length},${l.width},${l.angle},${l.spotRadius || 16},${l.zeroRf || 120}`
+    ),
+  ];
+  return rows.join('\n');
+}
+
 export function tlcLane(container: number, order: string = TLC_ORDER): number {
   const r = Math.floor(container / TLC_COLS);
   const c = container % TLC_COLS;

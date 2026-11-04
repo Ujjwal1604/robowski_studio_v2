@@ -378,7 +378,10 @@ export interface TlcSet {
   cfgText?: string;
   frameW: number;
   frontPx?: number | null;
+  frontHalfPx?: Record<number, number>; // side 0 (Lanes 0-26) and side 1 (Lanes 27-53)
   frontAuto?: Record<number, number>;
+  originPx?: number | null;
+  originAuto?: Record<number, number>;
   prof?: Record<string, number[]>;
   imgs: Record<string, TlcImageEntry>;
   missing?: string[];

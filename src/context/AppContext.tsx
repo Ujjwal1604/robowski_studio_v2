@@ -9,7 +9,7 @@ import {
   TlcImageEntry,
 } from '../types';
 import * as Core from '../engine';
-import { putTlcImage, getImagesForSets } from './tlcStorage';
+import { putTlcImage, getTlcImage, getImagesForSets } from './tlcStorage';
 import {
   exampleState,
   normalize,
@@ -40,8 +40,11 @@ function defaultTlcSet(): TlcSet {
     name: 'Set 1',
     cfg: null,
     cfgName: '',
-    frameW: 540,
+    frameW: Core.LANE_FRAME_WIDTH,
     frontPx: null,
+    frontAuto: {},
+    originPx: null,
+    originAuto: {},
     imgs: {},
   };
 }
@@ -649,7 +652,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           cfg: s.cfg,
           cfgName: s.cfgName,
           cfgText: s.cfgText,
-          frameW: s.frameW || 540,
+          frameW: s.frameW || Core.LANE_FRAME_WIDTH,
           frontPx: s.frontPx ?? null,
           frontAuto: s.frontAuto || {},
           imgMeta: Object.entries(s.imgs || {}).map(([k, im]) => ({
@@ -706,7 +709,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               cfg: s.cfg,
               cfgName: s.cfgName,
               cfgText: s.cfgText,
-              frameW: s.frameW || 540,
+              frameW: s.frameW || Core.LANE_FRAME_WIDTH,
               frontPx: s.frontPx ?? null,
               frontAuto: s.frontAuto || {},
               imgs: {},
@@ -724,7 +727,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const dupRun = useCallback(
-    (id: string) => {
+    async (id: string) => {
       const r = runsList.find((x) => x.id === id);
       if (r) {
         setStatus('draft');
@@ -733,20 +736,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         st.name = r.name + '-copy';
         setState(st);
         if (r.tlc_sets && r.tlc_sets.length > 0) {
-          setTlcSets(
-            r.tlc_sets.map((s: any) => ({
-              uid: s.uid,
+          const duplicatedSets: TlcSet[] = [];
+          for (const s of r.tlc_sets) {
+            const newUid = 'set_' + Math.random().toString(36).slice(2, 10);
+            duplicatedSets.push({
+              uid: newUid,
               name: s.name,
               cfg: s.cfg,
               cfgName: s.cfgName,
               cfgText: s.cfgText,
-              frameW: s.frameW || 540,
+              frameW: s.frameW || Core.LANE_FRAME_WIDTH,
               frontPx: s.frontPx ?? null,
               frontAuto: s.frontAuto || {},
               imgs: {},
               prof: {},
-            }))
-          );
+            });
+            // Copy image blobs in IndexedDB to the new set namespace
+            for (const k of ['UV254', 'White', 'UV366']) {
+              const oldImg = await getTlcImage(s.uid, k);
+              if (oldImg) {
+                await putTlcImage(newUid, k, oldImg.name, oldImg.blob);
+              }
+            }
+          }
+          setTlcSets(duplicatedSets);
+        } else {
+          setTlcSets([defaultTlcSet()]);
         }
         setVisited({ setup: true });
         setView('setup');
@@ -941,7 +956,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             cfg: s.cfg,
             cfgName: s.cfgName,
             cfgText: s.cfgText,
-            frameW: s.frameW || 540,
+            frameW: s.frameW || Core.LANE_FRAME_WIDTH,
             frontPx: s.frontPx ?? null,
             frontAuto: s.frontAuto || {},
             imgs,

@@ -141,7 +141,7 @@ export const FixDiffModal: React.FC<FixDiffModalProps> = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby="fixDiffTitle"
-        style={{ maxWidth: '680px', width: '92vw' }}
+        style={{ maxWidth: '880px', width: '92vw' }}
       >
         {/* Header */}
         <div className="modal-head">

@@ -755,6 +755,10 @@
       font: inherit;
       cursor: pointer;
       transition: border-color 0.15s ease, transform 0.12s ease;
+      min-width: 0;
+      width: 100%;
+      overflow: hidden;
+      box-sizing: border-box;
     }
     .tlccell:hover {
       border-color: var(--acc);
@@ -879,7 +883,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 24px;
+      padding: 16px;
       animation: fadeIn .2s var(--ease)
     }
 
@@ -908,8 +912,8 @@
       border: 1px solid var(--line);
       border-radius: 16px;
       box-shadow: var(--shadow-lg);
-      width: min(900px, 100%);
-      max-height: 86vh;
+      width: min(1380px, 96vw);
+      max-height: 94vh;
       display: flex;
       flex-direction: column;
       overflow: hidden;

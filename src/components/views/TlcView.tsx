@@ -23,13 +23,16 @@ import {
   computeLaneRowIntensity,
   tlcHalf,
   tlcFront,
+  tlcOrigin,
   tlcRfCsv,
   createDefaultLaneConfig,
   createDemoTlcDataSet,
+  exportLaneConfigCsv,
 } from '../../engine';
 import {
   TlcSet,
   TlcLane,
+  TlcLaneConfig,
   TlcImageEntry,
   TlcSpot,
   TlcDensitogramData,
@@ -63,15 +66,18 @@ function tlcNewSet(n: number): TlcSet {
     cfgName: '',
     frameW: LANE_FRAME_WIDTH,
     frontPx: null,
+    frontAuto: {},
+    originPx: null,
+    originAuto: {},
     imgs: {},
   };
 }
 
-function tlcKeyOf(name: string, set: TlcSet): TlcChannelKey | null {
-  if (/254/.test(name)) return 'UV254';
-  if (/36[56]|uv.?3/i.test(name)) return 'UV366';
-  if (/white|visible|vis\b|day/i.test(name)) return 'White';
-  return (TLC_KEYS as TlcChannelKey[]).find((k) => !set.imgs[k]) || null;
+function tlcKeyOf(name: string, assigned: Record<string, any>): TlcChannelKey | null {
+  if (/(?:^|[^0-9])254(?:[^0-9]|$)/i.test(name)) return 'UV254';
+  if (/(?:^|[^0-9])36[56](?:[^0-9]|$)|uv.?3/i.test(name)) return 'UV366';
+  if (/(?:^|[^a-z])(?:white|visible|vis)(?:[^a-z]|$)/i.test(name)) return 'White';
+  return (TLC_KEYS as TlcChannelKey[]).find((k) => !assigned[k]) || null;
 }
 
 export interface ImageFilters {
@@ -195,33 +201,23 @@ function drawLanePanels(
       dpr * (m[5] + top)
     );
 
-    if (filters) {
-      const parts = [];
-      if (filters.invert) parts.push('invert(1)');
-      if (filters.brightness !== 100) parts.push(`brightness(${filters.brightness}%)`);
-      if (filters.contrast !== 100) parts.push(`contrast(${filters.contrast}%)`);
-      ctx.filter = parts.length ? parts.join(' ') : 'none';
-    }
-
     ctx.drawImage(im.bmp, 0, 0);
-    ctx.filter = 'none';
     ctx.restore();
 
     ctx.save();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Yellow ticks where spot origin was applied (Rf = 0)
-    if (l.zeroRf != null) {
-      ctx.strokeStyle = '#FFC857';
-      ctx.lineWidth = 1.5;
-      const y = top + k * (l.length - l.zeroRf);
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + 5, y);
-      ctx.moveTo(x + w - 5, y);
-      ctx.lineTo(x + w, y);
-      ctx.stroke();
-    }
+    const origPx = tlcOrigin(p.s, l);
+    ctx.strokeStyle = '#FFC857';
+    ctx.lineWidth = 1.5;
+    const y = top + k * (l.length - origPx);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 5, y);
+    ctx.moveTo(x + w - 5, y);
+    ctx.lineTo(x + w, y);
+    ctx.stroke();
 
     // Pink ticks at detected spots
     if (showSpots && p.spots && p.spots.length) {
@@ -307,7 +303,7 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
       className="tlccell"
       onClick={() => onOpenModal(wellIndex)}
       title={`Inspect Well ${label} (TLC lane ${t})`}
-      style={{ textAlign: 'left' }}
+      style={{ textAlign: 'left', minWidth: 0, width: '100%', overflow: 'hidden' }}
     >
       <div className="tch" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <b>{label}</b>
@@ -345,10 +341,16 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
       {markSpots && primarySpots && (
         <div
           style={{
+            width: '100%',
+            maxWidth: '100%',
+            boxSizing: 'border-box',
             fontSize: '10px',
             fontFamily: 'monospace',
-            color: '#ec4899',
-            marginTop: '2px',
+            marginTop: '4px',
+            padding: '2px 4px',
+            background: 'rgba(236, 72, 153, 0.08)',
+            border: '1px solid rgba(236, 72, 153, 0.22)',
+            borderRadius: '4px',
             textAlign: 'center',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
@@ -360,12 +362,16 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
               : 'No spots detected'
           }
         >
-          {primarySpots.length
-            ? primarySpots
-                .slice(0, 3)
-                .map((s) => `Rf ${s.rf.toFixed(2)}`)
-                .join(' · ')
-            : 'Rf —'}
+          {primarySpots.length ? (
+            <span>
+              <b style={{ color: '#ec4899', marginRight: '3px' }}>Rf</b>
+              <span style={{ color: '#be185d' }}>
+                {primarySpots.slice(0, 4).map((s) => s.rf.toFixed(2)).join(', ')}
+              </span>
+            </span>
+          ) : (
+            <span style={{ color: 'var(--mut)' }}>Rf —</span>
+          )}
         </div>
       )}
     </button>
@@ -504,10 +510,10 @@ export const TlcView: React.FC = () => {
     const newImgs: Record<string, TlcImageEntry> = { ...currentSet.imgs };
 
     for (const f of files) {
-      let key = tlcKeyOf(f.name, currentSet);
+      const key = tlcKeyOf(f.name, newImgs);
       if (!key) {
-        // Fallback: assign to first unoccupied channel, or default to UV254
-        key = !newImgs.UV254 ? 'UV254' : !newImgs.UV366 ? 'UV366' : !newImgs.White ? 'White' : 'UV254';
+        toast(`Could not allocate channel for ${f.name}. All 3 channels (UV254, UV366, White) are already filled.`);
+        continue;
       }
       try {
         const bmp = await createImageBitmap(f);
@@ -526,19 +532,8 @@ export const TlcView: React.FC = () => {
     if (loadedCount > 0) {
       setSets((prev) => {
         const next = [...prev];
-        const s = next[cur];
-        let cfg = s.cfg;
-        let cfgName = s.cfgName;
-        // Auto-assign standard 54-lane grid if no lane configuration has been uploaded yet!
-        if (!cfg) {
-          const frameW = s.frameW || LANE_FRAME_WIDTH;
-          cfg = createDefaultLaneConfig(frameW, 'two-tier');
-          cfgName = 'Standard 6×9 Grid (Auto)';
-        }
         next[cur] = {
-          ...s,
-          cfg,
-          cfgName,
+          ...next[cur],
           imgs: newImgs,
           prof: {},
           frontAuto: {},
@@ -546,7 +541,11 @@ export const TlcView: React.FC = () => {
         return next;
       });
       setShow((prev) => ({ ...prev, UV254: true, UV366: true, White: true }));
-      toast(`Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}. Standard 54-lane grid activated.`);
+      toast(
+        currentSet.cfg
+          ? `Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}.`
+          : `Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}. Choose a Lane CSV to view sliced lanes and calculate Rf.`
+      );
     }
     e.target.value = '';
   };
@@ -569,37 +568,39 @@ export const TlcView: React.FC = () => {
     toast('Applied standard 54-lane TLC grid (27 + 27 two-tier layout).');
   };
 
-  // Load Synthetic Demo TLC Plate (UV 254 nm & 365 nm)
+  // Load Synthetic Demo TLC Plate as a new, separate set
   const handleLoadDemoTlc = async () => {
     try {
-      toast('Generating realistic demonstration TLC plate…');
+      toast('Generating demonstration TLC plate…');
       const demo = await createDemoTlcDataSet();
       const uv254Bmp = await createImageBitmap(demo.uv254Blob);
       const uv366Bmp = await createImageBitmap(demo.uv366Blob);
 
-      // Persist to IndexedDB
-      await putTlcImage(currentSet.uid, 'UV254', 'demo_plate_UV254.png', demo.uv254Blob);
-      await putTlcImage(currentSet.uid, 'UV366', 'demo_plate_UV366.png', demo.uv366Blob);
+      const demoUid = 'demo_' + Math.random().toString(36).slice(2, 10);
+      const demoSet: TlcSet = {
+        uid: demoUid,
+        name: `Demo Set ${sets.length + 1}`,
+        cfg: demo.config,
+        cfgName: demo.configName,
+        frameW: LANE_FRAME_WIDTH,
+        frontPx: null,
+        frontAuto: {},
+        imgs: {
+          UV254: { name: 'demo_UV254.png', bmp: uv254Bmp },
+          UV366: { name: 'demo_UV366.png', bmp: uv366Bmp },
+        },
+        prof: {},
+      };
 
-      setSets((prev) => {
-        const next = [...prev];
-        next[cur] = {
-          ...next[cur],
-          cfg: demo.config,
-          cfgName: demo.configName,
-          frameW: 2400,
-          imgs: {
-            UV254: { name: 'demo_plate_UV254.png', bmp: uv254Bmp },
-            UV366: { name: 'demo_plate_UV366.png', bmp: uv366Bmp },
-          },
-          prof: {},
-          frontAuto: {},
-        };
-        return next;
-      });
+      // Persist demo images to IndexedDB
+      await putTlcImage(demoUid, 'UV254', 'demo_UV254.png', demo.uv254Blob);
+      await putTlcImage(demoUid, 'UV366', 'demo_UV366.png', demo.uv366Blob);
+
+      setSets((prev) => [...prev, demoSet]);
+      setCur(sets.length);
       setShow((prev) => ({ ...prev, UV254: true, UV366: true }));
       setFullPlateChannel('UV254');
-      toast('Loaded sample TLC plate (UV 254 nm & 365 nm) with 54-lane grid!');
+      toast('Created new demo set with sample UV 254 nm & 365 nm plates.');
     } catch (err: any) {
       toast('Could not generate demo TLC plate: ' + (err.message || err));
     }
@@ -611,28 +612,64 @@ export const TlcView: React.FC = () => {
     setCur(sets.length);
   };
 
-  // Remove current TLC Set
-  const handleRemoveSet = () => {
-    if (sets.length <= 1) return;
-    const removedSet = currentSet;
-    Object.values(removedSet.imgs).forEach((im) => im.bmp?.close && im.bmp.close());
-    deleteTlcSetImages(removedSet.uid, Object.keys(removedSet.imgs));
-    setSets((prev) => prev.filter((_, i) => i !== cur));
-    setCur((prev) => Math.max(0, prev - 1));
-    if (sets.length - 1 < 2) setCompare(false);
-    toast(`Removed "${removedSet.name}".`);
+  // Remove or clear TLC Set
+  const handleRemoveSetIndex = (indexToRemove: number) => {
+    const setToRemove = sets[indexToRemove];
+    if (!setToRemove) return;
+    Object.values(setToRemove.imgs).forEach((im) => im.bmp?.close && im.bmp.close());
+    deleteTlcSetImages(setToRemove.uid, Object.keys(setToRemove.imgs));
+
+    if (sets.length > 1) {
+      setSets((prev) => prev.filter((_, i) => i !== indexToRemove));
+      setCur((prev) => {
+        if (prev === indexToRemove) {
+          return Math.max(0, prev - 1);
+        }
+        return prev > indexToRemove ? prev - 1 : prev;
+      });
+      if (sets.length - 1 < 2) setCompare(false);
+      toast(`Removed "${setToRemove.name}".`);
+    } else {
+      // If it's the only set, reset it to a clean blank default
+      setSets([tlcNewSet(1)]);
+      setCur(0);
+      setCompare(false);
+      toast(`Cleared "${setToRemove.name}".`);
+    }
+  };
+
+  // Remove individual channel image from current set
+  const handleRemoveImage = (key: TlcChannelKey) => {
+    const im = currentSet.imgs[key];
+    if (im?.bmp?.close) im.bmp.close();
+    deleteTlcSetImages(currentSet.uid, [key]);
+    setSets((prev) => {
+      const next = [...prev];
+      const newImgs = { ...next[cur].imgs };
+      delete newImgs[key];
+      next[cur] = {
+        ...next[cur],
+        imgs: newImgs,
+        prof: {},
+        frontAuto: {},
+        originAuto: {},
+      };
+      return next;
+    });
+    toast(`Removed ${TLC_LABEL[key]} image.`);
   };
 
   // Get Spots helper for a set, channel, and lane with center-weighted core sampling
   const getSpotsForLane = useCallback(
     (set: TlcSet, key: TlcChannelKey, lane: TlcLane): TlcSpot[] | null => {
-      if (lane.zeroRf == null || !set.imgs[key]) return null;
+      if (!set.imgs[key]) return null;
       const prof = extractLaneProfile(set, key, lane, coreFraction);
       if (!prof.length) return null;
+      const origin = tlcOrigin(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
       const front = tlcFront(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
       return findSpots(prof, {
         sign: TLC_SIGNAL[key].sign,
-        origin: lane.zeroRf,
+        origin,
         front,
         radius: lane.spotRadius || 24,
       });
@@ -710,9 +747,10 @@ export const TlcView: React.FC = () => {
       const newDens: { UV254?: TlcDensitogramData; UV366?: TlcDensitogramData; White?: TlcDensitogramData } = {};
       const primary = inspectPanels[0];
 
-      if (primary && primary.lane.zeroRf != null) {
+      if (primary) {
         const s = primary.s;
         const l = primary.lane;
+        const origin = tlcOrigin(s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
         const front = tlcFront(s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
 
         for (const k of TLC_KEYS) {
@@ -720,7 +758,7 @@ export const TlcView: React.FC = () => {
             const prof = extractLaneProfile(s, k, l, coreFraction);
             newDens[k] = extractDensitogram(prof, {
               sign: TLC_SIGNAL[k].sign,
-              origin: l.zeroRf,
+              origin,
               front,
               radius: l.spotRadius || 24,
             });
@@ -731,23 +769,103 @@ export const TlcView: React.FC = () => {
     }
   }, [inspectWell, inspectPanels, filters, markSpots, coreFraction]);
 
+  // Keyboard listener inside well inspection modal for instant nudging and tilt
+  useEffect(() => {
+    if (inspectWell === null || !currentSet.cfg) return;
+    const laneId = tlcLane(inspectWell, 'column');
+    const targetLane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+    if (!targetLane) return;
+
+    const handleModalKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+      const step = e.shiftKey ? 5 : 1;
+      const angleStep = e.shiftKey ? 1.0 : 0.2;
+
+      switch (e.key) {
+        case 'ArrowLeft':
+          e.preventDefault();
+          handleUpdateLane(laneId, { x0: Math.round(targetLane.x0 - step) });
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          handleUpdateLane(laneId, { x0: Math.round(targetLane.x0 + step) });
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          handleUpdateLane(laneId, { y0: Math.round(targetLane.y0 - step) });
+          break;
+        case 'ArrowDown':
+          e.preventDefault();
+          handleUpdateLane(laneId, { y0: Math.round(targetLane.y0 + step) });
+          break;
+        case 'q':
+        case 'Q':
+        case '[':
+          e.preventDefault();
+          handleUpdateLane(laneId, { angle: +(targetLane.angle - angleStep).toFixed(2) });
+          break;
+        case 'e':
+        case 'E':
+        case ']':
+          e.preventDefault();
+          handleUpdateLane(laneId, { angle: +(targetLane.angle + angleStep).toFixed(2) });
+          break;
+        case '-':
+        case '_':
+          e.preventDefault();
+          handleUpdateLane(laneId, { width: Math.max(8, Math.round(targetLane.width - (e.shiftKey ? 4 : 2))) });
+          break;
+        case '=':
+        case '+':
+          e.preventDefault();
+          handleUpdateLane(laneId, { width: Math.round(targetLane.width + (e.shiftKey ? 4 : 2)) });
+          break;
+        case 'Escape':
+          e.preventDefault();
+          setInspectWell(null);
+          break;
+        default:
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleModalKeyDown);
+    return () => window.removeEventListener('keydown', handleModalKeyDown);
+  }, [inspectWell, currentSet.cfg]);
+
   // Handle Mouse Move on Enlarged Canvas or Densitometer with Intelligent Peak Snapping
   const handleCanvasMouseMove = (e: React.MouseEvent<any>) => {
     if (!bigCanvasRef.current || inspectPanels.length === 0) return;
     const rect = bigCanvasRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
-    const primary = inspectPanels[0];
-    const l = primary.lane;
+
+    // Detect which specific panel the cursor is over in multi-channel/compare mode
+    let panelIdx = 0;
+    let currX = 0;
+    const gap = Math.max(3, Math.round(1.0 * 6));
+    for (let j = 0; j < inspectPanels.length; j++) {
+      const pw = Math.round(1.0 * inspectPanels[j].lane.width);
+      if (mouseX >= currX && mouseX <= currX + pw + gap) {
+        panelIdx = j;
+        break;
+      }
+      currX += pw + gap;
+    }
+    const targetPanel = inspectPanels[panelIdx] || inspectPanels[0];
+    const l = targetPanel.lane;
     const ph = 1.0 * l.length;
-    const zeroDist = l.zeroRf != null ? l.zeroRf : 0;
-    const frontPos = tlcFront(primary.s, l, (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction));
+    const zeroDist = tlcOrigin(targetPanel.s, l, (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction));
+    const frontPos = tlcFront(targetPanel.s, l, (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction));
     const span = Math.max(1, frontPos - zeroDist);
 
     // Unconstrained pos from bottom (0 = bottom, ph = top)
     const rawPos = ph - mouseY;
 
-    // Check if cursor is within 16px of a detected spot apex
-    const spots = primary.spots || [];
+    // Check if cursor is within 16px of a detected spot apex on this target panel
+    const spots = targetPanel.spots || [];
     const nearSpot = spots.find((sp) => Math.abs(sp.pos - rawPos) <= 16);
 
     let activePos = rawPos;
@@ -758,8 +876,8 @@ export const TlcView: React.FC = () => {
       activeSpot = nearSpot;
     } else {
       // Local maximum check in profile within ±10 px
-      const prof = extractLaneProfile(primary.s, primary.key, l, coreFraction);
-      const sg = TLC_SIGNAL[primary.key].sign;
+      const prof = extractLaneProfile(targetPanel.s, targetPanel.key, l, coreFraction);
+      const sg = TLC_SIGNAL[targetPanel.key].sign;
       let best = Math.round(rawPos);
       for (let d = -10; d <= 10; d++) {
         const x = Math.round(rawPos) + d;
@@ -774,7 +892,8 @@ export const TlcView: React.FC = () => {
       activePos = Math.max(0, Math.min(prof.length - 1, best));
     }
 
-    const calculatedRf = Math.max(0, Math.min(1, (activePos - zeroDist) / span));
+    // Compute Rf (unclamped at top so positions beyond front aren't falsely reported as exactly 1.00)
+    const calculatedRf = Math.max(0, (activePos - zeroDist) / span);
     const snappedY = ph - activePos;
 
     setHoverRf(Number(calculatedRf.toFixed(3)));
@@ -802,7 +921,13 @@ export const TlcView: React.FC = () => {
       return;
     }
     try {
-      const csvContent = tlcRfCsv(sets, run, getSpotsForLane, plate);
+      const csvContent = tlcRfCsv(
+        sets,
+        run,
+        getSpotsForLane,
+        plate,
+        (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)
+      );
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -815,6 +940,165 @@ export const TlcView: React.FC = () => {
       toast('Exported TLC Rf table CSV.');
     } catch (err: any) {
       toast('Error exporting Rf table: ' + err.message);
+    }
+  };
+
+  // Undo history stack for lane configurations
+  const [cfgHistory, setCfgHistory] = useState<TlcLaneConfig[]>([]);
+  const originalCfgRef = useRef<Record<string, TlcLaneConfig>>({});
+
+  // Capture original configuration for resetting
+  useEffect(() => {
+    if (currentSet?.cfg && !originalCfgRef.current[currentSet.uid]) {
+      originalCfgRef.current[currentSet.uid] = JSON.parse(JSON.stringify(currentSet.cfg));
+    }
+  }, [currentSet?.uid, currentSet?.cfg]);
+
+  // Real-time micro-adjustment of lane coordinates with Undo history
+  const handleUpdateLane = (laneId: number, patch: Partial<TlcLane>) => {
+    if (!currentSet?.cfg) return;
+    const currentCfg = currentSet.cfg;
+    // Push previous config to history for Undo (cap at 40 entries) outside of context updater
+    setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentCfg))]);
+    setSets((prev) => {
+      const next = [...prev];
+      const cfg = next[cur]?.cfg;
+      if (!cfg) return next;
+      const newLanes = cfg.lanes.map((l) => (l.id === laneId ? { ...l, ...patch } : l));
+      next[cur] = {
+        ...next[cur],
+        cfg: { ...cfg, lanes: newLanes },
+        prof: {}, // invalidate cached sampled profile so it re-slices at new coordinates
+        frontAuto: {},
+        originAuto: {},
+      };
+      return next;
+    });
+  };
+
+  // Revert last adjustment
+  const handleUndo = () => {
+    if (cfgHistory.length === 0) return;
+    const prevCfg = cfgHistory[cfgHistory.length - 1];
+    setCfgHistory((h) => h.slice(0, -1));
+    setSets((prev) => {
+      const next = [...prev];
+      next[cur] = {
+        ...next[cur],
+        cfg: prevCfg,
+        prof: {},
+        frontAuto: {},
+        originAuto: {},
+      };
+      return next;
+    });
+    toast('Reverted last adjustment (Undo).');
+  };
+
+  // Reset single lane to its original template configuration
+  const handleResetLane = (laneId: number) => {
+    const origSetCfg = originalCfgRef.current[currentSet.uid];
+    if (!origSetCfg) {
+      toast('No original lane template recorded.');
+      return;
+    }
+    const origLane = origSetCfg.lanes.find((l) => l.id === laneId);
+    if (!origLane) return;
+    handleUpdateLane(laneId, { ...origLane });
+    toast(`Reset Lane ${laneId} to original template.`);
+  };
+
+  // Reset all lanes in the set to their original template configuration
+  const handleResetAllLanes = () => {
+    const origSetCfg = originalCfgRef.current[currentSet.uid];
+    if (!origSetCfg) {
+      toast('No original lane template recorded.');
+      return;
+    }
+    if (currentSet.cfg) {
+      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg))]);
+    }
+    setSets((prev) => {
+      const next = [...prev];
+      next[cur] = {
+        ...next[cur],
+        cfg: JSON.parse(JSON.stringify(origSetCfg)),
+        prof: {},
+        frontAuto: {},
+        originAuto: {},
+      };
+      return next;
+    });
+    toast('Reset all lanes to original configuration.');
+  };
+
+  // Solvent front update (moves meniscus baseline across the plate or for a specific side)
+  const handleUpdateSetFront = (frontPx: number | null, side?: number) => {
+    setSets((prev) => {
+      const next = [...prev];
+      const target = next[cur];
+      if (!target) return next;
+      if (side !== undefined) {
+        const nextHalfFront = { ...(target.frontHalfPx || {}) };
+        if (frontPx != null && frontPx > 0) {
+          nextHalfFront[side] = frontPx;
+        } else {
+          delete nextHalfFront[side];
+        }
+        next[cur] = {
+          ...target,
+          frontHalfPx: nextHalfFront,
+          prof: {},
+          frontAuto: {},
+        };
+      } else {
+        next[cur] = {
+          ...target,
+          frontPx: frontPx != null && frontPx > 0 ? frontPx : null,
+          prof: {},
+          frontAuto: {},
+        };
+      }
+      return next;
+    });
+  };
+
+  // Global Ctrl+Z / Cmd+Z shortcut for Undo
+  useEffect(() => {
+    const handleGlobalUndoKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+        const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+        if (tag === 'input' || tag === 'textarea') return;
+        if (cfgHistory.length > 0) {
+          e.preventDefault();
+          handleUndo();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalUndoKey);
+    return () => window.removeEventListener('keydown', handleGlobalUndoKey);
+  }, [cfgHistory]);
+
+  // Export current (or corrected) Lane CSV
+  const handleExportLaneCsv = () => {
+    if (!currentSet.cfg) {
+      toast('No lane configuration to export.');
+      return;
+    }
+    try {
+      const csvContent = exportLaneConfigCsv(currentSet.cfg);
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lane_config_${currentSet.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_corrected.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast('Exported corrected lane CSV.');
+    } catch (err: any) {
+      toast('Error exporting lane CSV: ' + err.message);
     }
   };
 
@@ -892,12 +1176,12 @@ export const TlcView: React.FC = () => {
             </h2>
             <p className="sub" style={{ margin: '0 0 10px 0', fontSize: '12px', color: 'var(--mut)', maxWidth: '850px' }}>
               Each well is aligned with its TLC lane. Automated computer vision calculates
-              optical densitograms, solvent front meniscuses, retention factors ($R_f$), and
-              separation resolution ($\Delta R_f$) with edge-bleed suppression.
+              optical densitograms, solvent front meniscuses, retention factors (Rf), and
+              separation resolution (ΔRf) with edge-bleed suppression.
             </p>
           </div>
 
-          {hasConfig && currentSet.cfg?.hasZeroRf && (
+          {Boolean(run?.rows?.length) && hasConfig && (
             <button
               type="button"
               className="btn pri"
@@ -912,16 +1196,59 @@ export const TlcView: React.FC = () => {
         {/* Set Tabs */}
         <div className="tlcsets" role="group" aria-label="TLC sets" style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '10px' }}>
           {sets.map((x, i) => (
-            <button
+            <div
               key={x.uid}
-              type="button"
               className={`tlcsetbtn ${i === cur ? 'on' : ''}`}
-              onClick={() => setCur(i)}
-              aria-pressed={i === cur}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '0 4px 0 10px',
+                gap: '4px',
+              }}
             >
-              {isMultiSet ? <b>{tlcLetter(i)} </b> : null}
-              {x.name}
-            </button>
+              <button
+                type="button"
+                onClick={() => setCur(i)}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  padding: '6px 0',
+                  color: 'inherit',
+                  font: 'inherit',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                {isMultiSet ? <b>{tlcLetter(i)} </b> : null}
+                <span>{x.name}</span>
+              </button>
+              {sets.length > 1 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleRemoveSetIndex(i);
+                  }}
+                  title={`Delete ${x.name}`}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    color: 'var(--mut)',
+                    padding: '2px 4px',
+                    fontSize: '12px',
+                    lineHeight: 1,
+                    borderRadius: '3px',
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--mut)')}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
           ))}
           <button type="button" className="btn sm" onClick={handleAddSet}>
             + Add Solvent Set
@@ -950,11 +1277,14 @@ export const TlcView: React.FC = () => {
             />
           </label>
 
-          {isMultiSet && (
-            <button type="button" className="btn sm bad" onClick={handleRemoveSet}>
-              Remove Set
-            </button>
-          )}
+          <button
+            type="button"
+            className="btn sm bad"
+            onClick={() => handleRemoveSetIndex(cur)}
+            title={sets.length > 1 ? `Delete "${currentSet.name}"` : 'Clear images and reset this set'}
+          >
+            {sets.length > 1 ? '🗑️ Delete Set' : '🗑️ Clear Set'}
+          </button>
 
           <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
 
@@ -962,9 +1292,9 @@ export const TlcView: React.FC = () => {
             type="button"
             className="btn"
             onClick={handleApplyDefaultGrid}
-            title="Auto-apply standard 54-lane two-tier TLC grid (27 + 27 lanes) without needing a custom CSV file"
+            title="Apply standard geometric 54-lane template for preview. For real laboratory plate analysis, load your calibrated Lane CSV."
           >
-            Auto 6×9 Grid
+            Standard 6×9 Template (Demo)
           </button>
 
           <button type="button" className="btn" onClick={() => fileCsvRef.current?.click()}>
@@ -977,6 +1307,17 @@ export const TlcView: React.FC = () => {
             style={{ display: 'none' }}
             onChange={handleLoadCsv}
           />
+
+          {hasConfig && (
+            <button
+              type="button"
+              className="btn"
+              onClick={handleExportLaneCsv}
+              title="Download current lane configuration CSV with any micro-adjustments you made"
+            >
+              Export Lane CSV
+            </button>
+          )}
 
           <button type="button" className="btn pri" onClick={() => fileImgRef.current?.click()}>
             {hasImages ? 'Add / Replace Plate Photos' : 'Upload Plate Photos'}
@@ -1076,17 +1417,15 @@ export const TlcView: React.FC = () => {
           {hasConfig ? (
             <span className="chip ok" style={{ fontSize: '11px' }}>
               ✓ {currentSet.cfg?.lanes.length} lanes · {currentSet.cfgName}
-              {currentSet.cfg?.hasZeroRf ? ' · microadjusted' : ''}
+              {currentSet.cfg?.hasZeroRf
+                ? ' · microadjusted origins'
+                : currentSet.originPx
+                ? ` · manual origin (${currentSet.originPx} px)`
+                : ' · auto-detected baseline'}
             </span>
           ) : (
             <span className="chip warn" style={{ fontSize: '11px' }}>
               ⚠️ No lane CSV loaded yet
-            </span>
-          )}
-
-          {hasConfig && !currentSet.cfg?.hasZeroRf && (
-            <span className="chip warn" style={{ fontSize: '11px' }} title="Rf calculations need the px_location_of_zero_rf column">
-              ⚠️ Rf calculation requires microadjusted lane CSV with spot origin
             </span>
           )}
 
@@ -1116,6 +1455,29 @@ export const TlcView: React.FC = () => {
                     ? '…' + currentSet.imgs[k].name.slice(-18)
                     : currentSet.imgs[k].name}
                 </span>
+                <button
+                  type="button"
+                  title={`Remove ${TLC_LABEL[k]} photo`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleRemoveImage(k);
+                  }}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    color: 'var(--mut)',
+                    marginLeft: '4px',
+                    padding: '0 2px',
+                    fontSize: '12px',
+                    lineHeight: 1,
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--mut)')}
+                >
+                  ✕
+                </button>
               </label>
             ) : null;
           })}
@@ -1200,11 +1562,12 @@ export const TlcView: React.FC = () => {
               onChange={(e) => {
                 const cf = parseFloat(e.target.value);
                 setCoreFraction(cf);
-                // Clear cached profiles to recompute with new core corridor
+                // Clear cached profiles and auto-detected fronts to recompute with new core corridor
                 setSets((prev) =>
                   prev.map((s) => ({
                     ...s,
                     prof: {},
+                    frontAuto: {},
                   }))
                 );
               }}
@@ -1220,7 +1583,7 @@ export const TlcView: React.FC = () => {
             onClick={() => {
               setFilters({ brightness: 100, contrast: 100, invert: false });
               setCoreFraction(0.35);
-              setSets((prev) => prev.map((s) => ({ ...s, prof: {} })));
+              setSets((prev) => prev.map((s) => ({ ...s, prof: {}, frontAuto: {} })));
             }}
             style={{ marginLeft: 'auto', fontSize: '11px' }}
           >
@@ -1240,14 +1603,14 @@ export const TlcView: React.FC = () => {
                 <input
                   type="number"
                   className="f mono"
-                  style={{ width: '100px' }}
+                  style={{ width: '90px' }}
                   value={currentSet.frameW || LANE_FRAME_WIDTH}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
                     if (v >= 100) {
                       setSets((prev) => {
                         const next = [...prev];
-                        next[cur] = { ...next[cur], frameW: v, prof: {} };
+                        next[cur] = { ...next[cur], frameW: v, prof: {}, frontAuto: {}, originAuto: {} };
                         return next;
                       });
                     }
@@ -1256,18 +1619,37 @@ export const TlcView: React.FC = () => {
               </label>
 
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                <span>Manual Solvent Front (px from lane start):</span>
+                <span>Spot Origin Baseline (px from start):</span>
                 <input
                   type="number"
                   className="f mono"
-                  style={{ width: '100px' }}
+                  style={{ width: '90px' }}
+                  placeholder="auto"
+                  value={currentSet.originPx || ''}
+                  onChange={(e) => {
+                    const v = e.target.value ? parseInt(e.target.value, 10) : null;
+                    setSets((prev) => {
+                      const next = [...prev];
+                      next[cur] = { ...next[cur], originPx: v > 0 ? v : null, prof: {}, originAuto: {} };
+                      return next;
+                    });
+                  }}
+                />
+              </label>
+
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                <span>Solvent Front (px from start):</span>
+                <input
+                  type="number"
+                  className="f mono"
+                  style={{ width: '90px' }}
                   placeholder="auto"
                   value={currentSet.frontPx || ''}
                   onChange={(e) => {
                     const v = e.target.value ? parseInt(e.target.value, 10) : null;
                     setSets((prev) => {
                       const next = [...prev];
-                      next[cur] = { ...next[cur], frontPx: v > 0 ? v : null, prof: {} };
+                      next[cur] = { ...next[cur], frontPx: v > 0 ? v : null, prof: {}, frontAuto: {} };
                       return next;
                     });
                   }}
@@ -1275,11 +1657,10 @@ export const TlcView: React.FC = () => {
               </label>
             </div>
             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
-              Leave blank to automatically detect the solvent front from the UV 365 nm liquid meniscus peak in the upper 30% of each lane.
-              {currentSet.cfg && currentSet.imgs.UV366 && !currentSet.frontPx && (
+              Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
+              {currentSet.cfg && (
                 <span style={{ color: 'var(--pri)', marginLeft: '6px' }}>
-                  (Auto-detected front: {tlcFront(currentSet, currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px for first half,{' '}
-                  {tlcFront(currentSet, currentSet.cfg.lanes.find((l) => l.id >= 27) || currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px for second half)
+                  (Current baseline: {Math.round(tlcOrigin(currentSet, currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(currentSet, currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)
                 </span>
               )}
             </div>
@@ -1329,6 +1710,14 @@ export const TlcView: React.FC = () => {
             }}
             run={run}
             plate={plate}
+            getProfile={(s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)}
+            onUpdateLane={handleUpdateLane}
+            onUpdateSetFront={handleUpdateSetFront}
+            onUndo={handleUndo}
+            canUndo={cfgHistory.length > 0}
+            onResetLane={handleResetLane}
+            onResetAllLanes={handleResetAllLanes}
+            onExportLaneCsv={handleExportLaneCsv}
           />
         </div>
       ) : (
@@ -1407,9 +1796,9 @@ export const TlcView: React.FC = () => {
           <div
             className="modal"
             style={{
-              maxWidth: '1020px',
-              width: '95%',
-              maxHeight: '94vh',
+              maxWidth: '1440px',
+              width: '96vw',
+              maxHeight: '96vh',
               display: 'flex',
               flexDirection: 'column',
             }}
@@ -1530,21 +1919,41 @@ export const TlcView: React.FC = () => {
                     )}
                   </div>
 
-                  {/* Main Visualizer: Side-by-Side TLC Strip & Pixel-Matched Parallel Densitometer */}
+                  {/* Side-by-Side Split View: Visualizer on Left (Sticky), Micro-Adjust & Findings on Right */}
                   <div
                     style={{
                       display: 'flex',
-                      gap: '0px',
-                      justifyContent: 'center',
-                      alignItems: 'stretch',
-                      background: '#090d0c',
-                      padding: '24px 20px',
-                      borderRadius: '8px',
-                      overflowX: 'auto',
+                      flexWrap: 'wrap',
+                      gap: '20px',
+                      alignItems: 'flex-start',
                     }}
                   >
+                    {/* Left Sticky Column: Physical Canvas & Densitometer (Always in View!) */}
+                    <div
+                      style={{
+                        position: 'sticky',
+                        top: 0,
+                        zIndex: 10,
+                        flex: '0 0 auto',
+                        maxWidth: '100%',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          gap: '0px',
+                          justifyContent: 'center',
+                          alignItems: 'stretch',
+                          background: '#090d0c',
+                          padding: '20px 16px',
+                          borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.12)',
+                          boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+                          overflowX: 'auto',
+                        }}
+                      >
                     {/* Enlarged Physical TLC Canvas */}
-                    <div style={{ position: 'relative', display: 'inline-block' }}>
+                    <div>
                       <div
                         style={{
                           fontSize: '10px',
@@ -1557,93 +1966,98 @@ export const TlcView: React.FC = () => {
                       >
                         TLC Plate Lane
                       </div>
-                      <canvas
-                        ref={bigCanvasRef}
-                        onMouseMove={handleCanvasMouseMove}
-                        onMouseLeave={() => {
-                          setHoverRf(null);
-                          setHoverY(null);
-                          setHoverSpot(null);
-                        }}
-                        onClick={handleCanvasClick}
-                        style={{
-                          cursor: 'crosshair',
-                          display: 'block',
-                          boxShadow: '0 4px 14px rgba(0,0,0,0.6)',
-                          borderRadius: '3px 0 0 3px',
-                          border: '1px solid rgba(255,255,255,0.15)',
-                          borderRight: 'none',
-                        }}
-                      />
-
-                      {/* Live Cursor Crosshair Bar across lane */}
-                      {hoverY !== null && (
-                        <div
-                          style={{
-                            position: 'absolute',
-                            left: 0,
-                            right: 0,
-                            top: `${hoverY + 18}px`, // +18 for title header
-                            height: '1px',
-                            background: hoverSpot ? '#f43f5e' : '#38bdf8',
-                            boxShadow: hoverSpot ? '0 0 6px #f43f5e' : '0 0 4px #38bdf8',
-                            pointerEvents: 'none',
-                            zIndex: 10,
+                      <div style={{ position: 'relative', display: 'inline-block' }}>
+                        <canvas
+                          ref={bigCanvasRef}
+                          onMouseMove={handleCanvasMouseMove}
+                          onMouseLeave={() => {
+                            setHoverRf(null);
+                            setHoverY(null);
+                            setHoverSpot(null);
                           }}
-                        >
-                          <span
+                          onClick={handleCanvasClick}
+                          style={{
+                            cursor: 'crosshair',
+                            display: 'block',
+                            boxShadow: '0 4px 14px rgba(0,0,0,0.6)',
+                            borderRadius: '3px 0 0 3px',
+                            border: '1px solid rgba(255,255,255,0.15)',
+                            borderRight: 'none',
+                            filter: `brightness(${filters.brightness}%) contrast(${filters.contrast}%) ${
+                              filters.invert ? 'invert(1)' : ''
+                            }`,
+                          }}
+                        />
+
+                        {/* Live Cursor Crosshair Bar across lane */}
+                        {hoverY !== null && (
+                          <div
                             style={{
                               position: 'absolute',
-                              left: '4px',
-                              top: '-16px',
-                              background: 'rgba(0,0,0,0.85)',
-                              color: hoverSpot ? '#f43f5e' : '#38bdf8',
-                              fontSize: '10px',
-                              fontWeight: 700,
-                              fontFamily: 'monospace',
-                              padding: '1px 4px',
-                              borderRadius: '2px',
+                              left: 0,
+                              right: 0,
+                              top: `${hoverY}px`,
+                              height: '1px',
+                              background: hoverSpot ? '#f43f5e' : '#38bdf8',
+                              boxShadow: hoverSpot ? '0 0 6px #f43f5e' : '0 0 4px #38bdf8',
+                              pointerEvents: 'none',
+                              zIndex: 10,
                             }}
                           >
-                            Rf {hoverRf?.toFixed(2)}
-                          </span>
-                        </div>
-                      )}
+                            <span
+                              style={{
+                                position: 'absolute',
+                                left: '4px',
+                                top: '-16px',
+                                background: 'rgba(0,0,0,0.85)',
+                                color: hoverSpot ? '#f43f5e' : '#38bdf8',
+                                fontSize: '10px',
+                                fontWeight: 700,
+                                fontFamily: 'monospace',
+                                padding: '1px 4px',
+                                borderRadius: '2px',
+                              }}
+                            >
+                              Rf {hoverRf?.toFixed(2)}
+                            </span>
+                          </div>
+                        )}
 
-                      {/* Render Pinned Markers on Canvas */}
-                      {pinnedMarkers.map((m) => (
-                        <div
-                          key={m.id}
-                          style={{
-                            position: 'absolute',
-                            left: 0,
-                            right: 0,
-                            top: `${m.y + 18}px`,
-                            height: '2px',
-                            background: '#7CFC9A',
-                            boxShadow: '0 0 4px #7CFC9A',
-                            pointerEvents: 'none',
-                            zIndex: 9,
-                          }}
-                        >
-                          <span
+                        {/* Render Pinned Markers on Canvas */}
+                        {pinnedMarkers.map((m) => (
+                          <div
+                            key={m.id}
                             style={{
                               position: 'absolute',
-                              left: '4px',
-                              top: '-16px',
-                              background: 'rgba(0,0,0,0.85)',
-                              color: '#7CFC9A',
-                              fontSize: '10px',
-                              fontWeight: 700,
-                              fontFamily: 'monospace',
-                              padding: '1px 4px',
-                              borderRadius: '2px',
+                              left: 0,
+                              right: 0,
+                              top: `${m.y}px`,
+                              height: '2px',
+                              background: '#7CFC9A',
+                              boxShadow: '0 0 4px #7CFC9A',
+                              pointerEvents: 'none',
+                              zIndex: 9,
                             }}
                           >
-                            {m.label}: Rf {m.rf.toFixed(2)}
-                          </span>
-                        </div>
-                      ))}
+                            <span
+                              style={{
+                                position: 'absolute',
+                                left: '4px',
+                                top: '-16px',
+                                background: 'rgba(0,0,0,0.85)',
+                                color: '#7CFC9A',
+                                fontSize: '10px',
+                                fontWeight: 700,
+                                fontFamily: 'monospace',
+                                padding: '1px 4px',
+                                borderRadius: '2px',
+                              }}
+                            >
+                              {m.label}: Rf {m.rf.toFixed(2)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
 
                     {/* Pixel-Matched Parallel Densitometer SVG (Base to Solvent Front) */}
@@ -1679,7 +2093,7 @@ export const TlcView: React.FC = () => {
                           const primary = inspectPanels[0];
                           const l = primary.lane;
                           const ph = inspectHeight;
-                          const originY = ph - (l.zeroRf != null ? l.zeroRf : 0);
+                          const originY = ph - tlcOrigin(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
                           const frontY = ph - tlcFront(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
 
                           return (
@@ -1906,6 +2320,357 @@ export const TlcView: React.FC = () => {
                     )}
                   </div>
 
+                  {/* Live Keyboard Guide Bar underneath TLC Strip */}
+                  <div
+                    style={{
+                      marginTop: '8px',
+                      padding: '6px 12px',
+                      background: 'rgba(255,255,255,0.04)',
+                      borderRadius: '6px',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      fontSize: '11px',
+                      color: '#94a3b8',
+                      textAlign: 'center',
+                      display: 'flex',
+                      justifyContent: 'center',
+                      gap: '12px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <span>⌨️ <b>Live Keyboard:</b> <span className="mono">← → ↑ ↓</span> nudge</span>
+                    <span><span className="mono">Q / E</span> tilt</span>
+                    <span><span className="mono">Shift</span> 5×</span>
+                    <span><span className="mono">- / +</span> width</span>
+                  </div>
+                </div>
+
+                {/* Right Column: Micro-Adjustment Controls & Analysis */}
+                <div
+                  style={{
+                    flex: '1 1 420px',
+                    minWidth: '320px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '12px',
+                  }}
+                >
+                  {/* Real-Time Micro-Adjustment of This Lane (Prominently displayed right next to canvas!) */}
+                  {currentSet.cfg && (() => {
+                    const laneId = tlcLane(inspectWell, 'column');
+                    const targetLane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+                    if (!targetLane) return null;
+
+                    return (
+                      <div
+                        style={{
+                          padding: '14px 16px',
+                          background: '#0f172a',
+                          borderRadius: '10px',
+                          border: '2px solid #facc15',
+                          boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+                          color: '#f8fafc',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px',
+                          fontSize: '12px',
+                        }}
+                      >
+                        {/* Header with identity and action buttons */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                          <span style={{ fontWeight: 800, fontSize: '13px', color: '#facc15', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                            <span>📐</span>
+                            <span>Micro-Adjust Lane {laneId} ({wellLabel(inspectWell)})</span>
+                          </span>
+
+                          <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                            <button
+                              type="button"
+                              style={{
+                                background: cfgHistory.length > 0 ? '#334155' : '#1e293b',
+                                color: cfgHistory.length > 0 ? '#38bdf8' : '#64748b',
+                                border: '1px solid ' + (cfgHistory.length > 0 ? '#0284c7' : '#334155'),
+                                borderRadius: '4px',
+                                padding: '3px 8px',
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                cursor: cfgHistory.length > 0 ? 'pointer' : 'not-allowed',
+                                opacity: cfgHistory.length > 0 ? 1 : 0.6,
+                              }}
+                              onClick={handleUndo}
+                              disabled={cfgHistory.length === 0}
+                              title="Undo last adjustment (Ctrl+Z)"
+                            >
+                              ↺ Undo
+                            </button>
+                            <button
+                              type="button"
+                              style={{
+                                background: '#1e293b',
+                                color: '#fbbf24',
+                                border: '1px solid #b45309',
+                                borderRadius: '4px',
+                                padding: '3px 8px',
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                              onClick={() => handleResetLane(laneId)}
+                              title="Reset this lane to original template"
+                            >
+                              ⟲ Reset Lane
+                            </button>
+                            <button
+                              type="button"
+                              style={{
+                                background: '#059669',
+                                color: '#ffffff',
+                                border: '1px solid #047857',
+                                borderRadius: '4px',
+                                padding: '3px 8px',
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                              onClick={handleExportLaneCsv}
+                              title="Download corrected CSV"
+                            >
+                              💾 Export CSV
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Continuous Sliders Grid */}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+                          {/* Shift X Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift X:</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #334155' }}>
+                                {Math.round(targetLane.x0)} px
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { x0: targetLane.x0 - 1 })}
+                              >
+                                ◀ -1
+                              </button>
+                              <input
+                                type="range"
+                                min={Math.max(0, Math.round(targetLane.x0 - 120))}
+                                max={Math.min(currentSet.frameW || 3280, Math.round(targetLane.x0 + 120))}
+                                step={1}
+                                value={Math.round(targetLane.x0)}
+                                onChange={(e) => handleUpdateLane(laneId, { x0: +e.target.value })}
+                                style={{ flex: 1, accentColor: '#38bdf8', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { x0: targetLane.x0 + 1 })}
+                              >
+                                +1 ▶
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Shift Y Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift Y:</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #334155' }}>
+                                {Math.round(targetLane.y0)} px
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { y0: targetLane.y0 - 1 })}
+                              >
+                                ▲ -1
+                              </button>
+                              <input
+                                type="range"
+                                min={Math.max(50, Math.round(targetLane.y0 - 120))}
+                                max={Math.min(3200, Math.round(targetLane.y0 + 120))}
+                                step={1}
+                                value={Math.round(targetLane.y0)}
+                                onChange={(e) => handleUpdateLane(laneId, { y0: +e.target.value })}
+                                style={{ flex: 1, accentColor: '#38bdf8', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { y0: targetLane.y0 + 1 })}
+                              >
+                                +1 ▼
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Tilt Angle Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#facc15' }}>Tilt Angle:</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 800, color: '#facc15', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #b45309' }}>
+                                {targetLane.angle.toFixed(1)}°
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle - 0.2).toFixed(2) })}
+                              >
+                                ↺ -0.2°
+                              </button>
+                              <input
+                                type="range"
+                                min={Math.abs(targetLane.angle) > 90 ? 150 : -30}
+                                max={Math.abs(targetLane.angle) > 90 ? 210 : 30}
+                                step={0.1}
+                                value={targetLane.angle}
+                                onChange={(e) => handleUpdateLane(laneId, { angle: parseFloat((+e.target.value).toFixed(2)) })}
+                                style={{ flex: 1, accentColor: '#facc15', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle + 0.2).toFixed(2) })}
+                              >
+                                +0.2° ↻
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Origin Baseline (Rf = 0) Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24' }}>Origin (Rf=0):</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #78350f' }}>
+                                {Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => {
+                                  const curr = Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  handleUpdateLane(laneId, { zeroRf: Math.max(5, curr - 1) });
+                                }}
+                              >
+                                -1
+                              </button>
+                              <input
+                                type="range"
+                                min={5}
+                                max={Math.round(targetLane.length * 0.45)}
+                                step={1}
+                                value={Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
+                                onChange={(e) => handleUpdateLane(laneId, { zeroRf: +e.target.value })}
+                                style={{ flex: 1, accentColor: '#fbbf24', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => {
+                                  const curr = Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  handleUpdateLane(laneId, { zeroRf: curr + 1 });
+                                }}
+                              >
+                                +1
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Solvent Front (Rf = 1) Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front (Rf=1):</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
+                                {Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => {
+                                  const curr = Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  handleUpdateSetFront(Math.max(50, curr - 1));
+                                }}
+                              >
+                                -1
+                              </button>
+                              <input
+                                type="range"
+                                min={50}
+                                max={Math.round(targetLane.length * 1.05)}
+                                step={1}
+                                value={Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
+                                onChange={(e) => handleUpdateSetFront(+e.target.value)}
+                                style={{ flex: 1, accentColor: '#38bdf8', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => {
+                                  const curr = Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  handleUpdateSetFront(curr + 1);
+                                }}
+                              >
+                                +1
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Lane Width Slider */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#c084fc' }}>Lane Width:</span>
+                              <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#c084fc', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #6b21a8' }}>
+                                {Math.round(targetLane.width)} px
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { width: Math.max(8, targetLane.width - 1) })}
+                              >
+                                -1
+                              </button>
+                              <input
+                                type="range"
+                                min={8}
+                                max={120}
+                                step={1}
+                                value={Math.round(targetLane.width)}
+                                onChange={(e) => handleUpdateLane(laneId, { width: +e.target.value })}
+                                style={{ flex: 1, accentColor: '#c084fc', height: '5px', cursor: 'ew-resize' }}
+                              />
+                              <button
+                                type="button"
+                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                onClick={() => handleUpdateLane(laneId, { width: targetLane.width + 1 })}
+                              >
+                                +1
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ fontSize: '11px', color: '#94a3b8' }}>
+                          ⚡ Instant Redraw: Drag sliders for continuous scrubbing, or use keyboard arrow keys (<span className="mono">← → ↑ ↓</span>) and <span className="mono">Q / E</span>.
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {/* Automated Peak Findings & Chromatographic Separation (ΔRf) */}
                   <div
                     style={{
@@ -2042,6 +2807,9 @@ export const TlcView: React.FC = () => {
                         Click anywhere on the TLC strip or densitogram to pin custom reference spots.
                       </div>
                     )}
+                  </div>
+
+                    </div>
                   </div>
                 </div>
               ) : (

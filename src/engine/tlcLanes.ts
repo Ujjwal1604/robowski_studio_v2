@@ -141,10 +141,14 @@ export function createDefaultLaneConfig(
 
 export function createDefaultLaneCsvText(layout: 'two-tier' | 'single-tier' = 'two-tier'): string {
   const cfg = createDefaultLaneConfig(LANE_FRAME_WIDTH, layout);
+  return exportLaneConfigCsv(cfg);
+}
+
+export function exportLaneConfigCsv(cfg: TlcLaneConfig): string {
   const rows = [
     'id,x0,y0,length,width,direction_angle,spot_radius_px,px_location_of_zero_rf',
     ...cfg.lanes.map(
-      (l) => `${l.id},${l.x0},${l.y0},${l.length},${l.width},${l.angle},${l.spotRadius || 16},${l.zeroRf || 120}`
+      (l) => `${l.id},${Math.round(l.x0)},${Math.round(l.y0)},${Math.round(l.length)},${Math.round(l.width)},${Number(l.angle.toFixed(2))},${l.spotRadius ?? ''},${l.zeroRf != null ? Math.round(l.zeroRf) : ''}`
     ),
   ];
   return rows.join('\n');
@@ -304,6 +308,21 @@ export function detectFront(profile: number[]): number {
   return best;
 }
 
+// Detect spot origin from baseline deposit peak in lower 4%-25% of the lane
+export function detectOrigin(profile: number[], sign: number = -1): number {
+  if (!profile.length) return 0;
+  const sm = movingAvg(profile, 7);
+  const lo = Math.max(5, Math.floor(profile.length * 0.04));
+  const hi = Math.min(profile.length - 1, Math.floor(profile.length * 0.25));
+  let best = lo;
+  for (let i = lo; i <= hi; i++) {
+    const val = sign < 0 ? -sm[i] : sm[i];
+    const bestVal = sign < 0 ? -sm[best] : sm[best];
+    if (val > bestVal) best = i;
+  }
+  return best;
+}
+
 export const tlcHalf = (lane: TlcLane): number => (lane.id < 27 ? 0 : 1);
 
 // Find spots in a lane profile using rolling percentile baseline subtraction
@@ -337,11 +356,11 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const span = Math.max(1, o.front - o.origin);
   const end = Math.round(o.origin + 0.93 * span);
 
-  const all = d.slice(Math.max(0, from), Math.min(n, end));
-  const dmax = Math.max(...all, 1e-9);
+  const chrom = d.slice(Math.max(start, 0), Math.min(n, end));
+  const dmax = Math.max(...chrom, 1e-9);
   const med = pctile(d, 0.5);
   const noise = 1.4826 * pctile(d.map((v) => Math.abs(v - med)), 0.5);
-  const thr = Math.max(4 * noise, 0.06 * dmax);
+  const thr = Math.max(3.5 * noise, 0.05 * dmax);
   const spots: TlcSpot[] = [];
 
   for (let i = Math.max(start, 1); i < Math.min(end, n - 1); i++) {
@@ -451,17 +470,20 @@ export function extractDensitogram(
   };
 }
 
-// Solvent front resolution: explicit manual override -> UV366 meniscus detection -> fallback 93% of lane length
+// Solvent front resolution: explicit side override -> explicit global manual override -> UV366 meniscus detection -> fallback 93% of lane length
 export function tlcFront(
   set: TlcSet,
   lane: TlcLane,
   getProfile?: (set: TlcSet, key: 'UV366', lane: TlcLane) => number[]
 ): number {
+  const h = tlcHalf(lane);
+  if (set.frontHalfPx && set.frontHalfPx[h] != null && set.frontHalfPx[h]! > 0) {
+    return set.frontHalfPx[h]!;
+  }
   if (set.frontPx && set.frontPx > 0) return set.frontPx;
   if (!set.imgs.UV366 || !getProfile) return Math.round(lane.length * 0.93);
 
   set.frontAuto = set.frontAuto || {};
-  const h = tlcHalf(lane);
   if (set.frontAuto[h] == null && set.cfg) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
     const fronts = halfLanes
@@ -473,12 +495,47 @@ export function tlcFront(
   return set.frontAuto[h] ?? Math.round(lane.length * 0.93);
 }
 
+// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> auto-detected baseline peak -> fallback ~10% lane length
+export function tlcOrigin(
+  set: TlcSet,
+  lane: TlcLane,
+  getProfile?: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): number {
+  if (lane.zeroRf != null && lane.zeroRf > 0) return lane.zeroRf;
+  if (set.originPx != null && set.originPx > 0) return set.originPx;
+
+  set.originAuto = set.originAuto || {};
+  const h = tlcHalf(lane);
+  if (set.originAuto[h] == null && set.cfg && getProfile) {
+    const ch: TlcChannelKey | undefined = set.imgs.UV254
+      ? 'UV254'
+      : set.imgs.UV366
+      ? 'UV366'
+      : set.imgs.White
+      ? 'White'
+      : undefined;
+    if (ch && set.imgs[ch]) {
+      const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
+      const origins = halfLanes
+        .map((l) => detectOrigin(getProfile(set, ch, l), TLC_SIGNAL[ch].sign))
+        .filter((orig) => orig > 10)
+        .sort((a, b) => a - b);
+      if (origins.length > 0) {
+        set.originAuto[h] = origins[origins.length >> 1];
+      }
+    }
+  }
+
+  return set.originAuto?.[h] ?? Math.max(20, Math.round(lane.length * 0.10));
+}
+
 // Generate tlc_rf_table.csv: one line per lane of every set, with vial recipe, front, origin, and up to 5 spots
 export function tlcRfCsv(
   sets: TlcSet[],
   run: RunResult,
   getSpots: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => TlcSpot[] | null,
-  plateIndex: number = 0
+  plateIndex: number = 0,
+  getProfile?: (set: TlcSet, key: any, lane: TlcLane) => number[]
 ): string {
   const codes = run.reagents.map((r) => r.code);
   const head = [
@@ -526,8 +583,8 @@ export function tlcRfCsv(
         }),
         row ? +(+row['vol#solvent']).toFixed(2) : '',
         TLC_SIGNAL[key].label,
-        l.zeroRf != null ? Math.round(l.zeroRf) : '',
-        tlcFront(set, l),
+        Math.round(tlcOrigin(set, l, getProfile)),
+        tlcFront(set, l, getProfile),
         sp.length,
       ];
       for (let n = 0; n < 5; n++) {

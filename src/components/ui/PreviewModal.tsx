@@ -163,7 +163,7 @@ export const PreviewModal: React.FC = () => {
                       <b>{rows.length - 1}</b> rows
                     </span>
                   </div>
-                  <div className="tbl" style={{ maxHeight: '58vh', overflowY: 'auto' }}>
+                  <div className="tbl" style={{ maxHeight: '68vh', overflowY: 'auto' }}>
                     <table>
                       <thead>
                         <tr>
@@ -220,7 +220,7 @@ export const PreviewModal: React.FC = () => {
                 </div>
                 {xlsxSheets[activeSheet] && (
                   <div className="sheetpane">
-                    <div className="tbl" style={{ maxHeight: '52vh', overflowY: 'auto' }}>
+                    <div className="tbl" style={{ maxHeight: '68vh', overflowY: 'auto' }}>
                       <table>
                         <thead>
                           <tr>
@@ -293,7 +293,7 @@ export const PreviewModal: React.FC = () => {
                       borderRadius: '10px',
                       background: '#fff',
                       padding: '18px',
-                      maxHeight: '58vh',
+                      maxHeight: '68vh',
                       overflow: 'auto',
                     }}
                     dangerouslySetInnerHTML={{ __html: bp.body }}

@@ -8,7 +8,18 @@ export function assignDeckPositions(
   cfg?: Partial<DeckConfig> | null
 ): DeckLayout {
   const c = { ...defaultPlates(hood), ...(cfg || {}) };
-  const rows = Object.values(stocks);
+  // Only allocate deck positions for stocks that the robot will actually aspirate from.
+  // Intermediate hand-diluted stocks (prepared only to feed subsequent dilutions like N -> N2) have 0 direct consumption.
+  const rows = Object.values(stocks).filter((s) => {
+    if (
+      s.direct_consumption_ml === 0 &&
+      s.consumption_uL === 0 &&
+      (s.additional_dilution_source_ml > 0 || s.source_only)
+    ) {
+      return false;
+    }
+    return true;
+  });
   const base = rows.filter((s) => s.dilution_level === 0);
   const diluted = rows.filter((s) => s.dilution_level > 0);
   const all = [...base, ...diluted];

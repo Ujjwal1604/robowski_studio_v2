@@ -11,6 +11,8 @@ import {
   movingAvg,
   pctile,
   detectFront,
+  detectOrigin,
+  tlcOrigin,
   findSpots,
   extractDensitogram,
   computeLaneRowIntensity,
@@ -198,5 +200,28 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     const coreVal = computeLaneRowIntensity(row, width, 1, 0.35);
     // Average should reflect the center peak dip and NOT the edge spike
     expect(coreVal).toBeLessThan(100);
+  });
+
+  it('detects baseline origin and resolves tlcOrigin for microadjusted vs normal CSVs', () => {
+    // 1. Detect baseline peak in lower 4-25%
+    const prof = new Array(300).fill(180);
+    // Spot deposit at index 35 (approx 12%)
+    for (let i = 30; i <= 40; i++) prof[i] = 40;
+    const detected = detectOrigin(prof, -1);
+    expect(detected).toBeGreaterThanOrEqual(30);
+    expect(detected).toBeLessThanOrEqual(40);
+
+    // 2. Microadjusted lane with explicit zeroRf
+    const setA: any = { uid: 's1', name: 'Set A', imgs: {}, frameW: 3280 };
+    const laneWithZero: TlcLane = { id: 0, x0: 100, y0: 1000, length: 1000, width: 40, angle: 0, zeroRf: 135 };
+    expect(tlcOrigin(setA, laneWithZero)).toBe(135);
+
+    // 3. Normal lane without zeroRf: falls back to 10% length (100 px) or set.originPx
+    const normalLane: TlcLane = { id: 1, x0: 100, y0: 1000, length: 1000, width: 40, angle: 0 };
+    expect(tlcOrigin(setA, normalLane)).toBe(100);
+
+    // 4. Normal lane with manual set.originPx override
+    const setManual: any = { uid: 's2', name: 'Set B', imgs: {}, frameW: 3280, originPx: 115 };
+    expect(tlcOrigin(setManual, normalLane)).toBe(115);
   });
 });

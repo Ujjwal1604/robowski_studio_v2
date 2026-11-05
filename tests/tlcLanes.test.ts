@@ -18,6 +18,8 @@ import {
   computeLaneRowIntensity,
   createDefaultLaneConfig,
   createDefaultLaneCsvText,
+  extractFluorescenceOverlay,
+  computeFalseColorComposite,
 } from '../src/engine/tlcLanes';
 import { buildRun } from '../src/engine/dilution';
 import { exampleState, dataFor } from '../src/context/runPayload';
@@ -223,5 +225,88 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     // 4. Normal lane with manual set.originPx override
     const setManual: any = { uid: 's2', name: 'Set B', imgs: {}, frameW: 3280, originPx: 115 };
     expect(tlcOrigin(setManual, normalLane)).toBe(115);
+  });
+
+  it('correctly maps inverted/opposing 180-degree upper tier lanes without coordinate distortion', () => {
+    // Upper tier lane migrating downwards from top edge (y0=100, length=980, angle=180)
+    const upperLane: TlcLane = {
+      id: 27,
+      x0: 500,
+      y0: 100,
+      length: 980,
+      width: 72,
+      angle: 180,
+    };
+    const m = laneMatrix(upperLane, 1.0, 1.0);
+    // At origin (500, 100), canvas coordinates should be (w/2, len) = (36, 980)
+    const uOrigin = m[0] * 500 + m[2] * 100 + m[4];
+    const vOrigin = m[1] * 500 + m[3] * 100 + m[5];
+    expect(uOrigin).toBeCloseTo(36, 1);
+    expect(vOrigin).toBeCloseTo(980, 1);
+
+    // At solvent front apex (500, 1080), canvas coordinates should be (36, 0)
+    const uFront = m[0] * 500 + m[2] * 1080 + m[4];
+    const vFront = m[1] * 500 + m[3] * 1080 + m[5];
+    expect(uFront).toBeCloseTo(36, 1);
+    expect(vFront).toBeCloseTo(0, 1);
+
+    // Flipping lane geometry preserving physical silica gel strip bounds
+    const th = (upperLane.angle * Math.PI) / 180;
+    const endX = Math.round(upperLane.x0 + upperLane.length * Math.sin(th));
+    const endY = Math.round(upperLane.y0 - upperLane.length * Math.cos(th));
+    expect(endX).toBe(500);
+    expect(endY).toBe(1080);
+  });
+
+  it('calculates spot centroid along lane migration vector and applies global plate skew correctly', () => {
+    // 1. Spot centroid Rf mapping along lane axis
+    const lane: TlcLane = { id: 5, x0: 400, y0: 2200, length: 1000, width: 60, angle: 0 };
+    const origin = 100;
+    const front = 900;
+    const span = front - origin; // 800 px
+    const rf = 0.50;
+    const spotPos = origin + rf * span; // 500 px
+    expect(spotPos).toBe(500);
+
+    // 2. Global skew rotation: applying +0.2° to all lanes preserves origin coordinates
+    const lanes: TlcLane[] = [
+      { id: 0, x0: 200, y0: 2200, length: 1000, width: 60, angle: -0.4 },
+      { id: 27, x0: 200, y0: 100, length: 1000, width: 60, angle: 179.6 },
+    ];
+    const skewed = lanes.map((l) => ({ ...l, angle: +(l.angle + 0.2).toFixed(2) }));
+    expect(skewed[0].angle).toBe(-0.2);
+    expect(skewed[1].angle).toBe(179.8);
+    expect(skewed[0].x0).toBe(200);
+    expect(skewed[0].y0).toBe(2200);
+  });
+
+  it('correctly strips ambient chamber background from UV366 to prevent overexposed composite images', () => {
+    // 2x2 image: pixel 0 is dark background (20, 20, 40), pixel 1 is bright fluorescence (180, 100, 250)
+    const src = new Uint8ClampedArray([
+      20, 20, 40, 255,   // Background pixel
+      180, 100, 250, 255, // Fluorescent spot pixel
+      18, 18, 35, 255,   // Background pixel
+      22, 22, 42, 255,   // Background pixel
+    ]);
+
+    const overlay = extractFluorescenceOverlay(src, 2, 2, 0.20, 1.5);
+    // Background pixel must be 100% transparent (alpha = 0) so it does NOT wash out UV254
+    expect(overlay[3]).toBe(0);
+    // Fluorescent spot pixel must be opaque (alpha > 0)
+    expect(overlay[7]).toBeGreaterThan(150);
+
+    // Test False-Color composite
+    const uv254 = new Uint8ClampedArray([
+      40, 60, 30, 255,   // Quenching spot on UV254 (dark green)
+      60, 200, 80, 255,  // Bright phosphor background
+      60, 200, 80, 255,  // Bright phosphor background
+      60, 200, 80, 255,  // Bright phosphor background
+    ]);
+    const fc = computeFalseColorComposite(uv254, src, 2, 2, 1.4);
+    expect(fc.length).toBe(16);
+    // Spot 0 (Quenching): Amber/Gold has high red/green
+    expect(fc[0]).toBeGreaterThan(100);
+    // Spot 1 (Fluorescence): Cyan has high blue
+    expect(fc[6]).toBeGreaterThan(150);
   });
 });

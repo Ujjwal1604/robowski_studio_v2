@@ -395,7 +395,7 @@ export const TlcView: React.FC = () => {
 
   // Display Mode: 54-Well Sliced Grid vs Full Plate Photograph Overview
   const [viewMode, setViewMode] = useState<'grid' | 'full-plate'>('grid');
-  const [fullPlateChannel, setFullPlateChannel] = useState<TlcChannelKey>('UV254');
+  const [fullPlateChannel, setFullPlateChannel] = useState<TlcChannelKey | 'composite'>('UV254');
 
   // Sampling Corridor Core Fraction: default 35% to stop edge spillover
   const [coreFraction, setCoreFraction] = useState<number>(0.35);
@@ -725,13 +725,14 @@ export const TlcView: React.FC = () => {
     return getPanelsForLane(t);
   }, [inspectWell, getPanelsForLane]);
 
-  // Memoized panels for all 54 wells in the plate grid
+  // Memoized panels for all 54 wells in the plate grid (only computed when viewing 54-well grid)
   const allPanels = useMemo(() => {
+    if (viewMode !== 'grid') return [];
     return Array.from({ length: 54 }, (_, wellIndex) => {
       const laneId = tlcLane(wellIndex, 'column');
       return getPanelsForLane(laneId);
     });
-  }, [getPanelsForLane]);
+  }, [viewMode, getPanelsForLane]);
 
   // Exact vertical height of the enlarged TLC lane canvas (1:1 pixel scale)
   const inspectHeight = useMemo(() => {
@@ -954,12 +955,25 @@ export const TlcView: React.FC = () => {
     }
   }, [currentSet?.uid, currentSet?.cfg]);
 
-  // Real-time micro-adjustment of lane coordinates with Undo history
-  const handleUpdateLane = (laneId: number, patch: Partial<TlcLane>) => {
+  const lastHistorySnapshotRef = useRef<number>(0);
+
+  // Take explicit undo history snapshot (e.g. on slider grab or key press)
+  const handleSnapshotHistory = useCallback(() => {
     if (!currentSet?.cfg) return;
-    const currentCfg = currentSet.cfg;
-    // Push previous config to history for Undo (cap at 40 entries) outside of context updater
-    setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentCfg))]);
+    setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg!))]);
+    lastHistorySnapshotRef.current = Date.now();
+  }, [currentSet?.cfg]);
+
+  // Real-time micro-adjustment of lane coordinates with smart debounced Undo history
+  const handleUpdateLane = (laneId: number, patch: Partial<TlcLane>, forceSnapshot: boolean = false) => {
+    if (!currentSet?.cfg) return;
+    const now = Date.now();
+    // Snapshot history once at the start of a slide or after 500ms pause, or if forced
+    if (forceSnapshot || now - lastHistorySnapshotRef.current > 500) {
+      const currentCfg = currentSet.cfg;
+      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentCfg))]);
+      lastHistorySnapshotRef.current = now;
+    }
     setSets((prev) => {
       const next = [...prev];
       const cfg = next[cur]?.cfg;
@@ -1694,6 +1708,24 @@ export const TlcView: React.FC = () => {
                 {TLC_LABEL[k]} {currentSet.imgs[k] ? '✓' : '(empty)'}
               </button>
             ))}
+            {currentSet.imgs.UV254 && currentSet.imgs.UV366 && (
+              <button
+                type="button"
+                className={`btn sm ${fullPlateChannel === 'composite' ? 'pri' : ''}`}
+                onClick={() => setFullPlateChannel('composite')}
+                style={{
+                  fontSize: '11px',
+                  padding: '4px 10px',
+                  background: fullPlateChannel === 'composite' ? '#0f766e' : undefined,
+                  borderColor: fullPlateChannel === 'composite' ? '#14b8a6' : undefined,
+                  color: fullPlateChannel === 'composite' ? '#ffffff' : undefined,
+                  fontWeight: 700,
+                }}
+                title="Dual-channel overlay blending UV254 quenching with UV365 fluorescence"
+              >
+                ✨ Dual Composite (254+365) ✓
+              </button>
+            )}
           </div>
 
           <TlcFullPlateView
@@ -1713,6 +1745,7 @@ export const TlcView: React.FC = () => {
             getProfile={(s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)}
             onUpdateLane={handleUpdateLane}
             onUpdateSetFront={handleUpdateSetFront}
+            onSnapshotHistory={handleSnapshotHistory}
             onUndo={handleUndo}
             canUndo={cfgHistory.length > 0}
             onResetLane={handleResetLane}
@@ -2512,39 +2545,92 @@ export const TlcView: React.FC = () => {
                           </div>
 
                           {/* Tilt Angle Slider */}
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                              <span style={{ fontSize: '11px', fontWeight: 700, color: '#facc15' }}>Tilt Angle:</span>
-                              <span className="mono" style={{ fontSize: '11px', fontWeight: 800, color: '#facc15', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #b45309' }}>
-                                {targetLane.angle.toFixed(1)}°
-                              </span>
-                            </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <button
-                                type="button"
-                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
-                                onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle - 0.2).toFixed(2) })}
-                              >
-                                ↺ -0.2°
-                              </button>
-                              <input
-                                type="range"
-                                min={Math.abs(targetLane.angle) > 90 ? 150 : -30}
-                                max={Math.abs(targetLane.angle) > 90 ? 210 : 30}
-                                step={0.1}
-                                value={targetLane.angle}
-                                onChange={(e) => handleUpdateLane(laneId, { angle: parseFloat((+e.target.value).toFixed(2)) })}
-                                style={{ flex: 1, accentColor: '#facc15', height: '5px', cursor: 'ew-resize' }}
-                              />
-                              <button
-                                type="button"
-                                style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
-                                onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle + 0.2).toFixed(2) })}
-                              >
-                                +0.2° ↻
-                              </button>
-                            </div>
-                          </div>
+                          {(() => {
+                            const isOpposingModal = Math.abs(targetLane.angle) > 90;
+                            const baseAngleModal = isOpposingModal ? (targetLane.angle < 0 ? -180 : 180) : 0;
+                            const tiltMinModal = +(baseAngleModal - 30).toFixed(1);
+                            const tiltMaxModal = +(baseAngleModal + 30).toFixed(1);
+
+                            const handleFlipModalLane = () => {
+                              const th = (targetLane.angle * Math.PI) / 180;
+                              const endX = Math.round(targetLane.x0 + targetLane.length * Math.sin(th));
+                              const endY = Math.round(targetLane.y0 - targetLane.length * Math.cos(th));
+                              const newAngle = isOpposingModal
+                                ? +((targetLane.angle - (targetLane.angle > 0 ? 180 : -180))).toFixed(2)
+                                : +((targetLane.angle + 180)).toFixed(2);
+                              handleUpdateLane(laneId, { x0: endX, y0: endY, angle: newAngle });
+                            };
+
+                            return (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#facc15', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+                                    <span>Tilt Angle:</span>
+                                    <span style={{ fontSize: '9px', background: isOpposingModal ? '#7c2d12' : '#1e3a5f', color: isOpposingModal ? '#fdba74' : '#93c5fd', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
+                                      {isOpposingModal ? '↕ Downward' : '↑ Upward'}
+                                    </span>
+                                  </span>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                    <button
+                                      type="button"
+                                      style={{ background: '#1e293b', color: '#38bdf8', border: '1px solid #0284c7', borderRadius: '4px', padding: '1px 6px', fontSize: '10px', cursor: 'pointer' }}
+                                      onClick={handleFlipModalLane}
+                                      title="Flip lane direction 180°"
+                                    >
+                                      ↕ Flip 180°
+                                    </button>
+                                    <span className="mono" style={{ fontSize: '11px', fontWeight: 800, color: '#facc15', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #b45309' }}>
+                                      {targetLane.angle >= 0 ? '+' : ''}{targetLane.angle.toFixed(1)}°
+                                    </span>
+                                  </div>
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                  <button
+                                    type="button"
+                                    style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 5px', fontSize: '10px', cursor: 'pointer' }}
+                                    onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle - 1.0).toFixed(2) })}
+                                    title="Rotate counter-clockwise 1.0°"
+                                  >
+                                    -1°
+                                  </button>
+                                  <button
+                                    type="button"
+                                    style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 5px', fontSize: '10px', cursor: 'pointer' }}
+                                    onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle - 0.2).toFixed(2) })}
+                                    title="Rotate counter-clockwise 0.2°"
+                                  >
+                                    ↺ -0.2°
+                                  </button>
+                                  <input
+                                    type="range"
+                                    min={tiltMinModal}
+                                    max={tiltMaxModal}
+                                    step={0.1}
+                                    value={targetLane.angle}
+                                    onChange={(e) => handleUpdateLane(laneId, { angle: parseFloat((+e.target.value).toFixed(2)) })}
+                                    style={{ flex: 1, accentColor: '#facc15', height: '5px', cursor: 'ew-resize' }}
+                                    title={`Continuous Tilt Angle slider (${tiltMinModal}° to ${tiltMaxModal}°)`}
+                                  />
+                                  <button
+                                    type="button"
+                                    style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 5px', fontSize: '10px', cursor: 'pointer' }}
+                                    onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle + 0.2).toFixed(2) })}
+                                    title="Rotate clockwise 0.2°"
+                                  >
+                                    +0.2° ↻
+                                  </button>
+                                  <button
+                                    type="button"
+                                    style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 5px', fontSize: '10px', cursor: 'pointer' }}
+                                    onClick={() => handleUpdateLane(laneId, { angle: +(targetLane.angle + 1.0).toFixed(2) })}
+                                    title="Rotate clockwise 1.0°"
+                                  >
+                                    +1°
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })()}
 
                           {/* Origin Baseline (Rf = 0) Slider */}
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', background: 'rgba(255,255,255,0.03)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>

@@ -596,3 +596,96 @@ export function tlcRfCsv(
 
   return csvText(rows);
 }
+
+/**
+ * Computes isolated background-subtracted fluorescence pixel array.
+ * Strips ambient dark background from UV366 so it doesn't wash out or overexpose the UV254 plate.
+ */
+export function extractFluorescenceOverlay(
+  srcData: Uint8ClampedArray,
+  width: number,
+  height: number,
+  threshold: number = 0.15,
+  gain: number = 1.6
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(srcData.length);
+  // Estimate background level from sample points
+  let bgSum = 0;
+  let bgCount = 0;
+  const sampleStep = Math.max(1, Math.floor(width / 20));
+  for (let y = 0; y < Math.min(height, 50); y += 4) {
+    for (let x = 0; x < width; x += sampleStep) {
+      const idx = (y * width + x) * 4;
+      const lum = 0.299 * srcData[idx] + 0.587 * srcData[idx + 1] + 0.114 * srcData[idx + 2];
+      bgSum += lum;
+      bgCount++;
+    }
+  }
+  const bgLevel = bgCount > 0 ? bgSum / bgCount : 30;
+  const cutoff = Math.max(bgLevel + 6, threshold * 255);
+  const denom = Math.max(1, 255 - cutoff);
+
+  for (let i = 0; i < srcData.length; i += 4) {
+    const r = srcData[i];
+    const g = srcData[i + 1];
+    const b = srcData[i + 2];
+    const lum = 0.25 * r + 0.35 * g + 0.40 * b;
+
+    if (lum <= cutoff) {
+      // Background: totally transparent so it does NOT wash out UV254
+      out[i] = 0;
+      out[i + 1] = 0;
+      out[i + 2] = 0;
+      out[i + 3] = 0;
+    } else {
+      const excess = (lum - cutoff) / denom;
+      const alpha = Math.min(255, Math.round(Math.pow(excess, 0.85) * 255 * gain));
+      out[i] = Math.min(255, Math.round(r * gain + 20));
+      out[i + 1] = Math.min(255, Math.round(g * gain + 30));
+      out[i + 2] = Math.min(255, Math.round(Math.max(b, 160) * gain));
+      out[i + 3] = alpha;
+    }
+  }
+  return out;
+}
+
+/**
+ * Computes false-color dual channel composite (UV254 Quenching = Amber/Red, UV366 Fluorescence = Cyan).
+ */
+export function computeFalseColorComposite(
+  uv254Data: Uint8ClampedArray,
+  uv366Data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  gain: number = 1.4
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(uv254Data.length);
+
+  // Estimate UV254 bright phosphor baseline
+  let gSum = 0;
+  for (let i = 0; i < uv254Data.length; i += 16) {
+    gSum += uv254Data[i + 1];
+  }
+  const baseG = Math.max(100, (gSum / (uv254Data.length / 16)) * 1.05);
+
+  for (let i = 0; i < uv254Data.length; i += 4) {
+    // 1. Quenching signal (darkness in UV254 green channel)
+    const g254 = uv254Data[i + 1];
+    const qRaw = Math.max(0, (baseG - g254) / baseG);
+    const q = Math.min(1.0, Math.pow(qRaw, 0.9) * 1.6);
+
+    // 2. Fluorescence signal (brightness in UV366)
+    const lum366 = 0.25 * uv366Data[i] + 0.35 * uv366Data[i + 1] + 0.40 * uv366Data[i + 2];
+    const fRaw = Math.max(0, (lum366 - 25) / 230);
+    const f = Math.min(1.0, Math.pow(fRaw, 0.85) * gain);
+
+    // Dark matrix background: [12, 18, 30]
+    // Quenching: Gold/Amber [245, 158, 11]
+    // Fluorescence: Laser Cyan [6, 182, 212]
+    out[i] = Math.min(255, Math.round(12 + q * 233 + f * 50));
+    out[i + 1] = Math.min(255, Math.round(18 + q * 140 + f * 194));
+    out[i + 2] = Math.min(255, Math.round(30 + q * 10 + f * 225));
+    out[i + 3] = 255;
+  }
+  return out;
+}

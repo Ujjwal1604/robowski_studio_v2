@@ -117,7 +117,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               origin: oVal,
               front: fVal,
               radius: lane.spotRadius || 24,
-              minProminence: 0.35,
+              minProminence: 0.28, // default sensitivity; the TLC view slider is local to that view
             });
 
             if (chSpots && chSpots.length > 0) {

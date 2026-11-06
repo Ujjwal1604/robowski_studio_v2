@@ -509,3 +509,27 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     expect(standardSpots.length).toBe(2);
   });
 });
+
+describe('spot sensitivity slider', () => {
+  const n = 1000;
+  const g = (i: number, c: number, w: number, h: number) => h * Math.exp(-(((i - c) / w) ** 2));
+  const doublet = Array.from({ length: n }, (_, i) => 200 - g(i, 400, 14, 80) - g(i, 434, 14, 60) - g(i, 700, 12, 20));
+  const count = (p: number) => findSpots(doublet, { sign: -1, origin: 20, front: 980, radius: 24, minProminence: p }).length;
+
+  it('never finds more spots as the slider moves toward merging', () => {
+    let prev = Infinity;
+    for (let p = 0.08; p <= 0.7001; p += 0.02) {
+      const c = count(p);
+      expect(c).toBeLessThanOrEqual(prev);
+      prev = c;
+    }
+  });
+  it('resolves the doublet when sensitive and merges it when broad', () => {
+    expect(count(0.12)).toBe(3);
+    expect(count(0.55)).toBe(2);
+  });
+  it('changes the result inside the old Standard band, not only at mode edges', () => {
+    expect(count(0.2)).toBe(3);
+    expect(count(0.4)).toBe(2);
+  });
+});

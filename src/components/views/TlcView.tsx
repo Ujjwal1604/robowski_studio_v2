@@ -25,6 +25,9 @@ import {
   tlcFront,
   tlcOrigin,
   tlcRfCsv,
+  exportTlcAnalysisCsv,
+  exportTlcAnalysisJson,
+  TlcAnalysisExportOptions,
   createDefaultLaneConfig,
   createDemoTlcDataSet,
   exportLaneConfigCsv,
@@ -957,34 +960,50 @@ export const TlcView: React.FC = () => {
     }
   };
 
-  // Download Batch tlc_rf_table.csv
-  const handleDownloadRfCsv = () => {
-    if (!run) {
-      toast('No active run data.');
+  // Export current TLC plate analysis data as CSV or JSON
+  const handleExportAnalysis = (format: 'csv' | 'json', scope: 'current' | 'all' = 'current') => {
+    if (!currentSet.cfg && !hasConfig) {
+      toast('Please configure or generate lane grid before exporting analysis.');
       return;
     }
     try {
-      const csvContent = tlcRfCsv(
+      const opts: TlcAnalysisExportOptions = {
+        set: currentSet,
         sets,
         run,
-        getSpotsForLane,
-        plate,
-        (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)
-      );
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        plateIndex: plate,
+        getSpots: getSpotsForLane,
+        getProfile: (s, k, ln) => extractLaneProfile(s, k, ln, coreFraction),
+        spotProminence,
+        spotMode,
+        coreFraction,
+        scope,
+      };
+
+      const content = format === 'csv' ? exportTlcAnalysisCsv(opts) : exportTlcAnalysisJson(opts);
+      const mime = format === 'csv' ? 'text/csv;charset=utf-8;' : 'application/json;charset=utf-8;';
+      const ext = format === 'csv' ? 'csv' : 'json';
+      const blob = new Blob([content], { type: mime });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `tlc_rf_table_${run.runName.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}.csv`;
+      const baseName = (run?.runName || currentSet.name || 'tlc_plate')
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '_');
+      const scopeSuffix = scope === 'all' ? 'all_sets' : `plate_${plate + 1}`;
+      a.download = `tlc_analysis_${baseName}_${scopeSuffix}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast('Exported TLC Rf table CSV.');
+      toast(`Exported TLC plate analysis (${ext.toUpperCase()}).`);
     } catch (err: any) {
-      toast('Error exporting Rf table: ' + err.message);
+      toast(`Export failed: ${err.message || err}`);
     }
   };
+
+  // Download Batch tlc_rf_table.csv
+  const handleDownloadRfCsv = () => handleExportAnalysis('csv', 'current');
 
   // Undo history stack for lane configurations
   const [cfgHistory, setCfgHistory] = useState<TlcLaneConfig[]>([]);

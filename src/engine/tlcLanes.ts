@@ -359,10 +359,10 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const span = Math.max(1, o.front - o.origin);
   const minProm = o.minProminence ?? 0.28;
 
-  // Adaptive smoothing scaled with prominence mode:
-  // In Broad mode (minProm >= 0.40): smooth more generously to suppress camera noise ripples across wide plateaus.
-  // In Sensitive mode (minProm <= 0.16): light smoothing to preserve faint trace spots and tight doublets.
-  const smoothHalf = minProm >= 0.40 ? Math.max(8, Math.round(r * 0.40)) : minProm <= 0.16 ? 3 : 5;
+  // Continuous sensitivity: t = 0 (most sensitive, slider 8%) .. 1 (most merging, slider 70%).
+  // Every knob below scales smoothly with it, so each slider step changes the result.
+  const t = Math.min(1, Math.max(0, (minProm - 0.08) / 0.62));
+  const smoothHalf = Math.round(3 + 8 * t);
   const d = movingAvg(rawDiff, smoothHalf * 2 + 1);
 
   // Origin buffer: allow detecting polar products from Rf ~0.04 upwards
@@ -387,10 +387,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
 
   // 1. Initial Candidate Peaks via local maximum search
   // halfWin scales dynamically with minProminence to avoid fracturing broad spots
-  const halfWin = Math.max(
-    4,
-    Math.round(r * (minProm >= 0.40 ? 0.75 : minProm <= 0.16 ? 0.20 : 0.35))
-  );
+  const halfWin = Math.max(4, Math.round(r * (0.2 + 0.55 * t)));
 
   const candidates: Array<{ pos: number; val: number; extentStart: number; extentEnd: number }> = [];
 
@@ -443,35 +440,16 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       const lowerVal = Math.min(p1.val, p2.val);
       const valleyDrop = lowerVal - vMin;
       const dropRatio = lowerVal > 0 ? valleyDrop / lowerVal : 0;
-      const valleyAboveBaseline = vMin - thr;
 
-      // Check whether these two adjacent peaks belong to the SAME spot / chromatographic band:
-      let shouldMerge = false;
-
-      if (minProm >= 0.40) {
-        // BROAD MODE (Overloaded / Tailing Spots):
-        // Overloaded spots have optical saturation and tailing dips that can reach 60-70%.
-        // Consolidate into 1 spot unless the valley drops deeply (> 70%) AND distance >= 12% span
-        const spanDist = Math.max(28, Math.round(span * 0.12));
-        shouldMerge =
-          dropRatio < 0.65 ||
-          (dist < spanDist && dropRatio < 0.75) ||
-          valleyAboveBaseline > lowerVal * 0.28;
-      } else if (minProm <= 0.16) {
-        // SENSITIVE MODE (Fine trace spots & close doublets):
-        // Only merge if the valley drop is very shallow (< 20%) or extremely close (< 12 px).
-        shouldMerge = dropRatio < 0.20 || dist < 12;
-      } else {
-        // STANDARD MODE (Balanced for normal reaction mixtures):
-        // Merge if valley dip is shallow (< 35%),
-        // or if distance is close (< 6% of span) and drop < 50%.
-        // Distinct peaks where valley drops >= 50% remain resolved as separate spots.
-        const spanDist = Math.max(15, Math.round(span * 0.06));
-        shouldMerge =
-          dropRatio < Math.max(0.32, minProm * 1.25) ||
-          (dist < spanDist && dropRatio < 0.50) ||
-          valleyDrop < 2.5 * noise;
-      }
+      // Two adjacent peaks are one spot when the valley between them is shallow.
+      // mergeDrop grows continuously with the slider (8% -> 0.19, 28% -> 0.35, 55% -> 0.57, 70% -> 0.69);
+      // peaks that are also physically close (distance scales with the slider) merge a little more readily.
+      const mergeDrop = Math.min(0.92, 0.12 + 0.82 * minProm);
+      const closeDist = Math.max(10, Math.round(span * (0.01 + 0.10 * t)));
+      const shouldMerge =
+        dropRatio < mergeDrop ||
+        (dist < closeDist && dropRatio < Math.min(0.95, mergeDrop + 0.15)) ||
+        valleyDrop < 2.5 * noise;
 
       if (shouldMerge) {
         if (dropRatio < minValleyRatio) {
@@ -684,7 +662,318 @@ export function tlcOrigin(
   return set.originAuto?.[h] ?? Math.max(20, Math.round(lane.length * 0.10));
 }
 
-// Generate tlc_rf_table.csv: one line per lane of every set, with vial recipe, front, origin, and up to 5 spots
+export interface TlcAnalysisExportOptions {
+  set: TlcSet;
+  sets?: TlcSet[];
+  run?: RunResult | null;
+  plateIndex?: number;
+  getSpots: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => TlcSpot[] | null;
+  getProfile?: (set: TlcSet, key: any, lane: TlcLane) => number[];
+  spotProminence?: number;
+  spotMode?: string;
+  coreFraction?: number;
+  scope?: 'current' | 'all';
+}
+
+// Export comprehensive TLC Plate Analysis Data as CSV spreadsheet
+export function exportTlcAnalysisCsv(options: TlcAnalysisExportOptions): string {
+  const {
+    set,
+    sets = [set],
+    run,
+    plateIndex = 0,
+    getSpots,
+    getProfile,
+    scope = 'current',
+  } = options;
+
+  const targetSets = scope === 'all' ? sets : [set];
+  const codes = run?.reagents?.map((r) => r.code) || [];
+
+  const rowsData: Array<{
+    setName: string;
+    plate: number;
+    well: string;
+    laneId: number;
+    reactionIndex: string | number;
+    reagentConcs: Record<string, string | number>;
+    solventUl: string | number;
+    channel: string;
+    originPx: number;
+    frontPx: number;
+    spanPx: number;
+    spots: TlcSpot[];
+  }> = [];
+
+  let maxSpotsCount = 0;
+
+  for (const s of targetSets) {
+    if (!s.cfg) continue;
+    const availableChannels: TlcChannelKey[] = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter(
+      (k) => !!s.imgs[k]
+    );
+    if (!availableChannels.length) continue;
+
+    for (const l of [...s.cfg.lanes].sort((a, b) => a.id - b.id)) {
+      if (l.id < 0 || l.id > 53) continue;
+      const vialId = containerOfLane(l.id);
+      const row = run?.rows?.find(
+        (r) => r.plate_number === plateIndex && r.container_id === vialId
+      );
+
+      const originPx = Math.round(tlcOrigin(s, l, getProfile));
+      const frontPx = tlcFront(s, l, getProfile);
+      const spanPx = Math.max(1, frontPx - originPx);
+
+      for (const ch of availableChannels) {
+        const spots = getSpots(s, ch, l) || [];
+        if (spots.length > maxSpotsCount) {
+          maxSpotsCount = spots.length;
+        }
+
+        const concs: Record<string, string | number> = {};
+        codes.forEach((c) => {
+          const rc = row && row.recipe?.find((x: any) => x.code === c);
+          concs[c] = rc ? +rc.target_concentration.toFixed(4) : '';
+        });
+
+        rowsData.push({
+          setName: s.name,
+          plate: plateIndex + 1,
+          well: wellLabel(vialId),
+          laneId: l.id,
+          reactionIndex: row ? row.global_index + 1 : '',
+          reagentConcs: concs,
+          solventUl: row && row['vol#solvent'] != null ? +(+row['vol#solvent']).toFixed(2) : '',
+          channel: TLC_SIGNAL[ch]?.label || ch,
+          originPx,
+          frontPx,
+          spanPx,
+          spots,
+        });
+      }
+    }
+  }
+
+  // Ensure minimum 5 spot columns so format remains consistent
+  const spotColsCount = Math.max(5, maxSpotsCount);
+
+  // Build CSV header
+  const head = [
+    'plate',
+    'set_name',
+    'well',
+    'tlc_lane',
+    'reaction',
+    ...codes.map((c) => `${c}_mM`),
+    'solvent_uL',
+    'channel',
+    'origin_px',
+    'front_px',
+    'migration_span_px',
+    'spot_count',
+    'primary_rf',
+    'delta_rf',
+  ];
+
+  for (let n = 1; n <= spotColsCount; n++) {
+    head.push(`rf_${n}`, `strength_${n}`, `area_pct_${n}`, `pos_px_${n}`);
+  }
+
+  const csvRows: string[][] = [head];
+
+  for (const item of rowsData) {
+    const strongest = [...item.spots].sort((a, b) => b.strength - a.strength);
+    const primaryRf = strongest.length > 0 ? +strongest[0].rf.toFixed(3) : '';
+    let deltaRf: string | number = '';
+    if (item.spots.length >= 2) {
+      const sortedByRf = [...item.spots].sort((a, b) => a.rf - b.rf);
+      deltaRf = +(sortedByRf[sortedByRf.length - 1].rf - sortedByRf[0].rf).toFixed(3);
+    }
+
+    const rowCells: (string | number)[] = [
+      item.plate,
+      item.setName,
+      item.well,
+      item.laneId,
+      item.reactionIndex,
+      ...codes.map((c) => item.reagentConcs[c] ?? ''),
+      item.solventUl,
+      item.channel,
+      item.originPx,
+      item.frontPx,
+      item.spanPx,
+      item.spots.length,
+      primaryRf,
+      deltaRf,
+    ];
+
+    for (let n = 0; n < spotColsCount; n++) {
+      const sp = item.spots[n];
+      if (sp) {
+        rowCells.push(
+          +sp.rf.toFixed(3),
+          +sp.strength.toFixed(2),
+          sp.areaPct != null ? sp.areaPct : '',
+          Math.round(sp.pos)
+        );
+      } else {
+        rowCells.push('', '', '', '');
+      }
+    }
+
+    csvRows.push(rowCells.map((v) => (v === null || v === undefined ? '' : String(v))));
+  }
+
+  return csvText(csvRows);
+}
+
+// Export complete TLC Plate Analysis Data as structured JSON
+export function exportTlcAnalysisJson(options: TlcAnalysisExportOptions): string {
+  const {
+    set,
+    sets = [set],
+    run,
+    plateIndex = 0,
+    getSpots,
+    getProfile,
+    spotProminence = 0.28,
+    spotMode = 'standard',
+    coreFraction = 0.40,
+    scope = 'current',
+  } = options;
+
+  const targetSets = scope === 'all' ? sets : [set];
+
+  const exportPayload = {
+    format: 'Robowski-TLC-Analysis-Export',
+    version: '1.0',
+    exportedAt: new Date().toISOString(),
+    scope,
+    plateNumber: plateIndex + 1,
+    analysisParameters: {
+      spotProminence,
+      spotMode,
+      coreFraction,
+    },
+    runInfo: run
+      ? {
+          runName: run.runName,
+          mode: run.mode,
+          plates: run.plates,
+          vialVolume: run.vialVolume,
+          reagents: run.reagents.map((r) => ({
+            code: r.code,
+            name: r.name,
+            stock: r.stock,
+            solvent: r.solvent,
+          })),
+        }
+      : null,
+    plates: targetSets.map((s) => {
+      const availableChannels: TlcChannelKey[] = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter(
+        (k) => !!s.imgs[k]
+      );
+
+      const lanesData = (s.cfg?.lanes || [])
+        .slice()
+        .sort((a, b) => a.id - b.id)
+        .map((l) => {
+          const vialId = containerOfLane(l.id);
+          const row = run?.rows?.find(
+            (r) => r.plate_number === plateIndex && r.container_id === vialId
+          );
+
+          const originPx = Math.round(tlcOrigin(s, l, getProfile));
+          const frontPx = tlcFront(s, l, getProfile);
+          const spanPx = Math.max(1, frontPx - originPx);
+
+          const channelsData: Record<string, any> = {};
+
+          availableChannels.forEach((ch) => {
+            const spots = getSpots(s, ch, l) || [];
+            const strongest = [...spots].sort((a, b) => b.strength - a.strength);
+            const primaryRf = strongest.length > 0 ? +strongest[0].rf.toFixed(3) : null;
+            let deltaRf: number | null = null;
+            if (spots.length >= 2) {
+              const sortedByRf = [...spots].sort((a, b) => a.rf - b.rf);
+              deltaRf = +(sortedByRf[sortedByRf.length - 1].rf - sortedByRf[0].rf).toFixed(3);
+            }
+
+            channelsData[ch] = {
+              channelKey: ch,
+              channelLabel: TLC_SIGNAL[ch]?.label || ch,
+              spotCount: spots.length,
+              primaryRf,
+              deltaRf,
+              spots: spots.map((sp) => ({
+                rf: +sp.rf.toFixed(3),
+                posPx: Math.round(sp.pos),
+                strength: +sp.strength.toFixed(2),
+                areaPct: sp.areaPct != null ? sp.areaPct : undefined,
+                label: sp.label,
+              })),
+            };
+          });
+
+          return {
+            laneId: l.id,
+            wellCoordinate: wellLabel(vialId),
+            vialId,
+            reactionNumber: row ? row.global_index + 1 : null,
+            geometry: {
+              x0: l.x0,
+              y0: l.y0,
+              length: l.length,
+              width: l.width,
+              angle: l.angle,
+              spotRadius: l.spotRadius,
+              zeroRf: l.zeroRf,
+            },
+            originPx,
+            frontPx,
+            migrationSpanPx: spanPx,
+            reagents: row
+              ? row.recipe
+                  .filter((rc: any) => rc.target_concentration > 0)
+                  .map((rc: any) => ({
+                    code: rc.code,
+                    targetConcentration_mM: +rc.target_concentration.toFixed(4),
+                    dilutionLevel: rc.dilution_level,
+                  }))
+              : [],
+            solventVolume_uL: row && row['vol#solvent'] != null ? +(+row['vol#solvent']).toFixed(2) : null,
+            channels: channelsData,
+          };
+        });
+
+      const totalSpots = lanesData.reduce((acc, l) => {
+        return acc + Object.values(l.channels).reduce((cAcc: number, ch: any) => cAcc + ch.spotCount, 0);
+      }, 0);
+
+      const lanesWithSpots = lanesData.filter((l) =>
+        Object.values(l.channels).some((ch: any) => ch.spotCount > 0)
+      ).length;
+
+      return {
+        setName: s.name,
+        setUid: s.uid,
+        hasConfig: Boolean(s.cfg),
+        channelsLoaded: availableChannels,
+        summary: {
+          totalLanes: lanesData.length,
+          lanesWithSpots,
+          totalSpotsDetected: totalSpots,
+        },
+        lanes: lanesData,
+      };
+    }),
+  };
+
+  return JSON.stringify(exportPayload, null, 2);
+}
+
+// Generate tlc_rf_table.csv (backward compatibility)
 export function tlcRfCsv(
   sets: TlcSet[],
   run: RunResult,
@@ -692,64 +981,18 @@ export function tlcRfCsv(
   plateIndex: number = 0,
   getProfile?: (set: TlcSet, key: any, lane: TlcLane) => number[]
 ): string {
-  const codes = run.reagents.map((r) => r.code);
-  const head = [
-    'set',
-    'plate',
-    'well',
-    'tlc_lane',
-    'reaction',
-    ...codes.map((c) => c + '_mM'),
-    'solvent_uL',
-    'image',
-    'origin_px',
-    'front_px',
-    'spots',
-  ];
-  for (let n = 1; n <= 5; n++) {
-    head.push(`rf_${n}`, `strength_${n}`);
+  if (sets.length > 0) {
+    return exportTlcAnalysisCsv({
+      set: sets[0],
+      sets,
+      run,
+      plateIndex,
+      getSpots,
+      getProfile,
+      scope: 'all',
+    });
   }
-  const rows = [head];
-
-  for (const set of sets) {
-    const key: TlcChannelKey | undefined = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find(
-      (k) => !!set.imgs[k]
-    );
-    if (!set.cfg || !key) continue;
-
-    for (const l of [...set.cfg.lanes].sort((a, b) => a.id - b.id)) {
-      if (l.id < 0 || l.id > 53) continue;
-      const vialId = containerOfLane(l.id);
-      const row = run.rows.find(
-        (r) => r.plate_number === plateIndex && r.container_id === vialId
-      );
-      const sp = getSpots(set, key, l);
-      if (!sp) continue;
-
-      const r: (string | number)[] = [
-        set.name,
-        plateIndex,
-        wellLabel(vialId),
-        l.id,
-        row ? row.global_index + 1 : '',
-        ...codes.map((c) => {
-          const rc = row && row.recipe.find((x: any) => x.code === c);
-          return rc ? +rc.target_concentration.toFixed(4) : '';
-        }),
-        row ? +(+row['vol#solvent']).toFixed(2) : '',
-        TLC_SIGNAL[key].label,
-        Math.round(tlcOrigin(set, l, getProfile)),
-        tlcFront(set, l, getProfile),
-        sp.length,
-      ];
-      for (let n = 0; n < 5; n++) {
-        r.push(sp[n] ? +sp[n].rf.toFixed(3) : '', sp[n] ? +sp[n].strength.toFixed(2) : '');
-      }
-      rows.push(r.map((v) => (v === null || v === undefined ? '' : String(v))));
-    }
-  }
-
-  return csvText(rows);
+  return '';
 }
 
 /**

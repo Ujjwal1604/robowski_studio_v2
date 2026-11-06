@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { PAL, getVialTipHtml } from '../../engine';
+import { PAL, getVialTipHtml, wellLabel } from '../../engine';
 import { PlateHeatmap } from './PlateHeatmap';
 import { FixDiffModal } from '../ui/FixDiffModal';
+import { parseWellQuery } from '../ui/CommandPalette';
 
 export const CombinationsView: React.FC = () => {
   const {
@@ -23,6 +24,8 @@ export const CombinationsView: React.FC = () => {
     applyFix,
     tlcSets,
     toast,
+    targetWell,
+    setTargetWell,
   } = useApp();
 
   const [hoverRow, setHoverRow] = useState<number | null>(null);
@@ -34,6 +37,65 @@ export const CombinationsView: React.FC = () => {
   >('all');
   const [heatmapMetric, setHeatmapMetric] = useState<string>('dilution');
   const [heatmapPlate, setHeatmapPlate] = useState<number>(0);
+  const [quickJumpText, setQuickJumpText] = useState<string>('');
+
+  // Handle external or palette well jump commands
+  useEffect(() => {
+    if (!targetWell || !run) return;
+    const pIdx = targetWell.plateIndex ?? 0;
+    const globalIdx = pIdx * 54 + targetWell.wellIndex;
+
+    setSelectedVial(globalIdx);
+    setHoverRow(globalIdx);
+
+    if (targetWell.source === 'heatmap') {
+      setViewMode('matrix');
+      setHeatmapPlate(pIdx);
+    } else {
+      setViewMode('table');
+      setFilterMode('all');
+      setFilterBad(false);
+      setVialFocus(null);
+      const PS = 50;
+      setPage(Math.floor(globalIdx / PS));
+    }
+
+    setTargetWell(null);
+  }, [targetWell, run, setPage, setTargetWell]);
+
+  // Smooth scroll to selected row in table
+  useEffect(() => {
+    if (selectedVial !== null && viewMode === 'table') {
+      const timer = setTimeout(() => {
+        const el = document.getElementById(`reaction-row-${selectedVial}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 60);
+      return () => clearTimeout(timer);
+    }
+  }, [selectedVial, viewMode, page]);
+
+  // Handle direct inline quick well jump
+  const handleQuickJump = (raw: string) => {
+    setQuickJumpText(raw);
+    const parsed = parseWellQuery(raw, run?.plates || 1);
+    if (parsed) {
+      const pIdx = parsed.plateIndex;
+      const globalIdx = parsed.globalIndex;
+      setSelectedVial(globalIdx);
+      setHoverRow(globalIdx);
+      if (viewMode === 'matrix') {
+        setHeatmapPlate(pIdx);
+      } else {
+        setFilterMode('all');
+        setFilterBad(false);
+        setVialFocus(null);
+        setPage(Math.floor(globalIdx / 50));
+      }
+      toast(`Jumped to Well ${parsed.label} (Plate ${pIdx + 1})`);
+    }
+  };
 
   const nf = (v: any, d = 2) =>
     Number.isFinite(+v) ? (+v).toLocaleString('en-US', { maximumFractionDigits: d }) : '-';
@@ -287,6 +349,55 @@ export const CombinationsView: React.FC = () => {
                 Flagged ({badN})
               </button>
             )}
+
+            {/* Quick Well Jump Input */}
+            <div
+              style={{
+                marginLeft: 'auto',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                background: 'var(--soft)',
+                padding: '2px 8px',
+                borderRadius: '6px',
+                border: '1px solid var(--line)',
+              }}
+            >
+              <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 600 }}>Jump to:</span>
+              <input
+                type="text"
+                placeholder="A1, B4, F9..."
+                value={quickJumpText}
+                onChange={(e) => handleQuickJump(e.target.value)}
+                style={{
+                  width: '85px',
+                  background: 'transparent',
+                  border: 'none',
+                  outline: 'none',
+                  fontSize: '11px',
+                  color: 'var(--fg)',
+                  fontFamily: 'monospace',
+                  textTransform: 'uppercase',
+                }}
+              />
+              {quickJumpText && (
+                <button
+                  type="button"
+                  onClick={() => setQuickJumpText('')}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: 'var(--mut)',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    padding: 0,
+                  }}
+                  title="Clear jump"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
           </div>
 
           {vialFocus && (
@@ -329,6 +440,9 @@ export const CombinationsView: React.FC = () => {
               onPlateChange={setHeatmapPlate}
               tlcSets={tlcSets}
               onNavigateTlc={(ri) => {
+                const pIdx = Math.floor(ri / 54);
+                const wIdx = ri % 54;
+                setTargetWell({ wellIndex: wIdx, plateIndex: pIdx, source: 'combinations' });
                 setVisited((v) => ({ ...v, tlc: true }));
                 setView('tlc');
               }}
@@ -366,6 +480,7 @@ export const CombinationsView: React.FC = () => {
                     {slice.length ? (
                       slice.map(({ r, i, bad }) => (
                         <tr
+                          id={`reaction-row-${i}`}
                           key={i}
                           className={`hov ${bad ? 'badrow' : ''} ${
                             selectedVial === i ? 'selrow' : ''
@@ -482,9 +597,11 @@ export const CombinationsView: React.FC = () => {
                 }}
               >
                 <div>
-                  <b>Reaction {run.rows[activeDetailRow].global_index + 1}</b> · Plate{' '}
-                  {run.rows[activeDetailRow].plate_number + 1} · Container #
-                  {run.rows[activeDetailRow].container_id}
+                  <b>Reaction {run.rows[activeDetailRow].global_index + 1}</b> · Well{' '}
+                  <span className="mono" style={{ fontWeight: 700, color: 'var(--pri)' }}>
+                    {wellLabel(run.rows[activeDetailRow].container_id)}
+                  </span>{' '}
+                  · Plate {run.rows[activeDetailRow].plate_number + 1}
                 </div>
                 <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                   <button
@@ -492,6 +609,14 @@ export const CombinationsView: React.FC = () => {
                     className="btn sm"
                     style={{ height: '22px', padding: '0 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                     onClick={() => {
+                      const rowData = run.rows[activeDetailRow];
+                      if (rowData) {
+                        setTargetWell({
+                          wellIndex: rowData.container_id,
+                          plateIndex: rowData.plate_number,
+                          source: 'combinations',
+                        });
+                      }
                       setVisited((v) => ({ ...v, tlc: true }));
                       setView('tlc');
                     }}

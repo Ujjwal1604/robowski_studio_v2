@@ -39,6 +39,7 @@ import {
 } from '../../types';
 import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
 import { TlcFullPlateView } from './TlcFullPlateView';
+import { parseWellQuery } from '../ui/CommandPalette';
 
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
@@ -379,7 +380,16 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
 });
 
 export const TlcView: React.FC = () => {
-  const { run, toast, tlcSets: sets, setTlcSets: setSets, activeTlcStatus } = useApp();
+  const {
+    run,
+    toast,
+    tlcSets: sets,
+    setTlcSets: setSets,
+    activeTlcStatus,
+    targetWell,
+    setTargetWell,
+    view,
+  } = useApp();
 
   const [cur, setCur] = useState<number>(0);
   const [compare, setCompare] = useState<boolean>(false);
@@ -416,6 +426,18 @@ export const TlcView: React.FC = () => {
   const [hoverY, setHoverY] = useState<number | null>(null);
   const [hoverSpot, setHoverSpot] = useState<TlcSpot | null>(null);
   const [pinnedMarkers, setPinnedMarkers] = useState<RfMarker[]>([]);
+  const [tlcQuickJump, setTlcQuickJump] = useState<string>('');
+
+  // Handle external well jump commands directed to TLC Map
+  useEffect(() => {
+    if (targetWell && view === 'tlc') {
+      if (targetWell.plateIndex !== undefined) {
+        setPlate(targetWell.plateIndex);
+      }
+      setInspectWell(targetWell.wellIndex);
+      setTargetWell(null);
+    }
+  }, [targetWell, view, setTargetWell]);
 
   // Multi-Channel Densitometry Data Dictionary
   const [channelDensitograms, setChannelDensitograms] = useState<{
@@ -1424,6 +1446,64 @@ export const TlcView: React.FC = () => {
               </select>
             </label>
           )}
+
+          {/* Quick Well Jump in TLC View */}
+          <div
+            style={{
+              marginLeft: 'auto',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: 'var(--soft)',
+              padding: '2px 8px',
+              borderRadius: '6px',
+              border: '1px solid var(--line)',
+            }}
+          >
+            <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 600 }}>Jump to well:</span>
+            <input
+              type="text"
+              placeholder="A1, B4, F9..."
+              value={tlcQuickJump}
+              onChange={(e) => {
+                const val = e.target.value;
+                setTlcQuickJump(val);
+                const parsed = parseWellQuery(val, platesCount);
+                if (parsed) {
+                  setPlate(parsed.plateIndex);
+                  setInspectWell(parsed.wellIndex);
+                  toast(`Inspecting Well ${parsed.label} in TLC Lane ${parsed.laneIndex}`);
+                }
+              }}
+              style={{
+                width: '85px',
+                background: 'transparent',
+                border: 'none',
+                outline: 'none',
+                fontSize: '11px',
+                color: 'var(--fg)',
+                fontFamily: 'monospace',
+                textTransform: 'uppercase',
+              }}
+            />
+            {tlcQuickJump && (
+              <button
+                type="button"
+                onClick={() => setTlcQuickJump('')}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--mut)',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  padding: 0,
+                }}
+                title="Clear jump"
+              >
+                ✕
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Status Chips */}
@@ -2899,9 +2979,27 @@ export const TlcView: React.FC = () => {
                   </div>
                 </div>
               ) : (
-                <p style={{ textAlign: 'center', padding: '24px 0', color: 'var(--mut)' }}>
-                  No lane image available for this well yet. Load a lane CSV and plate images above.
-                </p>
+                <div style={{ textAlign: 'center', padding: '36px 16px', color: 'var(--mut)' }}>
+                  <p style={{ margin: '0 0 14px', fontSize: '13px' }}>
+                    No sliced lane image or grid configuration available for Well <b>{wellLabel(inspectWell)}</b> yet.
+                  </p>
+                  <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn sm pri"
+                      onClick={handleApplyDefaultGrid}
+                    >
+                      Apply Standard 54-Lane Grid
+                    </button>
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={handleLoadDemoTlc}
+                    >
+                      Load Demonstration Plate
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
 

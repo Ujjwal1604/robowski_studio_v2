@@ -1,6 +1,100 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
-import { wellLabel } from '../../engine';
+import { wellLabel, tlcLane, containerOfLane } from '../../engine';
+
+export interface ParsedWellQuery {
+  wellIndex: number;
+  label: string;
+  rowLetter: string;
+  colNum: number;
+  plateIndex: number;
+  globalIndex: number;
+  reactionNumber: number;
+  laneIndex: number;
+}
+
+export function parseWellQuery(rawQuery: string, maxPlates = 1): ParsedWellQuery | null {
+  const q = rawQuery.trim();
+  if (!q) return null;
+
+  // Case 1: Coordinate e.g. "A1", "b4", "F9", "well a1", "Plate 1 A1", "P2 C3", "A 1", "A-1", "A01"
+  const wellRegex = /^(?:(?:plate|p)\s*(\d+)[\s_-]*)?(?:well\s*)?([a-fA-F])[\s_-]*0?([1-9])$/i;
+  const match = q.match(wellRegex);
+  if (match) {
+    const parsedPlate = match[1] ? Math.max(0, parseInt(match[1], 10) - 1) : 0;
+    const rowLetter = match[2].toUpperCase();
+    const colNum = parseInt(match[3], 10);
+    const rowIdx = rowLetter.charCodeAt(0) - 65;
+    const colIdx = colNum - 1;
+    if (rowIdx >= 0 && rowIdx <= 5 && colIdx >= 0 && colIdx <= 8) {
+      const wellIndex = rowIdx * 9 + colIdx;
+      const plateIndex = parsedPlate;
+      const globalIndex = plateIndex * 54 + wellIndex;
+      const laneIndex = tlcLane(wellIndex, 'column');
+      return {
+        wellIndex,
+        label: `${rowLetter}${colNum}`,
+        rowLetter,
+        colNum,
+        plateIndex,
+        globalIndex,
+        reactionNumber: globalIndex + 1,
+        laneIndex,
+      };
+    }
+  }
+
+  // Case 2: Reaction index: "reaction 13", "rxn 5", "r12", "#13"
+  const rxnRegex = /^(?:reaction|rxn|r|#)\s*#?\s*(\d+)$/i;
+  const rxnMatch = q.match(rxnRegex);
+  if (rxnMatch) {
+    const rxnNum = parseInt(rxnMatch[1], 10);
+    if (rxnNum >= 1 && rxnNum <= Math.max(54 * maxPlates, 54)) {
+      const globalIndex = rxnNum - 1;
+      const plateIndex = Math.floor(globalIndex / 54);
+      const wellIndex = globalIndex % 54;
+      const rowIdx = Math.floor(wellIndex / 9);
+      const colNum = (wellIndex % 9) + 1;
+      const rowLetter = String.fromCharCode(65 + rowIdx);
+      const laneIndex = tlcLane(wellIndex, 'column');
+      return {
+        wellIndex,
+        label: `${rowLetter}${colNum}`,
+        rowLetter,
+        colNum,
+        plateIndex,
+        globalIndex,
+        reactionNumber: rxnNum,
+        laneIndex,
+      };
+    }
+  }
+
+  // Case 3: Lane index: "lane 12", "lane 0"
+  const laneRegex = /^lane\s*#?\s*(\d+)$/i;
+  const laneMatch = q.match(laneRegex);
+  if (laneMatch) {
+    const laneNum = parseInt(laneMatch[1], 10);
+    if (laneNum >= 0 && laneNum < 54) {
+      const wellIndex = containerOfLane(laneNum);
+      const rowIdx = Math.floor(wellIndex / 9);
+      const colNum = (wellIndex % 9) + 1;
+      const rowLetter = String.fromCharCode(65 + rowIdx);
+      return {
+        wellIndex,
+        label: `${rowLetter}${colNum}`,
+        rowLetter,
+        colNum,
+        plateIndex: 0,
+        globalIndex: wellIndex,
+        reactionNumber: wellIndex + 1,
+        laneIndex: laneNum,
+      };
+    }
+  }
+
+  return null;
+}
 
 interface CommandItem {
   id: string;
@@ -27,6 +121,8 @@ export const CommandPalette: React.FC = () => {
     setView,
     setVisited,
     setVialFocus,
+    targetWell,
+    setTargetWell,
     toggleTheme,
     downloadExport,
     exportRobowskiArchive,
@@ -147,40 +243,60 @@ export const CommandPalette: React.FC = () => {
     });
   });
 
-  // 3. Well Jump items (A1 through F9)
-  const qClean = query.trim().toUpperCase();
-  const wellMatch = qClean.match(/^([A-F])([1-9])$/);
-  if (wellMatch) {
-    const rowLetter = wellMatch[1];
-    const colNum = parseInt(wellMatch[2], 10);
-    const rowIdx = rowLetter.charCodeAt(0) - 65;
-    const wellIdx = rowIdx * 9 + (colNum - 1);
+  // 3. Well Jump items (A1 through F9, reactions, lanes)
+  const wellInfo = parseWellQuery(query, run?.plates || 1);
+  const wellItems: CommandItem[] = [];
 
-    items.unshift({
-      id: `well-jump-combos-${wellIdx}`,
-      category: 'Well Jump',
-      title: `Inspect Well ${rowLetter}${colNum} in Combinations Table`,
-      subtitle: `Jump to reaction ${wellIdx + 1} and view pipetted chemical volumes`,
-      badge: `Well ${rowLetter}${colNum}`,
-      icon: '🎯',
-      action: () => {
-        setVisited((v) => ({ ...v, combos: true }));
-        setView('combos');
-      },
-    });
+  if (wellInfo) {
+    const { wellIndex, label, plateIndex, reactionNumber, laneIndex, rowLetter, colNum } = wellInfo;
+    const globalIdx = plateIndex * 54 + wellIndex;
+    const isMultiPlate = (run?.plates || 1) > 1;
+    const plateSuffix = isMultiPlate ? ` (Plate ${plateIndex + 1})` : '';
 
-    items.unshift({
-      id: `well-jump-tlc-${wellIdx}`,
-      category: 'Well Jump',
-      title: `Inspect Well ${rowLetter}${colNum} in TLC Map`,
-      subtitle: `Jump to lane ${wellIdx} and review spot retention factors (Rf)`,
-      badge: `Lane ${wellIdx}`,
-      icon: '🔬',
-      action: () => {
-        setVisited((v) => ({ ...v, tlc: true }));
-        setView('tlc');
+    wellItems.push(
+      {
+        id: `well-jump-combos-${globalIdx}`,
+        category: 'Well Jump',
+        title: `Inspect Well ${label}${plateSuffix} in Combinations Table`,
+        subtitle: `Jump to reaction #${reactionNumber} (Row ${rowLetter}, Col ${colNum}) and view pipetted chemical volumes`,
+        badge: `Well ${label}`,
+        icon: '🎯',
+        action: () => {
+          setTargetWell({ wellIndex, plateIndex, source: 'combinations' });
+          setVisited((v) => ({ ...v, combos: true }));
+          setView('combos');
+          toast(`Jumped to Well ${label}${plateSuffix} in Combinations Table.`);
+        },
       },
-    });
+      {
+        id: `well-jump-tlc-${globalIdx}`,
+        category: 'Well Jump',
+        title: `Inspect Well ${label}${plateSuffix} in TLC Map & Densitometer`,
+        subtitle: `Open TLC Lane ${laneIndex} · 1D absorbance/fluorescence densitogram and Rf peaks`,
+        badge: `Lane ${laneIndex}`,
+        icon: '🔬',
+        action: () => {
+          setTargetWell({ wellIndex, plateIndex, source: 'palette' });
+          setVisited((v) => ({ ...v, tlc: true }));
+          setView('tlc');
+          toast(`Inspecting Well ${label}${plateSuffix} TLC lane ${laneIndex}.`);
+        },
+      },
+      {
+        id: `well-jump-heatmap-${globalIdx}`,
+        category: 'Well Jump',
+        title: `Highlight Well ${label}${plateSuffix} in 2D Plate Heatmap`,
+        subtitle: `Plate ${plateIndex + 1} Matrix Heatmap · Row ${rowLetter}, Col ${colNum}`,
+        badge: `Heatmap`,
+        icon: '▦',
+        action: () => {
+          setTargetWell({ wellIndex, plateIndex, source: 'heatmap' });
+          setVisited((v) => ({ ...v, combos: true }));
+          setView('combos');
+          toast(`Highlighted Well ${label}${plateSuffix} in 2D Plate Heatmap.`);
+        },
+      }
+    );
   }
 
   // 4. Quick Actions
@@ -220,7 +336,7 @@ export const CommandPalette: React.FC = () => {
   );
 
   // Filter items by search query
-  const filtered = query.trim()
+  const regularFiltered = query.trim()
     ? items.filter((item) => {
         const q = query.toLowerCase();
         return (
@@ -231,6 +347,9 @@ export const CommandPalette: React.FC = () => {
         );
       })
     : items;
+
+  // Well Jump items ALWAYS take top precedence if query matches a well coordinate!
+  const filtered = wellInfo ? [...wellItems, ...regularFiltered] : regularFiltered;
 
   const handleSelect = (item: CommandItem) => {
     setIsOpen(false);
@@ -308,7 +427,7 @@ export const CommandPalette: React.FC = () => {
               setSelectedIndex(0);
             }}
             onKeyDown={handleKeyDown}
-            placeholder="Type a step, action, reagent, or well (e.g. A1, Deck, Pd, Export)..."
+            placeholder="Jump to well (e.g. A1, B4, F9, P2 C3, Rxn 12) or search steps, reagents..."
             style={{
               flex: 1,
               background: 'transparent',
@@ -319,6 +438,27 @@ export const CommandPalette: React.FC = () => {
               fontFamily: 'inherit',
             }}
           />
+          {query && (
+            <button
+              type="button"
+              onClick={() => {
+                setQuery('');
+                setSelectedIndex(0);
+                inputRef.current?.focus();
+              }}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: 'var(--mut)',
+                cursor: 'pointer',
+                fontSize: '14px',
+                padding: '2px 4px',
+              }}
+              title="Clear search"
+            >
+              ✕
+            </button>
+          )}
           <span
             style={{
               fontSize: '11px',
@@ -332,6 +472,68 @@ export const CommandPalette: React.FC = () => {
             ESC to close
           </span>
         </div>
+
+        {/* Quick Coordinate Jump Suggestions when query is empty */}
+        {!query && (
+          <div
+            style={{
+              padding: '6px 14px',
+              background: 'rgba(255,255,255,0.02)',
+              borderBottom: '1px solid var(--line)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              flexWrap: 'wrap',
+              fontSize: '11px',
+              color: 'var(--mut)',
+            }}
+          >
+            <span>Jump to well:</span>
+            {['A1', 'B4', 'C6', 'D2', 'F9'].map((coord) => (
+              <button
+                key={coord}
+                type="button"
+                onClick={() => {
+                  setQuery(coord);
+                  setSelectedIndex(0);
+                }}
+                className="mono"
+                style={{
+                  background: 'var(--soft)',
+                  border: '1px solid var(--line)',
+                  borderRadius: '4px',
+                  padding: '1px 6px',
+                  fontSize: '11px',
+                  color: 'var(--fg)',
+                  cursor: 'pointer',
+                }}
+              >
+                {coord}
+              </button>
+            ))}
+            {(run?.plates || 1) > 1 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery('Plate 2 A1');
+                  setSelectedIndex(0);
+                }}
+                className="mono"
+                style={{
+                  background: 'var(--soft)',
+                  border: '1px solid var(--line)',
+                  borderRadius: '4px',
+                  padding: '1px 6px',
+                  fontSize: '11px',
+                  color: 'var(--fg)',
+                  cursor: 'pointer',
+                }}
+              >
+                P2 A1
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Results List */}
         <div

@@ -128,6 +128,8 @@ export interface AppContextType {
   activeTlcStatus: 'ready' | 'pending';
   exportRobowskiArchive: () => Promise<boolean>;
   importRobowskiArchiveFile: (f: File) => Promise<boolean>;
+  targetWell: { wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null;
+  setTargetWell: (w: { wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null) => void;
 }
 
 const AppContext: React.Context<AppContextType | null> =
@@ -173,6 +175,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [page, setPage] = useState<number>(0);
   const [filterBad, setFilterBad] = useState<boolean>(false);
   const [vialFocus, setVialFocus] = useState<{ label: string; rows: Set<number> } | null>(null);
+  const [targetWell, setTargetWell] = useState<{ wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null>(null);
   const [runFilter, setRunFilter] = useState<string>('all');
   const [runSearch, setRunSearch] = useState<string>('');
   const [compareIds, setCompareIds] = useState<string[]>([]);
@@ -1265,6 +1268,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         activeTlcStatus,
         exportRobowskiArchive,
         importRobowskiArchiveFile,
+        targetWell,
+        setTargetWell,
       }}
     >
       {children}

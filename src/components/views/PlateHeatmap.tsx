@@ -1,7 +1,16 @@
 // Robowski Studio - 2D Plate Heatmap Matrix Component
-import React from 'react';
-import { RunResult, RunState } from '../../types';
-import { PAL, getVialTipHtml } from '../../engine';
+import React, { useMemo } from 'react';
+import { RunResult, RunState, TlcSet, TlcSpot } from '../../types';
+import {
+  PAL,
+  getVialTipHtml,
+  findSpots,
+  tlcOrigin,
+  tlcFront,
+  TLC_SIGNAL,
+  TlcChannelKey,
+} from '../../engine';
+import { extractLaneProfile } from './TlcView';
 
 interface PlateHeatmapProps {
   run: RunResult;
@@ -16,6 +25,7 @@ interface PlateHeatmapProps {
   plateIndex: number;
   onPlateChange: (p: number) => void;
   onNavigateTlc?: (vialIndex: number) => void;
+  tlcSets?: TlcSet[];
 }
 
 export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
@@ -31,6 +41,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
   plateIndex,
   onPlateChange,
   onNavigateTlc,
+  tlcSets,
 }) => {
   const PLATE_SIZE = 54;
   const COLS = 9;
@@ -38,6 +49,53 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
   const ROW_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
   const factor = +state.dilutionFactor || 5;
   const vialVol = +state.vialVolume || 500;
+
+  // Derive TLC spot data for each lane on this plate
+  const activeTlcSet = (tlcSets && (tlcSets[plateIndex] || tlcSets[0])) || null;
+  const tlcLanes = activeTlcSet?.cfg?.lanes || [];
+  const tlcChannel: TlcChannelKey = activeTlcSet?.imgs.UV254 ? 'UV254' : 'UV366';
+  const hasTlcImages = Boolean(activeTlcSet?.imgs[tlcChannel]?.bmp);
+
+  // Map each well index (k = 0..53) to its detected spots
+  const wellTlcData = useMemo(() => {
+    const map = new Map<number, { count: number; spots: TlcSpot[]; mainRf: number | null; deltaRf: number | null }>();
+    if (!activeTlcSet || !hasTlcImages || tlcLanes.length === 0) return map;
+
+    tlcLanes.forEach((lane) => {
+      try {
+        const prof = extractLaneProfile(activeTlcSet, tlcChannel, lane, 0.35);
+        if (prof && prof.length > 0) {
+          const oVal = tlcOrigin(activeTlcSet, lane);
+          const fVal = tlcFront(activeTlcSet, lane);
+          const spots = findSpots(prof, {
+            sign: TLC_SIGNAL[tlcChannel]?.sign ?? -1,
+            origin: oVal,
+            front: fVal,
+            radius: lane.spotRadius || 24,
+          });
+
+          const sorted = [...spots].sort((a, b) => b.strength - a.strength);
+          const mainRf = sorted.length > 0 ? sorted[0].rf : null;
+          let deltaRf: number | null = null;
+          if (spots.length >= 2) {
+            const rfs = spots.map((s) => s.rf).sort((a, b) => a - b);
+            deltaRf = +(rfs[rfs.length - 1] - rfs[0]).toFixed(2);
+          }
+
+          map.set(lane.id, {
+            count: spots.length,
+            spots,
+            mainRf,
+            deltaRf,
+          });
+        }
+      } catch {
+        // Skip corrupted lane
+      }
+    });
+
+    return map;
+  }, [activeTlcSet, hasTlcImages, tlcLanes, tlcChannel]);
 
   const rcol = (i: number) => PAL[i % PAL.length];
 
@@ -106,6 +164,13 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
     { id: 'dilution', label: 'Dilution Level (1× vs 5× vs 25×)' },
     { id: 'solvent', label: 'Solvent Volume (µL)' },
     { id: 'issues', label: '⚠️ Issue Flags & Threshold Warnings' },
+    { id: 'tlc_spots', label: hasTlcImages ? '🔬 TLC Detected Spots (Reaction Outcome)' : '🔬 TLC Spots (Load Plate Photo)' },
+    ...(hasTlcImages
+      ? [
+          { id: 'tlc_rf', label: '🔬 TLC Primary Spot Rf (Migration)' },
+          { id: 'tlc_resolution', label: '🔬 TLC Spot Separation (ΔRf)' },
+        ]
+      : []),
     ...state.reagents.map((r, i) => ({
       id: `reagent:${i}`,
       label: `${r.code} Concentration (mM)`,
@@ -313,6 +378,52 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
                   bg = `color-mix(in srgb, ${baseCol} ${Math.round(15 + ratio * 70)}%, var(--panel))`;
                   border = `1px solid color-mix(in srgb, ${baseCol} 60%, var(--line))`;
                   valueLabel = `${nf(conc, 1)}`;
+                } else if (metric === 'tlc_spots') {
+                  const tlc = wellTlcData.get(k);
+                  if (!hasTlcImages) {
+                    bg = 'rgba(100, 116, 139, 0.15)';
+                    border = '1px dashed var(--line)';
+                    valueLabel = 'No TLC';
+                  } else if (!tlc || tlc.count === 0) {
+                    bg = 'rgba(71, 85, 105, 0.22)';
+                    border = '1px solid rgba(100, 116, 139, 0.45)';
+                    valueLabel = '0 spots';
+                  } else if (tlc.count === 1) {
+                    bg = 'rgba(245, 158, 11, 0.25)';
+                    border = '1px solid rgba(245, 158, 11, 0.7)';
+                    valueLabel = `1 spot (${tlc.mainRf?.toFixed(2)})`;
+                  } else if (tlc.count === 2) {
+                    bg = 'rgba(16, 185, 129, 0.28)';
+                    border = '1px solid rgba(16, 185, 129, 0.75)';
+                    valueLabel = `2 spots (Δ${tlc.deltaRf?.toFixed(2)})`;
+                  } else {
+                    bg = 'rgba(168, 85, 247, 0.32)';
+                    border = '1px solid rgba(168, 85, 247, 0.75)';
+                    valueLabel = `${tlc.count} spots`;
+                  }
+                } else if (metric === 'tlc_rf') {
+                  const tlc = wellTlcData.get(k);
+                  if (tlc && tlc.mainRf !== null) {
+                    const hue = Math.round(tlc.mainRf * 200);
+                    bg = `hsla(${hue}, 75%, 50%, 0.26)`;
+                    border = `1px solid hsla(${hue}, 75%, 45%, 0.65)`;
+                    valueLabel = `Rf ${tlc.mainRf.toFixed(2)}`;
+                  } else {
+                    bg = 'rgba(71, 85, 105, 0.15)';
+                    border = '1px solid var(--line)';
+                    valueLabel = '—';
+                  }
+                } else if (metric === 'tlc_resolution') {
+                  const tlc = wellTlcData.get(k);
+                  if (tlc && tlc.deltaRf !== null) {
+                    bg = 'rgba(6, 182, 212, 0.26)';
+                    border = '1px solid rgba(6, 182, 212, 0.65)';
+                    valueLabel = `ΔRf ${tlc.deltaRf.toFixed(2)}`;
+                  } else {
+                    bg = 'rgba(71, 85, 105, 0.15)';
+                    border = '1px solid var(--line)';
+                    valueLabel = '—';
+                  }
                 }
 
                 if (isBad) {
@@ -464,6 +575,45 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               />
               Dilution {factor * factor}× (N²)
             </span>
+          </div>
+        ) : metric === 'tlc_spots' ? (
+          <div style={{ display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 600, color: 'var(--mut)' }}>TLC Spot Outcome:</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: 'rgba(71, 85, 105, 0.4)', border: '1px solid #64748b' }} />
+              0 Spots (No conversion)
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: 'rgba(245, 158, 11, 0.4)', border: '1px solid #f59e0b' }} />
+              1 Spot (Single component)
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: 'rgba(16, 185, 129, 0.4)', border: '1px solid #10b981' }} />
+              2 Spots (Reaction product formed)
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: 'rgba(168, 85, 247, 0.4)', border: '1px solid #a855f7' }} />
+              3+ Spots (Multicomponent)
+            </span>
+          </div>
+        ) : metric === 'tlc_rf' ? (
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 600, color: 'var(--mut)' }}>Primary Rf Migration:</span>
+            <span className="mono">Rf 0.00 (Origin)</span>
+            <div
+              style={{
+                width: '120px',
+                height: '8px',
+                borderRadius: '4px',
+                background: 'linear-gradient(to right, hsla(0, 75%, 50%, 0.6), hsla(120, 75%, 50%, 0.6), hsla(200, 75%, 50%, 0.6))',
+              }}
+            />
+            <span className="mono">Rf 1.00 (Solvent Front)</span>
+          </div>
+        ) : metric === 'tlc_resolution' ? (
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 600, color: 'var(--mut)' }}>Separation Resolution (ΔRf):</span>
+            <span className="mono">ΔRf = Spot₂ - Spot₁ separation span (larger is better resolved)</span>
           </div>
         ) : metric === 'solvent' ? (
           <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>

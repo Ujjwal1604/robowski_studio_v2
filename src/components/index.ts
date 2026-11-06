@@ -19,3 +19,6 @@ export { Tooltip } from './ui/Tooltip';
 export { Toast } from './ui/Toast';
 export { PreviewModal } from './ui/PreviewModal';
 export { FixDiffModal } from './ui/FixDiffModal';
+export { StockCalculatorModal } from './ui/StockCalculatorModal';
+export { CommandPalette } from './ui/CommandPalette';
+export { BottomStepper } from './layout/BottomStepper';

@@ -13,6 +13,7 @@ import {
 import * as Tri from '../../engine';
 import { exampleState } from '../../context/runPayload';
 import { FixDiffModal } from '../ui/FixDiffModal';
+import { StockCalculatorModal } from '../ui/StockCalculatorModal';
 
 export const SetupView: React.FC = () => {
   const {
@@ -56,6 +57,7 @@ export const SetupView: React.FC = () => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [presetsOpen, setPresetsOpen] = useState(false);
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
+  const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
   const libFileInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleImportLibraryFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -766,14 +768,26 @@ export const SetupView: React.FC = () => {
                       placeholder="solid"
                       aria-label={`${r.code} density`}
                     />
-                    <input
-                      type="number"
-                      step="any"
-                      className={`f mono ${invalid.has(`reagents.${i}.stock`) ? 'inv' : ''}`}
-                      value={r.stock}
-                      onChange={(e) => setPath(`reagents.${i}.stock`, e.target.value)}
-                      aria-label={`${r.code} stock`}
-                    />
+                    <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
+                      <input
+                        type="number"
+                        step="any"
+                        className={`f mono ${invalid.has(`reagents.${i}.stock`) ? 'inv' : ''}`}
+                        value={r.stock}
+                        onChange={(e) => setPath(`reagents.${i}.stock`, e.target.value)}
+                        aria-label={`${r.code} stock`}
+                        style={{ flex: 1, minWidth: '40px' }}
+                      />
+                      <button
+                        type="button"
+                        className="ib"
+                        style={{ height: '32px', width: '28px', padding: 0, fontSize: '13px' }}
+                        title={`Open mass & solution volume calculator for ${r.code}`}
+                        onClick={() => setCalcReagentIndex(i)}
+                      >
+                        🧮
+                      </button>
+                    </div>
                     <select
                       className="f"
                       value={r.solvent}
@@ -1406,6 +1420,19 @@ export const SetupView: React.FC = () => {
         }}
         onClose={() => setInspectFixIndex(null)}
       />
+
+      {calcReagentIndex !== null && state.reagents[calcReagentIndex] && (
+        <StockCalculatorModal
+          reagent={state.reagents[calcReagentIndex]}
+          reagentIndex={calcReagentIndex}
+          isOpen={true}
+          onClose={() => setCalcReagentIndex(null)}
+          onApplyStock={(idx, conc) => {
+            setPath(`reagents.${idx}.stock`, conc);
+            toast(`Applied ${conc} mM stock concentration to Reagent ${state.reagents[idx].code}.`);
+          }}
+        />
+      )}
     </div>
   );
 };

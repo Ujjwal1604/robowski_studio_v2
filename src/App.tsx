@@ -14,6 +14,8 @@ import {
   PreviewModal,
   Toast,
   Tooltip,
+  BottomStepper,
+  CommandPalette,
 } from './components';
 
 export const App: React.FC = () => {
@@ -56,6 +58,8 @@ export const App: React.FC = () => {
         {view === 'compare' && <CompareView />}
       </main>
 
+      <BottomStepper />
+      <CommandPalette />
       <PreviewModal />
       <Toast />
       <Tooltip />

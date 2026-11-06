@@ -54,6 +54,41 @@ export const Header: React.FC = () => {
         </div>
 
         <div className="topr">
+          {/* Quick Search & Command Palette Button */}
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => {
+              window.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true })
+              );
+            }}
+            title="Search anything or jump to well (Ctrl+K / ⌘K)"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '4px 10px',
+              fontSize: '11px',
+              background: 'var(--soft)',
+              borderColor: 'var(--line)',
+              color: 'var(--mut)',
+            }}
+          >
+            <span>🔍 Search</span>
+            <kbd
+              style={{
+                fontSize: '10px',
+                padding: '1px 5px',
+                background: 'var(--panel)',
+                borderRadius: '3px',
+                border: '1px solid var(--line)',
+              }}
+            >
+              ⌘K
+            </kbd>
+          </button>
+
           <button
             type="button"
             className={`runsl ${view === 'runs' ? 'on' : ''}`}

@@ -21,6 +21,8 @@ export const CombinationsView: React.FC = () => {
     setOf,
     fixes,
     applyFix,
+    tlcSets,
+    toast,
   } = useApp();
 
   const [hoverRow, setHoverRow] = useState<number | null>(null);
@@ -98,6 +100,51 @@ export const CombinationsView: React.FC = () => {
   const factor = +state.dilutionFactor || 5;
   const activeDetailRow = selectedVial !== null ? selectedVial : hoverRow;
 
+  // Copy full reaction matrix as formatted Markdown table for Electronic Lab Notebook (Benchling, LabArchives)
+  const handleCopyEln = () => {
+    if (!run || allRows.length === 0) return;
+
+    const headers = [
+      '#',
+      'Vial',
+      'Plate',
+      ...state.reagents.map((r) => `${r.code} (mM)`),
+      `Solvent (${state.reactionSolvent}) µL`,
+      'Dilution Tier',
+    ];
+
+    const mdLines = [
+      `| ${headers.join(' | ')} |`,
+      `| ${headers.map(() => '---').join(' | ')} |`,
+    ];
+
+    allRows.forEach(({ r, i }) => {
+      const well = `P${r.plate_number + 1}_${r.container_id}`;
+      const reagConcs = state.reagents.map((_, ri) => {
+        const rc = r.recipe[ri];
+        return rc && rc.target_concentration > 0 ? rc.target_concentration.toFixed(2) : '0';
+      });
+      const maxDil = Math.max(...r.recipe.map((rc) => rc.dilution_level || 0));
+      const dilStr = maxDil === 0 ? '1× direct' : maxDil === 1 ? `${factor}×` : `${factor * factor}×`;
+
+      const rowVals = [
+        String(i + 1),
+        well,
+        String(r.plate_number + 1),
+        ...reagConcs,
+        String(Math.round(r['vol#solvent'])),
+        dilStr,
+      ];
+      mdLines.push(`| ${rowVals.join(' | ')} |`);
+    });
+
+    const mdContent = mdLines.join('\n');
+    navigator.clipboard.writeText(mdContent).then(
+      () => toast(`Copied ${allRows.length} reaction conditions as Markdown table for ELN!`),
+      () => toast('Could not copy to clipboard.')
+    );
+  };
+
   return (
     <div className="wrap">
       <div className="grid two">
@@ -122,21 +169,33 @@ export const CombinationsView: React.FC = () => {
               </p>
             </div>
 
-            <div className="seg" role="group" aria-label="Combinations view mode">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
               <button
                 type="button"
-                className={viewMode === 'table' ? 'on' : ''}
-                onClick={() => setViewMode('table')}
+                className="btn sm"
+                onClick={handleCopyEln}
+                title="Copy entire reaction table formatted for Benchling / Electronic Lab Notebook"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '11px' }}
               >
-                ≡ Table List
+                📋 Copy for ELN
               </button>
-              <button
-                type="button"
-                className={viewMode === 'matrix' ? 'on' : ''}
-                onClick={() => setViewMode('matrix')}
-              >
-                ▦ 2D Plate Heatmap
-              </button>
+
+              <div className="seg" role="group" aria-label="Combinations view mode">
+                <button
+                  type="button"
+                  className={viewMode === 'table' ? 'on' : ''}
+                  onClick={() => setViewMode('table')}
+                >
+                  ≡ Table List
+                </button>
+                <button
+                  type="button"
+                  className={viewMode === 'matrix' ? 'on' : ''}
+                  onClick={() => setViewMode('matrix')}
+                >
+                  ▦ 2D Plate Heatmap
+                </button>
+              </div>
             </div>
           </div>
 
@@ -268,6 +327,7 @@ export const CombinationsView: React.FC = () => {
               onMetricChange={setHeatmapMetric}
               plateIndex={heatmapPlate}
               onPlateChange={setHeatmapPlate}
+              tlcSets={tlcSets}
               onNavigateTlc={(ri) => {
                 setVisited((v) => ({ ...v, tlc: true }));
                 setView('tlc');
@@ -426,16 +486,30 @@ export const CombinationsView: React.FC = () => {
                   {run.rows[activeDetailRow].plate_number + 1} · Container #
                   {run.rows[activeDetailRow].container_id}
                 </div>
-                {selectedVial === activeDetailRow && (
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                   <button
                     type="button"
                     className="btn sm"
-                    style={{ height: '22px', padding: '0 8px', fontSize: '11px' }}
-                    onClick={() => setSelectedVial(null)}
+                    style={{ height: '22px', padding: '0 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                    onClick={() => {
+                      setVisited((v) => ({ ...v, tlc: true }));
+                      setView('tlc');
+                    }}
+                    title="Switch to TLC Map view and inspect this well's TLC lane"
                   >
-                    Deselect
+                    🔬 View in TLC
                   </button>
-                )}
+                  {selectedVial === activeDetailRow && (
+                    <button
+                      type="button"
+                      className="btn sm"
+                      style={{ height: '22px', padding: '0 8px', fontSize: '11px' }}
+                      onClick={() => setSelectedVial(null)}
+                    >
+                      Deselect
+                    </button>
+                  )}
+                </div>
               </div>
               <div style={{ lineHeight: 1.6, display: 'flex', flexDirection: 'column', gap: '3px' }}>
                 {run.rows[activeDetailRow].recipe

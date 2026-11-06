@@ -574,8 +574,8 @@ export const CombinationsView: React.FC = () => {
             </>
           )}
 
-          {/* Selected or Hovered Vial Recipe Inspector */}
-          {activeDetailRow !== null && run.rows[activeDetailRow] && (
+          {/* Selected or Hovered Vial Recipe Inspector (for Table view mode) */}
+          {viewMode === 'table' && activeDetailRow !== null && run.rows[activeDetailRow] && (
             <div
               style={{
                 marginTop: '14px',

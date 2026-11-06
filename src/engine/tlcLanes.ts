@@ -296,14 +296,17 @@ export function pctile(a: ArrayLike<number>, p: number): number {
   return b[Math.min(b.length - 1, Math.max(0, Math.round(p * (b.length - 1))))];
 }
 
-// Detect solvent front from the bright meniscus band near the far end of the lane (top 30%)
-export function detectFront(profile: number[]): number {
+// Detect solvent front from the meniscus band near the far end of the lane (upper 30%)
+export function detectFront(profile: number[], sign: number = 1): number {
   if (!profile.length) return 0;
   const sm = movingAvg(profile, 9);
-  const lo = Math.floor(profile.length * 0.7);
+  const lo = Math.floor(profile.length * 0.65);
+  const hi = Math.min(profile.length - 1, Math.floor(profile.length * 0.96));
   let best = lo;
-  for (let i = lo; i < sm.length; i++) {
-    if (sm[i] > sm[best]) best = i;
+  for (let i = lo; i <= hi; i++) {
+    const val = sign < 0 ? -sm[i] : sm[i];
+    const bestVal = sign < 0 ? -sm[best] : sm[best];
+    if (val > bestVal) best = i;
   }
   return best;
 }
@@ -325,11 +328,11 @@ export function detectOrigin(profile: number[], sign: number = -1): number {
 
 export const tlcHalf = (lane: TlcLane): number => (lane.id < 27 ? 0 : 1);
 
-// Find spots in a lane profile using rolling percentile baseline subtraction
+// Find spots in a lane profile using rolling percentile baseline subtraction and chromatographic prominence consolidation
 export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const n = profile.length;
   if (n < 10) return [];
-  const sm = movingAvg(profile, 7);
+  const sm1 = movingAvg(profile, 7);
   const step = 5;
   const win = 100;
   const base = new Array(n);
@@ -337,7 +340,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const pts: [number, number][] = [];
 
   for (let i = 0; i < n; i += step) {
-    const chunk = sm.slice(Math.max(0, i - win), Math.min(n, i + win + 1));
+    const chunk = sm1.slice(Math.max(0, i - win), Math.min(n, i + win + 1));
     pts.push([i, pctile(chunk, q)]);
   }
   pts.push([n - 1, pts[pts.length - 1][1]]);
@@ -349,38 +352,176 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     base[i] = x1 === x0 ? y0 : y0 + ((y1 - y0) * (i - x0)) / (x1 - x0);
   }
 
-  const d = sm.map((v, i) => (o.sign < 0 ? base[i] - v : v - base[i]));
-  const r = o.radius || 24;
-  const from = Math.round(o.origin - r);
-  const start = Math.round(o.origin + r * 1.2);
-  const span = Math.max(1, o.front - o.origin);
-  const end = Math.round(o.origin + 0.93 * span);
+  // Raw baseline-subtracted signal
+  const rawDiff = sm1.map((v, i) => (o.sign < 0 ? base[i] - v : v - base[i]));
 
+  const r = o.radius || 24;
+  const span = Math.max(1, o.front - o.origin);
+  const minProm = o.minProminence ?? 0.28;
+
+  // Adaptive smoothing scaled with prominence mode:
+  // In Broad mode (minProm >= 0.40): smooth more generously to suppress camera noise ripples across wide plateaus.
+  // In Sensitive mode (minProm <= 0.16): light smoothing to preserve faint trace spots and tight doublets.
+  const smoothHalf = minProm >= 0.40 ? Math.max(8, Math.round(r * 0.40)) : minProm <= 0.16 ? 3 : 5;
+  const d = movingAvg(rawDiff, smoothHalf * 2 + 1);
+
+  // Origin buffer: allow detecting polar products from Rf ~0.04 upwards
+  const originBuffer = Math.max(4, Math.min(10, Math.round(r * 0.25)));
+  const start = Math.round(o.origin + originBuffer);
+
+  // Front buffer: allow detecting fast-eluting nonpolar spots up to Rf ~0.975 while excluding the solvent front boundary
+  const end = Math.round(o.origin + Math.min(span - 3, 0.975 * span));
+
+  if (end <= start) return [];
+
+  // Compute baseline noise specifically within the chromatographic migration window (chrom)
   const chrom = d.slice(Math.max(start, 0), Math.min(n, end));
-  const dmax = Math.max(...chrom, 1e-9);
-  const med = pctile(d, 0.5);
-  const noise = 1.4826 * pctile(d.map((v) => Math.abs(v - med)), 0.5);
-  const thr = Math.max(3.5 * noise, 0.05 * dmax);
-  const spots: TlcSpot[] = [];
+  const dmax = chrom.length > 0 ? Math.max(...chrom, 1e-9) : Math.max(...d, 1e-9);
+  const med = chrom.length > 0 ? pctile(chrom, 0.5) : pctile(d, 0.5);
+  const noise = chrom.length > 0
+    ? 1.4826 * pctile(chrom.map((v) => Math.abs(v - med)), 0.5)
+    : 1.4826 * pctile(d.map((v) => Math.abs(v - med)), 0.5);
+
+  // Robust chromatographic signal threshold
+  const thr = Math.max(2.4 * noise, 0.035 * dmax);
+
+  // 1. Initial Candidate Peaks via local maximum search
+  // halfWin scales dynamically with minProminence to avoid fracturing broad spots
+  const halfWin = Math.max(
+    4,
+    Math.round(r * (minProm >= 0.40 ? 0.75 : minProm <= 0.16 ? 0.20 : 0.35))
+  );
+
+  const candidates: Array<{ pos: number; val: number; extentStart: number; extentEnd: number }> = [];
 
   for (let i = Math.max(start, 1); i < Math.min(end, n - 1); i++) {
     if (d[i] < thr) continue;
     let top = true;
-    for (let k = Math.max(0, i - 12); k <= Math.min(n - 1, i + 12); k++) {
+    for (let k = Math.max(0, i - halfWin); k <= Math.min(n - 1, i + halfWin); k++) {
       if (d[k] > d[i] || (d[k] === d[i] && k < i)) {
         top = false;
         break;
       }
     }
     if (top) {
-      spots.push({
+      candidates.push({
         pos: i,
-        rf: Math.max(0, Math.min(1, (i - o.origin) / span)),
-        strength: Math.min(1, Math.max(0, d[i] / dmax)),
+        val: d[i],
+        extentStart: Math.max(start, i - halfWin),
+        extentEnd: Math.min(end, i + halfWin),
       });
     }
   }
-  return spots;
+
+  if (candidates.length === 0) return [];
+
+  // 2. Iterative Chromatographic Basin & Prominence Consolidation
+  // In chromatography, two peaks in the same continuous band only represent separate compounds
+  // if the valley drops significantly towards baseline (achieving chromatographic resolution).
+  // If the valley is shallow or the peaks are physically close, they MUST be merged into one single spot.
+  let merged = [...candidates];
+  let changed = true;
+  let iterations = 0;
+
+  while (changed && merged.length > 1 && iterations < 30) {
+    changed = false;
+    iterations++;
+    let bestPairIdx = -1;
+    let minValleyRatio = 1.0;
+
+    for (let i = 0; i < merged.length - 1; i++) {
+      const p1 = merged[i];
+      const p2 = merged[i + 1];
+      const dist = p2.pos - p1.pos;
+
+      // Minimum valley signal between the two peaks
+      let vMin = Infinity;
+      for (let k = p1.pos; k <= p2.pos; k++) {
+        if (d[k] < vMin) vMin = d[k];
+      }
+
+      const lowerVal = Math.min(p1.val, p2.val);
+      const valleyDrop = lowerVal - vMin;
+      const dropRatio = lowerVal > 0 ? valleyDrop / lowerVal : 0;
+      const valleyAboveBaseline = vMin - thr;
+
+      // Check whether these two adjacent peaks belong to the SAME spot / chromatographic band:
+      let shouldMerge = false;
+
+      if (minProm >= 0.40) {
+        // BROAD MODE (Overloaded / Tailing Spots):
+        // Overloaded spots have optical saturation and tailing dips that can reach 60-70%.
+        // Consolidate into 1 spot unless the valley drops deeply (> 70%) AND distance >= 12% span
+        const spanDist = Math.max(28, Math.round(span * 0.12));
+        shouldMerge =
+          dropRatio < 0.65 ||
+          (dist < spanDist && dropRatio < 0.75) ||
+          valleyAboveBaseline > lowerVal * 0.28;
+      } else if (minProm <= 0.16) {
+        // SENSITIVE MODE (Fine trace spots & close doublets):
+        // Only merge if the valley drop is very shallow (< 20%) or extremely close (< 12 px).
+        shouldMerge = dropRatio < 0.20 || dist < 12;
+      } else {
+        // STANDARD MODE (Balanced for normal reaction mixtures):
+        // Merge if valley dip is shallow (< 35%),
+        // or if distance is close (< 6% of span) and drop < 50%.
+        // Distinct peaks where valley drops >= 50% remain resolved as separate spots.
+        const spanDist = Math.max(15, Math.round(span * 0.06));
+        shouldMerge =
+          dropRatio < Math.max(0.32, minProm * 1.25) ||
+          (dist < spanDist && dropRatio < 0.50) ||
+          valleyDrop < 2.5 * noise;
+      }
+
+      if (shouldMerge) {
+        if (dropRatio < minValleyRatio) {
+          minValleyRatio = dropRatio;
+          bestPairIdx = i;
+        }
+      }
+    }
+
+    if (bestPairIdx >= 0) {
+      const p1 = merged[bestPairIdx];
+      const p2 = merged[bestPairIdx + 1];
+      const extStart = Math.min(p1.extentStart, p2.extentStart);
+      const extEnd = Math.max(p1.extentEnd, p2.extentEnd);
+
+      // Unified centroid computed using square intensity weighting:
+      // Weighting by d[k]^2 places the spot marker firmly in the densest, darkest core of the spot
+      let sumWeight = 0;
+      let sumWeightPos = 0;
+      let maxVal = 0;
+
+      for (let k = extStart; k <= extEnd; k++) {
+        const val = d[k];
+        if (val > maxVal) maxVal = val;
+        const netVal = Math.max(0, val - thr * 0.5);
+        const w = netVal * netVal;
+        sumWeight += w;
+        sumWeightPos += k * w;
+      }
+
+      const centroid = sumWeight > 0 ? Math.round(sumWeightPos / sumWeight) : Math.round((p1.pos + p2.pos) / 2);
+
+      merged.splice(bestPairIdx, 2, {
+        pos: Math.max(start, Math.min(end, centroid)),
+        val: maxVal,
+        extentStart: extStart,
+        extentEnd: extEnd,
+      });
+      changed = true;
+    }
+  }
+
+  // 3. Final formatted spots sorted by position
+  merged.sort((a, b) => a.pos - b.pos);
+
+  return merged.map((p) => ({
+    pos: p.pos,
+    rf: Math.max(0, Math.min(1, +((p.pos - o.origin) / span).toFixed(3))),
+    strength: Math.min(1, Math.max(0, +(p.val / dmax).toFixed(3))),
+  }));
 }
 
 // Complete 1D Densitometry extraction: returns profile curve, rolling baseline, baseline-subtracted signal & spots
@@ -449,11 +590,15 @@ export function extractDensitogram(
     });
   }
 
-  // Calculate area percentage for each spot
-  if (totalArea > 0) {
-    spots.forEach((sp) => {
+  // Calculate area percentage for each spot with bounded chromatographic integration windows
+  if (totalArea > 0 && spots.length > 0) {
+    spots.forEach((sp, idx) => {
+      const prevPos = idx > 0 ? spots[idx - 1].pos : o.origin;
+      const nextPos = idx < spots.length - 1 ? spots[idx + 1].pos : o.front;
+      const leftBound = Math.max(0, Math.floor((sp.pos + prevPos) / 2), sp.pos - 15);
+      const rightBound = Math.min(n - 1, Math.ceil((sp.pos + nextPos) / 2), sp.pos + 15);
       let peakArea = 0;
-      for (let k = Math.max(0, sp.pos - 15); k <= Math.min(n - 1, sp.pos + 15); k++) {
+      for (let k = leftBound; k <= rightBound; k++) {
         peakArea += points[k]?.signal || 0;
       }
       sp.areaPct = Math.min(100, Math.round((peakArea / totalArea) * 100));
@@ -470,24 +615,34 @@ export function extractDensitogram(
   };
 }
 
-// Solvent front resolution: explicit side override -> explicit global manual override -> UV366 meniscus detection -> fallback 93% of lane length
+// Solvent front resolution: explicit side override -> explicit global manual override -> multi-channel meniscus detection -> fallback 93% of lane length
 export function tlcFront(
   set: TlcSet,
   lane: TlcLane,
-  getProfile?: (set: TlcSet, key: 'UV366', lane: TlcLane) => number[]
+  getProfile?: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
 ): number {
   const h = tlcHalf(lane);
   if (set.frontHalfPx && set.frontHalfPx[h] != null && set.frontHalfPx[h]! > 0) {
     return set.frontHalfPx[h]!;
   }
   if (set.frontPx && set.frontPx > 0) return set.frontPx;
-  if (!set.imgs.UV366 || !getProfile) return Math.round(lane.length * 0.93);
+
+  const ch: TlcChannelKey | undefined = set.imgs.UV366
+    ? 'UV366'
+    : set.imgs.UV254
+    ? 'UV254'
+    : set.imgs.White
+    ? 'White'
+    : undefined;
+
+  if (!ch || !getProfile) return Math.round(lane.length * 0.93);
 
   set.frontAuto = set.frontAuto || {};
   if (set.frontAuto[h] == null && set.cfg) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
+    const sign = TLC_SIGNAL[ch]?.sign ?? 1;
     const fronts = halfLanes
-      .map((l) => detectFront(getProfile(set, 'UV366', l)))
+      .map((l) => detectFront(getProfile(set, ch, l), sign))
       .filter((f) => f > 0)
       .sort((a, b) => a - b);
     set.frontAuto[h] = fronts.length ? fronts[fronts.length >> 1] : Math.round(lane.length * 0.93);

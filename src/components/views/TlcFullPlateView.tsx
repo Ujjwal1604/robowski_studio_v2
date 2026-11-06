@@ -31,6 +31,7 @@ interface TlcFullPlateViewProps {
   onResetLane?: (laneId: number) => void;
   onResetAllLanes?: () => void;
   onExportLaneCsv?: () => void;
+  spotProminence?: number;
 }
 
 // Explicit high-contrast button styling for the HUD dark theme
@@ -76,6 +77,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   onResetLane,
   onResetAllLanes,
   onExportLaneCsv,
+  spotProminence = 0.28,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -575,6 +577,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               origin: oVal,
               front: fVal,
               radius: l.spotRadius || 24,
+              minProminence: spotProminence,
             });
 
             if (spots && spots.length > 0) {

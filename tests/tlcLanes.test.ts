@@ -309,4 +309,203 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     // Spot 1 (Fluorescence): Cyan has high blue
     expect(fc[6]).toBeGreaterThan(150);
   });
+
+  it('detects low-Rf polar products and high-Rf nonpolar spots accurately', () => {
+    // 300-pixel lane with origin at 30, front at 270 (span = 240)
+    const profile = new Array(300).fill(200);
+
+    // 1. Low Rf peak at pixel 48 -> Rf = (48 - 30) / 240 = 0.075 (~0.08)
+    for (let i = 45; i <= 51; i++) {
+      profile[i] = 40;
+    }
+    // 2. High Rf peak at pixel 258 -> Rf = (258 - 30) / 240 = 0.95
+    for (let i = 255; i <= 261; i++) {
+      profile[i] = 50;
+    }
+
+    const spots = findSpots(profile, {
+      sign: -1,
+      origin: 30,
+      front: 270,
+      radius: 20,
+    });
+
+    expect(spots.length).toBe(2);
+    const lowRfSpot = spots.find((s) => s.rf < 0.2);
+    const highRfSpot = spots.find((s) => s.rf > 0.8);
+
+    expect(lowRfSpot).toBeDefined();
+    expect(lowRfSpot!.rf).toBeCloseTo(0.075, 2);
+
+    expect(highRfSpot).toBeDefined();
+    expect(highRfSpot!.rf).toBeCloseTo(0.95, 2);
+  });
+
+  it('resolves closely spaced doublet peaks without peak suppression', () => {
+    // 300-pixel lane with origin at 30, front at 270 (span = 240)
+    const profile = new Array(300).fill(200);
+
+    // Doublet peak: peak 1 at pixel 120 (Rf = 0.375), peak 2 at pixel 136 (Rf = 0.442) -> 16 px apart
+    for (let i = 117; i <= 123; i++) profile[i] = 40;
+    for (let i = 133; i <= 139; i++) profile[i] = 45;
+
+    const spots = findSpots(profile, {
+      sign: -1,
+      origin: 30,
+      front: 270,
+      radius: 20,
+    });
+
+    expect(spots.length).toBe(2);
+    expect(spots[0].rf).toBeCloseTo(0.375, 2);
+    expect(spots[1].rf).toBeCloseTo(0.442, 2);
+  });
+
+  it('ensures well coordinate to TLC lane mapping is bijective across all 54 wells', () => {
+    // Microplate row-major index k: k = row * 9 + col (A1=0, A2=1, B1=9, etc.)
+    // TLC lane column-major index: lane = col * 6 + row
+    for (let row = 0; row < 6; row++) {
+      for (let col = 0; col < 9; col++) {
+        const k = row * 9 + col;
+        const lane = tlcLane(k, 'column');
+        expect(lane).toBe(col * 6 + row);
+        expect(containerOfLane(lane)).toBe(k);
+      }
+    }
+  });
+
+  it('consolidates broad saturated/tailing spots into a single centroid instead of multiple sub-peaks', () => {
+    // 500-pixel lane, origin at 50, front at 450 (span = 400)
+    const profile = new Array(500).fill(220);
+
+    // Create a single broad saturated spot spanning 80 pixels (from pixel 180 to 260)
+    // with minor camera noise / plateau grain (+/- 2-3 units)
+    for (let i = 180; i <= 260; i++) {
+      const distFromCenter = Math.abs(i - 220);
+      // Bell/plateau curve with minor ripples
+      const ripple = (i % 7 === 0 ? 3 : i % 5 === 0 ? -3 : 0);
+      const intensity = Math.min(200, 180 - distFromCenter * 1.5 + ripple);
+      profile[i] = 220 - intensity; // quenching dip
+    }
+
+    // Also add one separate distinct small spot at pixel 350
+    for (let i = 346; i <= 354; i++) {
+      profile[i] = 130;
+    }
+
+    const spots = findSpots(profile, {
+      sign: -1,
+      origin: 50,
+      front: 450,
+      radius: 24,
+    });
+
+    // Must detect EXACTLY 2 spots: 1 for the broad spot, 1 for the distinct separate spot
+    expect(spots.length).toBe(2);
+
+    const broadSpot = spots.find((s) => s.pos >= 180 && s.pos <= 260);
+    const smallSpot = spots.find((s) => s.pos >= 340 && s.pos <= 360);
+
+    expect(broadSpot).toBeDefined();
+    // Centroid of broad spot should be close to center (pixel 220, Rf ~0.425)
+    expect(broadSpot!.pos).toBeGreaterThanOrEqual(210);
+    expect(broadSpot!.pos).toBeLessThanOrEqual(230);
+    expect(broadSpot!.rf).toBeCloseTo((220 - 50) / 400, 1);
+
+    expect(smallSpot).toBeDefined();
+    expect(smallSpot!.pos).toBeGreaterThanOrEqual(346);
+    expect(smallSpot!.pos).toBeLessThanOrEqual(354);
+  });
+
+  it('changes spot detection deconvolution distinctly across Broad, Standard, and Sensitive modes', () => {
+    // 500-pixel lane, origin at 50, front at 450 (span = 400)
+    const profile = new Array(500).fill(220);
+
+    // Overlapping peaks with a 35% valley dip between them:
+    // Peak A at pixel 200 (val: 170)
+    // Valley at pixel 225 (val: 110, dip = 60 units, drop ratio = 60/170 = 35%)
+    // Peak B at pixel 250 (val: 165)
+    for (let i = 180; i <= 270; i++) {
+      let signal = 0;
+      if (i <= 225) {
+        // Peak A bell curve
+        const d = Math.abs(i - 200);
+        signal = Math.max(0, 170 - d * 2.4);
+      } else {
+        // Peak B bell curve
+        const d = Math.abs(i - 250);
+        signal = Math.max(0, 165 - d * 2.2);
+      }
+      profile[i] = 220 - signal;
+    }
+
+    // 1. Broad Mode (minProminence = 0.55): 35% valley is under 55% -> merges into 1 broad spot
+    const broadSpots = findSpots(profile, {
+      sign: -1,
+      origin: 50,
+      front: 450,
+      radius: 24,
+      minProminence: 0.55,
+      minDistance: 56,
+    });
+    expect(broadSpots.length).toBe(1);
+
+    // 2. Sensitive Mode (minProminence = 0.12): 35% valley is above 12% -> resolves into 2 distinct spots
+    const sensitiveSpots = findSpots(profile, {
+      sign: -1,
+      origin: 50,
+      front: 450,
+      radius: 24,
+      minProminence: 0.12,
+      minDistance: 12,
+    });
+    expect(sensitiveSpots.length).toBe(2);
+  });
+
+  it('consolidates multi-ripple overloaded broad spots (4 peaks) into exactly 1 clean spot in Broad mode', () => {
+    // 900-pixel lane matching real high-res TLC plates
+    // Origin at 90, Front at 750 (span = 660)
+    const profile = new Array(900).fill(215);
+
+    // Massive broad spot from index 300 to 460 (160 px wide) with 4 ripples spaced ~35 px apart
+    for (let i = 290; i <= 470; i++) {
+      const envelope = Math.max(0, 160 * (1 - Math.pow((i - 380) / 90, 2)));
+      const ripple = 25 * Math.sin((i - 300) * 0.14);
+      profile[i] = 215 - Math.max(0, envelope + ripple);
+    }
+
+    // A separate distinct nonpolar spot at 580 (Rf = (580 - 90)/660 = 0.74)
+    for (let i = 568; i <= 592; i++) {
+      profile[i] = 215 - Math.max(0, 95 - Math.abs(i - 580) * 8);
+    }
+
+    // 1. Broad Spots mode: collapses the 4-ripple broad spot into exactly 1 spot + 1 separate spot = 2 spots
+    const broadSpots = findSpots(profile, {
+      sign: -1,
+      origin: 90,
+      front: 750,
+      radius: 24,
+      minProminence: 0.55,
+      minDistance: 92,
+    });
+
+    expect(broadSpots.length).toBe(2);
+    // Spot 1: Unified centroid of the broad spot in [360, 400]
+    expect(broadSpots[0].pos).toBeGreaterThanOrEqual(365);
+    expect(broadSpots[0].pos).toBeLessThanOrEqual(395);
+    // Spot 2: Distinct spot at 580
+    expect(broadSpots[1].pos).toBeGreaterThanOrEqual(575);
+    expect(broadSpots[1].pos).toBeLessThanOrEqual(585);
+
+    // 2. Standard mode: also merges the 4 ripples into 1 clean spot
+    const standardSpots = findSpots(profile, {
+      sign: -1,
+      origin: 90,
+      front: 750,
+      radius: 24,
+      minProminence: 0.28,
+      minDistance: 46,
+    });
+    expect(standardSpots.length).toBe(2);
+  });
 });

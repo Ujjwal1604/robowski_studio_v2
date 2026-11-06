@@ -345,6 +345,8 @@ export interface TlcProfileOptions {
   origin: number;
   front: number;
   radius?: number;
+  minProminence?: number;
+  minDistance?: number;
 }
 
 export interface TlcDensitogramPoint {

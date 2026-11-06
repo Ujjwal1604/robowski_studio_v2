@@ -427,6 +427,8 @@ export const TlcView: React.FC = () => {
   const [hoverSpot, setHoverSpot] = useState<TlcSpot | null>(null);
   const [pinnedMarkers, setPinnedMarkers] = useState<RfMarker[]>([]);
   const [tlcQuickJump, setTlcQuickJump] = useState<string>('');
+  const [spotMode, setSpotMode] = useState<'standard' | 'broad' | 'sensitive'>('standard');
+  const [spotProminence, setSpotProminence] = useState<number>(0.28);
 
   // Handle external well jump commands directed to TLC Map
   useEffect(() => {
@@ -689,14 +691,25 @@ export const TlcView: React.FC = () => {
       if (!prof.length) return null;
       const origin = tlcOrigin(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
       const front = tlcFront(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
+      const span = Math.max(1, front - origin);
+
+      // Distance scale proportional to spot prominence mode:
+      // Broad mode allows merging sub-peaks across up to 14% of the migration span
+      const minDistance = Math.max(
+        10,
+        Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
+      );
+
       return findSpots(prof, {
         sign: TLC_SIGNAL[key].sign,
         origin,
         front,
         radius: lane.spotRadius || 24,
+        minProminence: spotProminence,
+        minDistance,
       });
     },
-    [coreFraction]
+    [coreFraction, spotProminence]
   );
 
   // Helper to extract panels for lane t
@@ -779,18 +792,25 @@ export const TlcView: React.FC = () => {
         for (const k of TLC_KEYS) {
           if (s.imgs[k]) {
             const prof = extractLaneProfile(s, k, l, coreFraction);
+            const span = Math.max(1, front - origin);
+            const minDistance = Math.max(
+              10,
+              Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
+            );
             newDens[k] = extractDensitogram(prof, {
               sign: TLC_SIGNAL[k].sign,
               origin,
               front,
               radius: l.spotRadius || 24,
+              minProminence: spotProminence,
+              minDistance,
             });
           }
         }
       }
       setChannelDensitograms(newDens);
     }
-  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction]);
+  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction, spotProminence]);
 
   // Keyboard listener inside well inspection modal for instant nudging and tilt
   useEffect(() => {
@@ -1432,6 +1452,116 @@ export const TlcView: React.FC = () => {
             <span>Auto-detect spots &amp; show Rf</span>
           </label>
 
+          {markSpots && (
+            <div
+              style={{
+                display: 'inline-flex',
+                background: 'var(--soft)',
+                padding: '2px',
+                borderRadius: '6px',
+                border: '1px solid var(--line)',
+                gap: '2px',
+                fontSize: '11px',
+              }}
+              title="Chromatographic Peak Filter: 'Broad Spots' consolidates wide/tailing bands into 1 clean centroid; 'Standard' is calibrated for normal reaction spots; 'Sensitive' picks up trace impurities."
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setSpotMode('standard');
+                  setSpotProminence(0.28);
+                }}
+                style={{
+                  fontSize: '11px',
+                  padding: '2px 7px',
+                  border: 'none',
+                  background: spotMode === 'standard' ? 'var(--panel)' : 'transparent',
+                  color: spotMode === 'standard' ? 'var(--fg)' : 'var(--mut)',
+                  borderRadius: '4px',
+                  fontWeight: spotMode === 'standard' ? 600 : 400,
+                  cursor: 'pointer',
+                  boxShadow: spotMode === 'standard' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none',
+                }}
+              >
+                Standard
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSpotMode('broad');
+                  setSpotProminence(0.55);
+                }}
+                style={{
+                  fontSize: '11px',
+                  padding: '2px 7px',
+                  border: 'none',
+                  background: spotMode === 'broad' ? 'var(--panel)' : 'transparent',
+                  color: spotMode === 'broad' ? '#ec4899' : 'var(--mut)',
+                  borderRadius: '4px',
+                  fontWeight: spotMode === 'broad' ? 700 : 400,
+                  cursor: 'pointer',
+                  boxShadow: spotMode === 'broad' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none',
+                }}
+                title="Consolidates wide tailing bands and saturated spots into 1 clean Rf centroid"
+              >
+                Broad Spots
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSpotMode('sensitive');
+                  setSpotProminence(0.12);
+                }}
+                style={{
+                  fontSize: '11px',
+                  padding: '2px 7px',
+                  border: 'none',
+                  background: spotMode === 'sensitive' ? 'var(--panel)' : 'transparent',
+                  color: spotMode === 'sensitive' ? 'var(--fg)' : 'var(--mut)',
+                  borderRadius: '4px',
+                  fontWeight: spotMode === 'sensitive' ? 600 : 400,
+                  cursor: 'pointer',
+                  boxShadow: spotMode === 'sensitive' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none',
+                }}
+                title="Detects faint trace impurities and close doublets"
+              >
+                Sensitive
+              </button>
+
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  paddingLeft: '6px',
+                  borderLeft: '1px solid var(--line)',
+                  marginLeft: '2px',
+                }}
+              >
+                <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>Merge:</span>
+                <input
+                  type="range"
+                  min="0.08"
+                  max="0.70"
+                  step="0.02"
+                  value={spotProminence}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    setSpotProminence(v);
+                    if (v >= 0.45) setSpotMode('broad');
+                    else if (v <= 0.16) setSpotMode('sensitive');
+                    else setSpotMode('standard');
+                  }}
+                  style={{ width: '60px', height: '14px', cursor: 'pointer' }}
+                  title={`Valley Prominence Threshold: ${Math.round(spotProminence * 100)}% (higher = merges broad/tailing bands; lower = detects fine trace spots)`}
+                />
+                <span className="mono" style={{ fontSize: '10px', minWidth: '26px', color: 'var(--fg)', fontWeight: 700 }}>
+                  {Math.round(spotProminence * 100)}%
+                </span>
+              </div>
+            </div>
+          )}
+
           {platesCount > 1 && (
             <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
               <span>Plate:</span>
@@ -1831,6 +1961,7 @@ export const TlcView: React.FC = () => {
             onResetLane={handleResetLane}
             onResetAllLanes={handleResetAllLanes}
             onExportLaneCsv={handleExportLaneCsv}
+            spotProminence={spotProminence}
           />
         </div>
       ) : (

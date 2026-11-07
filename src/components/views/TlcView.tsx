@@ -33,6 +33,18 @@ import {
   exportLaneConfigCsv,
 } from '../../engine';
 import {
+  fitEdgeCurve,
+  fitEdgePicks,
+  edgeGain,
+  edgeActive,
+  correctSpots,
+  DEFAULT_EDGE_SETTING,
+  EdgeFit,
+  EdgeSetting,
+  EdgePoint,
+  EdgePick,
+} from '../../engine/tlcEdge';
+import {
   TlcSet,
   TlcLane,
   TlcLaneConfig,
@@ -392,6 +404,8 @@ export const TlcView: React.FC = () => {
     targetWell,
     setTargetWell,
     view,
+    spotProminence,
+    setSpotProminence,
   } = useApp();
 
   const [cur, setCur] = useState<number>(0);
@@ -431,7 +445,6 @@ export const TlcView: React.FC = () => {
   const [pinnedMarkers, setPinnedMarkers] = useState<RfMarker[]>([]);
   const [tlcQuickJump, setTlcQuickJump] = useState<string>('');
   const [spotMode, setSpotMode] = useState<'standard' | 'broad' | 'sensitive'>('standard');
-  const [spotProminence, setSpotProminence] = useState<number>(0.28);
 
   // Handle external well jump commands directed to TLC Map
   useEffect(() => {
@@ -686,33 +699,118 @@ export const TlcView: React.FC = () => {
     toast(`Removed ${TLC_LABEL[key]} image.`);
   };
 
-  // Get Spots helper for a set, channel, and lane with center-weighted core sampling
+  // ---- Edge-effect correction (fitted per half of every set) ----
+  const [edgeSettings, setEdgeSettings] = useState<Record<string, EdgeSetting>>({});
+  // Spots picked as 'same compound' per set; group = which compound
+  const [edgePicks, setEdgePicks] = useState<Record<string, EdgePick[]>>({});
+  const [pickMode, setPickMode] = useState(false);
+  const [pickGroup, setPickGroup] = useState(0);
+  const edgeCache = useRef(new WeakMap<TlcSet, { key: string; fits: (EdgeFit | null)[] }>());
+
+  const detectOptsFor = useCallback(
+    (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => {
+      const prof = extractLaneProfile(set, key, lane, coreFraction);
+      if (!prof.length) return null;
+      const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+      const origin = tlcOrigin(set, lane, get);
+      const front = tlcFront(set, lane, get);
+      return {
+        prof,
+        origin,
+        opts: {
+          sign: TLC_SIGNAL[key].sign,
+          origin,
+          front,
+          radius: lane.spotRadius || 24,
+          minProminence: spotProminence,
+        },
+      };
+    },
+    [coreFraction, spotProminence]
+  );
+
+  const getEdgeFits = useCallback(
+    (set: TlcSet): (EdgeFit | null)[] => {
+      const picks = edgePicks[set.uid] || [];
+      const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs).join()}`;
+      const hit = edgeCache.current.get(set);
+      if (hit && hit.key === key) return hit.fits;
+      const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
+      let fits: (EdgeFit | null)[] = [null, null];
+      if (ch && set.cfg) {
+        const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+        const auto: EdgePoint[][] = [[], []];
+        for (const lane of set.cfg.lanes) {
+          if (lane.id < 0 || lane.id > 53) continue;
+          const d = detectOptsFor(set, ch, lane);
+          if (!d) continue;
+          for (const sp of findSpots(d.prof, d.opts)) {
+            if (sp.rf > 0.1 && sp.rf < 0.95 && sp.strength > 0.15) {
+              auto[tlcHalf(lane)].push({ lane: lane.id, x: lane.x0, h: sp.pos - d.origin });
+            }
+          }
+        }
+        fits = [0, 1].map((h) => {
+          const mine = picks.filter((q) => (q.lane < 27 ? 0 : 1) === h);
+          if (mine.length) {
+            const groups = new Map<number, EdgePoint[]>();
+            for (const q of mine) {
+              const lane = set.cfg!.lanes.find((l) => l.id === q.lane);
+              if (!lane) continue;
+              const pt = { lane: q.lane, x: lane.x0, h: q.pos - tlcOrigin(set, lane, get) };
+              groups.set(q.group, [...(groups.get(q.group) || []), pt]);
+            }
+            const laneXs = set.cfg!.lanes.filter((l) => tlcHalf(l) === h).map((l) => l.x0);
+            return fitEdgePicks([...groups.values()], laneXs);
+          }
+          return auto[h].length ? fitEdgeCurve(auto[h]) : null;
+        });
+      }
+      edgeCache.current.set(set, { key, fits });
+      return fits;
+    },
+    [spotProminence, coreFraction, edgePicks, detectOptsFor]
+  );
+
+  const handlePickSpot = useCallback(
+    (laneId: number, pos: number) => {
+      const uid = currentSet.uid;
+      setEdgePicks((prev) => {
+        const cur = prev[uid] || [];
+        const same = cur.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
+        // clicking a picked spot again removes it
+        if (same >= 0) return { ...prev, [uid]: cur.filter((_, i) => i !== same) };
+        // one pick per lane and compound
+        const rest = cur.filter((q) => !(q.lane === laneId && q.group === pickGroup));
+        return { ...prev, [uid]: [...rest, { lane: laneId, pos, group: pickGroup }] };
+      });
+    },
+    [currentSet.uid, pickGroup]
+  );
+
+  const edgeSettingFor = useCallback(
+    (set: TlcSet, half: number): EdgeSetting => edgeSettings[`${set.uid}:${half}`] || DEFAULT_EDGE_SETTING,
+    [edgeSettings]
+  );
+
+  // Get Spots helper for a set, channel, and lane with center-weighted core sampling.
+  // When the edge-effect correction is active for the lane's half, Rf is corrected and the
+  // measured value is kept in rfRaw.
   const getSpotsForLane = useCallback(
     (set: TlcSet, key: TlcChannelKey, lane: TlcLane): TlcSpot[] | null => {
       if (!set.imgs[key]) return null;
-      const prof = extractLaneProfile(set, key, lane, coreFraction);
-      if (!prof.length) return null;
-      const origin = tlcOrigin(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
-      const front = tlcFront(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
-      const span = Math.max(1, front - origin);
-
-      // Distance scale proportional to spot prominence mode:
-      // Broad mode allows merging sub-peaks across up to 14% of the migration span
-      const minDistance = Math.max(
-        10,
-        Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
-      );
-
-      return findSpots(prof, {
-        sign: TLC_SIGNAL[key].sign,
-        origin,
-        front,
-        radius: lane.spotRadius || 24,
-        minProminence: spotProminence,
-        minDistance,
-      });
+      const d = detectOptsFor(set, key, lane);
+      if (!d) return null;
+      const spots = findSpots(d.prof, d.opts);
+      if (!spots.length) return spots;
+      const h = tlcHalf(lane);
+      const setting = edgeSettingFor(set, h);
+      if (setting.mode === 'off') return spots;
+      const fit = getEdgeFits(set)[h];
+      if (!edgeActive(fit, setting)) return spots;
+      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength));
     },
-    [coreFraction, spotProminence]
+    [detectOptsFor, edgeSettingFor, getEdgeFits]
   );
 
   // Helper to extract panels for lane t
@@ -1256,15 +1354,67 @@ export const TlcView: React.FC = () => {
             </p>
           </div>
 
-          {Boolean(run?.rows?.length) && hasConfig && (
-            <button
-              type="button"
-              className="btn pri"
-              onClick={handleDownloadRfCsv}
-              title="Export complete 54-well spreadsheet with recipes, solvent front, and detected spots"
-            >
-              📥 Download Rf Table (CSV)
-            </button>
+          {hasConfig && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <div
+                style={{
+                  display: 'inline-flex',
+                  borderRadius: '6px',
+                  border: '1px solid var(--border)',
+                  background: 'var(--card-bg, #ffffff)',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn pri sm"
+                  onClick={() => handleExportAnalysis('csv', 'current')}
+                  title="Export TLC analysis data including Rf values, peak strengths, and well coords as CSV"
+                  style={{ borderRadius: '5px 0 0 5px', margin: 0, fontWeight: 600 }}
+                >
+                  📥 Export CSV
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => handleExportAnalysis('json', 'current')}
+                  title="Export full TLC plate analysis data as structured JSON"
+                  style={{ borderRadius: '0 5px 5px 0', margin: 0, borderLeft: '1px solid var(--border)', fontWeight: 600 }}
+                >
+                  📦 Export JSON
+                </button>
+              </div>
+
+              {sets.length > 1 && (
+                <div
+                  style={{
+                    display: 'inline-flex',
+                    borderRadius: '6px',
+                    border: '1px solid var(--border)',
+                    background: 'var(--soft, #f8fafc)',
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => handleExportAnalysis('csv', 'all')}
+                    title="Export TLC analysis across all plate sets as CSV"
+                    style={{ borderRadius: '5px 0 0 5px', margin: 0, fontSize: '11px', padding: '4px 8px' }}
+                  >
+                    CSV (All {sets.length} Sets)
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => handleExportAnalysis('json', 'all')}
+                    title="Export TLC analysis across all plate sets as JSON"
+                    style={{ borderRadius: '0 5px 5px 0', margin: 0, fontSize: '11px', padding: '4px 8px', borderLeft: '1px solid var(--border)' }}
+                  >
+                    JSON (All {sets.length} Sets)
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -1981,6 +2131,16 @@ export const TlcView: React.FC = () => {
             onResetAllLanes={handleResetAllLanes}
             onExportLaneCsv={handleExportLaneCsv}
             spotProminence={spotProminence}
+            pickMode={pickMode}
+            picks={edgePicks[currentSet.uid] || []}
+            onPickSpot={handlePickSpot}
+            edgeFits={getEdgeFits(currentSet)}
+            edgeSettings={[edgeSettingFor(currentSet, 0), edgeSettingFor(currentSet, 1)]}
+            onEdgeSetting={(h, st) => setEdgeSettings((prev) => ({ ...prev, [`${currentSet.uid}:${h}`]: st }))}
+            onPickMode={setPickMode}
+            pickGroup={pickGroup}
+            onPickGroup={setPickGroup}
+            onClearPicks={() => setEdgePicks((prev) => ({ ...prev, [currentSet.uid]: [] }))}
           />
         </div>
       ) : (
@@ -3153,7 +3313,25 @@ export const TlcView: React.FC = () => {
               )}
             </div>
 
-            <div className="modal-foot">
+            <div className="modal-foot" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => handleExportAnalysis('csv', 'current')}
+                  title="Export TLC analysis data for this plate as CSV"
+                >
+                  📥 Export Plate CSV
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => handleExportAnalysis('json', 'current')}
+                  title="Export full TLC plate analysis data as JSON"
+                >
+                  📦 Export Plate JSON
+                </button>
+              </div>
               <button type="button" className="btn pri" onClick={() => setInspectWell(null)}>
                 Close
               </button>

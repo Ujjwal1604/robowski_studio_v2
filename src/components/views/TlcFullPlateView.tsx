@@ -11,6 +11,8 @@ import {
   extractFluorescenceOverlay,
   computeFalseColorComposite,
 } from '../../engine';
+import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
+import { TlcEdgePanel } from './TlcEdgePanel';
 
 export type CompositeSubMode = 'glow' | 'false-color' | 'split';
 
@@ -32,13 +34,32 @@ interface TlcFullPlateViewProps {
   onResetAllLanes?: () => void;
   onExportLaneCsv?: () => void;
   spotProminence?: number;
+  // Edge-effect spot picking: clicking a detected spot adds it to the current compound group
+  pickMode?: boolean;
+  picks?: { lane: number; pos: number; group: number }[];
+  onPickSpot?: (laneId: number, pos: number) => void;
+  // Edge-effect fits & settings for HUD integration
+  edgeFits?: (EdgeFit | null)[];
+  edgeSettings?: EdgeSetting[];
+  onEdgeSetting?: (half: number, s: EdgeSetting) => void;
+  onPickMode?: (on: boolean) => void;
+  pickGroup?: number;
+  onPickGroup?: (g: number) => void;
+  onClearPicks?: () => void;
 }
 
-// Explicit high-contrast button styling for the HUD dark theme
+const PICK_COLORS = ['#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
+
+export type HudModule = 'geometry' | 'baselines' | 'edge' | 'composite' | 'recipe' | 'tools' | 'none';
+export type OverviewModule = 'fronts' | 'edge' | 'composite' | 'skew' | 'none';
+
+// Explicit high-contrast button styling for the HUD dark theme (longhand border avoids React shorthand conflict)
 const hudBtn: React.CSSProperties = {
   background: '#1e293b',
   color: '#f8fafc',
-  border: '1px solid #475569',
+  borderWidth: '1px',
+  borderStyle: 'solid',
+  borderColor: '#475569',
   borderRadius: '4px',
   padding: '4px 8px',
   fontSize: '11px',
@@ -78,17 +99,43 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   onResetAllLanes,
   onExportLaneCsv,
   spotProminence = 0.28,
+  pickMode = false,
+  picks = [],
+  onPickSpot,
+  edgeFits,
+  edgeSettings,
+  onEdgeSetting,
+  onPickMode,
+  pickGroup = 0,
+  onPickGroup,
+  onClearPicks,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [hoveredLaneId, setHoveredLaneId] = useState<number | null>(null);
-  const [selectedLaneId, setSelectedLaneId] = useState<number | null>(null);
+  const [selectedLaneId, setSelectedLaneId] = useState<number | null>(0);
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
 
-  // HUD layout states: fixed sticky top or fixed bottom dock, and collapsible
+  // Modular HUD state: only the selected module's drawer is expanded, keeping HUD ultra-compact
+  const [activeHudModule, setActiveHudModule] = useState<HudModule>('geometry');
+  const [overviewModule, setOverviewModule] = useState<OverviewModule>('none');
+
+  const isEdgeActive = edgeFits && edgeSettings ? edgeFits.some((f, h) => edgeActive(f, edgeSettings[h])) : false;
+
+  // Auto-switch to edge module when user enters reference spot pick mode
+  useEffect(() => {
+    if (pickMode) {
+      if (selectedLaneId !== null) {
+        setActiveHudModule('edge');
+      } else {
+        setOverviewModule('edge');
+      }
+    }
+  }, [pickMode, selectedLaneId]);
+
+  // HUD layout states: fixed sticky top or fixed bottom dock
   const [hudPosition, setHudPosition] = useState<'top' | 'bottom'>('top');
-  const [isHudCollapsed, setIsHudCollapsed] = useState(false);
 
   // Dragging state for moving lanes directly on canvas
   const [isDragging, setIsDragging] = useState(false);
@@ -572,7 +619,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
           if (prof && prof.length > 0) {
             const oVal = tlcOrigin(currentSet, l, getProfile as any);
             const fVal = tlcFront(currentSet, l, getProfile);
-            const spots = findSpots(prof, {
+            const rawSpots = findSpots(prof, {
               sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
               origin: oVal,
               front: fVal,
@@ -580,38 +627,76 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               minProminence: spotProminence,
             });
 
-            if (spots && spots.length > 0) {
+            if (rawSpots && rawSpots.length > 0) {
+              const half = l.id < 27 ? 0 : 1;
+              const fit = edgeFits ? edgeFits[half] : null;
+              const setting = edgeSettings ? edgeSettings[half] : null;
+              const isCorrecting = edgeActive(fit, setting);
+              const gain = isCorrecting && fit ? edgeGain(fit, l.x0, setting?.strength ?? 1) : 1;
+              const spots = isCorrecting ? correctSpots(rawSpots, gain) : rawSpots;
+
               const spanDist = frontDist - originDist;
               spots.forEach((sp) => {
-                const spotY = -(originDist + sp.rf * spanDist);
+                const correctedSpotY = -(originDist + sp.rf * spanDist);
+                const rawSpotY = -(originDist + (sp.rfRaw ?? sp.rf) * spanDist);
                 const markerW = isSelected ? Math.min(w * 0.95, 34 / scale) : Math.min(w * 0.75, 20 / scale);
 
-                // Horizontal centerline tick
+                // If edge correction is active, draw the leveled alignment tick in emerald
+                if (isCorrecting && sp.rfRaw != null && Math.abs(gain - 1) >= 0.003) {
+                  ctx.beginPath();
+                  ctx.setLineDash([3 / scale, 3 / scale]);
+                  ctx.moveTo(-markerW / 2, correctedSpotY);
+                  ctx.lineTo(markerW / 2, correctedSpotY);
+                  ctx.strokeStyle = '#10b981';
+                  ctx.lineWidth = (isSelected ? 2.5 : 1.5) / scale;
+                  ctx.stroke();
+                  ctx.setLineDash([]);
+                }
+
+                // Horizontal centerline tick at raw physical spot
                 ctx.beginPath();
-                ctx.moveTo(-markerW / 2, spotY);
-                ctx.lineTo(markerW / 2, spotY);
+                ctx.moveTo(-markerW / 2, rawSpotY);
+                ctx.lineTo(markerW / 2, rawSpotY);
                 ctx.strokeStyle = isSelected ? '#38bdf8' : isHovered ? '#ec4899' : 'rgba(56, 189, 248, 0.75)';
                 ctx.lineWidth = (isSelected ? 2.5 : 1.5) / scale;
                 ctx.stroke();
 
                 // Centroid micro-dot
                 ctx.beginPath();
-                ctx.arc(0, spotY, (isSelected ? 3.5 : 2) / scale, 0, Math.PI * 2);
+                ctx.arc(0, rawSpotY, (isSelected ? 3.5 : 2) / scale, 0, Math.PI * 2);
                 ctx.fillStyle = isSelected ? '#38bdf8' : isHovered ? '#ec4899' : '#38bdf8';
                 ctx.fill();
 
+                // Spots picked as 'same compound' for the edge-effect correction
+                const pk = picks.find((q) => q.lane === l.id && Math.abs(q.pos - sp.pos) < 6);
+                if (pk) {
+                  const col = PICK_COLORS[pk.group % PICK_COLORS.length];
+                  ctx.beginPath();
+                  ctx.arc(0, rawSpotY, 9 / scale, 0, Math.PI * 2);
+                  ctx.strokeStyle = col;
+                  ctx.lineWidth = 2.5 / scale;
+                  ctx.stroke();
+                  ctx.fillStyle = col;
+                  ctx.font = `bold ${Math.max(10, Math.round(13 / scale))}px sans-serif`;
+                  ctx.textAlign = 'center';
+                  ctx.textBaseline = 'middle';
+                  ctx.fillText(String(pk.group + 1), 0, rawSpotY - 15 / scale);
+                }
+
                 // High-contrast Rf badge on selected or hovered lane
                 if (isSelected || isHovered) {
-                  const rfStr = `Rf ${sp.rf.toFixed(2)}`;
+                  const rfStr = isCorrecting && sp.rfRaw != null && Math.abs(gain - 1) >= 0.003
+                    ? `Rf ${sp.rf.toFixed(2)} (${sp.rfRaw.toFixed(2)})`
+                    : `Rf ${sp.rf.toFixed(2)}`;
                   ctx.font = `bold ${Math.max(10, Math.round(12 / scale))}px monospace`;
                   const textMetrics = ctx.measureText(rfStr);
                   const badgeW = textMetrics.width + 8 / scale;
                   const badgeH = 15 / scale;
                   const badgeX = w / 2 + 4 / scale;
-                  const badgeY = spotY - badgeH / 2;
+                  const badgeY = (isCorrecting ? correctedSpotY : rawSpotY) - badgeH / 2;
 
                   ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-                  ctx.strokeStyle = isSelected ? '#38bdf8' : '#ec4899';
+                  ctx.strokeStyle = isSelected ? (isCorrecting ? '#10b981' : '#38bdf8') : '#ec4899';
                   ctx.lineWidth = 1 / scale;
                   ctx.beginPath();
                   if ((ctx as any).roundRect) {
@@ -624,17 +709,17 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
                   // Connecting guide line
                   ctx.beginPath();
-                  ctx.moveTo(markerW / 2, spotY);
-                  ctx.lineTo(badgeX, spotY);
-                  ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+                  ctx.moveTo(markerW / 2, isCorrecting ? correctedSpotY : rawSpotY);
+                  ctx.lineTo(badgeX, isCorrecting ? correctedSpotY : rawSpotY);
+                  ctx.strokeStyle = isCorrecting ? 'rgba(16, 185, 129, 0.5)' : 'rgba(56, 189, 248, 0.4)';
                   ctx.lineWidth = 1 / scale;
                   ctx.stroke();
 
                   // Text label
-                  ctx.fillStyle = isSelected ? '#38bdf8' : '#f472b6';
+                  ctx.fillStyle = isSelected ? (isCorrecting ? '#a7f3d0' : '#38bdf8') : '#f472b6';
                   ctx.textAlign = 'left';
                   ctx.textBaseline = 'middle';
-                  ctx.fillText(rfStr, badgeX + 4 / scale, spotY);
+                  ctx.fillText(rfStr, badgeX + 4 / scale, isCorrecting ? correctedSpotY : rawSpotY);
                 }
               });
             }
@@ -663,6 +748,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     fluoGain,
     splitPos,
     activeChannel,
+    picks,
   ]);
 
   // Find lane collision at mouse coordinates
@@ -754,6 +840,44 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     }
 
     const hit = findLaneAtPoint(e.clientX, e.clientY);
+
+    // Pick mode: a click picks the detected spot nearest to the click, and never moves a lane
+    if (pickMode) {
+      const l = hit !== null ? lanes.find((q) => q.id === hit) : undefined;
+      const canvas = canvasRef.current;
+      if (l && canvas && imgEntry?.bmp && getProfile && onPickSpot) {
+        const rect = canvas.getBoundingClientRect();
+        const scale = rect.width / imgEntry.bmp.width;
+        const imgScale = imgEntry.bmp.width / frameW;
+        const th = (l.angle * Math.PI) / 180;
+        const dx = e.clientX - rect.left - l.x0 * imgScale * scale;
+        const dy = e.clientY - rect.top - l.y0 * imgScale * scale;
+        const localY = dx * Math.sin(-th) + dy * Math.cos(-th);
+        const dist = -localY / (imgScale * scale); // px along the lane, from its start
+        const ch: TlcChannelKey = isComposite
+          ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
+          : (activeChannel as TlcChannelKey);
+        const prof = currentSet.imgs[ch] ? getProfile(currentSet, ch, l) : [];
+        if (prof && prof.length) {
+          const spots = findSpots(prof, {
+            sign: TLC_SIGNAL[ch]?.sign ?? -1,
+            origin: tlcOrigin(currentSet, l, getProfile as any),
+            front: tlcFront(currentSet, l, getProfile),
+            radius: l.spotRadius || 24,
+            minProminence: spotProminence,
+          });
+          let best: (typeof spots)[number] | null = null;
+          for (const sp of spots) {
+            if (!best || Math.abs(sp.pos - dist) < Math.abs(best.pos - dist)) best = sp;
+          }
+          if (best && Math.abs(best.pos - dist) <= Math.max(20, (l.spotRadius || 24) * 0.9)) {
+            onPickSpot(l.id, best.pos);
+          }
+        }
+      }
+      return;
+    }
+
     if (hit !== null) {
       setSelectedLaneId(hit);
       const target = lanes.find((l) => l.id === hit);
@@ -915,7 +1039,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
   return (
     <div ref={containerRef} style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-      {/* FLOATING / PINNED ON-CANVAS HUD TOOLBAR WITH CONTINUOUS SLIDERS & UNDO/RESET */}
+      {/* FLOATING / PINNED ON-CANVAS HUD TOOLBAR WITH MODULAR PANELS & CONTINUOUS SLIDERS */}
       {selectedLane && onUpdateLane ? (
         <div
           style={{
@@ -927,103 +1051,256 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             width: hudPosition === 'bottom' ? 'min(1200px, calc(100vw - 32px))' : '100%',
             maxWidth: '1200px',
             marginBottom: hudPosition === 'top' ? '12px' : '0px',
-            padding: isHudCollapsed ? '10px 16px' : '14px 18px',
+            padding: activeHudModule === 'none' ? '6px 14px' : '10px 14px',
             background: 'rgba(15, 23, 42, 0.96)',
             backdropFilter: 'blur(12px)',
             WebkitBackdropFilter: 'blur(12px)',
-            borderRadius: '12px',
+            borderRadius: '10px',
             border: '2px solid #facc15',
-            boxShadow: '0 12px 36px rgba(0,0,0,0.65)',
+            boxShadow: '0 8px 30px rgba(0,0,0,0.6)',
             color: '#f8fafc',
             display: 'flex',
             flexDirection: 'column',
-            gap: isHudCollapsed ? '0px' : '12px',
+            gap: activeHudModule === 'none' ? '0px' : '8px',
             zIndex: 70,
-            transition: 'padding 0.15s ease',
+            transition: 'padding 0.15s ease, gap 0.15s ease',
           }}
         >
-          {/* Top Bar: Lane Identity, Well Formula, Dock/Collapse & Actions */}
+          {/* Top Master Strip: Lane identity, module switcher tabs, quick action cluster */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            {/* Left: Lane Identity, Well Coordinates, Prev/Next Navigation */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
               <span
                 style={{
                   background: '#facc15',
                   color: '#0f172a',
                   fontWeight: 800,
-                  fontSize: '13px',
-                  padding: '3px 10px',
+                  fontSize: '12px',
+                  padding: '2px 8px',
                   borderRadius: '4px',
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: '5px',
+                  gap: '4px',
                 }}
               >
-                🎯 Lane {selectedLane.id} (Well {wellLabel(selectedWell!)})
+                🎯 L{selectedLane.id} ({wellLabel(selectedWell!)})
               </span>
 
-              {selectedRow ? (
-                <span style={{ fontSize: '12px', color: '#cbd5e1' }}>
-                  {selectedRow.recipe
-                    .filter((rc: any) => rc.target_concentration > 0)
-                    .map((rc: any) => `${rc.code} ${rc.target_concentration.toFixed(1)} mM`)
-                    .join(' · ')}
-                </span>
-              ) : (
-                <span style={{ fontSize: '11px', color: '#94a3b8' }}>Unused / empty well</span>
-              )}
-
               {/* Lane Switcher */}
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '6px' }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
                 <button
                   type="button"
-                  style={hudBtn}
+                  style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                   onClick={() => {
                     const prevId = (selectedLane.id - 1 + lanes.length) % lanes.length;
                     setSelectedLaneId(prevId);
                   }}
                   title="Previous lane (A or PageUp)"
                 >
-                  ◀ Prev
+                  ◀
                 </button>
                 <button
                   type="button"
-                  style={hudBtn}
+                  style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                   onClick={() => {
                     const nextId = (selectedLane.id + 1) % lanes.length;
                     setSelectedLaneId(nextId);
                   }}
                   title="Next lane (D or PageDown)"
                 >
-                  Next ▶
+                  ▶
                 </button>
               </div>
+
+              {selectedRow ? (
+                <span
+                  style={{
+                    fontSize: '11px',
+                    color: '#cbd5e1',
+                    maxWidth: '190px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                  title={selectedRow.recipe
+                    .filter((rc: any) => rc.target_concentration > 0)
+                    .map((rc: any) => `${rc.code} ${rc.target_concentration.toFixed(1)} mM`)
+                    .join(' · ')}
+                >
+                  {selectedRow.recipe
+                    .filter((rc: any) => rc.target_concentration > 0)
+                    .map((rc: any) => `${rc.code} ${rc.target_concentration.toFixed(1)}mM`)
+                    .join(' · ')}
+                </span>
+              ) : (
+                <span style={{ fontSize: '11px', color: '#94a3b8' }}>Empty</span>
+              )}
             </div>
 
-            {/* Right Action Cluster: Channel Switcher, Dock toggle, Collapse, Undo, Reset Lane, Reset All, Inspect Modal, Export, Done */}
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* Channel Selector */}
-              {renderChannelButtons()}
-
-              {/* Dock Position Toggle */}
+            {/* Center: Modular Feature Tabs (Single-click switches active drawer) */}
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', background: '#090d16', padding: '2px 3px', borderRadius: '6px', border: '1px solid #334155' }}>
               <button
                 type="button"
                 style={{
                   ...hudBtn,
-                  background: hudPosition === 'bottom' ? '#0f766e' : '#1e293b',
-                  color: hudPosition === 'bottom' ? '#a7f3d0' : '#cbd5e1',
-                  borderColor: hudPosition === 'bottom' ? '#14b8a6' : '#475569',
+                  padding: '3px 8px',
+                  fontSize: '11px',
+                  background: activeHudModule === 'geometry' ? '#facc15' : 'transparent',
+                  color: activeHudModule === 'geometry' ? '#0f172a' : '#cbd5e1',
+                  borderColor: activeHudModule === 'geometry' ? '#facc15' : 'transparent',
+                  fontWeight: activeHudModule === 'geometry' ? 800 : 600,
                 }}
-                onClick={() => setHudPosition((pos) => (pos === 'top' ? 'bottom' : 'top'))}
-                title={hudPosition === 'top' ? 'Pin HUD to bottom of screen' : 'Pin HUD to top of screen'}
+                onClick={() => setActiveHudModule((m) => (m === 'geometry' ? 'none' : 'geometry'))}
+                title="Lane position (X/Y), tilt angle, and width continuous sliders"
               >
-                {hudPosition === 'top' ? '📌 Dock Bottom' : '📌 Dock Top'}
+                📐 Geometry
               </button>
 
-              {/* Rf Badges & Spot Annotations Toggle */}
               <button
                 type="button"
                 style={{
                   ...hudBtn,
+                  padding: '3px 8px',
+                  fontSize: '11px',
+                  background: activeHudModule === 'baselines' ? '#facc15' : 'transparent',
+                  color: activeHudModule === 'baselines' ? '#0f172a' : '#cbd5e1',
+                  borderColor: activeHudModule === 'baselines' ? '#facc15' : 'transparent',
+                  fontWeight: activeHudModule === 'baselines' ? 800 : 600,
+                }}
+                onClick={() => setActiveHudModule((m) => (m === 'baselines' ? 'none' : 'baselines'))}
+                title="Origin baseline and dual solvent front continuous sliders"
+              >
+                💧 Baselines
+              </button>
+
+              {edgeFits && edgeSettings && onEdgeSetting && (() => {
+                const hasSuggestion = edgeFits.some((f, h) => edgeSuggestion(f, edgeSettings[h]));
+                return (
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+                    <button
+                      type="button"
+                      style={{
+                        ...hudBtn,
+                        padding: '3px 8px',
+                        fontSize: '11px',
+                        background: activeHudModule === 'edge' ? '#ec4899' : pickMode ? '#831843' : isEdgeActive ? '#064e3b' : hasSuggestion ? '#78350f' : 'transparent',
+                        color: activeHudModule === 'edge' ? '#ffffff' : pickMode ? '#f472b6' : isEdgeActive ? '#6ee7b7' : hasSuggestion ? '#fde047' : '#cbd5e1',
+                        borderColor: activeHudModule === 'edge' ? '#db2777' : pickMode ? '#ec4899' : isEdgeActive ? '#059669' : hasSuggestion ? '#eab308' : 'transparent',
+                        fontWeight: activeHudModule === 'edge' ? 800 : 600,
+                      }}
+                      onClick={() => setActiveHudModule((m) => (m === 'edge' ? 'none' : 'edge'))}
+                      title="Edge-effect lateral migration speed correction & reference spot picker"
+                    >
+                      🎛️ Edge Corr {isEdgeActive ? '● ON' : hasSuggestion ? '⚡ Curve Found' : '○'}{pickMode ? ' (Pick)' : ''}
+                    </button>
+                    {!isEdgeActive && hasSuggestion && (
+                      <button
+                        type="button"
+                        style={{
+                          ...hudBtn,
+                          padding: '2px 7px',
+                          fontSize: '10px',
+                          background: '#10b981',
+                          color: '#022c22',
+                          borderColor: '#34d399',
+                          fontWeight: 800,
+                        }}
+                        onClick={() => {
+                          edgeFits.forEach((f, idx) => {
+                            if (f && f.ok && onEdgeSetting) onEdgeSetting(idx, { ...edgeSettings[idx], mode: 'on' });
+                          });
+                        }}
+                        title="Click to apply the detected lateral migration speed curve"
+                      >
+                        ⚡ Apply
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {isComposite && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: activeHudModule === 'composite' ? '#14b8a6' : 'transparent',
+                    color: activeHudModule === 'composite' ? '#042f2e' : '#5eead4',
+                    borderColor: activeHudModule === 'composite' ? '#2dd4bf' : 'transparent',
+                    fontWeight: activeHudModule === 'composite' ? 800 : 600,
+                  }}
+                  onClick={() => setActiveHudModule((m) => (m === 'composite' ? 'none' : 'composite'))}
+                  title="Dual-channel composite blending (Glow overlay, False-color, Split wipe)"
+                >
+                  ✨ Composite
+                </button>
+              )}
+
+              {selectedRow && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: activeHudModule === 'recipe' ? '#facc15' : 'transparent',
+                    color: activeHudModule === 'recipe' ? '#0f172a' : '#cbd5e1',
+                    borderColor: activeHudModule === 'recipe' ? '#facc15' : 'transparent',
+                    fontWeight: activeHudModule === 'recipe' ? 800 : 600,
+                  }}
+                  onClick={() => setActiveHudModule((m) => (m === 'recipe' ? 'none' : 'recipe'))}
+                  title="Detailed well formulation recipe and solvent volume"
+                >
+                  🧪 Recipe
+                </button>
+              )}
+
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 8px',
+                  fontSize: '11px',
+                  background: activeHudModule === 'tools' ? '#facc15' : 'transparent',
+                  color: activeHudModule === 'tools' ? '#0f172a' : '#cbd5e1',
+                  borderColor: activeHudModule === 'tools' ? '#facc15' : 'transparent',
+                  fontWeight: activeHudModule === 'tools' ? 800 : 600,
+                }}
+                onClick={() => setActiveHudModule((m) => (m === 'tools' ? 'none' : 'tools'))}
+                title="Global plate skew, lane resetting, and tier flipping"
+              >
+                ⚙️ Tools
+              </button>
+
+              {/* Minimize / Expand Drawer Toggle */}
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 6px',
+                  fontSize: '10px',
+                  background: 'transparent',
+                  color: '#94a3b8',
+                  borderColor: 'transparent',
+                }}
+                onClick={() => setActiveHudModule((m) => (m === 'none' ? 'geometry' : 'none'))}
+                title={activeHudModule === 'none' ? 'Open tool drawer' : 'Minimize drawer (view plate photo)'}
+              >
+                {activeHudModule === 'none' ? '▼' : '▲'}
+              </button>
+            </div>
+
+            {/* Right: Channel Switcher, Rf Badges, Undo, Inspect, CSV, Dock, Done */}
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'wrap' }}>
+              {renderChannelButtons()}
+
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 7px',
                   background: showRfBadges ? '#0284c7' : '#1e293b',
                   color: showRfBadges ? '#ffffff' : '#94a3b8',
                   borderColor: showRfBadges ? '#0369a1' : '#475569',
@@ -1031,187 +1308,15 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 onClick={() => setShowRfBadges((s) => !s)}
                 title="Toggle on-plate spot centroid ticks and numerical Rf badges"
               >
-                {showRfBadges ? '🏷️ Rf Badges ON' : '🏷️ Rf Badges OFF'}
+                🏷️ {showRfBadges ? 'Rf ON' : 'Rf OFF'}
               </button>
 
-              {/* Global Skew (All 54 Lanes) */}
-              <div
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '3px',
-                  background: '#0f172a',
-                  padding: '2px 6px',
-                  borderRadius: '4px',
-                  border: '1px solid #334155',
-                }}
-                title="Rotate all 54 lanes uniformly (e.g. for slightly tilted physical plates)"
-              >
-                <span style={{ fontSize: '10px', color: '#cbd5e1', fontWeight: 600 }}>Global Skew:</span>
-                <button
-                  type="button"
-                  style={{ ...hudBtn, padding: '2px 5px', fontSize: '10px' }}
-                  onClick={() => handleApplyGlobalSkew(-0.2)}
-                  title="Rotate all 54 lanes counter-clockwise by -0.2°"
-                >
-                  ↺ -0.2°
-                </button>
-                <button
-                  type="button"
-                  style={{ ...hudBtn, padding: '2px 5px', fontSize: '10px' }}
-                  onClick={() => handleApplyGlobalSkew(+0.2)}
-                  title="Rotate all 54 lanes clockwise by +0.2°"
-                >
-                  +0.2° ↻
-                </button>
-              </div>
-
-              {/* Dual-Channel Multi-Mode Composite Controls */}
-              {isComposite && (
-                <div
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    background: '#042f2e',
-                    padding: '3px 8px',
-                    borderRadius: '6px',
-                    border: '1px solid #0f766e',
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  {/* Mode Tabs */}
-                  <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
-                    <button
-                      type="button"
-                      style={{
-                        ...hudBtn,
-                        padding: '2px 6px',
-                        fontSize: '10px',
-                        background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
-                        borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
-                        color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
-                      }}
-                      onClick={() => setCompositeSubMode('glow')}
-                      title="Background-subtracted fluorescence glow overlaid on UV254 quenching plate"
-                    >
-                      ✨ Glow Overlay
-                    </button>
-                    <button
-                      type="button"
-                      style={{
-                        ...hudBtn,
-                        padding: '2px 6px',
-                        fontSize: '10px',
-                        background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
-                        borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
-                        color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
-                      }}
-                      onClick={() => setCompositeSubMode('false-color')}
-                      title="False-color dual channel (Amber = UV254 Quenching, Cyan = UV365 Fluorescence)"
-                    >
-                      🔬 False-Color
-                    </button>
-                    <button
-                      type="button"
-                      style={{
-                        ...hudBtn,
-                        padding: '2px 6px',
-                        fontSize: '10px',
-                        background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
-                        borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
-                        color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
-                      }}
-                      onClick={() => setCompositeSubMode('split')}
-                      title="Interactive draggable comparison curtain comparing UV254 and UV365 side-by-side"
-                    >
-                      ↔ Split Wipe
-                    </button>
-                  </div>
-
-                  {/* Mode-Specific Fine Controls */}
-                  {compositeSubMode === 'glow' && (
-                    <>
-                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="Ambient background cutoff: filters out chamber light so only true fluorescence is overlaid">
-                        <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
-                        <input
-                          type="range"
-                          min={0.05}
-                          max={0.40}
-                          step={0.01}
-                          value={fluoThreshold}
-                          onChange={(e) => setFluoThreshold(+e.target.value)}
-                          style={{ ...hudSliderTrack, width: '45px', accentColor: '#14b8a6' }}
-                        />
-                        <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
-                      </div>
-                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="Fluorescence glow intensity boost">
-                        <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
-                        <input
-                          type="range"
-                          min={1.0}
-                          max={2.8}
-                          step={0.1}
-                          value={fluoGain}
-                          onChange={(e) => setFluoGain(+e.target.value)}
-                          style={{ ...hudSliderTrack, width: '45px', accentColor: '#10b981' }}
-                        />
-                        <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
-                      </div>
-                    </>
-                  )}
-
-                  {compositeSubMode === 'false-color' && (
-                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                      <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
-                      <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
-                      <span style={{ fontSize: '10px', color: '#a7f3d0', marginLeft: '4px' }}>Gain:</span>
-                      <input
-                        type="range"
-                        min={0.8}
-                        max={2.5}
-                        step={0.1}
-                        value={fluoGain}
-                        onChange={(e) => setFluoGain(+e.target.value)}
-                        style={{ ...hudSliderTrack, width: '45px', accentColor: '#06b6d4' }}
-                      />
-                    </div>
-                  )}
-
-                  {compositeSubMode === 'split' && (
-                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="Wipe divider position (or click & drag the divider line on the canvas)">
-                      <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
-                      <input
-                        type="range"
-                        min={0.02}
-                        max={0.98}
-                        step={0.01}
-                        value={splitPos}
-                        onChange={(e) => setSplitPos(+e.target.value)}
-                        style={{ ...hudSliderTrack, width: '55px', accentColor: '#facc15' }}
-                      />
-                      <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Collapse / Expand Toggle */}
-              <button
-                type="button"
-                style={{ ...hudBtn, background: '#1e293b', color: '#cbd5e1', borderColor: '#475569' }}
-                onClick={() => setIsHudCollapsed((c) => !c)}
-                title={isHudCollapsed ? 'Expand all sliders' : 'Minimize to compact toolbar'}
-              >
-                {isHudCollapsed ? '▲ Expand Sliders' : '▼ Minimize'}
-              </button>
-
-              {/* Undo Button */}
               {onUndo && (
                 <button
                   type="button"
                   style={{
                     ...hudBtn,
+                    padding: '3px 7px',
                     background: canUndo ? '#334155' : '#1e293b',
                     color: canUndo ? '#38bdf8' : '#64748b',
                     borderColor: canUndo ? '#0284c7' : '#334155',
@@ -1222,39 +1327,749 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                   disabled={!canUndo}
                   title="Undo last change (Ctrl+Z)"
                 >
-                  ↺ Undo
+                  ↺
                 </button>
               )}
 
-              {/* Reset This Lane */}
-              {onResetLane && (
+              <button
+                type="button"
+                style={{ ...hudBtn, padding: '3px 8px', background: '#0284c7', color: '#ffffff', borderColor: '#0369a1' }}
+                onClick={() => onOpenWellModal(selectedWell!)}
+                title="Inspect densitogram and peaks (Enter)"
+              >
+                🔍 Inspect
+              </button>
+
+              {onExportLaneCsv && (
                 <button
                   type="button"
-                  style={{ ...hudBtn, background: '#1e293b', color: '#fbbf24', borderColor: '#b45309' }}
-                  onClick={() => onResetLane(selectedLane.id)}
-                  title="Reset this lane to original template"
+                  style={{ ...hudBtn, padding: '3px 7px', background: '#059669', color: '#ffffff', borderColor: '#047857' }}
+                  onClick={onExportLaneCsv}
+                  title="Export corrected lane CSV file"
                 >
-                  ⟲ Reset Lane
+                  💾 CSV
                 </button>
               )}
 
-              {/* Reset All Lanes */}
-              {onResetAllLanes && (
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 6px',
+                  background: hudPosition === 'bottom' ? '#0f766e' : '#1e293b',
+                  color: hudPosition === 'bottom' ? '#a7f3d0' : '#cbd5e1',
+                  borderColor: hudPosition === 'bottom' ? '#14b8a6' : '#475569',
+                }}
+                onClick={() => setHudPosition((pos) => (pos === 'top' ? 'bottom' : 'top'))}
+                title={hudPosition === 'top' ? 'Dock HUD to bottom of screen' : 'Dock HUD to top of screen'}
+              >
+                📌 {hudPosition === 'top' ? 'Bottom' : 'Top'}
+              </button>
+
+              <button
+                type="button"
+                style={{ ...hudBtn, padding: '3px 8px', background: '#334155', color: '#cbd5e1', borderColor: '#475569' }}
+                onClick={() => setSelectedLaneId(null)}
+                title="Deselect lane (Esc)"
+              >
+                ✕ Done
+              </button>
+            </div>
+          </div>
+
+          {/* MODULAR DRAWER: Render only the active module */}
+          {activeHudModule === 'none' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap', fontSize: '11px', color: '#94a3b8', padding: '2px 4px' }}>
+              <span>Shift: <b style={{ color: '#fff' }}>({Math.round(selectedLane.x0)}, {Math.round(selectedLane.y0)}) px</b></span>
+              <span>Tilt: <b style={{ color: '#facc15' }}>{selectedLane.angle >= 0 ? '+' : ''}{selectedLane.angle.toFixed(1)}°</b></span>
+              <span>Origin: <b style={{ color: '#fbbf24' }}>{currentOriginVal} px</b></span>
+              <span>Front: <b style={{ color: '#38bdf8' }}>{selectedSide === 1 ? frontSide1Val : frontSide0Val} px</b></span>
+              <span>Width: <b style={{ color: '#c084fc' }}>{Math.round(selectedLane.width)} px</b></span>
+              <span style={{ color: '#38bdf8' }}>| Arrow keys or drag on canvas to adjust live</span>
+            </div>
+          )}
+
+          {activeHudModule === 'geometry' && (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))',
+                gap: '8px',
+                background: 'rgba(0,0,0,0.35)',
+                padding: '8px 12px',
+                borderRadius: '8px',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              {/* Shift X */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift X:</span>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #334155' }}>
+                    {Math.round(selectedLane.x0)} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { x0: selectedLane.x0 - 1 });
+                    }}
+                    title="Shift left 1px (←)"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={minX}
+                    max={maxX}
+                    step={1}
+                    value={Math.round(selectedLane.x0)}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => onUpdateLane(selectedLane.id, { x0: +e.target.value })}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { x0: selectedLane.x0 + 1 });
+                    }}
+                    title="Shift right 1px (→)"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+
+              {/* Shift Y */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift Y:</span>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #334155' }}>
+                    {Math.round(selectedLane.y0)} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { y0: selectedLane.y0 - 1 });
+                    }}
+                    title="Shift up 1px (↑)"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={minY}
+                    max={maxY}
+                    step={1}
+                    value={Math.round(selectedLane.y0)}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => onUpdateLane(selectedLane.id, { y0: +e.target.value })}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { y0: selectedLane.y0 + 1 });
+                    }}
+                    title="Shift down 1px (↓)"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+
+              {/* Tilt Angle */}
+              {(() => {
+                const isOpposingTilt = Math.abs(selectedLane.angle) > 90;
+                const baseAngle = isOpposingTilt ? (selectedLane.angle < 0 ? -180 : 180) : 0;
+                const tiltMin = +(baseAngle - 30).toFixed(1);
+                const tiltMax = +(baseAngle + 30).toFixed(1);
+
+                const handleFlipLane = () => {
+                  if (onSnapshotHistory) onSnapshotHistory();
+                  const th = (selectedLane.angle * Math.PI) / 180;
+                  const endX = Math.round(selectedLane.x0 + selectedLane.length * Math.sin(th));
+                  const endY = Math.round(selectedLane.y0 - selectedLane.length * Math.cos(th));
+                  const newAngle = isOpposingTilt
+                    ? +((selectedLane.angle - (selectedLane.angle > 0 ? 180 : -180))).toFixed(2)
+                    : +((selectedLane.angle + 180)).toFixed(2);
+                  onUpdateLane(selectedLane.id, {
+                    x0: endX,
+                    y0: endY,
+                    angle: newAngle,
+                  });
+                };
+
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#facc15' }}>Tilt Angle:</span>
+                        <button
+                          type="button"
+                          style={{
+                            ...hudBtn,
+                            padding: '1px 5px',
+                            fontSize: '9px',
+                            background: '#1e293b',
+                            color: '#38bdf8',
+                            borderColor: '#0284c7',
+                          }}
+                          onClick={handleFlipLane}
+                          title="Flip lane direction 180°"
+                        >
+                          ↕ Flip 180°
+                        </button>
+                      </div>
+                      <span className="mono" style={{ fontSize: '11px', fontWeight: 800, color: '#facc15', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #b45309' }}>
+                        {selectedLane.angle >= 0 ? '+' : ''}{selectedLane.angle.toFixed(1)}°
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                      <button
+                        type="button"
+                        style={{ ...hudBtn, padding: '2px 4px', fontSize: '9px' }}
+                        onClick={() => {
+                          if (onSnapshotHistory) onSnapshotHistory();
+                          onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle - 1.0).toFixed(2) });
+                        }}
+                        title="-1.0°"
+                      >
+                        -1°
+                      </button>
+                      <button
+                        type="button"
+                        style={{ ...hudBtn, padding: '2px 4px', fontSize: '9px' }}
+                        onClick={() => {
+                          if (onSnapshotHistory) onSnapshotHistory();
+                          onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle - 0.2).toFixed(2) });
+                        }}
+                        title="-0.2°"
+                      >
+                        -0.2°
+                      </button>
+                      <input
+                        type="range"
+                        min={tiltMin}
+                        max={tiltMax}
+                        step={0.1}
+                        value={selectedLane.angle}
+                        onPointerDown={onSnapshotHistory}
+                        onMouseDown={onSnapshotHistory}
+                        onChange={(e) => onUpdateLane(selectedLane.id, { angle: parseFloat((+e.target.value).toFixed(2)) })}
+                        style={{ ...hudSliderTrack, flex: 1, accentColor: '#facc15' }}
+                      />
+                      <button
+                        type="button"
+                        style={{ ...hudBtn, padding: '2px 4px', fontSize: '9px' }}
+                        onClick={() => {
+                          if (onSnapshotHistory) onSnapshotHistory();
+                          onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle + 0.2).toFixed(2) });
+                        }}
+                        title="+0.2°"
+                      >
+                        +0.2°
+                      </button>
+                      <button
+                        type="button"
+                        style={{ ...hudBtn, padding: '2px 4px', fontSize: '9px' }}
+                        onClick={() => {
+                          if (onSnapshotHistory) onSnapshotHistory();
+                          onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle + 1.0).toFixed(2) });
+                        }}
+                        title="+1.0°"
+                      >
+                        +1°
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Lane Width */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#c084fc' }}>Lane Width:</span>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#c084fc', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #6b21a8' }}>
+                    {Math.round(selectedLane.width)} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { width: Math.max(8, selectedLane.width - 1) });
+                    }}
+                    title="Narrow lane 1px"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={8}
+                    max={120}
+                    step={1}
+                    value={Math.round(selectedLane.width)}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => onUpdateLane(selectedLane.id, { width: +e.target.value })}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#c084fc' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { width: selectedLane.width + 1 });
+                    }}
+                    title="Widen lane 1px"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeHudModule === 'baselines' && (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                gap: '8px',
+                background: 'rgba(0,0,0,0.35)',
+                padding: '8px 12px',
+                borderRadius: '8px',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              {/* Origin Baseline */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24' }}>Origin (Rf = 0.00):</span>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #78350f' }}>
+                    {currentOriginVal} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { zeroRf: Math.max(5, currentOriginVal - 1) });
+                    }}
+                    title="Lower origin 1px"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={5}
+                    max={Math.round(selectedLane.length * 0.45)}
+                    step={1}
+                    value={currentOriginVal}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => onUpdateLane(selectedLane.id, { zeroRf: +e.target.value })}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#fbbf24' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      onUpdateLane(selectedLane.id, { zeroRf: currentOriginVal + 1 });
+                    }}
+                    title="Raise origin 1px"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+
+              {/* Solvent Front Side 1 */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front Side 1 (L0–26):</span>
+                    {selectedSide === 0 && (
+                      <span style={{ fontSize: '9px', background: '#0284c7', color: '#fff', padding: '1px 4px', borderRadius: '3px', fontWeight: 600 }}>
+                        Active
+                      </span>
+                    )}
+                  </div>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
+                    {frontSide0Val} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      const nextVal = Math.max(50, frontSide0Val - 1);
+                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
+                    }}
+                    title="Lower Side 1 front 1px"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={50}
+                    max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
+                    step={1}
+                    value={frontSide0Val}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => {
+                      const val = +e.target.value;
+                      if (onUpdateSetFront) onUpdateSetFront(val, 0);
+                    }}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      const nextVal = frontSide0Val + 1;
+                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
+                    }}
+                    title="Raise Side 1 front 1px"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+
+              {/* Solvent Front Side 2 */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4' }}>Front Side 2 (L27–53):</span>
+                    {selectedSide === 1 && (
+                      <span style={{ fontSize: '9px', background: '#0891b2', color: '#fff', padding: '1px 4px', borderRadius: '3px', fontWeight: 600 }}>
+                        Active
+                      </span>
+                    )}
+                  </div>
+                  <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0891b2' }}>
+                    {frontSide1Val} px
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      const nextVal = Math.max(50, frontSide1Val - 1);
+                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
+                    }}
+                    title="Lower Side 2 front 1px"
+                  >
+                    -1
+                  </button>
+                  <input
+                    type="range"
+                    min={50}
+                    max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
+                    step={1}
+                    value={frontSide1Val}
+                    onPointerDown={onSnapshotHistory}
+                    onMouseDown={onSnapshotHistory}
+                    onChange={(e) => {
+                      const val = +e.target.value;
+                      if (onUpdateSetFront) onUpdateSetFront(val, 1);
+                    }}
+                    style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
+                  />
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      const nextVal = frontSide1Val + 1;
+                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
+                    }}
+                    title="Raise Side 2 front 1px"
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeHudModule === 'edge' && edgeFits && edgeSettings && onEdgeSetting && (
+            <div style={{ marginTop: '2px', marginBottom: '2px' }}>
+              <TlcEdgePanel
+                fits={edgeFits}
+                settings={edgeSettings}
+                onSetting={onEdgeSetting}
+                picks={picks}
+                pickMode={pickMode}
+                onPickMode={onPickMode || (() => {})}
+                pickGroup={pickGroup}
+                onPickGroup={onPickGroup || (() => {})}
+                onClearPicks={onClearPicks || (() => {})}
+                darkTheme={true}
+                defaultOpen={true}
+              />
+            </div>
+          )}
+
+          {activeHudModule === 'composite' && isComposite && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                background: 'rgba(4, 47, 46, 0.85)',
+                padding: '6px 10px',
+                borderRadius: '8px',
+                border: '1px solid #0f766e',
+                flexWrap: 'wrap',
+              }}
+            >
+              <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
                 <button
                   type="button"
-                  style={{ ...hudBtn, background: '#1e293b', color: '#94a3b8', borderColor: '#475569' }}
-                  onClick={onResetAllLanes}
-                  title="Reset all 54 lanes to template"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('glow')}
                 >
-                  ⟲ Reset All
+                  ✨ Glow
                 </button>
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('false-color')}
+                >
+                  🔬 False-Color
+                </button>
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('split')}
+                >
+                  ↔ Split Wipe
+                </button>
+              </div>
+
+              {compositeSubMode === 'glow' && (
+                <>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={0.4}
+                      step={0.01}
+                      value={fluoThreshold}
+                      onChange={(e) => setFluoThreshold(+e.target.value)}
+                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#14b8a6' }}
+                    />
+                    <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
+                  </div>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
+                    <input
+                      type="range"
+                      min={1.0}
+                      max={2.8}
+                      step={0.1}
+                      value={fluoGain}
+                      onChange={(e) => setFluoGain(+e.target.value)}
+                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#10b981' }}
+                    />
+                    <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
+                  </div>
+                </>
               )}
 
-              {/* Invert All Upper Tier Lanes (Side 2) */}
+              {compositeSubMode === 'false-color' && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
+                  <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
+                  <span style={{ fontSize: '10px', color: '#a7f3d0', marginLeft: '4px' }}>Gain:</span>
+                  <input
+                    type="range"
+                    min={0.8}
+                    max={2.5}
+                    step={0.1}
+                    value={fluoGain}
+                    onChange={(e) => setFluoGain(+e.target.value)}
+                    style={{ ...hudSliderTrack, width: '55px', accentColor: '#06b6d4' }}
+                  />
+                </div>
+              )}
+
+              {compositeSubMode === 'split' && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
+                  <input
+                    type="range"
+                    min={0.02}
+                    max={0.98}
+                    step={0.01}
+                    value={splitPos}
+                    onChange={(e) => setSplitPos(+e.target.value)}
+                    style={{ ...hudSliderTrack, width: '70px', accentColor: '#facc15' }}
+                  />
+                  <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeHudModule === 'recipe' && selectedRow && (
+            <div
+              style={{
+                background: 'rgba(0,0,0,0.3)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: '8px',
+                padding: '6px 10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
+                <span style={{ fontSize: '11px', fontWeight: 800, color: '#facc15' }}>
+                  🧪 Well {wellLabel(selectedWell!)} Recipe (Reaction #{selectedRow.global_index + 1})
+                </span>
+                {selectedRow['vol#solvent'] != null && (
+                  <span style={{ fontSize: '11px', color: '#cbd5e1' }}>
+                    Solvent Volume: <b style={{ color: '#38bdf8' }}>{Number(selectedRow['vol#solvent']).toFixed(1)} µL</b>
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '5px', flexWrap: 'wrap', alignItems: 'center' }}>
+                {selectedRow.recipe
+                  .filter((rc: any) => rc.target_concentration > 0)
+                  .map((rc: any) => (
+                    <div
+                      key={rc.code}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        background: '#0f172a',
+                        border: `1px solid ${rc.color || '#475569'}`,
+                        borderRadius: '4px',
+                        padding: '2px 6px',
+                        fontSize: '10px',
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: '6px',
+                          height: '6px',
+                          borderRadius: '50%',
+                          background: rc.color || '#38bdf8',
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ fontWeight: 700, color: '#f8fafc' }}>{rc.code}:</span>
+                      <span style={{ color: '#cbd5e1' }}>{rc.name}</span>
+                      <span className="mono" style={{ color: '#38bdf8', fontWeight: 700 }}>
+                        {rc.target_concentration.toFixed(1)} mM
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {activeHudModule === 'tools' && (
+            <div
+              style={{
+                display: 'flex',
+                gap: '8px',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                background: 'rgba(0,0,0,0.3)',
+                padding: '6px 10px',
+                borderRadius: '8px',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              {/* Global Skew */}
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '3px',
+                  background: '#0f172a',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  border: '1px solid #334155',
+                }}
+                title="Rotate all 54 lanes uniformly"
+              >
+                <span style={{ fontSize: '10px', color: '#cbd5e1', fontWeight: 600 }}>Global Skew:</span>
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '2px 5px', fontSize: '10px' }}
+                  onClick={() => handleApplyGlobalSkew(-0.2)}
+                  title="Rotate all 54 lanes CCW by -0.2°"
+                >
+                  ↺ -0.2°
+                </button>
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '2px 5px', fontSize: '10px' }}
+                  onClick={() => handleApplyGlobalSkew(+0.2)}
+                  title="Rotate all 54 lanes CW by +0.2°"
+                >
+                  +0.2° ↻
+                </button>
+              </div>
+
+              {/* Invert Upper Tier */}
               {selectedSide === 1 && (
                 <button
                   type="button"
-                  style={{ ...hudBtn, background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
+                  style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
                   onClick={() => {
                     if (onSnapshotHistory) onSnapshotHistory();
                     lanes.forEach((l) => {
@@ -1270,581 +2085,36 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                       }
                     });
                   }}
-                  title="Invert migration direction of all 27 upper tier lanes (Side 2) together"
+                  title="Invert migration direction of all 27 upper tier lanes"
                 >
-                  ↕ Flip Upper Side (L27–53)
+                  ↕ Flip Upper Tier (L27–53)
                 </button>
               )}
 
-              {/* Inspect Well Modal */}
-              <button
-                type="button"
-                style={{ ...hudBtn, background: '#0284c7', color: '#ffffff', borderColor: '#0369a1' }}
-                onClick={() => onOpenWellModal(selectedWell!)}
-                title="Inspect densitogram and peaks (Enter)"
-              >
-                🔍 Inspect Densitogram
-              </button>
-
-              {/* Export CSV */}
-              {onExportLaneCsv && (
+              {/* Reset Lane */}
+              {onResetLane && (
                 <button
                   type="button"
-                  style={{ ...hudBtn, background: '#059669', color: '#ffffff', borderColor: '#047857' }}
-                  onClick={onExportLaneCsv}
-                  title="Export corrected lane CSV file"
+                  style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#fbbf24', borderColor: '#b45309' }}
+                  onClick={() => onResetLane(selectedLane.id)}
+                  title="Reset this lane to original template"
                 >
-                  💾 Export CSV
+                  ⟲ Reset Lane
                 </button>
               )}
 
-              {/* Done */}
-              <button
-                type="button"
-                style={{ ...hudBtn, background: '#334155', color: '#cbd5e1', borderColor: '#475569' }}
-                onClick={() => setSelectedLaneId(null)}
-                title="Deselect lane (Esc)"
-              >
-                ✕ Done
-              </button>
-            </div>
-          </div>
-
-          {/* Minimized Quick Summary Bar */}
-          {isHudCollapsed ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap', fontSize: '11px', color: '#94a3b8', marginTop: '6px' }}>
-              <span>Shift X: <b style={{ color: '#fff' }}>{Math.round(selectedLane.x0)} px</b></span>
-              <span>Shift Y: <b style={{ color: '#fff' }}>{Math.round(selectedLane.y0)} px</b></span>
-              <span>Tilt: <b style={{ color: '#facc15' }}>{selectedLane.angle.toFixed(1)}°</b></span>
-              <span>Origin: <b style={{ color: '#fbbf24' }}>{currentOriginVal} px</b></span>
-              <span>Front: <b style={{ color: '#38bdf8' }}>{selectedSide === 1 ? frontSide1Val : frontSide0Val} px</b></span>
-              <span>Width: <b style={{ color: '#c084fc' }}>{Math.round(selectedLane.width)} px</b></span>
-              <span style={{ color: '#38bdf8' }}>| Arrow keys or drag on canvas to adjust live</span>
-            </div>
-          ) : (
-            <>
-              {/* ROW 1: Position & Orientation Continuous Sliders */}
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                  gap: '12px',
-                  background: 'rgba(0,0,0,0.35)',
-                  padding: '10px 14px',
-                  borderRadius: '8px',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                }}
-              >
-                {/* Shift X Continuous Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift X (Position):</span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #334155' }}>
-                      {Math.round(selectedLane.x0)} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { x0: selectedLane.x0 - 1 });
-                      }}
-                      title="Shift left 1px (←)"
-                    >
-                      ◀ -1
-                    </button>
-                    <input
-                      type="range"
-                      min={minX}
-                      max={maxX}
-                      step={1}
-                      value={Math.round(selectedLane.x0)}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => onUpdateLane(selectedLane.id, { x0: +e.target.value })}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
-                      title="Smooth continuous Shift X slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { x0: selectedLane.x0 + 1 });
-                      }}
-                      title="Shift right 1px (→)"
-                    >
-                      +1 ▶
-                    </button>
-                  </div>
-                </div>
-
-                {/* Shift Y Continuous Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Shift Y (Position):</span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#fff', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #334155' }}>
-                      {Math.round(selectedLane.y0)} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { y0: selectedLane.y0 - 1 });
-                      }}
-                      title="Shift up 1px (↑)"
-                    >
-                      ▲ -1
-                    </button>
-                    <input
-                      type="range"
-                      min={minY}
-                      max={maxY}
-                      step={1}
-                      value={Math.round(selectedLane.y0)}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => onUpdateLane(selectedLane.id, { y0: +e.target.value })}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
-                      title="Smooth continuous Shift Y slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { y0: selectedLane.y0 + 1 });
-                      }}
-                      title="Shift down 1px (↓)"
-                    >
-                      +1 ▼
-                    </button>
-                  </div>
-                </div>
-
-                {/* Tilt Angle Continuous Slider */}
-                {(() => {
-                  const isOpposingTilt = Math.abs(selectedLane.angle) > 90;
-                  const baseAngle = isOpposingTilt ? (selectedLane.angle < 0 ? -180 : 180) : 0;
-                  const tiltMin = +(baseAngle - 30).toFixed(1);
-                  const tiltMax = +(baseAngle + 30).toFixed(1);
-
-                  const handleFlipLane = () => {
-                    if (onSnapshotHistory) onSnapshotHistory();
-                    const th = (selectedLane.angle * Math.PI) / 180;
-                    const endX = Math.round(selectedLane.x0 + selectedLane.length * Math.sin(th));
-                    const endY = Math.round(selectedLane.y0 - selectedLane.length * Math.cos(th));
-                    const newAngle = isOpposingTilt
-                      ? +((selectedLane.angle - (selectedLane.angle > 0 ? 180 : -180))).toFixed(2)
-                      : +((selectedLane.angle + 180)).toFixed(2);
-                    onUpdateLane(selectedLane.id, {
-                      x0: endX,
-                      y0: endY,
-                      angle: newAngle,
-                    });
-                  };
-
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#facc15', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
-                          <span>Tilt Angle:</span>
-                          <span style={{ fontSize: '9px', background: isOpposingTilt ? '#7c2d12' : '#1e3a5f', color: isOpposingTilt ? '#fdba74' : '#93c5fd', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
-                            {isOpposingTilt ? '↕ Inverted / Downward' : '↑ Upward'}
-                          </span>
-                        </span>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                          <button
-                            type="button"
-                            style={{
-                              ...hudBtn,
-                              padding: '1px 6px',
-                              fontSize: '10px',
-                              background: '#1e293b',
-                              color: '#38bdf8',
-                              borderColor: '#0284c7',
-                            }}
-                            onClick={handleFlipLane}
-                            title="Flip lane direction 180° (flips between upward and downward development without shifting lane)"
-                          >
-                            ↕ Flip 180°
-                          </button>
-                          <span className="mono" style={{ fontSize: '12px', fontWeight: 800, color: '#facc15', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #b45309' }}>
-                            {selectedLane.angle >= 0 ? '+' : ''}{selectedLane.angle.toFixed(1)}°
-                          </span>
-                        </div>
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <button
-                          type="button"
-                          style={{ ...hudBtn, padding: '3px 5px', fontSize: '10px' }}
-                          onClick={() => {
-                            if (onSnapshotHistory) onSnapshotHistory();
-                            onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle - 1.0).toFixed(2) });
-                          }}
-                          title="Rotate counter-clockwise 1.0° (Shift+Q)"
-                        >
-                          -1°
-                        </button>
-                        <button
-                          type="button"
-                          style={hudBtn}
-                          onClick={() => {
-                            if (onSnapshotHistory) onSnapshotHistory();
-                            onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle - 0.2).toFixed(2) });
-                          }}
-                          title="Rotate counter-clockwise 0.2° (Q)"
-                        >
-                          ↺ -0.2°
-                        </button>
-                        <input
-                          type="range"
-                          min={tiltMin}
-                          max={tiltMax}
-                          step={0.1}
-                          value={selectedLane.angle}
-                          onPointerDown={onSnapshotHistory}
-                          onMouseDown={onSnapshotHistory}
-                          onChange={(e) => onUpdateLane(selectedLane.id, { angle: parseFloat((+e.target.value).toFixed(2)) })}
-                          style={{ ...hudSliderTrack, flex: 1, accentColor: '#facc15' }}
-                          title={`Smooth continuous Tilt Angle slider (${tiltMin}° to ${tiltMax}°)`}
-                        />
-                        <button
-                          type="button"
-                          style={hudBtn}
-                          onClick={() => {
-                            if (onSnapshotHistory) onSnapshotHistory();
-                            onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle + 0.2).toFixed(2) });
-                          }}
-                          title="Rotate clockwise 0.2° (E)"
-                        >
-                          +0.2° ↻
-                        </button>
-                        <button
-                          type="button"
-                          style={{ ...hudBtn, padding: '3px 5px', fontSize: '10px' }}
-                          onClick={() => {
-                            if (onSnapshotHistory) onSnapshotHistory();
-                            onUpdateLane(selectedLane.id, { angle: +(selectedLane.angle + 1.0).toFixed(2) });
-                          }}
-                          title="Rotate clockwise 1.0° (Shift+E)"
-                        >
-                          +1°
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })()}
-              </div>
-
-              {/* ROW 2: Chromatography Dimensions & Meniscus Sliders */}
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-                  gap: '12px',
-                  background: 'rgba(0,0,0,0.35)',
-                  padding: '10px 14px',
-                  borderRadius: '8px',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                }}
-              >
-                {/* Origin Baseline (Rf = 0.00) Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24' }}>Origin Baseline (Rf = 0.00):</span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#fbbf24', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #78350f' }}>
-                      {currentOriginVal} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { zeroRf: Math.max(5, currentOriginVal - 1) });
-                      }}
-                      title="Lower origin baseline 1px"
-                    >
-                      -1
-                    </button>
-                    <input
-                      type="range"
-                      min={5}
-                      max={Math.round(selectedLane.length * 0.45)}
-                      step={1}
-                      value={currentOriginVal}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => onUpdateLane(selectedLane.id, { zeroRf: +e.target.value })}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#fbbf24' }}
-                      title="Smooth continuous Origin Baseline slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { zeroRf: currentOriginVal + 1 });
-                      }}
-                      title="Raise origin baseline 1px"
-                    >
-                      +1
-                    </button>
-                  </div>
-                </div>
-
-                {/* Solvent Front - Side 1 (Lanes 0–26 / Half 1) Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                      <span>Front Side 1 (L0–26):</span>
-                      {selectedSide === 0 && (
-                        <span style={{ fontSize: '9px', background: '#0284c7', color: '#fff', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
-                          Active
-                        </span>
-                      )}
-                    </span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #0369a1' }}>
-                      {frontSide0Val} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        const nextVal = Math.max(50, frontSide0Val - 1);
-                        if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
-                      }}
-                      title="Lower Side 1 solvent front meniscus 1px"
-                    >
-                      -1
-                    </button>
-                    <input
-                      type="range"
-                      min={50}
-                      max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
-                      step={1}
-                      value={frontSide0Val}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => {
-                        const val = +e.target.value;
-                        if (onUpdateSetFront) onUpdateSetFront(val, 0);
-                      }}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
-                      title="Side 1 (Lanes 0-26 / Lower Tier) Solvent Front continuous slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        const nextVal = frontSide0Val + 1;
-                        if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
-                      }}
-                      title="Raise Side 1 solvent front meniscus 1px"
-                    >
-                      +1
-                    </button>
-                  </div>
-                </div>
-
-                {/* Solvent Front - Side 2 (Lanes 27–53 / Half 2) Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                      <span>Front Side 2 (L27–53):</span>
-                      {selectedSide === 1 && (
-                        <span style={{ fontSize: '9px', background: '#0891b2', color: '#fff', padding: '1px 5px', borderRadius: '3px', fontWeight: 600 }}>
-                          Active
-                        </span>
-                      )}
-                    </span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#06b6d4', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #0891b2' }}>
-                      {frontSide1Val} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        const nextVal = Math.max(50, frontSide1Val - 1);
-                        if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
-                      }}
-                      title="Lower Side 2 solvent front meniscus 1px"
-                    >
-                      -1
-                    </button>
-                    <input
-                      type="range"
-                      min={50}
-                      max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
-                      step={1}
-                      value={frontSide1Val}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => {
-                        const val = +e.target.value;
-                        if (onUpdateSetFront) onUpdateSetFront(val, 1);
-                      }}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
-                      title="Side 2 (Lanes 27-53 / Upper Tier) Solvent Front continuous slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        const nextVal = frontSide1Val + 1;
-                        if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
-                      }}
-                      title="Raise Side 2 solvent front meniscus 1px"
-                    >
-                      +1
-                    </button>
-                  </div>
-                </div>
-
-                {/* Lane Width Slider */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#c084fc' }}>Lane Width:</span>
-                    <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: '#c084fc', background: '#0f172a', padding: '1px 6px', borderRadius: '3px', border: '1px solid #6b21a8' }}>
-                      {Math.round(selectedLane.width)} px
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { width: Math.max(8, selectedLane.width - 1) });
-                      }}
-                      title="Narrow lane 1px"
-                    >
-                      -1
-                    </button>
-                    <input
-                      type="range"
-                      min={8}
-                      max={120}
-                      step={1}
-                      value={Math.round(selectedLane.width)}
-                      onPointerDown={onSnapshotHistory}
-                      onMouseDown={onSnapshotHistory}
-                      onChange={(e) => onUpdateLane(selectedLane.id, { width: +e.target.value })}
-                      style={{ ...hudSliderTrack, flex: 1, accentColor: '#c084fc' }}
-                      title="Smooth continuous Lane Width slider"
-                    />
-                    <button
-                      type="button"
-                      style={hudBtn}
-                      onClick={() => {
-                        if (onSnapshotHistory) onSnapshotHistory();
-                        onUpdateLane(selectedLane.id, { width: selectedLane.width + 1 });
-                      }}
-                      title="Widen lane 1px"
-                    >
-                      +1
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Interactive Well Recipe Preview Card */}
-              {selectedRow ? (
-                <div
-                  style={{
-                    background: 'rgba(0,0,0,0.3)',
-                    border: '1px solid rgba(255,255,255,0.08)',
-                    borderRadius: '8px',
-                    padding: '8px 12px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '6px',
-                  }}
+              {/* Reset All */}
+              {onResetAllLanes && (
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#94a3b8', borderColor: '#475569' }}
+                  onClick={onResetAllLanes}
+                  title="Reset all 54 lanes to template"
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <span style={{ fontSize: '11px', fontWeight: 800, color: '#facc15' }}>
-                        🧪 Well {wellLabel(selectedWell!)} Recipe
-                      </span>
-                      <span style={{ fontSize: '10px', color: '#94a3b8' }}>
-                        (Reaction #{selectedRow.global_index + 1})
-                      </span>
-                    </div>
-                    {selectedRow['vol#solvent'] != null && (
-                      <span style={{ fontSize: '11px', color: '#cbd5e1' }}>
-                        Solvent Volume: <b style={{ color: '#38bdf8' }}>{Number(selectedRow['vol#solvent']).toFixed(1)} µL</b>
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
-                    {selectedRow.recipe
-                      .filter((rc: any) => rc.target_concentration > 0)
-                      .map((rc: any) => (
-                        <div
-                          key={rc.code}
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '5px',
-                            background: '#0f172a',
-                            border: `1px solid ${rc.color || '#475569'}`,
-                            borderRadius: '4px',
-                            padding: '3px 8px',
-                            fontSize: '11px',
-                          }}
-                        >
-                          <span
-                            style={{
-                              width: '7px',
-                              height: '7px',
-                              borderRadius: '50%',
-                              background: rc.color || '#38bdf8',
-                              flexShrink: 0,
-                            }}
-                          />
-                          <span style={{ fontWeight: 700, color: '#f8fafc' }}>{rc.code}:</span>
-                          <span style={{ color: '#cbd5e1', maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={rc.name}>
-                            {rc.name}
-                          </span>
-                          <span className="mono" style={{ color: '#38bdf8', fontWeight: 700 }}>
-                            {rc.target_concentration.toFixed(1)} mM
-                          </span>
-                          {rc.transfer_volume != null && (
-                            <span style={{ color: '#94a3b8', fontSize: '10px' }}>
-                              ({Number(rc.transfer_volume).toFixed(1)} µL)
-                            </span>
-                          )}
-                        </div>
-                      ))}
-                  </div>
-                </div>
-              ) : null}
-
-              {/* Keyboard & Mouse Guide */}
-              <div style={{ fontSize: '11px', color: '#94a3b8', display: 'flex', gap: '14px', flexWrap: 'wrap', alignItems: 'center' }}>
-                <span>⚡ <b>Controls:</b> Drag continuous sliders for smooth real-time scrubbing</span>
-                <span>⌨️ Arrow keys (<span className="mono">← → ↑ ↓</span>) nudge position</span>
-                <span><span className="mono">Q / E</span> tilt angle</span>
-                <span><span className="mono">Shift</span> 5× step</span>
-                <span><span className="mono">Ctrl+Z</span> undo</span>
-                <span style={{ color: '#38bdf8' }}>🖱️ Or click &amp; drag the lane directly on the canvas!</span>
-              </div>
-            </>
+                  ⟲ Reset All Lanes
+                </button>
+              )}
+            </div>
           )}
         </div>
       ) : (
@@ -1856,7 +2126,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             width: '100%',
             maxWidth: '1200px',
             marginBottom: '10px',
-            padding: '10px 16px',
+            padding: overviewModule === 'none' ? '6px 14px' : '10px 14px',
             background: 'rgba(15, 23, 42, 0.94)',
             backdropFilter: 'blur(10px)',
             WebkitBackdropFilter: 'blur(10px)',
@@ -1865,24 +2135,242 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
             color: '#f8fafc',
             display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            flexWrap: 'wrap',
-            gap: '12px',
+            flexDirection: 'column',
+            gap: overviewModule === 'none' ? '0px' : '8px',
             fontSize: '12px',
           }}
         >
-          <span style={{ color: 'var(--fg)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-            <span>💡</span>
-            <span><b>Direct Lane Alignment:</b> Click any lane on the physical plate photograph below to open the continuous sliders for position, tilt, baseline origin, and dual solvent fronts.</span>
-          </span>
+          {/* Top Bar for Overview Mode */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+            <span style={{ color: 'var(--fg)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span>💡</span>
+              <span><b>Plate Overview:</b> Click any lane on the photograph to select &amp; align.</span>
+            </span>
 
-          {/* Dual Solvent Front Quick Sliders for both sides of the plate */}
-          {lanes.length > 0 && onUpdateSetFront && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap', background: 'rgba(0,0,0,0.2)', padding: '4px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
-              {/* Side 1 Front */}
+            {/* Modular Quick Tabs for Overview */}
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', background: '#090d16', padding: '2px 3px', borderRadius: '6px', border: '1px solid #334155' }}>
+              {lanes.length > 0 && onUpdateLane && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: '#1e293b',
+                    color: '#facc15',
+                    borderColor: '#475569',
+                    fontWeight: 700,
+                  }}
+                  onClick={() => {
+                    setSelectedLaneId(0);
+                    setActiveHudModule('geometry');
+                  }}
+                  title="Open Lane Geometry controls (Shift X/Y, Tilt Angle, Lane Width)"
+                >
+                  📐 Geometry
+                </button>
+              )}
+
+              {lanes.length > 0 && onUpdateSetFront && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: overviewModule === 'fronts' ? '#facc15' : 'transparent',
+                    color: overviewModule === 'fronts' ? '#0f172a' : '#cbd5e1',
+                    borderColor: overviewModule === 'fronts' ? '#facc15' : 'transparent',
+                    fontWeight: overviewModule === 'fronts' ? 800 : 600,
+                  }}
+                  onClick={() => setOverviewModule((m) => (m === 'fronts' ? 'none' : 'fronts'))}
+                  title="Solvent front continuous sliders"
+                >
+                  💧 Baselines ({frontSide0Val} / {frontSide1Val} px)
+                </button>
+              )}
+
+              {edgeFits && edgeSettings && onEdgeSetting && (() => {
+                const hasSuggestion = edgeFits.some((f, h) => edgeSuggestion(f, edgeSettings[h]));
+                return (
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+                    <button
+                      type="button"
+                      style={{
+                        ...hudBtn,
+                        padding: '3px 8px',
+                        fontSize: '11px',
+                        background: overviewModule === 'edge' ? '#ec4899' : pickMode ? '#831843' : isEdgeActive ? '#064e3b' : hasSuggestion ? '#78350f' : 'transparent',
+                        color: overviewModule === 'edge' ? '#ffffff' : pickMode ? '#f472b6' : isEdgeActive ? '#6ee7b7' : hasSuggestion ? '#fde047' : '#cbd5e1',
+                        borderColor: overviewModule === 'edge' ? '#db2777' : pickMode ? '#ec4899' : isEdgeActive ? '#059669' : hasSuggestion ? '#eab308' : 'transparent',
+                        fontWeight: overviewModule === 'edge' ? 800 : 600,
+                      }}
+                      onClick={() => setOverviewModule((m) => (m === 'edge' ? 'none' : 'edge'))}
+                      title="Toggle edge-effect migration speed correction & reference spot picker"
+                    >
+                      🎛️ Edge Corr {isEdgeActive ? '● ON' : hasSuggestion ? '⚡ Curve Found' : '○'}{pickMode ? ' (Picking…)' : ''}
+                    </button>
+                    {!isEdgeActive && hasSuggestion && (
+                      <button
+                        type="button"
+                        style={{
+                          ...hudBtn,
+                          padding: '2px 7px',
+                          fontSize: '10px',
+                          background: '#10b981',
+                          color: '#022c22',
+                          borderColor: '#34d399',
+                          fontWeight: 800,
+                        }}
+                        onClick={() => {
+                          edgeFits.forEach((f, idx) => {
+                            if (f && f.ok && onEdgeSetting) onEdgeSetting(idx, { ...edgeSettings[idx], mode: 'on' });
+                          });
+                        }}
+                        title="Click to apply the detected lateral migration speed curve"
+                      >
+                        ⚡ Apply
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {isComposite && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: overviewModule === 'composite' ? '#14b8a6' : 'transparent',
+                    color: overviewModule === 'composite' ? '#042f2e' : '#5eead4',
+                    borderColor: overviewModule === 'composite' ? '#2dd4bf' : 'transparent',
+                    fontWeight: overviewModule === 'composite' ? 800 : 600,
+                  }}
+                  onClick={() => setOverviewModule((m) => (m === 'composite' ? 'none' : 'composite'))}
+                  title="Dual-channel composite controls"
+                >
+                  ✨ Composite
+                </button>
+              )}
+
+              {lanes.length > 0 && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: '#1e293b',
+                    color: '#cbd5e1',
+                    borderColor: '#475569',
+                    fontWeight: 600,
+                  }}
+                  onClick={() => {
+                    setSelectedLaneId(0);
+                    setActiveHudModule('recipe');
+                  }}
+                  title="Detailed well formulation recipe"
+                >
+                  🧪 Recipe
+                </button>
+              )}
+
+              {lanes.length > 0 && onUpdateLane && (
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                    background: overviewModule === 'skew' ? '#facc15' : 'transparent',
+                    color: overviewModule === 'skew' ? '#0f172a' : '#cbd5e1',
+                    borderColor: overviewModule === 'skew' ? '#facc15' : 'transparent',
+                    fontWeight: overviewModule === 'skew' ? 800 : 600,
+                  }}
+                  onClick={() => setOverviewModule((m) => (m === 'skew' ? 'none' : 'skew'))}
+                  title="Global plate tilt skew and alignment tools"
+                >
+                  ⚙️ Tools
+                </button>
+              )}
+            </div>
+
+            {/* Right Action Cluster */}
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'wrap' }}>
+              {renderChannelButtons()}
+
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 7px',
+                  background: showRfBadges ? '#0284c7' : '#1e293b',
+                  color: showRfBadges ? '#ffffff' : '#94a3b8',
+                  borderColor: showRfBadges ? '#0369a1' : '#475569',
+                }}
+                onClick={() => setShowRfBadges((s) => !s)}
+                title="Toggle on-plate spot centroid ticks and numerical Rf badges"
+              >
+                🏷️ {showRfBadges ? 'Rf ON' : 'Rf OFF'}
+              </button>
+
+              {onUndo && (
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '3px 7px', opacity: canUndo ? 1 : 0.5, cursor: canUndo ? 'pointer' : 'not-allowed' }}
+                  onClick={onUndo}
+                  disabled={!canUndo}
+                  title="Undo last change (Ctrl+Z)"
+                >
+                  ↺ Undo
+                </button>
+              )}
+
+              {lanes.length > 0 && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, padding: '3px 8px', background: '#facc15', color: '#0f172a', borderColor: '#eab308', fontWeight: 700 }}
+                    onClick={() => {
+                      setSelectedLaneId(0);
+                      setActiveHudModule('geometry');
+                    }}
+                    title="Select Lane 0 and edit geometry"
+                  >
+                    Select Lane 0
+                  </button>
+                </div>
+              )}
+
+              {onExportLaneCsv && (
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '3px 8px', background: '#059669', color: '#fff', borderColor: '#047857' }}
+                  onClick={onExportLaneCsv}
+                >
+                  💾 CSV
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Overview Drawers */}
+          {overviewModule === 'fronts' && lanes.length > 0 && onUpdateSetFront && (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                gap: '8px',
+                background: 'rgba(0,0,0,0.3)',
+                padding: '8px 12px',
+                borderRadius: '6px',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front Side 1:</span>
+                <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front Side 1 (L0–26):</span>
                 <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
                   {frontSide0Val} px
                 </span>
@@ -1893,14 +2381,11 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                   step={1}
                   value={frontSide0Val}
                   onChange={(e) => onUpdateSetFront(+e.target.value, 0)}
-                  style={{ ...hudSliderTrack, width: '80px', accentColor: '#38bdf8' }}
-                  title="Side 1 (Lanes 0-26 / Lower Tier) continuous Solvent Front slider"
+                  style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
                 />
               </div>
-
-              {/* Side 2 Front */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4' }}>Front Side 2:</span>
+                <span style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4' }}>Front Side 2 (L27–53):</span>
                 <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0891b2' }}>
                   {frontSide1Val} px
                 </span>
@@ -1911,216 +2396,228 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                   step={1}
                   value={frontSide1Val}
                   onChange={(e) => onUpdateSetFront(+e.target.value, 1)}
-                  style={{ ...hudSliderTrack, width: '80px', accentColor: '#06b6d4' }}
-                  title="Side 2 (Lanes 27-53 / Upper Tier) continuous Solvent Front slider"
+                  style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
                 />
               </div>
             </div>
           )}
 
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-            {/* Channel Selector */}
-            {renderChannelButtons()}
+          {overviewModule === 'edge' && edgeFits && edgeSettings && onEdgeSetting && (
+            <div style={{ marginTop: '4px' }}>
+              <TlcEdgePanel
+                fits={edgeFits}
+                settings={edgeSettings}
+                onSetting={onEdgeSetting}
+                picks={picks}
+                pickMode={pickMode}
+                onPickMode={onPickMode || (() => {})}
+                pickGroup={pickGroup}
+                onPickGroup={onPickGroup || (() => {})}
+                onClearPicks={onClearPicks || (() => {})}
+                darkTheme={true}
+                defaultOpen={true}
+              />
+            </div>
+          )}
 
-            {/* Rf Badges Toggle */}
-            <button
-              type="button"
+          {overviewModule === 'composite' && isComposite && (
+            <div
               style={{
-                ...hudBtn,
-                background: showRfBadges ? '#0284c7' : '#1e293b',
-                color: showRfBadges ? '#ffffff' : '#94a3b8',
-                borderColor: showRfBadges ? '#0369a1' : '#475569',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                background: 'rgba(4, 47, 46, 0.85)',
+                padding: '6px 10px',
+                borderRadius: '6px',
+                border: '1px solid #0f766e',
+                flexWrap: 'wrap',
               }}
-              onClick={() => setShowRfBadges((s) => !s)}
-              title="Toggle on-plate spot centroid ticks and numerical Rf badges"
             >
-              {showRfBadges ? '🏷️ Rf Badges ON' : '🏷️ Rf Badges OFF'}
-            </button>
+              <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('glow')}
+                >
+                  ✨ Glow
+                </button>
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('false-color')}
+                >
+                  🔬 False-Color
+                </button>
+                <button
+                  type="button"
+                  style={{
+                    ...hudBtn,
+                    padding: '2px 6px',
+                    fontSize: '10px',
+                    background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
+                    borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
+                    color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
+                  }}
+                  onClick={() => setCompositeSubMode('split')}
+                >
+                  ↔ Split Wipe
+                </button>
+              </div>
 
-            {/* Global Skew Controls */}
-            {lanes.length > 0 && onUpdateLane && (
-              <div
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '3px',
-                  background: 'rgba(0,0,0,0.25)',
-                  padding: '3px 8px',
-                  borderRadius: '6px',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                }}
-                title="Rotate all 54 lanes uniformly (e.g. for slightly tilted physical plates)"
-              >
+              {compositeSubMode === 'glow' && (
+                <>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={0.4}
+                      step={0.01}
+                      value={fluoThreshold}
+                      onChange={(e) => setFluoThreshold(+e.target.value)}
+                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#14b8a6' }}
+                    />
+                    <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
+                  </div>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
+                    <input
+                      type="range"
+                      min={1.0}
+                      max={2.8}
+                      step={0.1}
+                      value={fluoGain}
+                      onChange={(e) => setFluoGain(+e.target.value)}
+                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#10b981' }}
+                    />
+                    <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
+                  </div>
+                </>
+              )}
+
+              {compositeSubMode === 'false-color' && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
+                  <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
+                </div>
+              )}
+
+              {compositeSubMode === 'split' && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
+                  <input
+                    type="range"
+                    min={0.02}
+                    max={0.98}
+                    step={0.01}
+                    value={splitPos}
+                    onChange={(e) => setSplitPos(+e.target.value)}
+                    style={{ ...hudSliderTrack, width: '70px', accentColor: '#facc15' }}
+                  />
+                  <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {overviewModule === 'skew' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', background: 'rgba(0,0,0,0.3)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.08)' }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                 <span style={{ fontSize: '11px', color: '#cbd5e1', fontWeight: 600 }}>Global Skew:</span>
                 <button
                   type="button"
-                  style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                  style={{ ...hudBtn, padding: '2px 8px', fontSize: '11px' }}
                   onClick={() => handleApplyGlobalSkew(-0.2)}
-                  title="Rotate all 54 lanes counter-clockwise by -0.2°"
+                  title="Rotate all 54 lanes CCW by -0.2°"
                 >
                   ↺ -0.2°
                 </button>
                 <button
                   type="button"
-                  style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
+                  style={{ ...hudBtn, padding: '2px 8px', fontSize: '11px' }}
                   onClick={() => handleApplyGlobalSkew(+0.2)}
-                  title="Rotate all 54 lanes clockwise by +0.2°"
+                  title="Rotate all 54 lanes CW by +0.2°"
                 >
                   +0.2° ↻
                 </button>
               </div>
-            )}
 
-            {/* Dual-Channel Multi-Mode Composite Controls */}
-            {isComposite && (
-              <div
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  background: 'rgba(4, 47, 46, 0.85)',
-                  padding: '3px 8px',
-                  borderRadius: '6px',
-                  border: '1px solid #0f766e',
-                  flexWrap: 'wrap',
-                }}
-              >
-                {/* Mode Tabs */}
-                <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
+              {onUpdateLane && (
+                <>
                   <button
                     type="button"
-                    style={{
-                      ...hudBtn,
-                      padding: '2px 6px',
-                      fontSize: '10px',
-                      background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
-                      borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
-                      color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
+                    style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      lanes.forEach((l) => {
+                        if (l.id >= 27) {
+                          const th = (l.angle * Math.PI) / 180;
+                          const endX = Math.round(l.x0 + l.length * Math.sin(th));
+                          const endY = Math.round(l.y0 - l.length * Math.cos(th));
+                          const isOpp = Math.abs(l.angle) > 90;
+                          const newAngle = isOpp
+                            ? +((l.angle - (l.angle > 0 ? 180 : -180))).toFixed(2)
+                            : +((l.angle + 180)).toFixed(2);
+                          onUpdateLane(l.id, { x0: endX, y0: endY, angle: newAngle });
+                        }
+                      });
                     }}
-                    onClick={() => setCompositeSubMode('glow')}
-                    title="Background-subtracted fluorescence glow overlaid on UV254 quenching plate"
+                    title="Invert migration direction of all 27 upper tier lanes"
                   >
-                    ✨ Glow Overlay
+                    ↕ Flip Upper Tier (L27–53)
                   </button>
+
                   <button
                     type="button"
-                    style={{
-                      ...hudBtn,
-                      padding: '2px 6px',
-                      fontSize: '10px',
-                      background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
-                      borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
-                      color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
+                    style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
+                    onClick={() => {
+                      if (onSnapshotHistory) onSnapshotHistory();
+                      lanes.forEach((l) => {
+                        if (l.id < 27) {
+                          const th = (l.angle * Math.PI) / 180;
+                          const endX = Math.round(l.x0 + l.length * Math.sin(th));
+                          const endY = Math.round(l.y0 - l.length * Math.cos(th));
+                          const isOpp = Math.abs(l.angle) > 90;
+                          const newAngle = isOpp
+                            ? +((l.angle - (l.angle > 0 ? 180 : -180))).toFixed(2)
+                            : +((l.angle + 180)).toFixed(2);
+                          onUpdateLane(l.id, { x0: endX, y0: endY, angle: newAngle });
+                        }
+                      });
                     }}
-                    onClick={() => setCompositeSubMode('false-color')}
-                    title="False-color dual channel (Amber = UV254 Quenching, Cyan = UV365 Fluorescence)"
+                    title="Invert migration direction of all 27 lower tier lanes"
                   >
-                    🔬 False-Color
+                    ↕ Flip Lower Tier (L0–26)
                   </button>
-                  <button
-                    type="button"
-                    style={{
-                      ...hudBtn,
-                      padding: '2px 6px',
-                      fontSize: '10px',
-                      background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
-                      borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
-                      color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
-                    }}
-                    onClick={() => setCompositeSubMode('split')}
-                    title="Interactive comparison curtain comparing UV254 and UV365 side-by-side"
-                  >
-                    ↔ Split Wipe
-                  </button>
-                </div>
+                </>
+              )}
 
-                {/* Sub-mode Controls */}
-                {compositeSubMode === 'glow' && (
-                  <>
-                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="Ambient background cutoff: filters out chamber light so only true fluorescence is overlaid">
-                      <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
-                      <input
-                        type="range"
-                        min={0.05}
-                        max={0.40}
-                        step={0.01}
-                        value={fluoThreshold}
-                        onChange={(e) => setFluoThreshold(+e.target.value)}
-                        style={{ ...hudSliderTrack, width: '45px', accentColor: '#14b8a6' }}
-                      />
-                      <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
-                    </div>
-                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="Fluorescence glow intensity boost">
-                      <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
-                      <input
-                        type="range"
-                        min={1.0}
-                        max={2.8}
-                        step={0.1}
-                        value={fluoGain}
-                        onChange={(e) => setFluoGain(+e.target.value)}
-                        style={{ ...hudSliderTrack, width: '45px', accentColor: '#10b981' }}
-                      />
-                      <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
-                    </div>
-                  </>
-                )}
-
-                {compositeSubMode === 'false-color' && (
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
-                    <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
-                  </div>
-                )}
-
-                {compositeSubMode === 'split' && (
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
-                    <input
-                      type="range"
-                      min={0.02}
-                      max={0.98}
-                      step={0.01}
-                      value={splitPos}
-                      onChange={(e) => setSplitPos(+e.target.value)}
-                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#facc15' }}
-                    />
-                    <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {onUndo && (
-              <button
-                type="button"
-                style={{ ...hudBtn, opacity: canUndo ? 1 : 0.5, cursor: canUndo ? 'pointer' : 'not-allowed' }}
-                onClick={onUndo}
-                disabled={!canUndo}
-                title="Undo last change (Ctrl+Z)"
-              >
-                ↺ Undo
-              </button>
-            )}
-            {lanes.length > 0 && (
-              <button
-                type="button"
-                style={hudBtn}
-                onClick={() => setSelectedLaneId(0)}
-              >
-                Select Lane 0 (A1)
-              </button>
-            )}
-            {onExportLaneCsv && (
-              <button
-                type="button"
-                style={{ ...hudBtn, background: '#059669', color: '#fff', borderColor: '#047857' }}
-                onClick={onExportLaneCsv}
-              >
-                💾 Export Lane CSV
-              </button>
-            )}
-          </div>
+              {onResetAllLanes && (
+                <button
+                  type="button"
+                  style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#94a3b8', borderColor: '#475569' }}
+                  onClick={onResetAllLanes}
+                  title="Reset all 54 lanes to template"
+                >
+                  ⟲ Reset All Lanes
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -2140,7 +2637,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               borderRadius: '8px',
               border: selectedLaneId !== null ? '2px solid #facc15' : '1px solid var(--line)',
               boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-              cursor: isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
+              cursor: pickMode ? 'copy' : isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
               filter: cssFilter,
             }}
           />

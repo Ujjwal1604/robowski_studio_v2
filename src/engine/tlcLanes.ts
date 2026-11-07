@@ -918,6 +918,7 @@ export function exportTlcAnalysisJson(options: TlcAnalysisExportOptions): string
 
           return {
             laneId: l.id,
+            well: wellLabel(vialId),
             wellCoordinate: wellLabel(vialId),
             vialId,
             reactionNumber: row ? row.global_index + 1 : null,
@@ -978,21 +979,60 @@ export function tlcRfCsv(
   sets: TlcSet[],
   run: RunResult,
   getSpots: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => TlcSpot[] | null,
-  plateIndex: number = 0,
-  getProfile?: (set: TlcSet, key: any, lane: TlcLane) => number[]
+  plateIndex: number = 0
 ): string {
-  if (sets.length > 0) {
-    return exportTlcAnalysisCsv({
-      set: sets[0],
-      sets,
-      run,
-      plateIndex,
-      getSpots,
-      getProfile,
-      scope: 'all',
-    });
+  const codes = run?.reagents?.map((r) => r.code) || [];
+  const head = [
+    'plate',
+    'set_name',
+    'lane',
+    'well',
+    'reaction',
+    ...codes.map((c) => `${c}_mM`),
+    'solvent_uL',
+  ];
+  for (let n = 1; n <= 5; n++) {
+    head.push(`rf_${n}`, `strength_${n}`);
   }
-  return '';
+  head.push('edge_gain');
+  for (let n = 1; n <= 5; n++) head.push(`rf_raw_${n}`);
+  const rows = [head];
+
+  for (const set of sets) {
+    if (!set.cfg) continue;
+    const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
+    if (!ch) continue;
+    for (const lane of [...set.cfg.lanes].sort((a, b) => a.id - b.id)) {
+      if (lane.id < 0 || lane.id > 53) continue;
+      const vialId = containerOfLane(lane.id);
+      const row = run?.rows?.find(
+        (r) => r.plate_number === plateIndex && r.container_id === vialId
+      );
+      const r: (string | number)[] = [
+        plateIndex + 1,
+        set.name,
+        lane.id,
+        wellLabel(vialId),
+        row ? row.global_index + 1 : '',
+        ...codes.map((c) => {
+          const rc = row && row.recipe?.find((x: any) => x.code === c);
+          return rc ? +rc.target_concentration.toFixed(4) : '';
+        }),
+        row && row['vol#solvent'] != null ? +(+row['vol#solvent']).toFixed(2) : '',
+      ];
+      const sp = getSpots(set, ch, lane) || [];
+      for (let n = 0; n < 5; n++) {
+        r.push(sp[n] ? +sp[n].rf.toFixed(3) : '', sp[n] ? +sp[n].strength.toFixed(2) : '');
+      }
+      // edge-effect correction: gain used for this lane, and the measured Rf before correction
+      r.push(sp.length && sp[0].edgeGain ? sp[0].edgeGain : '');
+      for (let n = 0; n < 5; n++) {
+        r.push(sp[n] ? +(sp[n].rfRaw ?? sp[n].rf).toFixed(3) : '');
+      }
+      rows.push(r.map((v) => (v === null || v === undefined ? '' : String(v))));
+    }
+  }
+  return csvText(rows);
 }
 
 /**

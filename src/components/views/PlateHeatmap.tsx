@@ -19,6 +19,7 @@ import {
   tlcLane,
 } from '../../engine';
 import { extractLaneProfile } from './TlcView';
+import { useApp } from '../../context/AppContext';
 
 interface PlateHeatmapProps {
   run: RunResult;
@@ -51,6 +52,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
   onNavigateTlc,
   tlcSets,
 }) => {
+  const { spotProminence } = useApp();
   const PLATE_SIZE = 54;
   const COLS = 9;
   const ROWS = 6;
@@ -117,7 +119,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               origin: oVal,
               front: fVal,
               radius: lane.spotRadius || 24,
-              minProminence: 0.28, // default sensitivity; the TLC view slider is local to that view
+              minProminence: spotProminence,
             });
 
             if (chSpots && chSpots.length > 0) {
@@ -164,7 +166,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
     });
 
     return map;
-  }, [activeTlcSet, hasTlcImages, tlcLanes, tlcChannelFilter]);
+  }, [activeTlcSet, hasTlcImages, tlcLanes, tlcChannelFilter, spotProminence]);
 
   const rcol = (i: number) => PAL[i % PAL.length];
 

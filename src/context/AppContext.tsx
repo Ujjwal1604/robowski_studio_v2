@@ -89,6 +89,8 @@ export interface AppContextType {
   theme: 'light' | 'dark';
   toggleTheme: () => void;
   toast: (msg: string, undo?: () => void) => void;
+  spotProminence: number;
+  setSpotProminence: (v: number) => void;
   toastState: { msg: string; undo?: () => void; id: number } | null;
   clearToast: () => void;
   previewModal: { kind: string; data?: any } | null;
@@ -174,6 +176,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [visited, setVisited] = useState<Record<string, boolean>>({ setup: true });
   const [page, setPage] = useState<number>(0);
   const [filterBad, setFilterBad] = useState<boolean>(false);
+  // Spot-detection sensitivity shared by the TLC view, CSV export and the plate heatmap.
+  const [spotProminence, setSpotProminence] = useState<number>(0.28);
   const [vialFocus, setVialFocus] = useState<{ label: string; rows: Set<number> } | null>(null);
   const [targetWell, setTargetWell] = useState<{ wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null>(null);
   const [runFilter, setRunFilter] = useState<string>('all');
@@ -1229,6 +1233,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         theme,
         toggleTheme,
         toast,
+        spotProminence,
+        setSpotProminence,
         toastState,
         clearToast,
         previewModal,

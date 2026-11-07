@@ -338,6 +338,8 @@ export interface TlcSpot {
   strength: number; // 0 to 1
   label?: string;
   areaPct?: number;
+  rfRaw?: number; // measured Rf before the edge-effect correction
+  edgeGain?: number; // relative migration speed g used for the correction
 }
 
 export interface TlcProfileOptions {

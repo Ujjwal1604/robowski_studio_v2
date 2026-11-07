@@ -1,0 +1,1029 @@
+From fb3bb214491733bc2be7a6d3b3cd7337705168d1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 22:42:26 +0900
+Subject: [PATCH] feat(tlc): per-half edge-effect correction from picked
+ same-compound spots
+
+Edge effect makes lanes near the plate edges run faster or slower than the
+middle, which shifts Rf. The relative migration speed g(x) is fitted
+separately for each half of the plate (either sign, either edge more).
+
+- Pick spots that must have the same Rf in the Full plate view (compound
+  groups, click again to remove). The correction is calculated from them
+  and applied in Auto mode only when the picks agree (scatter <= 6 %),
+  cover at least half the plate width and the curve exceeds the scatter.
+- Without picks, an automatic estimate from repeated compounds is shown as
+  a suggestion only; Force on applies it.
+- Per half: Auto / Force on / Off, strength 0-100 %, diagnostic plot.
+- Rf CSV gains edge_gain and rf_raw_1..5; raw Rf is kept next to corrected.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/components/views/TlcEdgePanel.tsx     | 150 +++++++++++
+ src/components/views/TlcFullPlateView.tsx |  66 ++++-
+ src/components/views/TlcView.tsx          | 162 ++++++++++--
+ src/engine/index.ts                       |   1 +
+ src/engine/tlcEdge.ts                     | 305 ++++++++++++++++++++++
+ src/engine/tlcLanes.ts                    |   7 +
+ src/types/index.ts                        |   2 +
+ tests/tlcEdge.test.ts                     | 154 +++++++++++
+ 8 files changed, 824 insertions(+), 23 deletions(-)
+ create mode 100644 src/components/views/TlcEdgePanel.tsx
+ create mode 100644 src/engine/tlcEdge.ts
+ create mode 100644 tests/tlcEdge.test.ts
+
+diff --git a/src/components/views/TlcEdgePanel.tsx b/src/components/views/TlcEdgePanel.tsx
+new file mode 100644
+index 0000000..0b278dc
+--- /dev/null
++++ b/src/components/views/TlcEdgePanel.tsx
+@@ -0,0 +1,150 @@
++import React from 'react';
++import { EdgeFit, EdgePick, EdgeSetting, edgeActive, edgeGain, edgeSuggestion } from '../../engine/tlcEdge';
++
++interface Props {
++  fits: (EdgeFit | null)[]; // one per half (lanes 0-26, lanes 27-53)
++  settings: EdgeSetting[];
++  onSetting: (half: number, s: EdgeSetting) => void;
++  picks: EdgePick[];
++  pickMode: boolean;
++  onPickMode: (on: boolean) => void;
++  pickGroup: number;
++  onPickGroup: (g: number) => void;
++  onClearPicks: () => void;
++}
++
++const PICK_COLORS = ['#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
++
++const HALF_NAME = ['Lanes 0–26', 'Lanes 27–53'];
++
++function Diagnostic({ fit, strength }: { fit: EdgeFit; strength: number }) {
++  const w = 190, h = 56, pad = 4;
++  const ys = fit.used.map((p) => p.y);
++  const lim = Math.max(0.03, ...ys.map(Math.abs), fit.maxShift);
++  const X = (u: number) => pad + ((u + 1) / 2) * (w - 2 * pad);
++  const Y = (v: number) => h / 2 - (v / lim) * (h / 2 - pad);
++  const path = Array.from({ length: 41 }, (_, i) => {
++    const u = -1 + i / 20;
++    return `${i ? 'L' : 'M'}${X(u).toFixed(1)},${Y(strength * (fit.c1 * u + fit.c2 * u * u)).toFixed(1)}`;
++  }).join('');
++  return (
++    <svg width={w} height={h} role="img" aria-label="Spot position against lane position, with the fitted curve" style={{ background: 'var(--soft)', borderRadius: 4, flex: '0 0 auto' }}>
++      <line x1={pad} x2={w - pad} y1={h / 2} y2={h / 2} stroke="var(--line)" />
++      {fit.used.map((p, i) => (
++        <circle key={i} cx={X(p.u)} cy={Y(p.y)} r={1.6} fill="var(--mut)" opacity={0.6} />
++      ))}
++      <path d={path} fill="none" stroke="#ec4899" strokeWidth={1.6} />
++    </svg>
++  );
++}
++
++export const TlcEdgePanel: React.FC<Props> = ({
++  fits,
++  settings,
++  onSetting,
++  picks,
++  pickMode,
++  onPickMode,
++  pickGroup,
++  onPickGroup,
++  onClearPicks,
++}) => {
++  const groups = Math.max(pickGroup + 1, ...picks.map((q) => q.group + 1), 1);
++  return (
++    <details style={{ fontSize: 12, border: '1px solid var(--line)', borderRadius: 6, padding: '4px 8px', background: 'var(--panel)' }}>
++      <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
++        Edge-effect correction
++        {fits.some((f, h) => edgeActive(f, settings[h])) ? ' — on' : ' — off'}
++      </summary>
++      <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
++        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
++          <button type="button" className={`btn sm${pickMode ? ' pri' : ''}`} onClick={() => onPickMode(!pickMode)}>
++            {pickMode ? 'Picking spots… (click to stop)' : 'Pick same-compound spots'}
++          </button>
++          <span style={{ color: 'var(--mut)' }}>Compound:</span>
++          {Array.from({ length: groups }, (_, g) => (
++            <button
++              key={g}
++              type="button"
++              className="btn sm"
++              onClick={() => onPickGroup(g)}
++              aria-pressed={pickGroup === g}
++              style={{ borderColor: PICK_COLORS[g % PICK_COLORS.length], fontWeight: pickGroup === g ? 700 : 400, outline: pickGroup === g ? `2px solid ${PICK_COLORS[g % PICK_COLORS.length]}` : undefined }}
++              title={`Compound ${g + 1}`}
++            >
++              {g + 1} ({picks.filter((q) => q.group === g).length})
++            </button>
++          ))}
++          <button type="button" className="btn sm" onClick={() => onPickGroup(groups)} title="Start another compound">+ new</button>
++          {picks.length > 0 ? (
++            <button type="button" className="btn sm" onClick={onClearPicks}>Clear picks</button>
++          ) : null}
++        </div>
++        <div style={{ color: 'var(--mut)' }}>
++          {pickMode
++            ? 'In the Full plate view, click a detected spot to add it to the chosen compound; click it again to remove it. Pick the same compound in lanes near both edges and in the middle.'
++            : 'Pick spots that must have the same Rf (for example a starting material) and the correction is calculated from them.'}
++        </div>
++        {[0, 1].map((h) => {
++          const fit = fits[h];
++          const s = settings[h];
++          const active = edgeActive(fit, s);
++          return (
++            <div key={h} style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
++              <div style={{ minWidth: 220, flex: '1 1 220px' }}>
++                <b>{HALF_NAME[h]}</b>{' '}
++                {!fit ? (
++                  <span style={{ color: 'var(--mut)' }}>no data</span>
++                ) : active ? (
++                  <span>
++                    corrected: edge lanes {((edgeGain(fit, fit.xmin, s.strength) - 1) * 100).toFixed(1)} % /{' '}
++                    {((edgeGain(fit, fit.xmax, s.strength) - 1) * 100).toFixed(1)} % ({fit.nClusters} compound group
++                    {fit.nClusters === 1 ? '' : 's'}, {fit.nSpots} spots, scatter {(fit.scatter * 100).toFixed(1)} %)
++                  </span>
++                ) : edgeSuggestion(fit, s) ? (
++                  <span style={{ color: 'var(--mut)' }}>
++                    suggestion only, not applied: edge lanes {((edgeGain(fit, fit.xmin) - 1) * 100).toFixed(1)} % /{' '}
++                    {((edgeGain(fit, fit.xmax) - 1) * 100).toFixed(1)} % from {fit.nClusters} compound groups. Pick same-compound
++                    spots to apply a measured correction, or use Force on.
++                  </span>
++                ) : (
++                  <span style={{ color: 'var(--mut)' }}>{s.mode === 'off' ? 'off' : `not applied. ${fit.reason}`}</span>
++                )}
++                {fit && fit.nSpots > 0 && !active && !edgeSuggestion(fit, s) && s.mode !== 'off' ? (
++                  <span style={{ color: 'var(--mut)' }}> Measured curve {(fit.maxShift * 100).toFixed(1)} % at most.</span>
++                ) : null}
++              </div>
++              <select
++                className="f"
++                value={s.mode}
++                onChange={(e) => onSetting(h, { ...s, mode: e.target.value as EdgeSetting['mode'] })}
++                aria-label={`${HALF_NAME[h]} edge correction mode`}
++              >
++                <option value="auto">Auto</option>
++                <option value="on">Force on</option>
++                <option value="off">Off</option>
++              </select>
++              <label style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
++                <span>Strength</span>
++                <input
++                  type="range"
++                  min={0}
++                  max={1}
++                  step={0.05}
++                  value={s.strength}
++                  onChange={(e) => onSetting(h, { ...s, strength: parseFloat(e.target.value) })}
++                  style={{ width: 70 }}
++                />
++                <span className="mono" style={{ minWidth: 30 }}>{Math.round(s.strength * 100)}%</span>
++              </label>
++              {fit && fit.used.length > 0 ? <Diagnostic fit={fit} strength={active ? s.strength : 1} /> : null}
++            </div>
++          );
++        })}
++        <div style={{ color: 'var(--mut)' }}>
++          Each half of the plate is fitted on its own from compounds that appear in many lanes. Raw Rf is kept next to the corrected Rf in the CSV.
++        </div>
++      </div>
++    </details>
++  );
++};
+diff --git a/src/components/views/TlcFullPlateView.tsx b/src/components/views/TlcFullPlateView.tsx
+index 382d8bb..67919fd 100644
+--- a/src/components/views/TlcFullPlateView.tsx
++++ b/src/components/views/TlcFullPlateView.tsx
+@@ -32,8 +32,14 @@ interface TlcFullPlateViewProps {
+   onResetAllLanes?: () => void;
+   onExportLaneCsv?: () => void;
+   spotProminence?: number;
++  // Edge-effect spot picking: clicking a detected spot adds it to the current compound group
++  pickMode?: boolean;
++  picks?: { lane: number; pos: number; group: number }[];
++  onPickSpot?: (laneId: number, pos: number) => void;
+ }
+ 
++const PICK_COLORS = ['#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
++
+ // Explicit high-contrast button styling for the HUD dark theme
+ const hudBtn: React.CSSProperties = {
+   background: '#1e293b',
+@@ -78,6 +84,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+   onResetAllLanes,
+   onExportLaneCsv,
+   spotProminence = 0.28,
++  pickMode = false,
++  picks = [],
++  onPickSpot,
+ }) => {
+   const canvasRef = useRef<HTMLCanvasElement>(null);
+   const containerRef = useRef<HTMLDivElement>(null);
+@@ -600,6 +609,22 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+                 ctx.fillStyle = isSelected ? '#38bdf8' : isHovered ? '#ec4899' : '#38bdf8';
+                 ctx.fill();
+ 
++                // Spots picked as 'same compound' for the edge-effect correction
++                const pk = picks.find((q) => q.lane === l.id && Math.abs(q.pos - sp.pos) < 6);
++                if (pk) {
++                  const col = PICK_COLORS[pk.group % PICK_COLORS.length];
++                  ctx.beginPath();
++                  ctx.arc(0, spotY, 9 / scale, 0, Math.PI * 2);
++                  ctx.strokeStyle = col;
++                  ctx.lineWidth = 2.5 / scale;
++                  ctx.stroke();
++                  ctx.fillStyle = col;
++                  ctx.font = `bold ${Math.max(10, Math.round(13 / scale))}px sans-serif`;
++                  ctx.textAlign = 'center';
++                  ctx.textBaseline = 'middle';
++                  ctx.fillText(String(pk.group + 1), 0, spotY - 15 / scale);
++                }
++
+                 // High-contrast Rf badge on selected or hovered lane
+                 if (isSelected || isHovered) {
+                   const rfStr = `Rf ${sp.rf.toFixed(2)}`;
+@@ -663,6 +688,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+     fluoGain,
+     splitPos,
+     activeChannel,
++    picks,
+   ]);
+ 
+   // Find lane collision at mouse coordinates
+@@ -754,6 +780,44 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+     }
+ 
+     const hit = findLaneAtPoint(e.clientX, e.clientY);
++
++    // Pick mode: a click picks the detected spot nearest to the click, and never moves a lane
++    if (pickMode) {
++      const l = hit !== null ? lanes.find((q) => q.id === hit) : undefined;
++      const canvas = canvasRef.current;
++      if (l && canvas && imgEntry?.bmp && getProfile && onPickSpot) {
++        const rect = canvas.getBoundingClientRect();
++        const scale = rect.width / imgEntry.bmp.width;
++        const imgScale = imgEntry.bmp.width / frameW;
++        const th = (l.angle * Math.PI) / 180;
++        const dx = e.clientX - rect.left - l.x0 * imgScale * scale;
++        const dy = e.clientY - rect.top - l.y0 * imgScale * scale;
++        const localY = dx * Math.sin(-th) + dy * Math.cos(-th);
++        const dist = -localY / (imgScale * scale); // px along the lane, from its start
++        const ch: TlcChannelKey = isComposite
++          ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
++          : (activeChannel as TlcChannelKey);
++        const prof = currentSet.imgs[ch] ? getProfile(currentSet, ch, l) : [];
++        if (prof && prof.length) {
++          const spots = findSpots(prof, {
++            sign: TLC_SIGNAL[ch]?.sign ?? -1,
++            origin: tlcOrigin(currentSet, l, getProfile as any),
++            front: tlcFront(currentSet, l, getProfile),
++            radius: l.spotRadius || 24,
++            minProminence: spotProminence,
++          });
++          let best: (typeof spots)[number] | null = null;
++          for (const sp of spots) {
++            if (!best || Math.abs(sp.pos - dist) < Math.abs(best.pos - dist)) best = sp;
++          }
++          if (best && Math.abs(best.pos - dist) <= Math.max(20, (l.spotRadius || 24) * 0.9)) {
++            onPickSpot(l.id, best.pos);
++          }
++        }
++      }
++      return;
++    }
++
+     if (hit !== null) {
+       setSelectedLaneId(hit);
+       const target = lanes.find((l) => l.id === hit);
+@@ -2140,7 +2204,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+               borderRadius: '8px',
+               border: selectedLaneId !== null ? '2px solid #facc15' : '1px solid var(--line)',
+               boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+-              cursor: isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
++              cursor: pickMode ? 'copy' : isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
+               filter: cssFilter,
+             }}
+           />
+diff --git a/src/components/views/TlcView.tsx b/src/components/views/TlcView.tsx
+index a289037..875c448 100644
+--- a/src/components/views/TlcView.tsx
++++ b/src/components/views/TlcView.tsx
+@@ -38,6 +38,19 @@ import {
+   TlcDensitogramData,
+ } from '../../types';
+ import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
++import {
++  fitEdgeCurve,
++  fitEdgePicks,
++  edgeGain,
++  edgeActive,
++  correctSpots,
++  DEFAULT_EDGE_SETTING,
++  EdgeFit,
++  EdgeSetting,
++  EdgePoint,
++  EdgePick,
++} from '../../engine/tlcEdge';
++import { TlcEdgePanel } from './TlcEdgePanel';
+ import { TlcFullPlateView } from './TlcFullPlateView';
+ import { parseWellQuery } from '../ui/CommandPalette';
+ 
+@@ -683,35 +696,120 @@ export const TlcView: React.FC = () => {
+     toast(`Removed ${TLC_LABEL[key]} image.`);
+   };
+ 
+-  // Get Spots helper for a set, channel, and lane with center-weighted core sampling
+-  const getSpotsForLane = useCallback(
+-    (set: TlcSet, key: TlcChannelKey, lane: TlcLane): TlcSpot[] | null => {
+-      if (!set.imgs[key]) return null;
++  // ---- Edge-effect correction (fitted per half of every set) ----
++  const [edgeSettings, setEdgeSettings] = useState<Record<string, EdgeSetting>>({});
++  // Spots picked as 'same compound' per set; group = which compound
++  const [edgePicks, setEdgePicks] = useState<Record<string, EdgePick[]>>({});
++  const [pickMode, setPickMode] = useState(false);
++  const [pickGroup, setPickGroup] = useState(0);
++  const edgeCache = useRef(new WeakMap<TlcSet, { key: string; fits: (EdgeFit | null)[] }>());
++
++  const detectOptsFor = useCallback(
++    (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => {
+       const prof = extractLaneProfile(set, key, lane, coreFraction);
+       if (!prof.length) return null;
+-      const origin = tlcOrigin(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
+-      const front = tlcFront(set, lane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction));
+-      const span = Math.max(1, front - origin);
+-
+-      // Distance scale proportional to spot prominence mode:
+-      // Broad mode allows merging sub-peaks across up to 14% of the migration span
+-      const minDistance = Math.max(
+-        10,
+-        Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
+-      );
+-
+-      return findSpots(prof, {
+-        sign: TLC_SIGNAL[key].sign,
++      const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
++      const origin = tlcOrigin(set, lane, get);
++      const front = tlcFront(set, lane, get);
++      return {
++        prof,
+         origin,
+-        front,
+-        radius: lane.spotRadius || 24,
+-        minProminence: spotProminence,
+-        minDistance,
+-      });
++        opts: {
++          sign: TLC_SIGNAL[key].sign,
++          origin,
++          front,
++          radius: lane.spotRadius || 24,
++          minProminence: spotProminence,
++        },
++      };
+     },
+     [coreFraction, spotProminence]
+   );
+ 
++  const getEdgeFits = useCallback(
++    (set: TlcSet): (EdgeFit | null)[] => {
++      const picks = edgePicks[set.uid] || [];
++      const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs).join()}`;
++      const hit = edgeCache.current.get(set);
++      if (hit && hit.key === key) return hit.fits;
++      const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
++      let fits: (EdgeFit | null)[] = [null, null];
++      if (ch && set.cfg) {
++        const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
++        const auto: EdgePoint[][] = [[], []];
++        for (const lane of set.cfg.lanes) {
++          if (lane.id < 0 || lane.id > 53) continue;
++          const d = detectOptsFor(set, ch, lane);
++          if (!d) continue;
++          for (const sp of findSpots(d.prof, d.opts)) {
++            if (sp.rf > 0.1 && sp.rf < 0.95 && sp.strength > 0.15) {
++              auto[tlcHalf(lane)].push({ lane: lane.id, x: lane.x0, h: sp.pos - d.origin });
++            }
++          }
++        }
++        fits = [0, 1].map((h) => {
++          const mine = picks.filter((q) => (q.lane < 27 ? 0 : 1) === h);
++          if (mine.length) {
++            const groups = new Map<number, EdgePoint[]>();
++            for (const q of mine) {
++              const lane = set.cfg!.lanes.find((l) => l.id === q.lane);
++              if (!lane) continue;
++              const pt = { lane: q.lane, x: lane.x0, h: q.pos - tlcOrigin(set, lane, get) };
++              groups.set(q.group, [...(groups.get(q.group) || []), pt]);
++            }
++            const laneXs = set.cfg!.lanes.filter((l) => tlcHalf(l) === h).map((l) => l.x0);
++            return fitEdgePicks([...groups.values()], laneXs);
++          }
++          return auto[h].length ? fitEdgeCurve(auto[h]) : null;
++        });
++      }
++      edgeCache.current.set(set, { key, fits });
++      return fits;
++    },
++    [spotProminence, coreFraction, edgePicks, detectOptsFor]
++  );
++
++  const handlePickSpot = useCallback(
++    (laneId: number, pos: number) => {
++      const uid = currentSet.uid;
++      setEdgePicks((prev) => {
++        const cur = prev[uid] || [];
++        const same = cur.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
++        // clicking a picked spot again removes it
++        if (same >= 0) return { ...prev, [uid]: cur.filter((_, i) => i !== same) };
++        // one pick per lane and compound
++        const rest = cur.filter((q) => !(q.lane === laneId && q.group === pickGroup));
++        return { ...prev, [uid]: [...rest, { lane: laneId, pos, group: pickGroup }] };
++      });
++    },
++    [currentSet.uid, pickGroup]
++  );
++
++  const edgeSettingFor = useCallback(
++    (set: TlcSet, half: number): EdgeSetting => edgeSettings[`${set.uid}:${half}`] || DEFAULT_EDGE_SETTING,
++    [edgeSettings]
++  );
++
++  // Get Spots helper for a set, channel, and lane with center-weighted core sampling.
++  // When the edge-effect correction is active for the lane's half, Rf is corrected and the
++  // measured value is kept in rfRaw.
++  const getSpotsForLane = useCallback(
++    (set: TlcSet, key: TlcChannelKey, lane: TlcLane): TlcSpot[] | null => {
++      if (!set.imgs[key]) return null;
++      const d = detectOptsFor(set, key, lane);
++      if (!d) return null;
++      const spots = findSpots(d.prof, d.opts);
++      if (!spots.length) return spots;
++      const h = tlcHalf(lane);
++      const setting = edgeSettingFor(set, h);
++      if (setting.mode === 'off') return spots;
++      const fit = getEdgeFits(set)[h];
++      if (!edgeActive(fit, setting)) return spots;
++      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength));
++    },
++    [detectOptsFor, edgeSettingFor, getEdgeFits]
++  );
++
+   // Helper to extract panels for lane t
+   const getPanelsForLane = useCallback(
+     (t: number): LanePanel[] => {
+@@ -1562,6 +1660,23 @@ export const TlcView: React.FC = () => {
+             </div>
+           )}
+ 
++          {markSpots && currentSet.cfg && TLC_KEYS.some((k) => currentSet.imgs[k]) && (
++            <TlcEdgePanel
++              fits={getEdgeFits(currentSet)}
++              settings={[edgeSettingFor(currentSet, 0), edgeSettingFor(currentSet, 1)]}
++              onSetting={(h, st) => setEdgeSettings((prev) => ({ ...prev, [`${currentSet.uid}:${h}`]: st }))}
++              picks={edgePicks[currentSet.uid] || []}
++              pickMode={pickMode}
++              onPickMode={(on) => {
++                setPickMode(on);
++                if (on) setViewMode('full-plate');
++              }}
++              pickGroup={pickGroup}
++              onPickGroup={setPickGroup}
++              onClearPicks={() => setEdgePicks((prev) => ({ ...prev, [currentSet.uid]: [] }))}
++            />
++          )}
++
+           {platesCount > 1 && (
+             <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+               <span>Plate:</span>
+@@ -1962,6 +2077,9 @@ export const TlcView: React.FC = () => {
+             onResetAllLanes={handleResetAllLanes}
+             onExportLaneCsv={handleExportLaneCsv}
+             spotProminence={spotProminence}
++            pickMode={pickMode}
++            picks={edgePicks[currentSet.uid] || []}
++            onPickSpot={handlePickSpot}
+           />
+         </div>
+       ) : (
+diff --git a/src/engine/index.ts b/src/engine/index.ts
+index 78bd173..f19f6fe 100644
+--- a/src/engine/index.ts
++++ b/src/engine/index.ts
+@@ -20,6 +20,7 @@ export * from './importers/robotParser';
+ export * from './presets';
+ export * from './dilutionTier';
+ export * from './tlcLanes';
++export * from './tlcEdge';
+ export * from './barcode';
+ export * from './demoTlc';
+ 
+diff --git a/src/engine/tlcEdge.ts b/src/engine/tlcEdge.ts
+new file mode 100644
+index 0000000..464fb13
+--- /dev/null
++++ b/src/engine/tlcEdge.ts
+@@ -0,0 +1,305 @@
++// Robowski Studio - TLC edge-effect (lateral migration speed) correction.
++//
++// Model: a spot that has run a true distance h in a lane at lateral position x ends up at
++// h * g(x). g(x) is the relative migration speed (1 at the middle of the plate). Taking logs,
++//   ln(position) = ln(h) + ln g(x)
++// so the same compound (same Rf) found in many lanes lines up on a curve across the plate.
++//
++// g is fitted separately for every half of a plate:
++//   1. spots from all lanes of the half are grouped by Rf (same compound -> same group),
++//   2. within each group the group's own mean is removed (this removes the compound's true Rf),
++//   3. what is left, ln g(x), is a quadratic in the lateral position, fitted by least squares
++//      over all groups at once, with g = 1 at the middle of the half.
++// The correction is only switched on when the fit is stable (it must survive dropping any
++// single group) and large enough to matter.
++
++export interface EdgePoint {
++  lane: number;
++  x: number; // lateral position of the lane (any consistent unit, e.g. frame px)
++  h: number; // distance of the spot from the origin line (px)
++}
++
++/** A spot the user picked as 'same compound': lane, position along the lane (px), compound group. */
++export interface EdgePick {
++  lane: number;
++  pos: number;
++  group: number;
++}
++
++export interface EdgeFit {
++  ok: boolean;
++  reason: string;
++  xm: number; // middle of the half, g = 1 here
++  hr: number; // half range of the lane positions
++  c1: number; // ln g(u) = c1*u + c2*u^2 with u = (x - xm) / hr
++  c2: number;
++  nClusters: number;
++  nSpots: number;
++  maxShift: number; // largest |g - 1| inside the half
++  scatter: number; // residual SD of ln position (fraction)
++  stable: boolean;
++  fromPicks: boolean; // fitted on spots the user picked (the only case Auto applies)
++  xmin: number;
++  xmax: number;
++  // for the diagnostic plot: lateral position (u) and ln-position residual of every used spot
++  used: { u: number; y: number }[];
++}
++
++export const EDGE_CLUSTER_TOL = 0.04; // spots closer than 4 % in position are the same group
++export const EDGE_MIN_GROUP_SPOTS = 5;
++export const EDGE_MIN_GROUP_LANES = 5;
++export const EDGE_MIN_CLUSTERS = 3;
++export const EDGE_MIN_SPOTS = 20;
++export const EDGE_MIN_SHIFT = 0.01;
++export const EDGE_MIN_SNR = 1.5; // curve at the edges must exceed 1.5x the scatter between lanes
++
++interface Row {
++  u: number;
++  y: number;
++  g: number; // group index
++}
++
++/** Least squares for y = c1*u + c2*u^2 after removing each group's own mean. */
++function withinFit(rows: Row[], skipGroup = -1): { c1: number; c2: number; resid: number; n: number } {
++  const byG = new Map<number, Row[]>();
++  for (const r of rows) {
++    if (r.g === skipGroup) continue;
++    if (!byG.has(r.g)) byG.set(r.g, []);
++    byG.get(r.g)!.push(r);
++  }
++  let s11 = 0, s12 = 0, s22 = 0, t1 = 0, t2 = 0, n = 0;
++  const dm: { a: number; b: number; y: number }[] = [];
++  for (const rs of byG.values()) {
++    const mu = rs.reduce((p, r) => p + r.u, 0) / rs.length;
++    const mu2 = rs.reduce((p, r) => p + r.u * r.u, 0) / rs.length;
++    const my = rs.reduce((p, r) => p + r.y, 0) / rs.length;
++    for (const r of rs) {
++      const a = r.u - mu;
++      const b = r.u * r.u - mu2;
++      const y = r.y - my;
++      s11 += a * a; s12 += a * b; s22 += b * b; t1 += a * y; t2 += b * y; n++;
++      dm.push({ a, b, y });
++    }
++  }
++  const det = s11 * s22 - s12 * s12;
++  if (n < 4 || Math.abs(det) < 1e-12) return { c1: 0, c2: 0, resid: NaN, n };
++  const c1 = (t1 * s22 - t2 * s12) / det;
++  const c2 = (t2 * s11 - t1 * s12) / det;
++  let rss = 0;
++  for (const d of dm) rss += (d.y - c1 * d.a - c2 * d.b) ** 2;
++  return { c1, c2, resid: Math.sqrt(rss / Math.max(1, n - byG.size - 2)), n };
++}
++
++const shiftAt = (c1: number, c2: number, u: number) => Math.expm1(c1 * u + c2 * u * u);
++function maxShiftOf(c1: number, c2: number): number {
++  let m = 0;
++  for (let t = 0; t <= 20; t++) m = Math.max(m, Math.abs(shiftAt(c1, c2, -1 + t / 10)));
++  return m;
++}
++
++interface Ctx {
++  xm: number;
++  hr: number;
++  xmin: number;
++  xmax: number;
++  fromPicks: boolean;
++  snr: number;
++  minShift: number;
++}
++
++function emptyFit(c: Ctx, reason: string, extra: Partial<EdgeFit> = {}): EdgeFit {
++  return {
++    ok: false,
++    reason,
++    xm: c.xm,
++    hr: c.hr,
++    c1: 0,
++    c2: 0,
++    nClusters: 0,
++    nSpots: 0,
++    maxShift: 0,
++    scatter: 0,
++    stable: false,
++    fromPicks: c.fromPicks,
++    xmin: c.xmin,
++    xmax: c.xmax,
++    used: [],
++    ...extra,
++  };
++}
++
++/** Fit ln g(u) = c1*u + c2*u^2 from rows (one group = one compound) and judge whether to trust it. */
++function solve(rows: Row[], gi: number, c: Ctx): EdgeFit {
++  const f = withinFit(rows);
++  if (!isFinite(f.resid)) {
++    return emptyFit(c, 'The spots are too close together across the plate to fit a curve.', { nClusters: gi, nSpots: rows.length });
++  }
++  const full = maxShiftOf(f.c1, f.c2);
++  let stable = true;
++  for (let g = 0; g < gi && gi >= 2; g++) {
++    const fg = withinFit(rows, g);
++    if (!isFinite(fg.resid)) { stable = false; break; }
++    const sg = maxShiftOf(fg.c1, fg.c2);
++    const sameSign = Math.sign(fg.c2) === Math.sign(f.c2) || Math.abs(fg.c2) < 1e-3;
++    if (!sameSign || sg < 0.5 * full) { stable = false; break; }
++  }
++  const mean = new Map<number, { s: number; n: number }>();
++  for (const r of rows) {
++    const m = mean.get(r.g) || { s: 0, n: 0 };
++    m.s += r.y; m.n++;
++    mean.set(r.g, m);
++  }
++  const used = rows.map((r) => ({ u: r.u, y: r.y - mean.get(r.g)!.s / mean.get(r.g)!.n }));
++  const base: EdgeFit = {
++    ok: true,
++    reason: '',
++    xm: c.xm,
++    hr: c.hr,
++    c1: f.c1,
++    c2: f.c2,
++    nClusters: gi,
++    nSpots: rows.length,
++    maxShift: full,
++    scatter: f.resid,
++    stable,
++    fromPicks: c.fromPicks,
++    xmin: c.xmin,
++    xmax: c.xmax,
++    used,
++  };
++  if (!stable) return { ...base, ok: false, reason: 'The curve changes sign or size when one compound is left out, so it is not reliable.' };
++  if (c.fromPicks && f.resid > PICK_MAX_SCATTER) {
++    return { ...base, ok: false, reason: `The picked spots do not agree with each other (scatter ${(f.resid * 100).toFixed(1)} %, limit ${(PICK_MAX_SCATTER * 100).toFixed(0)} %). Are they really the same compound?` };
++  }
++  if (full < c.snr * f.resid) {
++    return { ...base, ok: false, reason: `The curve (${(full * 100).toFixed(1)} % at the edges) is not clearly larger than the scatter between ${c.fromPicks ? 'the picked spots' : 'lanes'} (${(f.resid * 100).toFixed(1)} %).${c.fromPicks ? '' : ' Picking spots of the same compound would settle it.'}` };
++  }
++  if (full < c.minShift) {
++    return { ...base, ok: false, reason: `The curve is negligible (${(full * 100).toFixed(1)} % at the edges).` };
++  }
++  return base;
++}
++
++function context(xsAll: number[], fromPicks: boolean, snr: number, minShift: number): Ctx {
++  const xmin = xsAll.length ? Math.min(...xsAll) : 0;
++  const xmax = xsAll.length ? Math.max(...xsAll) : 0;
++  return { xm: (xmin + xmax) / 2, hr: Math.max(1e-9, (xmax - xmin) / 2), xmin, xmax, fromPicks, snr, minShift };
++}
++
++/**
++ * Automatic estimate: spots from every lane are grouped by position, hoping that the same compound
++ * lines up across lanes. This is only a suggestion; Auto does not apply it (see edgeActive).
++ */
++export function fitEdgeCurve(
++  points: EdgePoint[],
++  opt: { tol?: number; minClusters?: number; minSpots?: number; minShift?: number; snr?: number } = {}
++): EdgeFit {
++  const tol = opt.tol ?? EDGE_CLUSTER_TOL;
++  const minClusters = opt.minClusters ?? EDGE_MIN_CLUSTERS;
++  const minSpots = opt.minSpots ?? EDGE_MIN_SPOTS;
++  const pts = points.filter((p) => p.h > 0 && isFinite(p.x));
++  const c = context(pts.map((p) => p.x), false, opt.snr ?? EDGE_MIN_SNR, opt.minShift ?? EDGE_MIN_SHIFT);
++
++  const sorted = pts.map((p) => ({ ...p, y: Math.log(p.h) })).sort((a, b) => a.y - b.y);
++  const groups: (typeof sorted)[] = [];
++  for (const p of sorted) {
++    const g = groups[groups.length - 1];
++    if (g && p.y - g[g.length - 1].y < tol) g.push(p);
++    else groups.push([p]);
++  }
++  const rows: Row[] = [];
++  let gi = 0;
++  for (const g of groups) {
++    const lanes = new Set(g.map((p) => p.lane));
++    const spread = g[g.length - 1].y - g[0].y;
++    if (g.length >= EDGE_MIN_GROUP_SPOTS && lanes.size >= EDGE_MIN_GROUP_LANES && spread < 0.25) {
++      for (const p of g) rows.push({ u: (p.x - c.xm) / c.hr, y: p.y, g: gi });
++      gi++;
++    }
++  }
++  if (gi < minClusters || rows.length < minSpots) {
++    return emptyFit(
++      c,
++      `Not enough repeated compounds to measure the curve (${gi} group(s) over ${rows.length} spots; need ${minClusters} over ${minSpots}).`,
++      { nClusters: gi, nSpots: rows.length }
++    );
++  }
++  return solve(rows, gi, c);
++}
++
++export const PICK_MIN_SPOTS = 4;
++export const PICK_MIN_LANES = 3;
++export const PICK_MAX_SCATTER = 0.06; // picked spots must agree within 6 % after the curve is removed
++export const PICK_MIN_SNR = 1.0;
++export const PICK_MIN_COVERAGE = 0.5; // picked spots must span at least half of the plate width
++
++/**
++ * Fit from spots the user picked. Each inner array is one compound (spots that must have the same Rf).
++ * laneXs are the lateral positions of all lanes of the half, which fix the width of the plate.
++ */
++export function fitEdgePicks(
++  groups: EdgePoint[][],
++  laneXs: number[],
++  opt: { minShift?: number } = {}
++): EdgeFit {
++  const c = context(laneXs, true, PICK_MIN_SNR, opt.minShift ?? EDGE_MIN_SHIFT);
++  const kept = groups
++    .map((g) => g.filter((p) => p.h > 0 && isFinite(p.x)))
++    .filter((g) => g.length >= 2 && new Set(g.map((p) => p.lane)).size >= 2);
++  const rows: Row[] = [];
++  kept.forEach((g, i) => g.forEach((p) => rows.push({ u: (p.x - c.xm) / c.hr, y: Math.log(p.h), g: i })));
++  const lanes = new Set(kept.flat().map((p) => p.lane));
++  const picked = kept.flat().length;
++  if (picked < PICK_MIN_SPOTS || lanes.size < PICK_MIN_LANES) {
++    return emptyFit(
++      c,
++      `Pick at least ${PICK_MIN_SPOTS} spots in ${PICK_MIN_LANES} different lanes, two or more per compound (now ${picked} spots in ${lanes.size} lanes).`,
++      { nClusters: kept.length, nSpots: picked }
++    );
++  }
++  const xs = kept.flat().map((p) => p.x);
++  const coverage = c.xmax > c.xmin ? (Math.max(...xs) - Math.min(...xs)) / (c.xmax - c.xmin) : 0;
++  const fit = solve(rows, kept.length, c);
++  if (coverage < PICK_MIN_COVERAGE) {
++    return { ...fit, ok: false, reason: `The picked spots cover only ${Math.round(coverage * 100)} % of the plate width. Pick spots in lanes near both edges as well as the middle.` };
++  }
++  return fit;
++}
++
++/** Relative migration speed g at lateral position x. strength 0..1 scales ln g. */
++export function edgeGain(fit: EdgeFit | null | undefined, x: number, strength = 1): number {
++  if (!fit) return 1;
++  const u = (x - fit.xm) / fit.hr;
++  return Math.exp(strength * (fit.c1 * u + fit.c2 * u * u));
++}
++
++export type EdgeMode = 'auto' | 'on' | 'off';
++export interface EdgeSetting {
++  mode: EdgeMode;
++  strength: number; // 0..1
++}
++export const DEFAULT_EDGE_SETTING: EdgeSetting = { mode: 'auto', strength: 1 };
++
++export function edgeActive(fit: EdgeFit | null | undefined, s: EdgeSetting): boolean {
++  if (!fit || s.mode === 'off' || s.strength <= 0) return false;
++  if (s.mode === 'on') return fit.nSpots > 0;
++  // Auto applies only when the curve was measured on spots the user picked. A fit from mixed compounds
++  // is shown as a suggestion, because which compounds sit in which lane follows the reaction design.
++  return fit.ok && fit.fromPicks;
++}
++
++/** A usable fit that Auto does not apply because it did not come from reference lanes. */
++export function edgeSuggestion(fit: EdgeFit | null | undefined, s: EdgeSetting): boolean {
++  return !!fit && s.mode === 'auto' && fit.ok && !fit.fromPicks;
++}
++
++/** Corrected copy of the spots of a lane; keeps the measured value in rfRaw. */
++export function correctSpots<T extends { rf: number }>(spots: T[], gain: number): (T & { rfRaw?: number; edgeGain?: number })[] {
++  if (!(gain > 0) || Math.abs(gain - 1) < 1e-6) return spots;
++  return spots.map((sp) => ({
++    ...sp,
++    rfRaw: sp.rf,
++    edgeGain: +gain.toFixed(4),
++    rf: Math.max(0, Math.min(1.2, +(sp.rf / gain).toFixed(3))),
++  }));
++}
+diff --git a/src/engine/tlcLanes.ts b/src/engine/tlcLanes.ts
+index 27574e7..de4f49a 100644
+--- a/src/engine/tlcLanes.ts
++++ b/src/engine/tlcLanes.ts
+@@ -709,6 +709,8 @@ export function tlcRfCsv(
+   for (let n = 1; n <= 5; n++) {
+     head.push(`rf_${n}`, `strength_${n}`);
+   }
++  head.push('edge_gain');
++  for (let n = 1; n <= 5; n++) head.push(`rf_raw_${n}`);
+   const rows = [head];
+ 
+   for (const set of sets) {
+@@ -745,6 +747,11 @@ export function tlcRfCsv(
+       for (let n = 0; n < 5; n++) {
+         r.push(sp[n] ? +sp[n].rf.toFixed(3) : '', sp[n] ? +sp[n].strength.toFixed(2) : '');
+       }
++      // edge-effect correction: gain used for this lane, and the measured Rf before correction
++      r.push(sp.length && sp[0].edgeGain ? sp[0].edgeGain : '');
++      for (let n = 0; n < 5; n++) {
++        r.push(sp[n] ? +(sp[n].rfRaw ?? sp[n].rf).toFixed(3) : '');
++      }
+       rows.push(r.map((v) => (v === null || v === undefined ? '' : String(v))));
+     }
+   }
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 0eb7581..25e0a36 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -338,6 +338,8 @@ export interface TlcSpot {
+   strength: number; // 0 to 1
+   label?: string;
+   areaPct?: number;
++  rfRaw?: number; // measured Rf before the edge-effect correction
++  edgeGain?: number; // relative migration speed g used for the correction
+ }
+ 
+ export interface TlcProfileOptions {
+diff --git a/tests/tlcEdge.test.ts b/tests/tlcEdge.test.ts
+new file mode 100644
+index 0000000..2295634
+--- /dev/null
++++ b/tests/tlcEdge.test.ts
+@@ -0,0 +1,154 @@
++import { describe, it, expect } from 'vitest';
++import { tlcRfCsv } from '../src/engine/tlcLanes';
++import { fitEdgeCurve, fitEdgePicks, edgeGain, edgeActive, edgeSuggestion, correctSpots, DEFAULT_EDGE_SETTING } from '../src/engine/tlcEdge';
++import type { EdgePoint } from '../src/engine/tlcEdge';
++
++// A half plate with 27 lanes; several compounds (true heights) turn up in many lanes.
++function half(gFn: (x: number) => number, sd = 0.01, seed = 1): EdgePoint[] {
++  let s = seed;
++  const rnd = () => ((s = (s * 16807) % 2147483647) / 2147483647) - 0.5;
++  const heights = [180, 330, 470, 610, 760];
++  const pts: EdgePoint[] = [];
++  for (let i = 0; i < 27; i++) {
++    const x = 150 + i * 110;
++    heights.forEach((h, k) => {
++      if ((i + k) % 3 === 0 && k % 2 === 0 && i % 5 === 4) return; // some lanes miss some compounds
++      if ((i * 7 + k * 3) % 4 === 0) return;
++      pts.push({ lane: i, x, h: h * gFn(x) * (1 + sd * 2 * rnd()) });
++    });
++  }
++  return pts;
++}
++const XM = 150 + 13 * 110;
++const curve = (a: number) => (x: number) => 1 + a * ((x - XM) / 1430) ** 2;
++
++describe('edge-effect correction', () => {
++  it('recovers a plate whose edges lag and one whose edges run ahead', () => {
++    for (const a of [-0.04, 0.04]) {
++      const fit = fitEdgeCurve(half(curve(a)));
++      expect(fit.ok).toBe(true);
++      const est = edgeGain(fit, fit.xmax) - 1;
++      expect(Math.sign(est)).toBe(Math.sign(a));
++      expect(Math.abs(est - a)).toBeLessThan(0.01);
++      expect(edgeGain(fit, fit.xm)).toBeCloseTo(1, 9);
++    }
++  });
++
++  it('can follow a lopsided curve (one edge more than the other)', () => {
++    const g = (x: number) => Math.exp(0.05 * ((x - XM) / 1430) + 0.03 * ((x - XM) / 1430) ** 2);
++    const fit = fitEdgeCurve(half(g));
++    expect(edgeGain(fit, fit.xmax)).toBeGreaterThan(edgeGain(fit, fit.xmin));
++    expect(Math.abs(edgeGain(fit, fit.xmax) - g(fit.xmax))).toBeLessThan(0.01);
++  });
++
++  it('switches itself off on a flat half and keeps the raw Rf', () => {
++    const fit = fitEdgeCurve(half(() => 1, 0.012, 7));
++    expect(fit.ok).toBe(false);
++    expect(edgeActive(fit, DEFAULT_EDGE_SETTING)).toBe(false);
++    expect(edgeActive(fit, { mode: 'on', strength: 1 })).toBe(true);
++    expect(edgeActive(fit, { mode: 'off', strength: 1 })).toBe(false);
++  });
++
++  it('refuses when there are no repeated compounds', () => {
++    const pts: EdgePoint[] = [];
++    for (let i = 0; i < 27; i++) pts.push({ lane: i, x: i * 100, h: 100 + i * 23 });
++    const fit = fitEdgeCurve(pts);
++    expect(fit.ok).toBe(false);
++    expect(fit.reason).toMatch(/repeated/);
++  });
++
++  it('correction divides Rf by g; strength scales it; strength 0 and gain 1 change nothing', () => {
++    const fit = fitEdgeCurve(half(curve(0.05)));
++    const g = edgeGain(fit, fit.xmax);
++    const sp = [{ pos: 500, rf: 0.5, strength: 1 }];
++    const c = correctSpots(sp, g)[0];
++    expect(c.rfRaw).toBe(0.5);
++    expect(c.rf).toBeCloseTo(0.5 / g, 3);
++    expect(edgeGain(fit, fit.xmax, 0)).toBe(1);
++    expect(edgeGain(fit, fit.xmax, 0.5)).toBeCloseTo(Math.sqrt(g), 6);
++    expect(correctSpots(sp, 1)).toBe(sp);
++  });
++
++  it('after correction the same compound agrees across lanes much better', () => {
++    const pts = half(curve(0.05), 0.008, 3);
++    const fit = fitEdgeCurve(pts);
++    const hs = pts.filter((p) => Math.abs(p.h / edgeGain(null, p.x) - 470) < 40);
++    const raw = pts.filter((p) => p.h > 420 && p.h < 560).map((p) => p.h);
++    const cor = pts.filter((p) => p.h > 420 && p.h < 560).map((p) => p.h / edgeGain(fit, p.x));
++    const spread = (a: number[]) => Math.max(...a) - Math.min(...a);
++    expect(hs.length).toBeGreaterThan(5);
++    expect(spread(cor)).toBeLessThan(spread(raw) * 0.4);
++  });
++});
++
++describe('edge-effect gating and reference lanes', () => {
++  it('stays off when the curve is smaller than the scatter, even if a fit exists', () => {
++    const fit = fitEdgeCurve(half(curve(0.015), 0.05, 11));
++    expect(fit.ok).toBe(false);
++    expect(fit.reason).toMatch(/scatter|negligible|sign/);
++  });
++  it('fits spots the user picked, and Auto applies that fit', () => {
++    const g = curve(0.05);
++    const xs = Array.from({ length: 27 }, (_, i) => 150 + i * 110);
++    const mk = (h: number, lanes: number[]): EdgePoint[] =>
++      lanes.map((i, k) => ({ lane: i, x: xs[i], h: h * g(xs[i]) * (1 + 0.004 * ((k % 3) - 1)) }));
++    const fit = fitEdgePicks([mk(420, [0, 5, 10, 13, 16, 21, 26]), mk(250, [2, 8, 13, 19, 24])], xs);
++    expect(fit.ok).toBe(true);
++    expect(fit.fromPicks).toBe(true);
++    expect(edgeActive(fit, DEFAULT_EDGE_SETTING)).toBe(true);
++    expect(Math.abs(edgeGain(fit, fit.xmax) - g(fit.xmax))).toBeLessThan(0.01);
++    expect(Math.abs(edgeGain(fit, fit.xmin) - g(fit.xmin))).toBeLessThan(0.01);
++  });
++  it('asks for more picks, and for picks near both edges', () => {
++    const xs = Array.from({ length: 27 }, (_, i) => 150 + i * 110);
++    const mk = (h: number, lanes: number[]): EdgePoint[] => lanes.map((i) => ({ lane: i, x: xs[i], h }));
++    const few = fitEdgePicks([mk(400, [3, 20])], xs);
++    expect(few.ok).toBe(false);
++    expect(few.reason).toMatch(/Pick at least/);
++    const middle = fitEdgePicks([mk(400, [10, 11, 12, 13, 14, 15])], xs);
++    expect(middle.ok).toBe(false);
++    expect(middle.reason).toMatch(/cover only/);
++  });
++  it('a fit from mixed compounds is only a suggestion in Auto, and applies when forced on', () => {
++    const fit = fitEdgeCurve(half(curve(0.05)));
++    expect(fit.ok).toBe(true);
++    expect(edgeSuggestion(fit, DEFAULT_EDGE_SETTING)).toBe(true);
++    expect(edgeActive(fit, DEFAULT_EDGE_SETTING)).toBe(false);
++    expect(edgeActive(fit, { mode: 'on', strength: 1 })).toBe(true);
++  });
++});
++
++describe('picked spots that do not agree', () => {
++  it('is not applied when the picked spots are scattered (not one compound)', () => {
++    const xs = Array.from({ length: 27 }, (_, i) => 150 + i * 110);
++    const lanes = [0, 3, 6, 9, 12, 15, 18, 21, 24, 26];
++    const pts: EdgePoint[] = lanes.map((i, k) => ({ lane: i, x: xs[i], h: 300 + ((k * 137) % 400) }));
++    const fit = fitEdgePicks([pts], xs);
++    expect(fit.ok).toBe(false);
++    expect(fit.reason).toMatch(/do not agree|not clearly larger/);
++    expect(edgeActive(fit, DEFAULT_EDGE_SETTING)).toBe(false);
++  });
++});
++
++describe('Rf CSV with edge correction', () => {
++  it('writes the gain and the raw Rf next to the corrected Rf', () => {
++    const lane = { id: 0, x0: 100, y0: 2000, length: 1000, width: 72, angle: 0, zeroRf: 100 };
++    const set: any = { name: 'A', uid: 'u', imgs: { UV254: {} }, cfg: { lanes: [lane] }, frontPx: 900 };
++    const run: any = {
++      reagents: [{ code: 'X' }],
++      rows: [{ plate_number: 0, container_id: 0, global_index: 0, recipe: [{ code: 'X', target_concentration: 1 }], 'vol#solvent': 10 }],
++    };
++    const getSpots = () =>
++      correctSpots([{ pos: 500, rf: 0.5, strength: 1 }, { pos: 300, rf: 0.25, strength: 0.5 }], 1.05);
++    const csv = tlcRfCsv([set], run, getSpots as any, 0);
++    const [head, row] = csv.split('\n');
++    const cols = head.split(',');
++    const cells = row.split(',');
++    const at = (name: string) => cells[cols.indexOf(name)];
++    expect(cols).toContain('edge_gain');
++    expect(at('edge_gain')).toBe('1.05');
++    expect(at('rf_1')).toBe((0.5 / 1.05).toFixed(3));
++    expect(at('rf_raw_1')).toBe('0.5');
++    expect(at('rf_raw_2')).toBe('0.25');
++  });
++});
+-- 
+2.43.0

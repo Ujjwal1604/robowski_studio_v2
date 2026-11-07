@@ -20,6 +20,10 @@ import {
   createDefaultLaneCsvText,
   extractFluorescenceOverlay,
   computeFalseColorComposite,
+  exportTlcAnalysisCsv,
+  exportTlcAnalysisJson,
+  TlcSet,
+  TlcSpot,
 } from '../src/engine/tlcLanes';
 import { buildRun } from '../src/engine/dilution';
 import { exampleState, dataFor } from '../src/context/runPayload';
@@ -531,5 +535,95 @@ describe('spot sensitivity slider', () => {
   it('changes the result inside the old Standard band, not only at mode edges', () => {
     expect(count(0.2)).toBe(3);
     expect(count(0.4)).toBe(2);
+  });
+});
+
+describe('exportTlcAnalysisCsv and exportTlcAnalysisJson', () => {
+  const mockLaneConfig = createDefaultLaneConfig(600, 1000);
+  const mockSet: TlcSet = {
+    uid: 'set-test-1',
+    name: 'Plate 1 UV254',
+    imgs: {
+      UV254: 'data:image/png;base64,fakeuv254data',
+    },
+    cfg: mockLaneConfig,
+    frontPx: 900,
+    originPx: 100,
+    prof: {},
+    frontAuto: {},
+    originAuto: {},
+  };
+
+  const mockSpots: TlcSpot[] = [
+    { pos: 300, rf: 0.25, strength: 85.5, areaPct: 45.2, width: 20 },
+    { pos: 600, rf: 0.625, strength: 42.1, areaPct: 54.8, width: 18 },
+  ];
+
+  it('exports valid CSV table with dynamic spot headers and reaction details', () => {
+    const csv = exportTlcAnalysisCsv({
+      set: mockSet,
+      sets: [mockSet],
+      plateIndex: 0,
+      getSpots: () => mockSpots,
+      getProfile: () => [],
+      spotProminence: 0.28,
+      spotMode: 'standard',
+      coreFraction: 0.4,
+    });
+
+    expect(typeof csv).toBe('string');
+    const lines = csv.trim().split('\n');
+    expect(lines.length).toBeGreaterThan(1);
+
+    const header = lines[0].split(',');
+    expect(header).toContain('plate');
+    expect(header).toContain('well');
+    expect(header).toContain('tlc_lane');
+    expect(header).toContain('channel');
+    expect(header).toContain('spot_count');
+    expect(header).toContain('primary_rf');
+    expect(header).toContain('rf_1');
+    expect(header).toContain('strength_1');
+    expect(header).toContain('area_pct_1');
+    expect(header).toContain('rf_2');
+
+    // Lane 0 row
+    const row1 = lines[1].split(',');
+    expect(row1[header.indexOf('plate')]).toBe('1');
+    expect(row1[header.indexOf('tlc_lane')]).toBe('0');
+    expect(row1[header.indexOf('spot_count')]).toBe('2');
+    expect(row1[header.indexOf('primary_rf')]).toBe('0.25');
+    expect(row1[header.indexOf('rf_1')]).toBe('0.25');
+    expect(row1[header.indexOf('rf_2')]).toBe('0.625');
+  });
+
+  it('exports valid JSON payload adhering to Robowski-TLC-Analysis-Export schema', () => {
+    const jsonStr = exportTlcAnalysisJson({
+      set: mockSet,
+      sets: [mockSet],
+      plateIndex: 0,
+      getSpots: () => mockSpots,
+      getProfile: () => [],
+      spotProminence: 0.35,
+      spotMode: 'standard',
+      coreFraction: 0.45,
+      scope: 'current',
+    });
+
+    const parsed = JSON.parse(jsonStr);
+    expect(parsed.format).toBe('Robowski-TLC-Analysis-Export');
+    expect(parsed.version).toBe('1.0');
+    expect(parsed.analysisParameters.spotProminence).toBe(0.35);
+    expect(parsed.analysisParameters.coreFraction).toBe(0.45);
+    expect(parsed.plates.length).toBe(1);
+    expect(parsed.plates[0].setName).toBe('Plate 1 UV254');
+    expect(parsed.plates[0].lanes.length).toBe(54);
+
+    const firstLane = parsed.plates[0].lanes[0];
+    expect(firstLane.laneId).toBe(0);
+    expect(firstLane.well).toBe('A1');
+    expect(firstLane.channels.UV254.spots.length).toBe(2);
+    expect(firstLane.channels.UV254.spots[0].rf).toBe(0.25);
+    expect(firstLane.channels.UV254.spots[1].rf).toBe(0.625);
   });
 });

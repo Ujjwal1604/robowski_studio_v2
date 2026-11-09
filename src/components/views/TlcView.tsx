@@ -31,11 +31,13 @@ import {
   createDefaultLaneConfig,
   createDemoTlcDataSet,
   exportLaneConfigCsv,
+  getEffectiveLaneSpots,
 } from '../../engine';
 import {
   fitEdgeCurve,
   fitEdgePicks,
   edgeGain,
+  edgeOffset,
   edgeActive,
   correctSpots,
   DEFAULT_EDGE_SETTING,
@@ -235,17 +237,17 @@ function drawLanePanels(
     ctx.lineTo(x + w, y);
     ctx.stroke();
 
-    // Pink ticks at detected spots
+    // Ticks at spots with provenance coloring
     if (showSpots && p.spots && p.spots.length) {
-      ctx.strokeStyle = '#FF4D8D';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      for (const sp of p.spots.slice(0, 6)) {
+      for (const sp of p.spots) {
         const y = top + k * (l.length - sp.pos);
-        ctx.moveTo(x + w - 7, y);
+        ctx.strokeStyle = sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : '#FF4D8D';
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(x + w - 8, y);
         ctx.lineTo(x + w, y);
+        ctx.stroke();
       }
-      ctx.stroke();
     }
 
     // Set comparison badge (A, B, etc.)
@@ -453,7 +455,10 @@ export const TlcView: React.FC = () => {
         setPlate(targetWell.plateIndex);
       }
       setInspectWell(targetWell.wellIndex);
-      setTargetWell(null);
+      const timer = setTimeout(() => {
+        setTargetWell(null);
+      }, 0);
+      return () => clearTimeout(timer);
     }
   }, [targetWell, view, setTargetWell]);
 
@@ -468,6 +473,20 @@ export const TlcView: React.FC = () => {
   const fileImgRef = useRef<HTMLInputElement>(null);
   const bigCanvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Modal spot dragging & fine interaction state for zoomed-in lane
+  const [isDraggingModalSpot, setIsDraggingModalSpot] = useState(false);
+  const dragModalSpotRef = useRef<{
+    laneId: number;
+    spotIndex: number;
+    startPos: number;
+    startRf: number;
+    originDist: number;
+    spanDist: number;
+    laneLength: number;
+    initialSpots: TlcSpot[];
+  } | null>(null);
+  const [hoveredModalSpotIdx, setHoveredModalSpotIdx] = useState<number | null>(null);
+
   const currentSet = sets[cur] || sets[0];
   const platesCount = run?.plates || 1;
   const isMultiSet = sets.length > 1;
@@ -476,39 +495,51 @@ export const TlcView: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     const restoreCachedImages = async () => {
+      let anyLoaded = false;
+      const loadedBySet: Record<number, Partial<Record<TlcChannelKey, TlcImageEntry>>> = {};
+
       for (let sIdx = 0; sIdx < sets.length; sIdx++) {
         const s = sets[sIdx];
         for (const k of TLC_KEYS) {
           if (!s.imgs[k]) {
-            const cached = await getTlcImage(s.uid, k);
-            if (cached && !cancelled) {
-              try {
+            try {
+              const cached = await getTlcImage(s.uid, k);
+              if (cached && !cancelled) {
                 const bmp = await createImageBitmap(cached.blob);
                 if (!cancelled) {
-                  setSets((prev) => {
-                    const next = [...prev];
-                    if (next[sIdx]) {
-                      next[sIdx] = {
-                        ...next[sIdx],
-                        imgs: { ...next[sIdx].imgs, [k]: { name: cached.name, bmp } },
-                      };
-                    }
-                    return next;
-                  });
+                  if (!loadedBySet[sIdx]) loadedBySet[sIdx] = {};
+                  loadedBySet[sIdx][k] = { name: cached.name, bmp };
+                  anyLoaded = true;
                 }
-              } catch {
-                // soft fail
               }
+            } catch {
+              // soft fail
             }
           }
         }
+      }
+
+      if (anyLoaded && !cancelled) {
+        setSets((prev) => {
+          const next = [...prev];
+          for (const [idxStr, imgs] of Object.entries(loadedBySet)) {
+            const idx = Number(idxStr);
+            if (next[idx]) {
+              next[idx] = {
+                ...next[idx],
+                imgs: { ...next[idx].imgs, ...imgs },
+              };
+            }
+          }
+          return next;
+        });
       }
     };
     restoreCachedImages();
     return () => {
       cancelled = true;
     };
-  }, [sets.length]);
+  }, [sets.length, setSets]);
 
   // Load Lane Config CSV
   const handleLoadCsv = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -700,9 +731,24 @@ export const TlcView: React.FC = () => {
   };
 
   // ---- Edge-effect correction (fitted per half of every set) ----
-  const [edgeSettings, setEdgeSettings] = useState<Record<string, EdgeSetting>>({});
+  const [edgeSettings, setEdgeSettings] = useState<Record<string, EdgeSetting>>(() => {
+    const init: Record<string, EdgeSetting> = {};
+    for (const s of sets) {
+      if (s.edgeSettings) {
+        if (s.edgeSettings[0]) init[`${s.uid}:0`] = s.edgeSettings[0];
+        if (s.edgeSettings[1]) init[`${s.uid}:1`] = s.edgeSettings[1];
+      }
+    }
+    return init;
+  });
   // Spots picked as 'same compound' per set; group = which compound
-  const [edgePicks, setEdgePicks] = useState<Record<string, EdgePick[]>>({});
+  const [edgePicks, setEdgePicks] = useState<Record<string, EdgePick[]>>(() => {
+    const init: Record<string, EdgePick[]> = {};
+    for (const s of sets) {
+      if (s.edgePicks) init[s.uid] = s.edgePicks;
+    }
+    return init;
+  });
   const [pickMode, setPickMode] = useState(false);
   const [pickGroup, setPickGroup] = useState(0);
   const edgeCache = useRef(new WeakMap<TlcSet, { key: string; fits: (EdgeFit | null)[] }>());
@@ -744,8 +790,11 @@ export const TlcView: React.FC = () => {
           if (lane.id < 0 || lane.id > 53) continue;
           const d = detectOptsFor(set, ch, lane);
           if (!d) continue;
-          for (const sp of findSpots(d.prof, d.opts)) {
-            if (sp.rf > 0.1 && sp.rf < 0.95 && sp.strength > 0.15) {
+          const laneSpots = (lane.customSpots && lane.customSpots.length > 0)
+            ? lane.customSpots
+            : findSpots(d.prof, d.opts);
+          for (const sp of laneSpots) {
+            if (sp.rf > 0.05 && sp.rf < 0.98 && (sp.source === 'manual' || sp.source === 'adjusted' || sp.strength > 0.15)) {
               auto[tlcHalf(lane)].push({ lane: lane.id, x: lane.x0, h: sp.pos - d.origin });
             }
           }
@@ -757,7 +806,9 @@ export const TlcView: React.FC = () => {
             for (const q of mine) {
               const lane = set.cfg!.lanes.find((l) => l.id === q.lane);
               if (!lane) continue;
-              const pt = { lane: q.lane, x: lane.x0, h: q.pos - tlcOrigin(set, lane, get) };
+              const o = tlcOrigin(set, lane, get);
+              const span = Math.max(1, tlcFront(set, lane, get) - o);
+              const pt = { lane: q.lane, x: lane.x0, h: q.pos - o, rf: (q.pos - o) / span };
               groups.set(q.group, [...(groups.get(q.group) || []), pt]);
             }
             const laneXs = set.cfg!.lanes.filter((l) => tlcHalf(l) === h).map((l) => l.x0);
@@ -775,18 +826,47 @@ export const TlcView: React.FC = () => {
   const handlePickSpot = useCallback(
     (laneId: number, pos: number) => {
       const uid = currentSet.uid;
-      setEdgePicks((prev) => {
-        const cur = prev[uid] || [];
-        const same = cur.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
-        // clicking a picked spot again removes it
-        if (same >= 0) return { ...prev, [uid]: cur.filter((_, i) => i !== same) };
+      const cur = edgePicks[uid] || [];
+      const same = cur.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
+      let updated: EdgePick[];
+      // clicking a picked spot again removes it
+      if (same >= 0) {
+        updated = cur.filter((_, i) => i !== same);
+      } else {
         // one pick per lane and compound
         const rest = cur.filter((q) => !(q.lane === laneId && q.group === pickGroup));
-        return { ...prev, [uid]: [...rest, { lane: laneId, pos, group: pickGroup }] };
-      });
+        updated = [...rest, { lane: laneId, pos, group: pickGroup }];
+      }
+      setEdgePicks((prev) => ({ ...prev, [uid]: updated }));
+      setSets((allSets) =>
+        allSets.map((s) => (s.uid === uid ? { ...s, edgePicks: updated } : s))
+      );
     },
-    [currentSet.uid, pickGroup]
+    [currentSet.uid, edgePicks, pickGroup, setSets]
   );
+
+  const handleEdgeSetting = useCallback(
+    (h: number, st: EdgeSetting) => {
+      const uid = currentSet.uid;
+      setEdgeSettings((prev) => ({ ...prev, [`${uid}:${h}`]: st }));
+      setSets((prev) =>
+        prev.map((s) =>
+          s.uid === uid
+            ? { ...s, edgeSettings: { ...(s.edgeSettings || {}), [h]: st } }
+            : s
+        )
+      );
+    },
+    [currentSet.uid, setSets]
+  );
+
+  const handleClearPicks = useCallback(() => {
+    const uid = currentSet.uid;
+    setEdgePicks((prev) => ({ ...prev, [uid]: [] }));
+    setSets((prev) =>
+      prev.map((s) => (s.uid === uid ? { ...s, edgePicks: [] } : s))
+    );
+  }, [currentSet.uid, setSets]);
 
   const edgeSettingFor = useCallback(
     (set: TlcSet, half: number): EdgeSetting => edgeSettings[`${set.uid}:${half}`] || DEFAULT_EDGE_SETTING,
@@ -801,14 +881,15 @@ export const TlcView: React.FC = () => {
       if (!set.imgs[key]) return null;
       const d = detectOptsFor(set, key, lane);
       if (!d) return null;
-      const spots = findSpots(d.prof, d.opts);
+      const autoSpots = findSpots(d.prof, d.opts);
+      const spots = getEffectiveLaneSpots(lane, autoSpots);
       if (!spots.length) return spots;
       const h = tlcHalf(lane);
       const setting = edgeSettingFor(set, h);
       if (setting.mode === 'off') return spots;
       const fit = getEdgeFits(set)[h];
       if (!edgeActive(fit, setting)) return spots;
-      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength));
+      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
     },
     [detectOptsFor, edgeSettingFor, getEdgeFits]
   );
@@ -889,6 +970,12 @@ export const TlcView: React.FC = () => {
         const l = primary.lane;
         const origin = tlcOrigin(s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
         const front = tlcFront(s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
+        const h = tlcHalf(l);
+        const setting = edgeSettingFor(s, h);
+        const fit = getEdgeFits(s)[h];
+        const isCorr = edgeActive(fit, setting);
+        const gain = isCorr && fit ? edgeGain(fit, l.x0, setting.strength) : 1;
+        const offset = isCorr && fit ? edgeOffset(fit, l.x0, setting.strength) : 0;
 
         for (const k of TLC_KEYS) {
           if (s.imgs[k]) {
@@ -898,7 +985,7 @@ export const TlcView: React.FC = () => {
               10,
               Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
             );
-            newDens[k] = extractDensitogram(prof, {
+            const rawDens = extractDensitogram(prof, {
               sign: TLC_SIGNAL[k].sign,
               origin,
               front,
@@ -906,12 +993,15 @@ export const TlcView: React.FC = () => {
               minProminence: spotProminence,
               minDistance,
             });
+            const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
+            const corrSpots = isCorr ? correctSpots(baseSpots, gain, offset) : baseSpots;
+            newDens[k] = { ...rawDens, spots: corrSpots };
           }
         }
       }
       setChannelDensitograms(newDens);
     }
-  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction, spotProminence]);
+  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction, spotProminence, edgeSettingFor, getEdgeFits]);
 
   // Keyboard listener inside well inspection modal for instant nudging and tilt
   useEffect(() => {
@@ -981,6 +1071,7 @@ export const TlcView: React.FC = () => {
 
   // Handle Mouse Move on Enlarged Canvas or Densitometer with Intelligent Peak Snapping
   const handleCanvasMouseMove = (e: React.MouseEvent<any>) => {
+    if (isDraggingModalSpot) return;
     if (!bigCanvasRef.current || inspectPanels.length === 0) return;
     const rect = bigCanvasRef.current.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
@@ -1009,8 +1100,9 @@ export const TlcView: React.FC = () => {
     const rawPos = ph - mouseY;
 
     // Check if cursor is within 16px of a detected spot apex on this target panel
-    const spots = targetPanel.spots || [];
-    const nearSpot = spots.find((sp) => Math.abs(sp.pos - rawPos) <= 16);
+    const spots = targetPanel.spots || activeDens?.spots || [];
+    const nearSpotIdx = spots.findIndex((sp) => Math.abs(sp.pos - rawPos) <= 16);
+    const nearSpot = nearSpotIdx >= 0 ? spots[nearSpotIdx] : null;
 
     let activePos = rawPos;
     let activeSpot: TlcSpot | null = null;
@@ -1018,7 +1110,9 @@ export const TlcView: React.FC = () => {
     if (nearSpot) {
       activePos = nearSpot.pos;
       activeSpot = nearSpot;
+      setHoveredModalSpotIdx(nearSpotIdx);
     } else {
+      setHoveredModalSpotIdx(null);
       // Local maximum check in profile within ±10 px
       const prof = extractLaneProfile(targetPanel.s, targetPanel.key, l, coreFraction);
       const sg = TLC_SIGNAL[targetPanel.key].sign;
@@ -1037,17 +1131,83 @@ export const TlcView: React.FC = () => {
     }
 
     // Compute Rf (unclamped at top so positions beyond front aren't falsely reported as exactly 1.00)
-    const calculatedRf = Math.max(0, (activePos - zeroDist) / span);
+    const rawRf = Math.max(0, (activePos - zeroDist) / span);
     const snappedY = ph - activePos;
 
-    setHoverRf(Number(calculatedRf.toFixed(3)));
+    const h = tlcHalf(l);
+    const setting = edgeSettingFor(targetPanel.s, h);
+    const fit = getEdgeFits(targetPanel.s)[h];
+    const isCorr = edgeActive(fit, setting);
+    const gain = isCorr && fit ? edgeGain(fit, l.x0, setting.strength) : 1;
+    const offset = isCorr && fit ? edgeOffset(fit, l.x0, setting.strength) : 0;
+    const corrRf = isCorr && gain > 0 ? Math.max(0, Math.min(1.2, (rawRf - offset) / gain)) : rawRf;
+
+    const finalRf = activeSpot ? activeSpot.rf : corrRf;
+    setHoverRf(Number(finalRf.toFixed(3)));
     setHoverY(snappedY);
-    setHoverSpot(activeSpot);
+    setHoverSpot(
+      activeSpot ||
+        (isCorr && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)
+          ? { pos: activePos, rf: corrRf, strength: 0, rfRaw: rawRf }
+          : null)
+    );
   };
 
-  // Click on Canvas to Pin a Spot Marker
-  const handleCanvasClick = () => {
-    if (hoverRf === null || hoverY === null) return;
+  // Canvas Mouse Down: Start spot dragging or handle Alt-delete
+  const handleCanvasMouseDown = (e: React.MouseEvent<any>) => {
+    if (e.shiftKey || inspectPanels.length === 0 || !bigCanvasRef.current) return;
+    const primary = inspectPanels[0];
+    const l = primary.lane;
+    const ph = 1.0 * l.length;
+    const rect = bigCanvasRef.current.getBoundingClientRect();
+    const mouseY = e.clientY - rect.top;
+    const spots = primary.spots || activeDens?.spots || [];
+
+    // Check if mouse clicked near a spot line (within 10px)
+    const hitIdx = spots.findIndex((sp) => Math.abs(ph - sp.pos - mouseY) <= 10);
+    if (hitIdx >= 0) {
+      if (e.altKey) {
+        handleDeleteSpotInModal(hitIdx);
+        return;
+      }
+      const zeroDist = tlcOrigin(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
+      const frontPos = tlcFront(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
+      const span = Math.max(1, frontPos - zeroDist);
+      dragModalSpotRef.current = {
+        laneId: l.id,
+        spotIndex: hitIdx,
+        startPos: spots[hitIdx].pos,
+        startRf: spots[hitIdx].rf,
+        originDist: zeroDist,
+        spanDist: span,
+        laneLength: ph,
+        initialSpots: JSON.parse(JSON.stringify(spots)),
+      };
+      setIsDraggingModalSpot(true);
+      handleSnapshotHistory();
+      e.preventDefault();
+    }
+  };
+
+  // Click on Canvas to Pin a Spot Marker, Shift+Click to Add Spot, Alt+Click to Delete Spot
+  const handleCanvasClick = (e: React.MouseEvent<any>) => {
+    if (hoverRf === null || hoverY === null || !inspectPanels[0]) return;
+    // Shift + Click: Add manual spot at exact hover Rf
+    if (e.shiftKey) {
+      handleAddSpotInModal(hoverRf);
+      return;
+    }
+    // Alt + Click: Delete spot if near
+    if (e.altKey) {
+      const spots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const ph = 1.0 * inspectPanels[0].lane.length;
+      const clickedIdx = spots.findIndex((sp) => Math.abs(ph - sp.pos - hoverY) <= 12);
+      if (clickedIdx >= 0) {
+        handleDeleteSpotInModal(clickedIdx);
+        return;
+      }
+    }
+    // Default: Pin / unpin marker
     const existingIdx = pinnedMarkers.findIndex((m) => Math.abs(m.rf - hoverRf) < 0.02);
     if (existingIdx >= 0) {
       setPinnedMarkers((prev) => prev.filter((_, idx) => idx !== existingIdx));
@@ -1300,6 +1460,150 @@ export const TlcView: React.FC = () => {
     }
     return deltas;
   }, [activeDens]);
+
+  // Spot management callbacks for the zoomed-in lane modal
+  const handleAddSpotInModal = useCallback(
+    (targetRf: number = 0.5) => {
+      if (inspectWell === null || !currentSet.cfg) return;
+      const laneId = tlcLane(inspectWell, 'column');
+      const lane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+      if (!lane) return;
+      handleSnapshotHistory();
+      const primary = inspectPanels[0];
+      const originDist = primary
+        ? tlcOrigin(primary.s, lane, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction))
+        : lane.length * 0.1;
+      const frontPos = primary
+        ? tlcFront(primary.s, lane, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction))
+        : lane.length * 0.9;
+      const spanDist = Math.max(1, frontPos - originDist);
+      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const clampedRf = Math.max(0, Math.min(1.0, +targetRf.toFixed(3)));
+      const pos = Math.round(originDist + clampedRf * spanDist);
+      const newSpot: TlcSpot = {
+        pos,
+        rf: clampedRf,
+        rfRaw: clampedRf,
+        strength: 0.5,
+        areaPct: 20,
+        source: 'manual',
+      };
+      const nextSpots = [...currentSpots, newSpot].sort((a, b) => a.pos - b.pos);
+      handleUpdateLane(laneId, { customSpots: nextSpots }, true);
+      toast(`Added manual spot at Rf ${clampedRf.toFixed(2)}.`);
+    },
+    [inspectWell, currentSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+  );
+
+  const handleDeleteSpotInModal = useCallback(
+    (spotIndex: number) => {
+      if (inspectWell === null || !currentSet.cfg) return;
+      const laneId = tlcLane(inspectWell, 'column');
+      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      if (!currentSpots[spotIndex]) return;
+      handleSnapshotHistory();
+      const remaining = currentSpots.filter((_, idx) => idx !== spotIndex);
+      handleUpdateLane(laneId, { customSpots: remaining }, true);
+      toast(`Removed spot #${spotIndex + 1}.`);
+    },
+    [inspectWell, currentSet.cfg, inspectPanels, activeDens, handleSnapshotHistory]
+  );
+
+  const handleNudgeSpotInModal = useCallback(
+    (spotIndex: number, deltaRf: number) => {
+      if (inspectWell === null || !currentSet.cfg) return;
+      const laneId = tlcLane(inspectWell, 'column');
+      const lane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+      if (!lane) return;
+      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      if (!currentSpots[spotIndex]) return;
+      handleSnapshotHistory();
+      const primary = inspectPanels[0];
+      const originDist = primary
+        ? tlcOrigin(primary.s, lane, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction))
+        : lane.length * 0.1;
+      const frontPos = primary
+        ? tlcFront(primary.s, lane, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction))
+        : lane.length * 0.9;
+      const spanDist = Math.max(1, frontPos - originDist);
+      const targetRf = Math.max(0, Math.min(1.0, +(currentSpots[spotIndex].rf + deltaRf).toFixed(3)));
+      const pos = Math.round(originDist + targetRf * spanDist);
+      const updated = currentSpots.map((s, idx) => {
+        if (idx === spotIndex) {
+          return {
+            ...s,
+            pos,
+            rf: targetRf,
+            rfRaw: targetRf,
+            source: (s.source === 'manual' ? 'manual' : 'adjusted') as 'manual' | 'adjusted',
+          };
+        }
+        return s;
+      });
+      handleUpdateLane(laneId, { customSpots: updated }, true);
+    },
+    [inspectWell, currentSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+  );
+
+  const handleResetLaneSpotsInModal = useCallback(() => {
+    if (inspectWell === null || !currentSet.cfg) return;
+    const laneId = tlcLane(inspectWell, 'column');
+    handleSnapshotHistory();
+    handleUpdateLane(laneId, { customSpots: undefined }, true);
+    toast('Reset lane spots back to automated detection.');
+  }, [inspectWell, currentSet.cfg, handleSnapshotHistory]);
+
+  // Window mousemove and mouseup listeners for continuous dragging across canvas & densitometer
+  useEffect(() => {
+    if (!isDraggingModalSpot) return;
+
+    const handleWindowMouseMove = (e: MouseEvent) => {
+      const drag = dragModalSpotRef.current;
+      if (!drag || !bigCanvasRef.current) return;
+      const rect = bigCanvasRef.current.getBoundingClientRect();
+      const mouseY = e.clientY - rect.top;
+      const rawPos = drag.laneLength - mouseY;
+      const clampedPos = Math.max(drag.originDist * 0.4, Math.min(drag.laneLength * 1.05, rawPos));
+      const rawRf = (clampedPos - drag.originDist) / drag.spanDist;
+      const clampedRf = Math.max(0, Math.min(1.0, +rawRf.toFixed(3)));
+
+      const updated = drag.initialSpots.map((s, idx) => {
+        if (idx === drag.spotIndex) {
+          return {
+            ...s,
+            pos: Math.round(clampedPos),
+            rf: clampedRf,
+            rfRaw: clampedRf,
+            source: (s.source === 'manual' ? 'manual' : 'adjusted') as 'manual' | 'adjusted',
+          };
+        }
+        return s;
+      });
+
+      handleUpdateLane(drag.laneId, { customSpots: updated }, false);
+      setHoverRf(clampedRf);
+      setHoverY(Math.round(drag.laneLength - clampedPos));
+    };
+
+    const handleWindowMouseUp = () => {
+      const drag = dragModalSpotRef.current;
+      if (drag && currentSet?.cfg) {
+        const lane = currentSet.cfg.lanes.find((l) => l.id === drag.laneId);
+        if (lane && lane.customSpots) {
+          handleUpdateLane(drag.laneId, { customSpots: lane.customSpots }, true);
+        }
+      }
+      dragModalSpotRef.current = null;
+      setIsDraggingModalSpot(false);
+    };
+
+    window.addEventListener('mousemove', handleWindowMouseMove);
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleWindowMouseMove);
+      window.removeEventListener('mouseup', handleWindowMouseUp);
+    };
+  }, [isDraggingModalSpot, currentSet?.cfg]);
 
   return (
     <div className="tab-pane" style={{ padding: '16px' }}>
@@ -2136,11 +2440,11 @@ export const TlcView: React.FC = () => {
             onPickSpot={handlePickSpot}
             edgeFits={getEdgeFits(currentSet)}
             edgeSettings={[edgeSettingFor(currentSet, 0), edgeSettingFor(currentSet, 1)]}
-            onEdgeSetting={(h, st) => setEdgeSettings((prev) => ({ ...prev, [`${currentSet.uid}:${h}`]: st }))}
+            onEdgeSetting={handleEdgeSetting}
             onPickMode={setPickMode}
             pickGroup={pickGroup}
             onPickGroup={setPickGroup}
-            onClearPicks={() => setEdgePicks((prev) => ({ ...prev, [currentSet.uid]: [] }))}
+            onClearPicks={handleClearPicks}
           />
         </div>
       ) : (
@@ -2336,7 +2640,9 @@ export const TlcView: React.FC = () => {
                         }}
                       >
                         {hoverSpot
-                          ? `Peak Apex: Rf ${hoverRf.toFixed(2)} (${hoverSpot.strength > 0.5 ? 'strong' : hoverSpot.strength > 0.2 ? 'medium' : 'weak'}, ${hoverSpot.areaPct || 0}% area)`
+                          ? (hoverSpot.strength > 0
+                              ? `Peak Apex: Rf ${hoverSpot.rf.toFixed(2)}${hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005 ? ` (${hoverSpot.rfRaw.toFixed(2)} raw)` : ''} (${hoverSpot.strength > 0.5 ? 'strong' : hoverSpot.strength > 0.2 ? 'medium' : 'weak'}, ${hoverSpot.areaPct || 0}% area)`
+                              : `Rf: ${hoverSpot.rf.toFixed(2)}${hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005 ? ` (${hoverSpot.rfRaw.toFixed(2)} raw)` : ''}`)
                           : `Rf: ${hoverRf.toFixed(2)}`}
                       </span>
                     )}
@@ -2393,14 +2699,18 @@ export const TlcView: React.FC = () => {
                         <canvas
                           ref={bigCanvasRef}
                           onMouseMove={handleCanvasMouseMove}
+                          onMouseDown={handleCanvasMouseDown}
                           onMouseLeave={() => {
-                            setHoverRf(null);
-                            setHoverY(null);
-                            setHoverSpot(null);
+                            if (!isDraggingModalSpot) {
+                              setHoverRf(null);
+                              setHoverY(null);
+                              setHoverSpot(null);
+                              setHoveredModalSpotIdx(null);
+                            }
                           }}
                           onClick={handleCanvasClick}
                           style={{
-                            cursor: 'crosshair',
+                            cursor: isDraggingModalSpot ? 'ns-resize' : hoveredModalSpotIdx !== null ? 'ns-resize' : 'crosshair',
                             display: 'block',
                             boxShadow: '0 4px 14px rgba(0,0,0,0.6)',
                             borderRadius: '3px 0 0 3px',
@@ -2412,6 +2722,142 @@ export const TlcView: React.FC = () => {
                           }}
                         />
 
+                        {/* Interactive Spot Guide Lines & Drag Grab Handles */}
+                        {(() => {
+                          const primary = inspectPanels[0];
+                          const spots = primary?.spots || activeDens?.spots || [];
+                          if (!primary || !spots.length) return null;
+                          const l = primary.lane;
+                          const ph = inspectHeight;
+
+                          return spots.map((sp, idx) => {
+                            const y = ph - sp.pos;
+                            const isHovered = hoveredModalSpotIdx === idx;
+                            const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                            const spotColor = isDragged
+                              ? '#facc15'
+                              : sp.source === 'manual'
+                              ? '#f59e0b'
+                              : sp.source === 'adjusted'
+                              ? '#a855f7'
+                              : '#38bdf8';
+
+                            return (
+                              <div
+                                key={idx}
+                                onMouseEnter={() => setHoveredModalSpotIdx(idx)}
+                                onMouseLeave={() => setHoveredModalSpotIdx((prev) => (prev === idx ? null : prev))}
+                                style={{
+                                  position: 'absolute',
+                                  left: 0,
+                                  right: 0,
+                                  top: `${y}px`,
+                                  height: '0px',
+                                  zIndex: isDragged ? 25 : isHovered ? 20 : 15,
+                                  pointerEvents: 'none',
+                                }}
+                              >
+                                {/* Full-width spot horizontal guideline */}
+                                <div
+                                  style={{
+                                    position: 'absolute',
+                                    left: 0,
+                                    right: 0,
+                                    top: '-1px',
+                                    height: isDragged || isHovered ? '2.5px' : '1.5px',
+                                    background: spotColor,
+                                    boxShadow: isDragged
+                                      ? '0 0 10px #facc15, 0 0 4px #000'
+                                      : isHovered
+                                      ? `0 0 6px ${spotColor}`
+                                      : '0 0 2px rgba(0,0,0,0.8)',
+                                    pointerEvents: 'none',
+                                  }}
+                                />
+
+                                {/* Grab Handle / Pill at Center */}
+                                <div
+                                  onMouseDown={(e) => {
+                                    e.stopPropagation();
+                                    e.preventDefault();
+                                    if (e.altKey) {
+                                      handleDeleteSpotInModal(idx);
+                                      return;
+                                    }
+                                    const zeroDist = tlcOrigin(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
+                                    const frontPos = tlcFront(primary.s, l, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction));
+                                    const span = Math.max(1, frontPos - zeroDist);
+                                    dragModalSpotRef.current = {
+                                      laneId: l.id,
+                                      spotIndex: idx,
+                                      startPos: sp.pos,
+                                      startRf: sp.rf,
+                                      originDist: zeroDist,
+                                      spanDist: span,
+                                      laneLength: ph,
+                                      initialSpots: JSON.parse(JSON.stringify(spots)),
+                                    };
+                                    setIsDraggingModalSpot(true);
+                                    handleSnapshotHistory();
+                                  }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (e.altKey) {
+                                      handleDeleteSpotInModal(idx);
+                                    }
+                                  }}
+                                  title={`Spot #${idx + 1} (${sp.source || 'auto'}): Rf ${sp.rf.toFixed(2)}\n• Drag vertically to slide Rf\n• Alt+Click to remove spot`}
+                                  style={{
+                                    position: 'absolute',
+                                    left: '50%',
+                                    top: '-8px',
+                                    transform: 'translateX(-50%)',
+                                    height: '16px',
+                                    minWidth: '28px',
+                                    padding: '0 5px',
+                                    borderRadius: '8px',
+                                    background: isDragged ? '#facc15' : isHovered ? '#ffffff' : spotColor,
+                                    color: isDragged || isHovered || sp.source === 'manual' ? '#000000' : '#ffffff',
+                                    boxShadow: '0 2px 6px rgba(0,0,0,0.8), 0 0 0 1px rgba(0,0,0,0.4)',
+                                    cursor: 'ns-resize',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '9px',
+                                    fontWeight: 800,
+                                    fontFamily: 'monospace',
+                                    userSelect: 'none',
+                                    pointerEvents: 'auto',
+                                  }}
+                                >
+                                  {sp.source === 'manual' ? '✋' : sp.source === 'adjusted' ? '✨' : '●'}
+                                </div>
+
+                                {/* Rf Tag on Left edge */}
+                                <div
+                                  style={{
+                                    position: 'absolute',
+                                    left: '2px',
+                                    top: '-16px',
+                                    background: 'rgba(0,0,0,0.85)',
+                                    border: `1px solid ${spotColor}`,
+                                    color: spotColor,
+                                    fontSize: '9px',
+                                    fontWeight: 700,
+                                    fontFamily: 'monospace',
+                                    padding: '0 4px',
+                                    borderRadius: '2px',
+                                    pointerEvents: 'none',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  #{idx + 1} Rf {sp.rf.toFixed(2)}
+                                </div>
+                              </div>
+                            );
+                          });
+                        })()}
+
                         {/* Live Cursor Crosshair Bar across lane */}
                         {hoverY !== null && (
                           <div
@@ -2421,10 +2867,10 @@ export const TlcView: React.FC = () => {
                               right: 0,
                               top: `${hoverY}px`,
                               height: '1px',
-                              background: hoverSpot ? '#f43f5e' : '#38bdf8',
-                              boxShadow: hoverSpot ? '0 0 6px #f43f5e' : '0 0 4px #38bdf8',
+                              background: isDraggingModalSpot ? '#facc15' : hoverSpot ? '#f43f5e' : '#38bdf8',
+                              boxShadow: isDraggingModalSpot ? '0 0 8px #facc15' : hoverSpot ? '0 0 6px #f43f5e' : '0 0 4px #38bdf8',
                               pointerEvents: 'none',
-                              zIndex: 10,
+                              zIndex: 30,
                             }}
                           >
                             <span
@@ -2433,7 +2879,7 @@ export const TlcView: React.FC = () => {
                                 left: '4px',
                                 top: '-16px',
                                 background: 'rgba(0,0,0,0.85)',
-                                color: hoverSpot ? '#f43f5e' : '#38bdf8',
+                                color: isDraggingModalSpot ? '#facc15' : hoverSpot ? '#f43f5e' : '#38bdf8',
                                 fontSize: '10px',
                                 fontWeight: 700,
                                 fontFamily: 'monospace',
@@ -2441,7 +2887,9 @@ export const TlcView: React.FC = () => {
                                 borderRadius: '2px',
                               }}
                             >
-                              Rf {hoverRf?.toFixed(2)}
+                              {isDraggingModalSpot ? `Dragging Spot: Rf ${hoverRf?.toFixed(2)}` : hoverSpot && hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005
+                                ? `${hoverSpot.rf.toFixed(2)} (${hoverSpot.rfRaw.toFixed(2)})`
+                                : `Rf ${hoverRf?.toFixed(2)}`}
                             </span>
                           </div>
                         )}
@@ -2609,16 +3057,39 @@ export const TlcView: React.FC = () => {
                                   return (
                                     <g key="uv254">
                                       <path d={dStr} fill="none" stroke="#10b981" strokeWidth="2" />
-                                      {/* Detected Peak Apex Dots */}
+                                      {/* Detected Peak Apex Dots with Provenance Styling */}
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const spotColor = isDragged
+                                          ? '#facc15'
+                                          : sp.source === 'manual'
+                                          ? '#f59e0b'
+                                          : sp.source === 'adjusted'
+                                          ? '#a855f7'
+                                          : '#34d399';
                                         return (
                                           <g key={idx}>
-                                            <circle cx={x} cy={y} r="3.5" fill="#34d399" stroke="#ffffff" strokeWidth="1" />
-                                            <text x={Math.min(270, x + 6)} y={y + 3} fill="#34d399" fontSize="9" fontWeight="bold" fontFamily="monospace">
-                                              Rf {sp.rf.toFixed(2)}
+                                            <circle
+                                              cx={x}
+                                              cy={y}
+                                              r={isDragged ? '5' : '3.5'}
+                                              fill={spotColor}
+                                              stroke="#ffffff"
+                                              strokeWidth={isDragged ? '2' : '1'}
+                                            />
+                                            <text
+                                              x={Math.min(270, x + 6)}
+                                              y={y + 3}
+                                              fill={spotColor}
+                                              fontSize="9"
+                                              fontWeight="bold"
+                                              fontFamily="monospace"
+                                            >
+                                              {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
                                             </text>
                                           </g>
                                         );
@@ -2644,16 +3115,39 @@ export const TlcView: React.FC = () => {
                                   return (
                                     <g key="uv366">
                                       <path d={dStr} fill="none" stroke="#a855f7" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '4,2' : undefined} />
-                                      {/* Detected Peak Apex Dots */}
+                                      {/* Detected Peak Apex Dots with Provenance Styling */}
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const spotColor = isDragged
+                                          ? '#facc15'
+                                          : sp.source === 'manual'
+                                          ? '#f59e0b'
+                                          : sp.source === 'adjusted'
+                                          ? '#c084fc'
+                                          : '#a855f7';
                                         return (
                                           <g key={idx}>
-                                            <circle cx={x} cy={y} r="3.5" fill="#c084fc" stroke="#ffffff" strokeWidth="1" />
-                                            <text x={Math.min(270, x + 6)} y={y + 3} fill="#c084fc" fontSize="9" fontWeight="bold" fontFamily="monospace">
-                                              Rf {sp.rf.toFixed(2)}
+                                            <circle
+                                              cx={x}
+                                              cy={y}
+                                              r={isDragged ? '5' : '3.5'}
+                                              fill={spotColor}
+                                              stroke="#ffffff"
+                                              strokeWidth={isDragged ? '2' : '1'}
+                                            />
+                                            <text
+                                              x={Math.min(270, x + 6)}
+                                              y={y + 3}
+                                              fill={spotColor}
+                                              fontSize="9"
+                                              fontWeight="bold"
+                                              fontFamily="monospace"
+                                            >
+                                              {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
                                             </text>
                                           </g>
                                         );
@@ -2683,11 +3177,34 @@ export const TlcView: React.FC = () => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const spotColor = isDragged
+                                          ? '#facc15'
+                                          : sp.source === 'manual'
+                                          ? '#f59e0b'
+                                          : sp.source === 'adjusted'
+                                          ? '#a855f7'
+                                          : '#fbbf24';
                                         return (
                                           <g key={idx}>
-                                            <circle cx={x} cy={y} r="3.5" fill="#fbbf24" stroke="#ffffff" strokeWidth="1" />
-                                            <text x={Math.min(270, x + 6)} y={y + 3} fill="#fbbf24" fontSize="9" fontWeight="bold" fontFamily="monospace">
-                                              Rf {sp.rf.toFixed(2)}
+                                            <circle
+                                              cx={x}
+                                              cy={y}
+                                              r={isDragged ? '5' : '3.5'}
+                                              fill={spotColor}
+                                              stroke="#ffffff"
+                                              strokeWidth={isDragged ? '2' : '1'}
+                                            />
+                                            <text
+                                              x={Math.min(270, x + 6)}
+                                              y={y + 3}
+                                              fill={spotColor}
+                                              fontSize="9"
+                                              fontWeight="bold"
+                                              fontFamily="monospace"
+                                            >
+                                              {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
                                             </text>
                                           </g>
                                         );
@@ -2696,16 +3213,16 @@ export const TlcView: React.FC = () => {
                                   );
                                 })()}
 
-                              {/* Synchronized Hover Crosshair on Densitometer */}
+                              {/* Synchronized Hover / Drag Crosshair on Densitometer */}
                               {hoverY !== null && (
                                 <line
                                   x1="0"
                                   y1={hoverY}
                                   x2="320"
                                   y2={hoverY}
-                                  stroke={hoverSpot ? '#f43f5e' : '#38bdf8'}
-                                  strokeWidth="1.5"
-                                  strokeDasharray="3,3"
+                                  stroke={isDraggingModalSpot ? '#facc15' : hoverSpot ? '#f43f5e' : '#38bdf8'}
+                                  strokeWidth={isDraggingModalSpot ? '2' : '1.5'}
+                                  strokeDasharray={isDraggingModalSpot ? '4,2' : '3,3'}
                                 />
                               )}
                             </svg>
@@ -3157,38 +3674,226 @@ export const TlcView: React.FC = () => {
                       borderRadius: '8px',
                     }}
                   >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                      <span style={{ fontSize: '13px', fontWeight: 700 }}>
-                        Chromatographic Peak Deconvolution &amp; Resolution:
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                      <span style={{ fontSize: '13px', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                        <span>🎯 Chromatographic Peak Deconvolution &amp; Resolution:</span>
                       </span>
-                      {activeDens?.spots.length ? (
-                        <span className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                          {activeDens.spots.length} peak{activeDens.spots.length === 1 ? '' : 's'} identified
-                        </span>
-                      ) : null}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{
+                            fontSize: '11px',
+                            height: '24px',
+                            padding: '0 8px',
+                            background: '#0284c7',
+                            color: '#ffffff',
+                            border: '1px solid #0369a1',
+                            borderRadius: '4px',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            fontWeight: 600,
+                          }}
+                          onClick={() => handleAddSpotInModal(0.50)}
+                          title="Add a new custom/manual spot pick at Rf 0.50 (or Shift+Click anywhere on the TLC lane)"
+                        >
+                          + Add Spot (Rf 0.50)
+                        </button>
+                        {currentSet.cfg && (() => {
+                          const lId = tlcLane(inspectWell, 'column');
+                          const lObj = currentSet.cfg.lanes.find((l) => l.id === lId);
+                          if (lObj?.customSpots !== undefined) {
+                            return (
+                              <button
+                                type="button"
+                                className="btn sm"
+                                style={{
+                                  fontSize: '11px',
+                                  height: '24px',
+                                  padding: '0 8px',
+                                  background: '#334155',
+                                  color: '#fbbf24',
+                                  border: '1px solid #78350f',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  fontWeight: 600,
+                                }}
+                                onClick={handleResetLaneSpotsInModal}
+                                title="Reset manual and adjusted spots back to auto-detected peaks"
+                              >
+                                ↺ Reset to Auto Picks
+                              </button>
+                            );
+                          }
+                          return null;
+                        })()}
+                        {activeDens?.spots.length ? (
+                          <span className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                            {activeDens.spots.length} peak{activeDens.spots.length === 1 ? '' : 's'} identified
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
 
                     {activeDens?.spots.length ? (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                          {activeDens.spots.map((sp, idx) => (
-                            <span
-                              key={idx}
-                              className="chip"
-                              style={{
-                                background: '#fdf2f8',
-                                color: '#be185d',
-                                border: '1px solid #fbcfe8',
-                                fontWeight: 600,
-                                fontSize: '12px',
-                              }}
-                            >
-                              Peak {idx + 1}: Rf {sp.rf.toFixed(2)}
-                              <span style={{ marginLeft: '6px', fontSize: '10px', color: '#9d174d', textTransform: 'capitalize' }}>
-                                ({sp.strength > 0.5 ? 'strong' : sp.strength > 0.2 ? 'medium' : 'weak'} · {sp.areaPct || 0}% area)
-                              </span>
-                            </span>
-                          ))}
+                        {/* Interactive Peak Adjustment Cards */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                          {activeDens.spots.map((sp, idx) => {
+                            const isSelected = hoveredModalSpotIdx === idx || (isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx);
+                            const cardBg = sp.source === 'manual'
+                              ? 'rgba(245, 158, 11, 0.08)'
+                              : sp.source === 'adjusted'
+                              ? 'rgba(168, 85, 247, 0.08)'
+                              : 'rgba(255, 255, 255, 0.03)';
+                            const cardBorder = isSelected
+                              ? '#facc15'
+                              : sp.source === 'manual'
+                              ? '#f59e0b'
+                              : sp.source === 'adjusted'
+                              ? '#a855f7'
+                              : 'rgba(255, 255, 255, 0.12)';
+
+                            return (
+                              <div
+                                key={idx}
+                                onMouseEnter={() => setHoveredModalSpotIdx(idx)}
+                                onMouseLeave={() => setHoveredModalSpotIdx((prev) => (prev === idx ? null : prev))}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  padding: '8px 12px',
+                                  background: cardBg,
+                                  border: `1px solid ${cardBorder}`,
+                                  borderRadius: '6px',
+                                  gap: '12px',
+                                  flexWrap: 'wrap',
+                                  boxShadow: isSelected ? '0 0 8px rgba(250, 204, 21, 0.25)' : 'none',
+                                  transition: 'border-color 0.15s, box-shadow 0.15s',
+                                }}
+                              >
+                                {/* Left Side: Index, Rf value, Provenance Tag, Signal Strength */}
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                  <span
+                                    style={{
+                                      fontWeight: 800,
+                                      fontSize: '11px',
+                                      color: '#ffffff',
+                                      background: sp.source === 'manual' ? '#b45309' : sp.source === 'adjusted' ? '#7e22ce' : '#0284c7',
+                                      borderRadius: '4px',
+                                      padding: '2px 6px',
+                                    }}
+                                  >
+                                    #{idx + 1}
+                                  </span>
+                                  <span
+                                    className="mono"
+                                    style={{
+                                      fontWeight: 700,
+                                      fontSize: '13px',
+                                      color: sp.source === 'manual' ? '#fbbf24' : sp.source === 'adjusted' ? '#d8b4fe' : '#38bdf8',
+                                    }}
+                                  >
+                                    Rf {sp.rf.toFixed(2)}
+                                    {sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)} raw)` : ''}
+                                  </span>
+                                  {sp.source === 'manual' && (
+                                    <span style={{ background: '#f59e0b', color: '#000000', padding: '1px 5px', borderRadius: '3px', fontSize: '10px', fontWeight: 700 }}>
+                                      ✋ Manual
+                                    </span>
+                                  )}
+                                  {sp.source === 'adjusted' && (
+                                    <span style={{ background: '#a855f7', color: '#ffffff', padding: '1px 5px', borderRadius: '3px', fontSize: '10px', fontWeight: 700 }}>
+                                      ✨ Adjusted
+                                    </span>
+                                  )}
+                                  {(sp.source === 'auto' || !sp.source) && (
+                                    <span style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid #0284c7', padding: '1px 5px', borderRadius: '3px', fontSize: '10px', fontWeight: 600 }}>
+                                      Auto
+                                    </span>
+                                  )}
+                                  <span style={{ fontSize: '11px', color: 'var(--mut)', textTransform: 'capitalize' }}>
+                                    ({sp.strength > 0.5 ? 'strong' : sp.strength > 0.2 ? 'medium' : 'weak'} · {sp.areaPct || 0}% area)
+                                  </span>
+                                </div>
+
+                                {/* Right Side: Fine Nudge Buttons, Continuous Slider, Delete Button */}
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '10px', padding: '2px 6px', height: '22px', background: '#1e293b', color: '#ffffff', border: '1px solid #475569', borderRadius: '3px', cursor: 'pointer' }}
+                                    onClick={() => handleNudgeSpotInModal(idx, -0.05)}
+                                    title="Nudge Rf -0.05"
+                                  >
+                                    -0.05
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '10px', padding: '2px 6px', height: '22px', background: '#1e293b', color: '#ffffff', border: '1px solid #475569', borderRadius: '3px', cursor: 'pointer' }}
+                                    onClick={() => handleNudgeSpotInModal(idx, -0.01)}
+                                    title="Nudge Rf -0.01"
+                                  >
+                                    -0.01
+                                  </button>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.005"
+                                    value={sp.rf}
+                                    onChange={(e) => {
+                                      const targetRf = parseFloat(e.target.value);
+                                      if (!isNaN(targetRf)) {
+                                        handleNudgeSpotInModal(idx, targetRf - sp.rf);
+                                      }
+                                    }}
+                                    style={{
+                                      width: '90px',
+                                      height: '5px',
+                                      accentColor: sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : '#38bdf8',
+                                      cursor: 'ew-resize',
+                                    }}
+                                    title={`Continuous Rf slider: ${sp.rf.toFixed(2)}`}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '10px', padding: '2px 6px', height: '22px', background: '#1e293b', color: '#ffffff', border: '1px solid #475569', borderRadius: '3px', cursor: 'pointer' }}
+                                    onClick={() => handleNudgeSpotInModal(idx, +0.01)}
+                                    title="Nudge Rf +0.01"
+                                  >
+                                    +0.01
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '10px', padding: '2px 6px', height: '22px', background: '#1e293b', color: '#ffffff', border: '1px solid #475569', borderRadius: '3px', cursor: 'pointer' }}
+                                    onClick={() => handleNudgeSpotInModal(idx, +0.05)}
+                                    title="Nudge Rf +0.05"
+                                  >
+                                    +0.05
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="ib sm"
+                                    style={{ color: '#ef4444', fontSize: '12px', padding: '2px 6px', cursor: 'pointer', background: 'transparent', border: 'none' }}
+                                    onClick={() => handleDeleteSpotInModal(idx)}
+                                    title="Delete this spot pick (Alt+Click on lane also deletes)"
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
 
                         {/* Separation Resolution Metrics */}
@@ -3208,10 +3913,43 @@ export const TlcView: React.FC = () => {
                             ))}
                           </div>
                         )}
+
+                        {/* Interactive Workflow Hint Bar */}
+                        <div
+                          style={{
+                            marginTop: '6px',
+                            padding: '6px 10px',
+                            background: 'rgba(255,255,255,0.02)',
+                            border: '1px solid rgba(255,255,255,0.06)',
+                            borderRadius: '4px',
+                            fontSize: '11px',
+                            color: '#94a3b8',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          <span style={{ color: '#facc15', fontWeight: 700 }}>💡 Controls:</span>
+                          <span>• <strong>Drag</strong> spot handle or line vertically on the TLC lane to slide Rf in real time</span>
+                          <span>• <strong>Shift+Click</strong> on lane to drop a new manual spot</span>
+                          <span>• <strong>Alt+Click</strong> on spot to delete</span>
+                          <span>• All custom picks persist across views, heatmap, and CSV/JSON exports</span>
+                        </div>
                       </div>
                     ) : (
-                      <div style={{ fontSize: '12px', color: 'var(--mut)' }}>
-                        No peaks detected above noise threshold.
+                      <div style={{ padding: '12px', textAlign: 'center', background: 'rgba(255,255,255,0.02)', borderRadius: '6px', border: '1px dashed rgba(255,255,255,0.1)' }}>
+                        <p style={{ fontSize: '12px', color: 'var(--mut)', marginBottom: '8px' }}>
+                          No chromatographic peaks currently picked for this lane.
+                        </p>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ fontSize: '11px', background: '#0284c7', color: '#fff', border: 'none', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer' }}
+                          onClick={() => handleAddSpotInModal(0.50)}
+                        >
+                          + Add Spot at Rf 0.50
+                        </button>
                       </div>
                     )}
                   </div>

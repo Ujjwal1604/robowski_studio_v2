@@ -314,6 +314,7 @@ export interface TlcLane {
   angle: number;
   spotRadius?: number | null;
   zeroRf?: number | null;
+  customSpots?: TlcSpot[];
 }
 
 export interface TlcLaneConfig {
@@ -340,6 +341,8 @@ export interface TlcSpot {
   areaPct?: number;
   rfRaw?: number; // measured Rf before the edge-effect correction
   edgeGain?: number; // relative migration speed g used for the correction
+  edgeOffset?: number; // additive Rf shift used for the correction
+  source?: 'auto' | 'adjusted' | 'manual';
 }
 
 export interface TlcProfileOptions {
@@ -374,6 +377,19 @@ export interface TlcImageEntry {
   bmp: ImageBitmap;
 }
 
+export interface EdgePick {
+  lane: number;
+  pos: number;
+  group: number;
+}
+
+export type EdgeMode = 'auto' | 'on' | 'off';
+
+export interface EdgeSetting {
+  mode: EdgeMode;
+  strength: number; // 0..1
+}
+
 export interface TlcSet {
   uid: string;
   name: string;
@@ -389,4 +405,8 @@ export interface TlcSet {
   prof?: Record<string, number[]>;
   imgs: Record<string, TlcImageEntry>;
   missing?: string[];
+  edgePicks?: EdgePick[];
+  edgeSettings?: Record<number, EdgeSetting>;
+  spotProminence?: number;
 }
+

@@ -12,6 +12,7 @@ import {
   pctile,
   detectFront,
   detectOrigin,
+  tlcFront,
   tlcOrigin,
   findSpots,
   extractDensitogram,
@@ -24,6 +25,7 @@ import {
   exportTlcAnalysisJson,
   TlcSet,
   TlcSpot,
+  getEffectiveLaneSpots,
 } from '../src/engine/tlcLanes';
 import { buildRun } from '../src/engine/dilution';
 import { exampleState, dataFor } from '../src/context/runPayload';
@@ -626,4 +628,82 @@ describe('exportTlcAnalysisCsv and exportTlcAnalysisJson', () => {
     expect(firstLane.channels.UV254.spots[0].rf).toBe(0.25);
     expect(firstLane.channels.UV254.spots[1].rf).toBe(0.625);
   });
+
+  it('invalidates and re-detects auto front and origin when photo or lane geometry changes', () => {
+    let callCount = 0;
+    const dummySet: any = {
+      uid: 'test_set_1',
+      name: 'Plate 1',
+      imgs: { UV254: { name: 'photo_v1.png', bmp: {} } },
+      cfg: {
+        lanes: [{ id: 0, x0: 100, y0: 800, length: 700, width: 30, angle: 0 }],
+        hasZeroRf: false,
+        warnings: [],
+      },
+    };
+
+    const dummyProfile = () => {
+      callCount++;
+      // Return a dummy profile where index 600 has a front drop
+      const p = new Array(700).fill(200);
+      for (let i = 590; i < 700; i++) p[i] = 20;
+      return p;
+    };
+
+    const f1 = tlcFront(dummySet, dummySet.cfg.lanes[0], dummyProfile);
+    expect(callCount).toBe(1);
+
+    // Calling again with same photo and lane configuration re-uses the cached value
+    const f2 = tlcFront(dummySet, dummySet.cfg.lanes[0], dummyProfile);
+    expect(callCount).toBe(1);
+    expect(f2).toBe(f1);
+
+    // Swapping to a new photo invalidates the cache and forces fresh detection
+    dummySet.imgs = { UV254: { name: 'photo_v2.png', bmp: {} } };
+    const f3 = tlcFront(dummySet, dummySet.cfg.lanes[0], dummyProfile);
+    expect(callCount).toBe(2);
+
+    // Changing lane geometry invalidates the cache and forces fresh detection
+    dummySet.cfg.lanes = [{ id: 0, x0: 120, y0: 800, length: 700, width: 30, angle: 0 }];
+    const f4 = tlcFront(dummySet, dummySet.cfg.lanes[0], dummyProfile);
+    expect(callCount).toBe(3);
+  });
+
+  it('respects getEffectiveLaneSpots and user custom/adjusted/manual spot overrides', () => {
+    const lane: TlcLane = { id: 0, x0: 100, y0: 800, length: 700, width: 30, angle: 0 };
+    const autoSpots: TlcSpot[] = [
+      { pos: 250, rf: 0.35, strength: 0.4, source: 'auto' },
+      { pos: 450, rf: 0.70, strength: 0.6, source: 'auto' },
+    ];
+
+    // 1. When customSpots is undefined, returns automated peaks with source 'auto'
+    const defaultEffective = getEffectiveLaneSpots(lane, autoSpots);
+    expect(defaultEffective).toHaveLength(2);
+    expect(defaultEffective[0].rf).toBe(0.35);
+    expect(defaultEffective[0].source).toBe('auto');
+
+    // 2. When user adjusts a spot or creates a manual spot, customSpots takes precedence
+    lane.customSpots = [
+      { pos: 280, rf: 0.40, strength: 0.4, source: 'adjusted' },
+      { pos: 450, rf: 0.70, strength: 0.6, source: 'auto' },
+      { pos: 550, rf: 0.85, strength: 0.5, source: 'manual' },
+    ];
+    const customEffective = getEffectiveLaneSpots(lane, autoSpots);
+    expect(customEffective).toHaveLength(3);
+    expect(customEffective[0].rf).toBe(0.40);
+    expect(customEffective[0].source).toBe('adjusted');
+    expect(customEffective[2].rf).toBe(0.85);
+    expect(customEffective[2].source).toBe('manual');
+
+    // 3. When user deletes all spots, empty array customSpots = [] is honored as zero spots
+    lane.customSpots = [];
+    const emptyEffective = getEffectiveLaneSpots(lane, autoSpots);
+    expect(emptyEffective).toEqual([]);
+
+    // 4. Resetting customSpots to undefined restores automated picks
+    delete lane.customSpots;
+    const restoredEffective = getEffectiveLaneSpots(lane, autoSpots);
+    expect(restoredEffective).toEqual(autoSpots);
+  });
 });
+

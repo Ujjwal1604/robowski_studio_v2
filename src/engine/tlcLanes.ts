@@ -499,7 +499,16 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     pos: p.pos,
     rf: Math.max(0, Math.min(1, +((p.pos - o.origin) / span).toFixed(3))),
     strength: Math.min(1, Math.max(0, +(p.val / dmax).toFixed(3))),
+    source: 'auto' as const,
   }));
+}
+
+// Get effective spots for a lane: prioritizes user-adjusted/manual custom spots over auto-detected spots
+export function getEffectiveLaneSpots(lane: TlcLane, autoSpots: TlcSpot[]): TlcSpot[] {
+  if (lane.customSpots !== undefined && Array.isArray(lane.customSpots)) {
+    return lane.customSpots;
+  }
+  return autoSpots;
 }
 
 // Complete 1D Densitometry extraction: returns profile curve, rolling baseline, baseline-subtracted signal & spots
@@ -593,6 +602,16 @@ export function extractDensitogram(
   };
 }
 
+function autoCacheSignature(set: TlcSet): string {
+  const imgSig = Object.entries(set.imgs || {})
+    .map(([k, im]) => `${k}:${im.name}`)
+    .sort()
+    .join(';');
+  const l0 = set.cfg?.lanes[0];
+  const laneSig = set.cfg ? `${set.cfg.lanes.length}_${l0?.x0 ?? 0}_${l0?.y0 ?? 0}_${l0?.length ?? 0}` : 'none';
+  return `${imgSig}|${laneSig}`;
+}
+
 // Solvent front resolution: explicit side override -> explicit global manual override -> multi-channel meniscus detection -> fallback 93% of lane length
 export function tlcFront(
   set: TlcSet,
@@ -615,6 +634,13 @@ export function tlcFront(
 
   if (!ch || !getProfile) return Math.round(lane.length * 0.93);
 
+  const sig = autoCacheSignature(set);
+  if ((set as any)._autoCacheSig !== sig) {
+    set.frontAuto = {};
+    set.originAuto = {};
+    (set as any)._autoCacheSig = sig;
+  }
+
   set.frontAuto = set.frontAuto || {};
   if (set.frontAuto[h] == null && set.cfg) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
@@ -636,6 +662,13 @@ export function tlcOrigin(
 ): number {
   if (lane.zeroRf != null && lane.zeroRf > 0) return lane.zeroRf;
   if (set.originPx != null && set.originPx > 0) return set.originPx;
+
+  const sig = autoCacheSignature(set);
+  if ((set as any)._autoCacheSig !== sig) {
+    set.frontAuto = {};
+    set.originAuto = {};
+    (set as any)._autoCacheSig = sig;
+  }
 
   set.originAuto = set.originAuto || {};
   const h = tlcHalf(lane);
@@ -994,7 +1027,7 @@ export function tlcRfCsv(
   for (let n = 1; n <= 5; n++) {
     head.push(`rf_${n}`, `strength_${n}`);
   }
-  head.push('edge_gain');
+  head.push('edge_gain', 'edge_offset');
   for (let n = 1; n <= 5; n++) head.push(`rf_raw_${n}`);
   const rows = [head];
 
@@ -1025,7 +1058,7 @@ export function tlcRfCsv(
         r.push(sp[n] ? +sp[n].rf.toFixed(3) : '', sp[n] ? +sp[n].strength.toFixed(2) : '');
       }
       // edge-effect correction: gain used for this lane, and the measured Rf before correction
-      r.push(sp.length && sp[0].edgeGain ? sp[0].edgeGain : '');
+      r.push(sp.length && sp[0].edgeGain ? sp[0].edgeGain : '', sp.length && sp[0].edgeGain ? sp[0].edgeOffset ?? 0 : '');
       for (let n = 0; n < 5; n++) {
         r.push(sp[n] ? +(sp[n].rfRaw ?? sp[n].rf).toFixed(3) : '');
       }

@@ -111,28 +111,32 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
 
         let mergedSpots: TlcSpot[] = [];
 
-        for (const ch of channelsToCheck) {
-          const prof = getProf(activeTlcSet, ch, lane);
-          if (prof && prof.length > 0) {
-            const chSpots = findSpots(prof, {
-              sign: TLC_SIGNAL[ch]?.sign ?? -1,
-              origin: oVal,
-              front: fVal,
-              radius: lane.spotRadius || 24,
-              minProminence: spotProminence,
-            });
+        if (lane.customSpots && lane.customSpots.length > 0) {
+          mergedSpots = [...lane.customSpots];
+        } else {
+          for (const ch of channelsToCheck) {
+            const prof = getProf(activeTlcSet, ch, lane);
+            if (prof && prof.length > 0) {
+              const chSpots = findSpots(prof, {
+                sign: TLC_SIGNAL[ch]?.sign ?? -1,
+                origin: oVal,
+                front: fVal,
+                radius: lane.spotRadius || 24,
+                minProminence: spotProminence,
+              });
 
-            if (chSpots && chSpots.length > 0) {
-              if (mergedSpots.length === 0) {
-                mergedSpots = [...chSpots];
-              } else {
-                for (const sp of chSpots) {
-                  const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
-                  if (!match) {
-                    mergedSpots.push(sp);
-                  } else if (sp.strength > match.strength) {
-                    match.strength = sp.strength;
-                    match.pos = sp.pos;
+              if (chSpots && chSpots.length > 0) {
+                if (mergedSpots.length === 0) {
+                  mergedSpots = [...chSpots];
+                } else {
+                  for (const sp of chSpots) {
+                    const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
+                    if (!match) {
+                      mergedSpots.push(sp);
+                    } else if (sp.strength > match.strength) {
+                      match.strength = sp.strength;
+                      match.pos = sp.pos;
+                    }
                   }
                 }
               }

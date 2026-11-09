@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { tlcRfCsv } from '../src/engine/tlcLanes';
-import { fitEdgeCurve, fitEdgePicks, edgeGain, edgeActive, edgeSuggestion, correctSpots, DEFAULT_EDGE_SETTING } from '../src/engine/tlcEdge';
+import { fitEdgeCurve, fitEdgePicks, edgeOffset, edgeGain, edgeActive, edgeSuggestion, correctSpots, DEFAULT_EDGE_SETTING } from '../src/engine/tlcEdge';
 import type { EdgePoint } from '../src/engine/tlcEdge';
 
 // A half plate with 27 lanes; several compounds (true heights) turn up in many lanes.
@@ -150,5 +150,57 @@ describe('Rf CSV with edge correction', () => {
     expect(at('rf_1')).toBe((0.5 / 1.05).toFixed(3));
     expect(at('rf_raw_1')).toBe('0.5');
     expect(at('rf_raw_2')).toBe('0.25');
+  });
+});
+
+describe('picked-spot model selection', () => {
+  const xs = Array.from({ length: 27 }, (_, i) => 150 + i * 110);
+  const XMID = (xs[0] + xs[26]) / 2;
+  const U = (x: number) => (x - XMID) / ((xs[26] - xs[0]) / 2);
+  let seed = 5;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) - 0.5;
+  // measured Rf = true * (1 + s(u)) + b(u)
+  const picks = (trues: number[], lanesOf: (k: number) => number[], s: (u: number) => number, b: (u: number) => number, sd = 0.004) =>
+    trues.map((r, k) =>
+      lanesOf(k).map((i) => ({ lane: i, x: xs[i], h: 1, rf: (r * (1 + s(U(xs[i]))) + b(U(xs[i]))) * (1 + sd * rnd()) } as EdgePoint))
+    );
+  const laneSets = [[0, 1, 4, 7, 10, 13, 16, 19, 22, 25, 26], [0, 2, 5, 8, 12, 14, 18, 21, 24, 26], [1, 3, 6, 9, 13, 17, 20, 23, 25]];
+
+  it('keeps the parabola when the data are a parabola', () => {
+    const fit = fitEdgePicks(picks([0.62, 0.38, 0.2], (k) => laneSets[k], (u) => 0.05 * u * u, () => 0), xs);
+    expect(fit.ok).toBe(true);
+    expect(fit.model).toBe('parabola');
+    expect(Math.abs(edgeGain(fit, xs[26]) - 1.05)).toBeLessThan(0.008);
+  });
+
+  it('switches to sharper edges when only the outer lanes bend', () => {
+    const s = (u: number) => 0.07 * u ** 4;
+    const fit = fitEdgePicks(picks([0.62, 0.38, 0.2], (k) => laneSets[k], s, () => 0, 0.002), xs);
+    expect(fit.model).toMatch(/sharper/);
+    for (const i of [0, 3, 13, 22, 26]) expect(Math.abs(edgeGain(fit, xs[i]) - (1 + s(U(xs[i]))))).toBeLessThan(0.012);
+  });
+
+  it('finds an offset that a pure height-proportional model cannot', () => {
+    const b = (u: number) => 0.02 * u * u;
+    const fit = fitEdgePicks(picks([0.7, 0.45, 0.2], (k) => laneSets[k], (u) => 0.03 * u * u, b, 0.002), xs);
+    expect(fit.model).toMatch(/offset/);
+    // corrected Rf of a high and a low spot at an edge lane both land on the truth
+    const x = xs[26];
+    for (const r of [0.7, 0.2]) {
+      const meas = r * (1 + 0.03) + b(U(x));
+      expect(Math.abs((meas - edgeOffset(fit, x)) / edgeGain(fit, x) - r)).toBeLessThan(0.006);
+    }
+  });
+
+  it('does not add an offset with compounds at nearly the same height', () => {
+    const fit = fitEdgePicks(picks([0.5, 0.52], (k) => laneSets[k], (u) => 0.04 * u * u, () => 0), xs);
+    expect(fit.model).not.toMatch(/offset/);
+  });
+
+  it('correctSpots applies gain and offset and keeps the raw value', () => {
+    const c = correctSpots([{ rf: 0.5 }], 1.04, 0.01)[0];
+    expect(c.rfRaw).toBe(0.5);
+    expect(c.rf).toBeCloseTo((0.5 - 0.01) / 1.04, 3);
+    expect(c.edgeOffset).toBe(0.01);
   });
 });

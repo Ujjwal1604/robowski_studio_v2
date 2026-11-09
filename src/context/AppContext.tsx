@@ -662,6 +662,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           frameW: s.frameW || Core.LANE_FRAME_WIDTH,
           frontPx: s.frontPx ?? null,
           frontAuto: s.frontAuto || {},
+          edgePicks: s.edgePicks || [],
+          edgeSettings: s.edgeSettings || {},
+          spotProminence: s.spotProminence ?? spotProminence,
           imgMeta: Object.entries(s.imgs || {}).map(([k, im]) => ({
             key: k,
             name: im.name,
@@ -685,7 +688,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         toast('Could not save: ' + (e?.message || e));
       }
     },
-    [run, triPending, state, triMeta, status, activeTlcStatus, tlcSets, putRun, toast]
+    [run, triPending, state, triMeta, status, activeTlcStatus, tlcSets, putRun, toast, spotProminence]
   );
 
   const startNewRun = useCallback(() => {
@@ -719,10 +722,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               frameW: s.frameW || Core.LANE_FRAME_WIDTH,
               frontPx: s.frontPx ?? null,
               frontAuto: s.frontAuto || {},
+              edgePicks: s.edgePicks || [],
+              edgeSettings: s.edgeSettings || {},
+              spotProminence: s.spotProminence,
               imgs: {},
               prof: {},
             }))
           );
+          if (r.tlc_sets[0]?.spotProminence != null) {
+            setSpotProminence(r.tlc_sets[0].spotProminence);
+          }
         } else {
           setTlcSets([defaultTlcSet()]);
         }
@@ -730,7 +739,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setView('setup');
       }
     },
-    [runsList]
+    [runsList, setSpotProminence]
   );
 
   const dupRun = useCallback(
@@ -755,6 +764,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               frameW: s.frameW || Core.LANE_FRAME_WIDTH,
               frontPx: s.frontPx ?? null,
               frontAuto: s.frontAuto || {},
+              edgePicks: s.edgePicks ? JSON.parse(JSON.stringify(s.edgePicks)) : [],
+              edgeSettings: s.edgeSettings ? JSON.parse(JSON.stringify(s.edgeSettings)) : {},
+              spotProminence: s.spotProminence,
               imgs: {},
               prof: {},
             });

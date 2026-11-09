@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { TlcSet, TlcLane } from '../../types';
+import { TlcSet, TlcLane, TlcSpot } from '../../types';
 import {
   containerOfLane,
   wellLabel,
@@ -7,11 +7,12 @@ import {
   tlcOrigin,
   TlcChannelKey,
   findSpots,
+  getEffectiveLaneSpots,
   TLC_SIGNAL,
   extractFluorescenceOverlay,
   computeFalseColorComposite,
 } from '../../engine';
-import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
+import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
 
 export type CompositeSubMode = 'glow' | 'false-color' | 'split';
@@ -50,7 +51,7 @@ interface TlcFullPlateViewProps {
 
 const PICK_COLORS = ['#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
 
-export type HudModule = 'geometry' | 'baselines' | 'edge' | 'composite' | 'recipe' | 'tools' | 'none';
+export type HudModule = 'geometry' | 'baselines' | 'spots' | 'edge' | 'composite' | 'recipe' | 'tools' | 'none';
 export type OverviewModule = 'fronts' | 'edge' | 'composite' | 'skew' | 'none';
 
 // Explicit high-contrast button styling for the HUD dark theme (longhand border avoids React shorthand conflict)
@@ -116,6 +117,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const [hoveredLaneId, setHoveredLaneId] = useState<number | null>(null);
   const [selectedLaneId, setSelectedLaneId] = useState<number | null>(0);
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
+  // Preview of the edge-effect correction: re-stretch the photo so same-compound spots line up
+  const [straighten, setStraighten] = useState(false);
 
   // Modular HUD state: only the selected module's drawer is expanded, keeping HUD ultra-compact
   const [activeHudModule, setActiveHudModule] = useState<HudModule>('geometry');
@@ -140,6 +143,23 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   // Dragging state for moving lanes directly on canvas
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef<{ mouseX: number; mouseY: number; x0: number; y0: number } | null>(null);
+
+  // Spot dragging & interaction state (direct on-canvas Rf adjustment)
+  const [isDraggingSpot, setIsDraggingSpot] = useState(false);
+  const dragSpotRef = useRef<{
+    laneId: number;
+    spotIndex: number;
+    startPos: number;
+    startRf: number;
+    originDist: number;
+    spanDist: number;
+    initialSpots: TlcSpot[];
+  } | null>(null);
+  const [hoveredSpotInfo, setHoveredSpotInfo] = useState<{
+    laneId: number;
+    spotIndex: number;
+    spot: TlcSpot;
+  } | null>(null);
 
   // Rf Badges & Spot Annotations toggle
   const [showRfBadges, setShowRfBadges] = useState(true);
@@ -309,6 +329,57 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     );
   };
 
+  // Helper to extract effective spots for any lane (respecting lane.customSpots override)
+  const getLaneEffectiveSpots = useCallback(
+    (l: TlcLane): {
+      spots: TlcSpot[];
+      originDist: number;
+      frontDist: number;
+      spanDist: number;
+      isCorrecting: boolean;
+      gain: number;
+      offset: number;
+    } => {
+      const oVal = tlcOrigin(currentSet, l, getProfile as any);
+      const fVal = tlcFront(currentSet, l, getProfile);
+      const span = Math.max(1, fVal - oVal);
+      const spotChannel: TlcChannelKey = isComposite
+        ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
+        : (activeChannel as TlcChannelKey);
+      let autoSpots: TlcSpot[] = [];
+      if (getProfile && currentSet.imgs[spotChannel]) {
+        const prof = getProfile(currentSet, spotChannel, l);
+        if (prof && prof.length > 0) {
+          autoSpots = findSpots(prof, {
+            sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
+            origin: oVal,
+            front: fVal,
+            radius: l.spotRadius || 24,
+            minProminence: spotProminence,
+          });
+        }
+      }
+      const baseSpots = getEffectiveLaneSpots(l, autoSpots);
+      const half = l.id < 27 ? 0 : 1;
+      const fit = edgeFits ? edgeFits[half] : null;
+      const setting = edgeSettings ? edgeSettings[half] : null;
+      const isCorrecting = edgeActive(fit, setting);
+      const gain = isCorrecting && fit ? edgeGain(fit, l.x0, setting?.strength ?? 1) : 1;
+      const offset = isCorrecting && fit ? edgeOffset(fit, l.x0, setting?.strength ?? 1) : 0;
+      const spots = isCorrecting ? correctSpots(baseSpots, gain, offset) : baseSpots;
+      return {
+        spots,
+        originDist: oVal,
+        frontDist: fVal,
+        spanDist: span,
+        isCorrecting,
+        gain,
+        offset,
+      };
+    },
+    [currentSet, getProfile, isComposite, activeChannel, spotProminence, edgeFits, edgeSettings]
+  );
+
   // Render Full Plate Canvas (clears context, resets transform, and ensures leak-free drawing)
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -471,6 +542,67 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
     const imgScale = bmp.width / frameW;
 
+    // Straightened preview: each half of the plate is re-stretched strip by strip about its origin
+    // line, dividing the distance run by g(x). A spot at h*g(x) lands at h, so spots of one compound
+    // line up in a row when the correction is right.
+    const straightHalf = [0, 1].map((h) => {
+      const fit = edgeFits ? edgeFits[h] : null;
+      const st = edgeSettings ? edgeSettings[h] : null;
+      return straighten && fit && st && edgeActive(fit, st) ? { fit, strength: st.strength } : null;
+    });
+    if (straightHalf.some(Boolean)) {
+      const k = dpr * scale; // canvas px per image px
+      const src = document.createElement('canvas');
+      src.width = canvas.width;
+      src.height = canvas.height;
+      const sctx = src.getContext('2d');
+      if (sctx) {
+        sctx.drawImage(canvas, 0, 0);
+        [0, 1].forEach((h) => {
+          const sh = straightHalf[h];
+          if (!sh) return;
+          const hl = lanes.filter((l) => (l.id < 27 ? 0 : 1) === h);
+          if (!hl.length) return;
+          const xs = hl.map((l) => l.x0);
+          const xLo = Math.min(...xs);
+          const xHi = Math.max(...xs);
+          // origin line (image px) of the lane nearest to a strip, and the run direction
+          const originOf = (l: TlcLane) => {
+            const th = (l.angle * Math.PI) / 180;
+            const o = tlcOrigin(currentSet, l, getProfile as any);
+            return { y: (l.y0 - o * Math.cos(th)) * imgScale, up: Math.cos(th) > 0, len: l.length * imgScale };
+          };
+          const strip = 4; // image px
+          const x0px = (xLo - 70) * imgScale;
+          const x1px = (xHi + 70) * imgScale;
+          for (let xp = Math.max(0, x0px); xp < Math.min(bmp.width, x1px); xp += strip) {
+            const xf = (xp + strip / 2) / imgScale;
+            const near = hl.reduce((a, b) => (Math.abs(b.x0 - xf) < Math.abs(a.x0 - xf) ? b : a));
+            const { y: oy, up, len } = originOf(near);
+            const xc = Math.min(xHi, Math.max(xLo, xf));
+            const g = edgeGain(sh.fit, xc, sh.strength);
+            const bOff = edgeOffset(sh.fit, xc, sh.strength);
+            if (!(g > 0) || (Math.abs(g - 1) < 1e-4 && Math.abs(bOff) < 1e-4)) continue;
+            const spanPx = Math.max(1, tlcFront(currentSet, near, getProfile) - tlcOrigin(currentSet, near, getProfile as any)) * imgScale;
+            const offPx = bOff * spanPx; // additive part, image px toward the front
+            // A spot at distance t from the origin line in the corrected photo comes from distance
+            // t*g + offset in the original. dir = +1 when the run goes down the image, -1 when up.
+            const dir = up ? -1 : 1;
+            const srcA = up ? oy - offPx - len * g : oy + offPx;
+            const srcB = up ? oy - offPx : oy + offPx + len * g;
+            const a = Math.max(0, srcA);
+            const b = Math.min(bmp.height, srcB);
+            if (b - a < 2) continue;
+            const dest = (ys: number) => oy + dir * ((dir * (ys - oy) - offPx) / g);
+            const dA = dest(a);
+            const dB = dest(b);
+            if (!(dB - dA > 0)) continue;
+            ctx.drawImage(src, xp * k, a * k, strip * k, (b - a) * k, xp, dA, strip, dB - dA);
+          }
+        });
+      }
+    }
+
     // Draw All Lanes
     lanes.forEach((l) => {
       const isSelected = l.id === selectedLaneId;
@@ -609,121 +741,185 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         ctx.fillText(label, 0, 22 / scale);
       }
 
-      // In-Plate Spot Centroids & Rf Annotations
+      // In-Plate Spot Centroids & Rf Annotations (Supports interactive drag, manual/adjusted styling)
       if (showRfBadges && getProfile) {
-        const spotChannel: TlcChannelKey = isComposite
-          ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
-          : (activeChannel as TlcChannelKey);
-        if (currentSet.imgs[spotChannel]) {
-          const prof = getProfile(currentSet, spotChannel, l);
-          if (prof && prof.length > 0) {
-            const oVal = tlcOrigin(currentSet, l, getProfile as any);
-            const fVal = tlcFront(currentSet, l, getProfile);
-            const rawSpots = findSpots(prof, {
-              sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
-              origin: oVal,
-              front: fVal,
-              radius: l.spotRadius || 24,
-              minProminence: spotProminence,
-            });
+        const { spots, originDist, spanDist, isCorrecting, gain, offset } = getLaneEffectiveSpots(l);
+        if (spots && spots.length > 0) {
+          const straightHere = straighten && isCorrecting;
+          spots.forEach((sp, spIdx) => {
+            const isDragged = isDraggingSpot && dragSpotRef.current?.laneId === l.id && dragSpotRef.current?.spotIndex === spIdx;
+            const isHoveredSpot = hoveredSpotInfo?.laneId === l.id && hoveredSpotInfo?.spotIndex === spIdx;
 
-            if (rawSpots && rawSpots.length > 0) {
-              const half = l.id < 27 ? 0 : 1;
-              const fit = edgeFits ? edgeFits[half] : null;
-              const setting = edgeSettings ? edgeSettings[half] : null;
-              const isCorrecting = edgeActive(fit, setting);
-              const gain = isCorrecting && fit ? edgeGain(fit, l.x0, setting?.strength ?? 1) : 1;
-              const spots = isCorrecting ? correctSpots(rawSpots, gain) : rawSpots;
+            const correctedSpotY = -(originDist + sp.rf * spanDist);
+            // In the straightened photo the spot itself has moved, so the marker follows it
+            const rawSpotY = straightHere ? correctedSpotY : -(originDist + (sp.rfRaw ?? sp.rf) * spanDist);
+            const markerW = isDragged
+              ? Math.max(w * 0.98, 48 / scale)
+              : isSelected
+              ? Math.min(w * 0.95, 36 / scale)
+              : Math.min(w * 0.75, 22 / scale);
 
-              const spanDist = frontDist - originDist;
-              spots.forEach((sp) => {
-                const correctedSpotY = -(originDist + sp.rf * spanDist);
-                const rawSpotY = -(originDist + (sp.rfRaw ?? sp.rf) * spanDist);
-                const markerW = isSelected ? Math.min(w * 0.95, 34 / scale) : Math.min(w * 0.75, 20 / scale);
+            // Determine spot color & styling based on source (manual vs adjusted vs auto)
+            const spotSource = sp.source || 'auto';
+            const baseColor = isDragged
+              ? '#facc15'
+              : spotSource === 'manual'
+              ? '#f59e0b'
+              : spotSource === 'adjusted'
+              ? '#a855f7'
+              : isSelected
+              ? '#38bdf8'
+              : isHovered
+              ? '#ec4899'
+              : 'rgba(56, 189, 248, 0.85)';
 
-                // If edge correction is active, draw the leveled alignment tick in emerald
-                if (isCorrecting && sp.rfRaw != null && Math.abs(gain - 1) >= 0.003) {
-                  ctx.beginPath();
-                  ctx.setLineDash([3 / scale, 3 / scale]);
-                  ctx.moveTo(-markerW / 2, correctedSpotY);
-                  ctx.lineTo(markerW / 2, correctedSpotY);
-                  ctx.strokeStyle = '#10b981';
-                  ctx.lineWidth = (isSelected ? 2.5 : 1.5) / scale;
-                  ctx.stroke();
-                  ctx.setLineDash([]);
-                }
-
-                // Horizontal centerline tick at raw physical spot
-                ctx.beginPath();
-                ctx.moveTo(-markerW / 2, rawSpotY);
-                ctx.lineTo(markerW / 2, rawSpotY);
-                ctx.strokeStyle = isSelected ? '#38bdf8' : isHovered ? '#ec4899' : 'rgba(56, 189, 248, 0.75)';
-                ctx.lineWidth = (isSelected ? 2.5 : 1.5) / scale;
-                ctx.stroke();
-
-                // Centroid micro-dot
-                ctx.beginPath();
-                ctx.arc(0, rawSpotY, (isSelected ? 3.5 : 2) / scale, 0, Math.PI * 2);
-                ctx.fillStyle = isSelected ? '#38bdf8' : isHovered ? '#ec4899' : '#38bdf8';
-                ctx.fill();
-
-                // Spots picked as 'same compound' for the edge-effect correction
-                const pk = picks.find((q) => q.lane === l.id && Math.abs(q.pos - sp.pos) < 6);
-                if (pk) {
-                  const col = PICK_COLORS[pk.group % PICK_COLORS.length];
-                  ctx.beginPath();
-                  ctx.arc(0, rawSpotY, 9 / scale, 0, Math.PI * 2);
-                  ctx.strokeStyle = col;
-                  ctx.lineWidth = 2.5 / scale;
-                  ctx.stroke();
-                  ctx.fillStyle = col;
-                  ctx.font = `bold ${Math.max(10, Math.round(13 / scale))}px sans-serif`;
-                  ctx.textAlign = 'center';
-                  ctx.textBaseline = 'middle';
-                  ctx.fillText(String(pk.group + 1), 0, rawSpotY - 15 / scale);
-                }
-
-                // High-contrast Rf badge on selected or hovered lane
-                if (isSelected || isHovered) {
-                  const rfStr = isCorrecting && sp.rfRaw != null && Math.abs(gain - 1) >= 0.003
-                    ? `Rf ${sp.rf.toFixed(2)} (${sp.rfRaw.toFixed(2)})`
-                    : `Rf ${sp.rf.toFixed(2)}`;
-                  ctx.font = `bold ${Math.max(10, Math.round(12 / scale))}px monospace`;
-                  const textMetrics = ctx.measureText(rfStr);
-                  const badgeW = textMetrics.width + 8 / scale;
-                  const badgeH = 15 / scale;
-                  const badgeX = w / 2 + 4 / scale;
-                  const badgeY = (isCorrecting ? correctedSpotY : rawSpotY) - badgeH / 2;
-
-                  ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-                  ctx.strokeStyle = isSelected ? (isCorrecting ? '#10b981' : '#38bdf8') : '#ec4899';
-                  ctx.lineWidth = 1 / scale;
-                  ctx.beginPath();
-                  if ((ctx as any).roundRect) {
-                    (ctx as any).roundRect(badgeX, badgeY, badgeW, badgeH, 3 / scale);
-                  } else {
-                    ctx.rect(badgeX, badgeY, badgeW, badgeH);
-                  }
-                  ctx.fill();
-                  ctx.stroke();
-
-                  // Connecting guide line
-                  ctx.beginPath();
-                  ctx.moveTo(markerW / 2, isCorrecting ? correctedSpotY : rawSpotY);
-                  ctx.lineTo(badgeX, isCorrecting ? correctedSpotY : rawSpotY);
-                  ctx.strokeStyle = isCorrecting ? 'rgba(16, 185, 129, 0.5)' : 'rgba(56, 189, 248, 0.4)';
-                  ctx.lineWidth = 1 / scale;
-                  ctx.stroke();
-
-                  // Text label
-                  ctx.fillStyle = isSelected ? (isCorrecting ? '#a7f3d0' : '#38bdf8') : '#f472b6';
-                  ctx.textAlign = 'left';
-                  ctx.textBaseline = 'middle';
-                  ctx.fillText(rfStr, badgeX + 4 / scale, isCorrecting ? correctedSpotY : rawSpotY);
-                }
-              });
+            // If edge correction is active, draw the leveled alignment tick in emerald
+            if (isCorrecting && !straightHere && sp.rfRaw != null && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)) {
+              ctx.beginPath();
+              ctx.setLineDash([3 / scale, 3 / scale]);
+              ctx.moveTo(-markerW / 2, correctedSpotY);
+              ctx.lineTo(markerW / 2, correctedSpotY);
+              ctx.strokeStyle = '#10b981';
+              ctx.lineWidth = (isSelected ? 2.5 : 1.5) / scale;
+              ctx.stroke();
+              ctx.setLineDash([]);
             }
-          }
+
+            // If spot is actively dragged, draw glowing full-width cross-lane indicator
+            if (isDragged) {
+              ctx.save();
+              ctx.shadowColor = '#facc15';
+              ctx.shadowBlur = 10 / scale;
+              ctx.beginPath();
+              ctx.moveTo(-w / 2, rawSpotY);
+              ctx.lineTo(w / 2, rawSpotY);
+              ctx.strokeStyle = '#facc15';
+              ctx.lineWidth = 3 / scale;
+              ctx.stroke();
+              ctx.restore();
+            } else {
+              // Horizontal tick at physical spot location
+              ctx.beginPath();
+              ctx.moveTo(-markerW / 2, rawSpotY);
+              ctx.lineTo(markerW / 2, rawSpotY);
+              ctx.strokeStyle = baseColor;
+              ctx.lineWidth = (isHoveredSpot || isSelected ? 2.5 : 1.5) / scale;
+              ctx.stroke();
+            }
+
+            // Draggable Centroid Grab Handle: distinct ring + inner dot
+            const handleRadius = isDragged
+              ? 6.5 / scale
+              : isHoveredSpot
+              ? 6 / scale
+              : isSelected
+              ? 4.2 / scale
+              : 2.8 / scale;
+
+            if (spotSource === 'manual' || spotSource === 'adjusted' || isHoveredSpot || isDragged) {
+              // Draw provenance aura / grab target halo
+              ctx.beginPath();
+              ctx.arc(0, rawSpotY, handleRadius + 3 / scale, 0, Math.PI * 2);
+              ctx.fillStyle = isDragged
+                ? 'rgba(250, 204, 21, 0.45)'
+                : spotSource === 'manual'
+                ? 'rgba(245, 158, 11, 0.32)'
+                : spotSource === 'adjusted'
+                ? 'rgba(168, 85, 247, 0.32)'
+                : 'rgba(56, 189, 248, 0.28)';
+              ctx.fill();
+            }
+
+            ctx.beginPath();
+            ctx.arc(0, rawSpotY, handleRadius, 0, Math.PI * 2);
+            ctx.fillStyle = isDragged ? '#facc15' : baseColor;
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.3 / scale;
+            ctx.stroke();
+
+            // Spots picked as 'same compound' for edge correction
+            const pk = picks.find((q) => q.lane === l.id && Math.abs(q.pos - sp.pos) < 6);
+            if (pk) {
+              const col = PICK_COLORS[pk.group % PICK_COLORS.length];
+              ctx.beginPath();
+              ctx.arc(0, rawSpotY, 9 / scale, 0, Math.PI * 2);
+              ctx.strokeStyle = col;
+              ctx.lineWidth = 2.5 / scale;
+              ctx.stroke();
+              ctx.fillStyle = col;
+              ctx.font = `bold ${Math.max(10, Math.round(13 / scale))}px sans-serif`;
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText(String(pk.group + 1), 0, rawSpotY - 15 / scale);
+            }
+
+            // High-contrast Rf badge on selected, hovered, or actively manipulated spot
+            if (isSelected || isHovered || isDragged || isHoveredSpot) {
+              const sourceBadge = spotSource === 'manual' ? ' ✋' : spotSource === 'adjusted' ? ' ✨' : '';
+              const rfStr = isCorrecting && sp.rfRaw != null && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)
+                ? `Rf ${sp.rf.toFixed(2)} (${sp.rfRaw.toFixed(2)})${sourceBadge}`
+                : `Rf ${sp.rf.toFixed(2)}${sourceBadge}`;
+              ctx.font = `bold ${Math.max(10, Math.round(12 / scale))}px monospace`;
+              const textMetrics = ctx.measureText(rfStr);
+              const badgeW = textMetrics.width + 8 / scale;
+              const badgeH = 15 / scale;
+              const badgeX = w / 2 + 4 / scale;
+              const badgeY = (isCorrecting ? correctedSpotY : rawSpotY) - badgeH / 2;
+
+              ctx.fillStyle = isDragged
+                ? '#facc15'
+                : 'rgba(15, 23, 42, 0.94)';
+              ctx.strokeStyle = isDragged
+                ? '#eab308'
+                : spotSource === 'manual'
+                ? '#f59e0b'
+                : spotSource === 'adjusted'
+                ? '#a855f7'
+                : isSelected
+                ? (isCorrecting ? '#10b981' : '#38bdf8')
+                : '#ec4899';
+              ctx.lineWidth = (isDragged ? 2 : 1) / scale;
+              ctx.beginPath();
+              if ((ctx as any).roundRect) {
+                (ctx as any).roundRect(badgeX, badgeY, badgeW, badgeH, 3 / scale);
+              } else {
+                ctx.rect(badgeX, badgeY, badgeW, badgeH);
+              }
+              ctx.fill();
+              ctx.stroke();
+
+              // Connecting guide line
+              ctx.beginPath();
+              ctx.moveTo(markerW / 2, isCorrecting ? correctedSpotY : rawSpotY);
+              ctx.lineTo(badgeX, isCorrecting ? correctedSpotY : rawSpotY);
+              ctx.strokeStyle = isDragged
+                ? '#facc15'
+                : spotSource === 'manual'
+                ? 'rgba(245, 158, 11, 0.6)'
+                : spotSource === 'adjusted'
+                ? 'rgba(168, 85, 247, 0.6)'
+                : isCorrecting
+                ? 'rgba(16, 185, 129, 0.5)'
+                : 'rgba(56, 189, 248, 0.4)';
+              ctx.lineWidth = 1 / scale;
+              ctx.stroke();
+
+              // Text label
+              ctx.fillStyle = isDragged
+                ? '#0f172a'
+                : spotSource === 'manual'
+                ? '#fde68a'
+                : spotSource === 'adjusted'
+                ? '#e9d5ff'
+                : isSelected
+                ? (isCorrecting ? '#a7f3d0' : '#38bdf8')
+                : '#f472b6';
+              ctx.textAlign = 'left';
+              ctx.textBaseline = 'middle';
+              ctx.fillText(rfStr, badgeX + 4 / scale, isCorrecting ? correctedSpotY : rawSpotY);
+            }
+          });
         }
       }
 
@@ -749,7 +945,158 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     splitPos,
     activeChannel,
     picks,
+    straighten,
+    edgeFits,
+    edgeSettings,
+    spotProminence,
+    getLaneEffectiveSpots,
+    isDraggingSpot,
+    hoveredSpotInfo,
   ]);
+
+  // Find spot collision at mouse coordinates (for dragging, Alt+Click deletion, or tooltip)
+  const findSpotAtPoint = useCallback(
+    (clientX: number, clientY: number): {
+      laneId: number;
+      spotIndex: number;
+      spot: TlcSpot;
+      lane: TlcLane;
+      originDist: number;
+      spanDist: number;
+    } | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || !imgEntry?.bmp) return null;
+
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = clientX - rect.left;
+      const mouseY = clientY - rect.top;
+
+      const scale = rect.width / imgEntry.bmp.width;
+      const imgScale = imgEntry.bmp.width / frameW;
+
+      // Check selected lane first for responsive priority, then all lanes
+      const targetLanes: TlcLane[] = [];
+      if (selectedLaneId !== null) {
+        const sel = lanes.find((l) => l.id === selectedLaneId);
+        if (sel) targetLanes.push(sel);
+      }
+      for (const l of lanes) {
+        if (l.id !== selectedLaneId) targetLanes.push(l);
+      }
+
+      for (const l of targetLanes) {
+        const ox = l.x0 * imgScale * scale;
+        const oy = l.y0 * imgScale * scale;
+        const w = l.width * imgScale * scale;
+        const len = l.length * imgScale * scale;
+        const th = (l.angle * Math.PI) / 180;
+
+        const dx = mouseX - ox;
+        const dy = mouseY - oy;
+
+        const cos = Math.cos(-th);
+        const sin = Math.sin(-th);
+        const localX = dx * cos - dy * sin;
+        const localY = dx * sin + dy * cos;
+
+        // Skip if far outside lane bounding box
+        if (localX < -w / 2 - 16 || localX > w / 2 + 16 || localY < -len - 16 || localY > 16) {
+          continue;
+        }
+
+        const { spots, originDist, spanDist, isCorrecting } = getLaneEffectiveSpots(l);
+        const straightHere = straighten && isCorrecting;
+
+        for (let i = 0; i < spots.length; i++) {
+          const sp = spots[i];
+          const spotDist = straightHere ? (originDist + sp.rf * spanDist) : (sp.rfRaw != null ? originDist + sp.rfRaw * spanDist : sp.pos);
+          const spotY = -spotDist * imgScale * scale;
+
+          const distToSpot = Math.hypot(localX, localY - spotY);
+          // Grab radius of 16px minimum on screen for easy click & drag
+          if (distToSpot <= Math.max(16, w * 0.45)) {
+            return { laneId: l.id, spotIndex: i, spot: sp, lane: l, originDist, spanDist };
+          }
+        }
+      }
+      return null;
+    },
+    [imgEntry, frameW, lanes, selectedLaneId, getLaneEffectiveSpots, straighten]
+  );
+
+  // Spot management callbacks: Add, Delete, Reset, and Nudge
+  const handleAddSpotToLane = useCallback(
+    (laneId: number, targetRf: number = 0.5) => {
+      if (!onUpdateLane) return;
+      const lane = lanes.find((l) => l.id === laneId);
+      if (!lane) return;
+      if (onSnapshotHistory) onSnapshotHistory();
+      const { spots, originDist, spanDist } = getLaneEffectiveSpots(lane);
+      const clampedRf = Math.max(0, Math.min(1.0, targetRf));
+      const pos = Math.round(originDist + clampedRf * spanDist);
+      const newSpot: TlcSpot = {
+        pos,
+        rf: +clampedRf.toFixed(3),
+        rfRaw: +clampedRf.toFixed(3),
+        strength: 0.5,
+        areaPct: 20,
+        source: 'manual',
+      };
+      const nextSpots = [...spots, newSpot].sort((a, b) => a.pos - b.pos);
+      onUpdateLane(laneId, { customSpots: nextSpots });
+      setSelectedLaneId(laneId);
+    },
+    [lanes, onUpdateLane, onSnapshotHistory, getLaneEffectiveSpots]
+  );
+
+  const handleDeleteSpotFromLane = useCallback(
+    (laneId: number, spotIndex: number) => {
+      if (!onUpdateLane) return;
+      const lane = lanes.find((l) => l.id === laneId);
+      if (!lane) return;
+      if (onSnapshotHistory) onSnapshotHistory();
+      const { spots } = getLaneEffectiveSpots(lane);
+      const remaining = spots.filter((_, idx) => idx !== spotIndex);
+      onUpdateLane(laneId, { customSpots: remaining });
+    },
+    [lanes, onUpdateLane, onSnapshotHistory, getLaneEffectiveSpots]
+  );
+
+  const handleResetLaneSpotsToAuto = useCallback(
+    (laneId: number) => {
+      if (!onUpdateLane) return;
+      if (onSnapshotHistory) onSnapshotHistory();
+      onUpdateLane(laneId, { customSpots: undefined });
+    },
+    [onUpdateLane, onSnapshotHistory]
+  );
+
+  const handleNudgeSpotRf = useCallback(
+    (laneId: number, spotIndex: number, deltaRf: number) => {
+      if (!onUpdateLane) return;
+      const lane = lanes.find((l) => l.id === laneId);
+      if (!lane) return;
+      const { spots, originDist, spanDist } = getLaneEffectiveSpots(lane);
+      if (!spots[spotIndex]) return;
+      if (onSnapshotHistory) onSnapshotHistory();
+      const targetRf = Math.max(0, Math.min(1.0, +(spots[spotIndex].rf + deltaRf).toFixed(3)));
+      const pos = Math.round(originDist + targetRf * spanDist);
+      const updated = spots.map((s, idx) => {
+        if (idx === spotIndex) {
+          return {
+            ...s,
+            pos,
+            rf: targetRf,
+            rfRaw: targetRf,
+            source: (s.source === 'manual' ? 'manual' : 'adjusted') as 'manual' | 'adjusted',
+          };
+        }
+        return s;
+      });
+      onUpdateLane(laneId, { customSpots: updated });
+    },
+    [lanes, onUpdateLane, onSnapshotHistory, getLaneEffectiveSpots]
+  );
 
   // Find lane collision at mouse coordinates
   const findLaneAtPoint = useCallback(
@@ -793,7 +1140,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     [imgEntry, frameW, lanes]
   );
 
-  // Mouse Move: update hover and handle on-canvas dragging
+  // Mouse Move: update hover, handle on-canvas lane drag & spot centroid drag
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     setMousePos({ x: e.clientX, y: e.clientY });
 
@@ -805,6 +1152,42 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       return;
     }
 
+    // Handle dragging a spot along the lane trajectory
+    if (isDraggingSpot && dragSpotRef.current && onUpdateLane && imgEntry?.bmp) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const scale = rect.width / imgEntry.bmp.width;
+      const imgScale = imgEntry.bmp.width / frameW;
+      const targetLane = lanes.find((l) => l.id === dragSpotRef.current!.laneId);
+      if (targetLane) {
+        const th = (targetLane.angle * Math.PI) / 180;
+        const dx = e.clientX - rect.left - targetLane.x0 * imgScale * scale;
+        const dy = e.clientY - rect.top - targetLane.y0 * imgScale * scale;
+        const localY = dx * Math.sin(-th) + dy * Math.cos(-th);
+        const dist = -localY / (imgScale * scale);
+        const { originDist, spanDist, initialSpots, spotIndex, laneId } = dragSpotRef.current;
+        const clampedDist = Math.max(originDist * 0.4, Math.min(targetLane.length * 1.05, dist));
+        const rf = Math.max(0, Math.min(1.0, (clampedDist - originDist) / spanDist));
+
+        const updatedSpots = initialSpots.map((s, idx) => {
+          if (idx === spotIndex) {
+            return {
+              ...s,
+              pos: Math.round(clampedDist),
+              rf: +rf.toFixed(3),
+              rfRaw: +rf.toFixed(3),
+              source: (s.source === 'manual' ? 'manual' : 'adjusted') as 'manual' | 'adjusted',
+            };
+          }
+          return s;
+        });
+        onUpdateLane(laneId, { customSpots: updatedSpots });
+      }
+      return;
+    }
+
+    // Handle dragging whole lane bounding box
     if (isDragging && dragStartRef.current && selectedLane && onUpdateLane && imgEntry?.bmp) {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -822,11 +1205,28 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       return;
     }
 
+    // Hit testing for spots and lanes
+    const spotHit = findSpotAtPoint(e.clientX, e.clientY);
+    setHoveredSpotInfo(spotHit);
+
     const hit = findLaneAtPoint(e.clientX, e.clientY);
     setHoveredLaneId(hit);
+
+    // Update dynamic cursor
+    if (canvasRef.current) {
+      if (spotHit) {
+        canvasRef.current.style.cursor = e.altKey ? 'pointer' : 'ns-resize';
+      } else if (e.shiftKey && hit !== null) {
+        canvasRef.current.style.cursor = 'crosshair';
+      } else if (hit !== null) {
+        canvasRef.current.style.cursor = 'move';
+      } else {
+        canvasRef.current.style.cursor = 'default';
+      }
+    }
   };
 
-  // Mouse Down: select lane or initiate drag
+  // Mouse Down: select lane, start spot drag, add spot (Shift), delete spot (Alt), or drag lane
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     // Check if user clicked near the split wipe curtain handle
     if (isComposite && compositeSubMode === 'split' && canvasRef.current) {
@@ -859,13 +1259,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
           : (activeChannel as TlcChannelKey);
         const prof = currentSet.imgs[ch] ? getProfile(currentSet, ch, l) : [];
         if (prof && prof.length) {
-          const spots = findSpots(prof, {
-            sign: TLC_SIGNAL[ch]?.sign ?? -1,
-            origin: tlcOrigin(currentSet, l, getProfile as any),
-            front: tlcFront(currentSet, l, getProfile),
-            radius: l.spotRadius || 24,
-            minProminence: spotProminence,
-          });
+          const { spots } = getLaneEffectiveSpots(l);
           let best: (typeof spots)[number] | null = null;
           for (const sp of spots) {
             if (!best || Math.abs(sp.pos - dist) < Math.abs(best.pos - dist)) best = sp;
@@ -878,6 +1272,54 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       return;
     }
 
+    // Spot-specific interactions when NOT in edge pick mode:
+    const spotHit = findSpotAtPoint(e.clientX, e.clientY);
+    if (spotHit) {
+      if (e.altKey) {
+        // Alt+Click: Delete this picked spot!
+        handleDeleteSpotFromLane(spotHit.laneId, spotHit.spotIndex);
+        setSelectedLaneId(spotHit.laneId);
+        return;
+      }
+
+      // Click on spot centroid: start sliding / dragging spot along the lane
+      if (onSnapshotHistory) onSnapshotHistory();
+      setIsDraggingSpot(true);
+      setSelectedLaneId(spotHit.laneId);
+      const { spots, originDist, spanDist } = getLaneEffectiveSpots(spotHit.lane);
+      dragSpotRef.current = {
+        laneId: spotHit.laneId,
+        spotIndex: spotHit.spotIndex,
+        startPos: spotHit.spot.pos,
+        startRf: spotHit.spot.rf,
+        originDist,
+        spanDist,
+        initialSpots: [...spots],
+      };
+      return;
+    }
+
+    // Shift + Click on a lane: Drop a new manual spot at clicked location
+    if (e.shiftKey && hit !== null && canvasRef.current && imgEntry?.bmp && onUpdateLane) {
+      const target = lanes.find((l) => l.id === hit);
+      if (target) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const scale = rect.width / imgEntry.bmp.width;
+        const imgScale = imgEntry.bmp.width / frameW;
+        const th = (target.angle * Math.PI) / 180;
+        const dx = e.clientX - rect.left - target.x0 * imgScale * scale;
+        const dy = e.clientY - rect.top - target.y0 * imgScale * scale;
+        const localY = dx * Math.sin(-th) + dy * Math.cos(-th);
+        const dist = -localY / (imgScale * scale);
+        const { originDist, spanDist } = getLaneEffectiveSpots(target);
+        const rf = Math.max(0, Math.min(1.0, (dist - originDist) / spanDist));
+        handleAddSpotToLane(target.id, rf);
+        setActiveHudModule('spots');
+        return;
+      }
+    }
+
+    // Standard lane selection and whole-lane dragging
     if (hit !== null) {
       setSelectedLaneId(hit);
       const target = lanes.find((l) => l.id === hit);
@@ -896,15 +1338,20 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const handleMouseUp = () => {
     setIsDragging(false);
     setIsDraggingSplit(false);
+    setIsDraggingSpot(false);
     dragStartRef.current = null;
+    dragSpotRef.current = null;
   };
 
   const handleMouseLeave = () => {
     setHoveredLaneId(null);
+    setHoveredSpotInfo(null);
     setMousePos(null);
     setIsDragging(false);
     setIsDraggingSplit(false);
+    setIsDraggingSpot(false);
     dragStartRef.current = null;
+    dragSpotRef.current = null;
   };
 
   // Double click on canvas lane opens detailed well inspection modal
@@ -1032,6 +1479,11 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const currentFrontVal = selectedLane
     ? Math.round(tlcFront(currentSet, selectedLane, getProfile))
     : (selectedSide === 1 ? frontSide1Val : frontSide0Val);
+
+  const selectedLaneEffective = selectedLane ? getLaneEffectiveSpots(selectedLane) : null;
+  const selectedLaneSpots = selectedLaneEffective?.spots || [];
+  const selectedLaneManualCount = selectedLaneSpots.filter((s) => s.source === 'manual').length;
+  const selectedLaneAdjustedCount = selectedLaneSpots.filter((s) => s.source === 'adjusted').length;
 
   const cssFilter = `brightness(${filters.brightness}%) contrast(${filters.contrast}%) ${
     filters.invert ? 'invert(1)' : ''
@@ -1173,8 +1625,34 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 💧 Baselines
               </button>
 
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '3px 8px',
+                  fontSize: '11px',
+                  background: activeHudModule === 'spots' ? '#f59e0b' : 'transparent',
+                  color: activeHudModule === 'spots' ? '#0f172a' : '#cbd5e1',
+                  borderColor: activeHudModule === 'spots' ? '#f59e0b' : 'transparent',
+                  fontWeight: activeHudModule === 'spots' ? 800 : 600,
+                }}
+                onClick={() => setActiveHudModule((m) => (m === 'spots' ? 'none' : 'spots'))}
+                title="Manage detected and custom spot picks (drag, add, delete, reset)"
+              >
+                🎯 Spots ({selectedLaneSpots.length})
+                {selectedLane.customSpots !== undefined && (
+                  <span style={{ marginLeft: '4px', background: '#d97706', color: '#fff', padding: '0 4px', borderRadius: '3px', fontSize: '9px', fontWeight: 700 }}>
+                    Custom
+                  </span>
+                )}
+              </button>
+
               {edgeFits && edgeSettings && onEdgeSetting && (() => {
-                const hasSuggestion = edgeFits.some((f, h) => edgeSuggestion(f, edgeSettings[h]));
+                const h = selectedSide === 1 ? 1 : 0;
+                const fit = edgeFits[h];
+                const st = edgeSettings[h];
+                const isThisSideActive = fit && st ? edgeActive(fit, st) : false;
+                const hasThisSideSugg = fit && st ? edgeSuggestion(fit, st) : false;
                 return (
                   <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
                     <button
@@ -1183,17 +1661,17 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                         ...hudBtn,
                         padding: '3px 8px',
                         fontSize: '11px',
-                        background: activeHudModule === 'edge' ? '#ec4899' : pickMode ? '#831843' : isEdgeActive ? '#064e3b' : hasSuggestion ? '#78350f' : 'transparent',
-                        color: activeHudModule === 'edge' ? '#ffffff' : pickMode ? '#f472b6' : isEdgeActive ? '#6ee7b7' : hasSuggestion ? '#fde047' : '#cbd5e1',
-                        borderColor: activeHudModule === 'edge' ? '#db2777' : pickMode ? '#ec4899' : isEdgeActive ? '#059669' : hasSuggestion ? '#eab308' : 'transparent',
+                        background: activeHudModule === 'edge' ? '#ec4899' : pickMode ? '#831843' : isThisSideActive ? '#064e3b' : hasThisSideSugg ? '#78350f' : 'transparent',
+                        color: activeHudModule === 'edge' ? '#ffffff' : pickMode ? '#f472b6' : isThisSideActive ? '#6ee7b7' : hasThisSideSugg ? '#fde047' : '#cbd5e1',
+                        borderColor: activeHudModule === 'edge' ? '#db2777' : pickMode ? '#ec4899' : isThisSideActive ? '#059669' : hasThisSideSugg ? '#eab308' : 'transparent',
                         fontWeight: activeHudModule === 'edge' ? 800 : 600,
                       }}
                       onClick={() => setActiveHudModule((m) => (m === 'edge' ? 'none' : 'edge'))}
-                      title="Edge-effect lateral migration speed correction & reference spot picker"
+                      title={`Open Edge Leveling controls for Side ${h + 1} (Lane ${selectedLane.id})`}
                     >
-                      🎛️ Edge Corr {isEdgeActive ? '● ON' : hasSuggestion ? '⚡ Curve Found' : '○'}{pickMode ? ' (Pick)' : ''}
+                      🎛️ Side {h + 1} Edge {isThisSideActive ? '● ON' : hasThisSideSugg ? '⚡ Curve' : '○ OFF'}{pickMode ? ' (Pick)' : ''}
                     </button>
-                    {!isEdgeActive && hasSuggestion && (
+                    {!isThisSideActive && (hasThisSideSugg || (fit && fit.ok)) ? (
                       <button
                         type="button"
                         style={{
@@ -1205,16 +1683,29 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                           borderColor: '#34d399',
                           fontWeight: 800,
                         }}
-                        onClick={() => {
-                          edgeFits.forEach((f, idx) => {
-                            if (f && f.ok && onEdgeSetting) onEdgeSetting(idx, { ...edgeSettings[idx], mode: 'on' });
-                          });
-                        }}
-                        title="Click to apply the detected lateral migration speed curve"
+                        onClick={() => onEdgeSetting(h, { ...st, mode: 'on' })}
+                        title={`Apply detected leveling curve to Side ${h + 1} (Lanes ${h === 0 ? '0–26' : '27–53'})`}
                       >
-                        ⚡ Apply
+                        ⚡ Level Side {h + 1}
                       </button>
-                    )}
+                    ) : isThisSideActive ? (
+                      <button
+                        type="button"
+                        style={{
+                          ...hudBtn,
+                          padding: '2px 6px',
+                          fontSize: '10px',
+                          background: '#334155',
+                          color: '#f87171',
+                          borderColor: '#475569',
+                          fontWeight: 600,
+                        }}
+                        onClick={() => onEdgeSetting(h, { ...st, mode: 'off' })}
+                        title={`Turn off edge leveling for Side ${h + 1}`}
+                      >
+                        Off
+                      </button>
+                    ) : null}
                   </div>
                 );
               })()}
@@ -1819,8 +2310,208 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             </div>
           )}
 
+          {activeHudModule === 'spots' && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                background: 'rgba(0,0,0,0.35)',
+                padding: '10px 14px',
+                borderRadius: '8px',
+                border: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              {/* Header row: title, counts, add button, reset button */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: '#f59e0b' }}>
+                    🎯 Spots on Lane {selectedLane.id}:
+                  </span>
+                  <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                    {selectedLaneSpots.length} pick{selectedLaneSpots.length === 1 ? '' : 's'}
+                    {selectedLaneManualCount > 0 && ` (${selectedLaneManualCount} manual)`}
+                    {selectedLaneAdjustedCount > 0 && ` (${selectedLaneAdjustedCount} adjusted)`}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    style={{
+                      ...hudBtn,
+                      background: '#047857',
+                      color: '#ffffff',
+                      borderColor: '#10b981',
+                      padding: '3px 8px',
+                    }}
+                    onClick={() => handleAddSpotToLane(selectedLane.id, 0.50)}
+                    title="Add a new spot at Rf 0.50 (or Shift+Click anywhere on the lane)"
+                  >
+                    + Add Spot (Rf 0.50)
+                  </button>
+
+                  {selectedLane.customSpots !== undefined && (
+                    <button
+                      type="button"
+                      style={{
+                        ...hudBtn,
+                        background: '#334155',
+                        color: '#fbbf24',
+                        borderColor: '#78350f',
+                        padding: '3px 8px',
+                      }}
+                      onClick={() => handleResetLaneSpotsToAuto(selectedLane.id)}
+                      title="Clear custom adjustments and restore automated peak detection for this lane"
+                    >
+                      ↺ Reset to Auto Detection
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Spots list */}
+              {selectedLaneSpots.length > 0 ? (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+                    gap: '8px',
+                    maxHeight: 'min(240px, 35vh)',
+                    overflowY: 'auto',
+                    padding: '2px',
+                  }}
+                >
+                  {selectedLaneSpots.map((sp, idx) => {
+                    const src = sp.source || 'auto';
+                    const srcColor = src === 'manual' ? '#f59e0b' : src === 'adjusted' ? '#a855f7' : '#38bdf8';
+                    const srcBg = src === 'manual' ? 'rgba(245, 158, 11, 0.15)' : src === 'adjusted' ? 'rgba(168, 85, 247, 0.15)' : 'rgba(56, 189, 248, 0.12)';
+                    const srcBorder = src === 'manual' ? '#b45309' : src === 'adjusted' ? '#7e22ce' : '#0369a1';
+                    return (
+                      <div
+                        key={idx}
+                        style={{
+                          background: 'rgba(15, 23, 42, 0.85)',
+                          borderRadius: '6px',
+                          border: `1px solid ${srcBorder}`,
+                          padding: '6px 8px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span style={{ fontWeight: 800, fontSize: '11px', color: '#fff' }}>
+                              #{idx + 1}
+                            </span>
+                            <span
+                              style={{
+                                fontSize: '10px',
+                                fontWeight: 700,
+                                background: srcBg,
+                                color: srcColor,
+                                border: `1px solid ${srcBorder}`,
+                                padding: '1px 5px',
+                                borderRadius: '3px',
+                              }}
+                            >
+                              {src === 'manual' ? '✋ Manual' : src === 'adjusted' ? '✨ Adjusted' : 'Auto'}
+                            </span>
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: srcColor }}>
+                              Rf {sp.rf.toFixed(2)}
+                            </span>
+                            <button
+                              type="button"
+                              style={{
+                                ...hudBtn,
+                                padding: '1px 5px',
+                                fontSize: '10px',
+                                background: 'transparent',
+                                color: '#ef4444',
+                                borderColor: 'rgba(239, 68, 68, 0.4)',
+                              }}
+                              onClick={() => handleDeleteSpotFromLane(selectedLane.id, idx)}
+                              title="Delete this spot (or Alt+Click on the canvas)"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Fine nudge controls */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                          <button
+                            type="button"
+                            style={{ ...hudBtn, padding: '1px 5px', fontSize: '9px' }}
+                            onClick={() => handleNudgeSpotRf(selectedLane.id, idx, -0.05)}
+                            title="Nudge Rf -0.05"
+                          >
+                            -0.05
+                          </button>
+                          <button
+                            type="button"
+                            style={{ ...hudBtn, padding: '1px 5px', fontSize: '9px' }}
+                            onClick={() => handleNudgeSpotRf(selectedLane.id, idx, -0.01)}
+                            title="Nudge Rf -0.01"
+                          >
+                            -0.01
+                          </button>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={1}
+                            value={Math.round(sp.rf * 100)}
+                            onPointerDown={onSnapshotHistory}
+                            onMouseDown={onSnapshotHistory}
+                            onChange={(e) => {
+                              const targetRf = +e.target.value / 100;
+                              handleNudgeSpotRf(selectedLane.id, idx, targetRf - sp.rf);
+                            }}
+                            style={{ ...hudSliderTrack, flex: 1, accentColor: srcColor }}
+                          />
+                          <button
+                            type="button"
+                            style={{ ...hudBtn, padding: '1px 5px', fontSize: '9px' }}
+                            onClick={() => handleNudgeSpotRf(selectedLane.id, idx, +0.01)}
+                            title="Nudge Rf +0.01"
+                          >
+                            +0.01
+                          </button>
+                          <button
+                            type="button"
+                            style={{ ...hudBtn, padding: '1px 5px', fontSize: '9px' }}
+                            onClick={() => handleNudgeSpotRf(selectedLane.id, idx, +0.05)}
+                            title="Nudge Rf +0.05"
+                          >
+                            +0.05
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: '11px', color: '#94a3b8', fontStyle: 'italic', padding: '4px' }}>
+                  No spots on this lane. Click "+ Add Spot" above or Shift+Click on the lane photograph to place a spot pick.
+                </div>
+              )}
+
+              {/* Interaction Guide */}
+              <div style={{ fontSize: '10px', color: '#38bdf8', display: 'flex', gap: '12px', flexWrap: 'wrap', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '4px' }}>
+                <span>💡 <b>Interactive Controls:</b> Click &amp; drag any spot centroid ring on the photograph to slide its Rf</span>
+                <span><b>Shift+Click</b> on lane to place new spot</span>
+                <span><b>Alt+Click</b> on spot to delete</span>
+              </div>
+            </div>
+          )}
+
           {activeHudModule === 'edge' && edgeFits && edgeSettings && onEdgeSetting && (
-            <div style={{ marginTop: '2px', marginBottom: '2px' }}>
+            <div style={{ marginTop: '2px', marginBottom: '2px', maxHeight: 'min(360px, 45vh)', overflowY: 'auto' }}>
               <TlcEdgePanel
                 fits={edgeFits}
                 settings={edgeSettings}
@@ -1833,6 +2524,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 onClearPicks={onClearPicks || (() => {})}
                 darkTheme={true}
                 defaultOpen={true}
+                selectedLaneId={selectedLaneId}
+                straighten={straighten}
+                onToggleStraighten={setStraighten}
               />
             </div>
           )}
@@ -2142,7 +2836,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         >
           {/* Top Bar for Overview Mode */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-            <span style={{ color: 'var(--fg)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ color: '#e2e8f0', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
               <span>💡</span>
               <span><b>Plate Overview:</b> Click any lane on the photograph to select &amp; align.</span>
             </span>
@@ -2191,7 +2885,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               )}
 
               {edgeFits && edgeSettings && onEdgeSetting && (() => {
-                const hasSuggestion = edgeFits.some((f, h) => edgeSuggestion(f, edgeSettings[h]));
+                const isSide0Active = edgeFits[0] && edgeSettings[0] ? edgeActive(edgeFits[0], edgeSettings[0]) : false;
+                const isSide1Active = edgeFits[1] && edgeSettings[1] ? edgeActive(edgeFits[1], edgeSettings[1]) : false;
+                const hasSide0Sugg = edgeFits[0] && edgeSettings[0] ? edgeSuggestion(edgeFits[0], edgeSettings[0]) : false;
+                const hasSide1Sugg = edgeFits[1] && edgeSettings[1] ? edgeSuggestion(edgeFits[1], edgeSettings[1]) : false;
                 return (
                   <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
                     <button
@@ -2200,36 +2897,50 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                         ...hudBtn,
                         padding: '3px 8px',
                         fontSize: '11px',
-                        background: overviewModule === 'edge' ? '#ec4899' : pickMode ? '#831843' : isEdgeActive ? '#064e3b' : hasSuggestion ? '#78350f' : 'transparent',
-                        color: overviewModule === 'edge' ? '#ffffff' : pickMode ? '#f472b6' : isEdgeActive ? '#6ee7b7' : hasSuggestion ? '#fde047' : '#cbd5e1',
-                        borderColor: overviewModule === 'edge' ? '#db2777' : pickMode ? '#ec4899' : isEdgeActive ? '#059669' : hasSuggestion ? '#eab308' : 'transparent',
+                        background: overviewModule === 'edge' ? '#ec4899' : (isSide0Active || isSide1Active) ? '#064e3b' : (hasSide0Sugg || hasSide1Sugg) ? '#78350f' : 'transparent',
+                        color: overviewModule === 'edge' ? '#ffffff' : (isSide0Active || isSide1Active) ? '#6ee7b7' : (hasSide0Sugg || hasSide1Sugg) ? '#fde047' : '#cbd5e1',
+                        borderColor: overviewModule === 'edge' ? '#db2777' : (isSide0Active || isSide1Active) ? '#059669' : (hasSide0Sugg || hasSide1Sugg) ? '#eab308' : 'transparent',
                         fontWeight: overviewModule === 'edge' ? 800 : 600,
                       }}
                       onClick={() => setOverviewModule((m) => (m === 'edge' ? 'none' : 'edge'))}
-                      title="Toggle edge-effect migration speed correction & reference spot picker"
+                      title="Open Edge Migration Leveling controls for Side 1 and Side 2"
                     >
-                      🎛️ Edge Corr {isEdgeActive ? '● ON' : hasSuggestion ? '⚡ Curve Found' : '○'}{pickMode ? ' (Picking…)' : ''}
+                      🎛️ Edge: S1 {isSide0Active ? '● ON' : hasSide0Sugg ? '⚡' : '○'} | S2 {isSide1Active ? '● ON' : hasSide1Sugg ? '⚡' : '○'}{pickMode ? ' (Pick)' : ''}
                     </button>
-                    {!isEdgeActive && hasSuggestion && (
+                    {!isSide0Active && hasSide0Sugg && (
                       <button
                         type="button"
                         style={{
                           ...hudBtn,
-                          padding: '2px 7px',
+                          padding: '2px 6px',
                           fontSize: '10px',
                           background: '#10b981',
                           color: '#022c22',
                           borderColor: '#34d399',
                           fontWeight: 800,
                         }}
-                        onClick={() => {
-                          edgeFits.forEach((f, idx) => {
-                            if (f && f.ok && onEdgeSetting) onEdgeSetting(idx, { ...edgeSettings[idx], mode: 'on' });
-                          });
-                        }}
-                        title="Click to apply the detected lateral migration speed curve"
+                        onClick={() => onEdgeSetting(0, { ...edgeSettings[0], mode: 'on' })}
+                        title="Apply detected leveling curve to Side 1 (Lanes 0–26)"
                       >
-                        ⚡ Apply
+                        ⚡ S1
+                      </button>
+                    )}
+                    {!isSide1Active && hasSide1Sugg && (
+                      <button
+                        type="button"
+                        style={{
+                          ...hudBtn,
+                          padding: '2px 6px',
+                          fontSize: '10px',
+                          background: '#06b6d4',
+                          color: '#042f2e',
+                          borderColor: '#22d3ee',
+                          fontWeight: 800,
+                        }}
+                        onClick={() => onEdgeSetting(1, { ...edgeSettings[1], mode: 'on' })}
+                        title="Apply detected leveling curve to Side 2 (Lanes 27–53)"
+                      >
+                        ⚡ S2
                       </button>
                     )}
                   </div>
@@ -2403,7 +3114,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
           )}
 
           {overviewModule === 'edge' && edgeFits && edgeSettings && onEdgeSetting && (
-            <div style={{ marginTop: '4px' }}>
+            <div style={{ marginTop: '4px', maxHeight: 'min(360px, 45vh)', overflowY: 'auto' }}>
               <TlcEdgePanel
                 fits={edgeFits}
                 settings={edgeSettings}
@@ -2414,6 +3125,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 pickGroup={pickGroup}
                 onPickGroup={onPickGroup || (() => {})}
                 onClearPicks={onClearPicks || (() => {})}
+                selectedLaneId={selectedLaneId}
+                straighten={straighten}
+                onToggleStraighten={setStraighten}
                 darkTheme={true}
                 defaultOpen={true}
               />
@@ -2624,6 +3338,49 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       {/* Plate Image Display */}
       {imgEntry?.bmp ? (
         <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
+          {pickMode && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '8px',
+                padding: '6px 12px',
+                background: '#831843',
+                color: '#fdf2f8',
+                borderRadius: '6px',
+                borderWidth: '1px',
+                borderStyle: 'solid',
+                borderColor: '#ec4899',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+                marginBottom: '8px',
+                fontSize: '11px',
+              }}
+            >
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+                <span>🎯 <b>Picking Spots for Compound {pickGroup + 1}</b> ({picks.filter((q) => q.group === pickGroup).length} picked)</span>
+                <span style={{ fontSize: '11px', color: '#fbcfe8' }}>— Click detected spots along lanes; click again to remove</span>
+              </div>
+              <button
+                type="button"
+                style={{
+                  ...hudBtn,
+                  padding: '2px 8px',
+                  background: '#ec4899',
+                  color: '#ffffff',
+                  borderWidth: '1px',
+                  borderStyle: 'solid',
+                  borderColor: '#f472b6',
+                  fontWeight: 700,
+                  fontSize: '11px',
+                }}
+                onClick={() => onPickMode && onPickMode(false)}
+              >
+                ✓ Done Picking
+              </button>
+            </div>
+          )}
           <canvas
             ref={canvasRef}
             onMouseMove={handleMouseMove}
@@ -2712,8 +3469,22 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             </span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
               <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#38bdf8' }} />
-              Spot Centroid &amp; Rf Badge
+              Auto Pick
             </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#f59e0b' }}>
+              <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#f59e0b', border: '1px solid #ffffff' }} />
+              ✋ Manual Pick
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#c084fc' }}>
+              <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#a855f7', border: '1px solid #ffffff' }} />
+              ✨ User Adjusted (Drag along lane)
+            </span>
+            {isEdgeActive && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#10b981' }}>
+                <span style={{ display: 'inline-block', width: '14px', height: '0px', borderTop: '2px dashed #10b981' }} />
+                Leveled Spot Position (Emerald Dashed: Corrected Rf)
+              </span>
+            )}
             {isComposite && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#10b981' }}>
                 <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '2px', background: '#10b981' }} />

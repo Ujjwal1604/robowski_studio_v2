@@ -59,6 +59,7 @@ export const SetupView: React.FC = () => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [presetsOpen, setPresetsOpen] = useState(false);
   const [showStructures, setShowStructures] = useState(true);
+  const [reagentViewMode, setReagentViewMode] = useState<'cards' | 'table'>('cards');
   const [resolvingStructures, setResolvingStructures] = useState(false);
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
   const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
@@ -679,23 +680,75 @@ export const SetupView: React.FC = () => {
           </div>
         </div>
 
-        {/* Reagents Table Card */}
+        {/* Reagents Table / Studio Card */}
         <div className="card pad" style={{ overflowX: 'auto' }}>
-          <div style={{ minWidth: '860px' }}>
-            <div className="chead">
+          <div style={{ minWidth: reagentViewMode === 'table' ? '860px' : 'auto' }}>
+            <div className="chead" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
               <div className="ct">
                 Reagents{' '}
                 <span className="cnt">{state.reagents.length} of 12 · in order of addition</span>
               </div>
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginLeft: 'auto' }}>
+                {/* View Mode Segmented Switcher */}
+                <div style={{ display: 'inline-flex', background: 'var(--soft)', borderRadius: '8px', padding: '2px', border: '1px solid var(--line)' }}>
+                  <button
+                    type="button"
+                    className={`btn sm ${reagentViewMode === 'cards' ? 'pri' : ''}`}
+                    style={{
+                      height: '28px',
+                      padding: '0 10px',
+                      borderRadius: '6px',
+                      border: 'none',
+                      fontSize: '12px',
+                      boxShadow: reagentViewMode === 'cards' ? 'var(--shadow-sm)' : 'none',
+                    }}
+                    onClick={() => setReagentViewMode('cards')}
+                    title="Modern spacious reagent studio cards"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '5px' }}>
+                      <rect x="2" y="2" width="5" height="5" rx="1" />
+                      <rect x="9" y="2" width="5" height="5" rx="1" />
+                      <rect x="2" y="9" width="5" height="5" rx="1" />
+                      <rect x="9" y="9" width="5" height="5" rx="1" />
+                    </svg>
+                    Cards
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn sm ${reagentViewMode === 'table' ? 'pri' : ''}`}
+                    style={{
+                      height: '28px',
+                      padding: '0 10px',
+                      borderRadius: '6px',
+                      border: 'none',
+                      fontSize: '12px',
+                      boxShadow: reagentViewMode === 'table' ? 'var(--shadow-sm)' : 'none',
+                    }}
+                    onClick={() => setReagentViewMode('table')}
+                    title="Compact spreadsheet table view"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '5px' }}>
+                      <line x1="2" y1="4" x2="14" y2="4" />
+                      <line x1="2" y1="8" x2="14" y2="8" />
+                      <line x1="2" y1="12" x2="14" y2="12" />
+                    </svg>
+                    Table
+                  </button>
+                </div>
+
+                <div style={{ width: '1px', height: '18px', background: 'var(--line)', margin: '0 2px' }} />
+
                 <button
                   type="button"
-                  className="btn"
+                  className="btn sm"
                   onClick={() => {
                     libFileInputRef.current?.click();
                   }}
                   title="Fill the library from a CSV or Excel file"
                 >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '4px' }}>
+                    <path d="M8 12V3M4 7l4-4 4 4M2 13h12" />
+                  </svg>
                   Import library
                 </button>
                 <input
@@ -728,7 +781,6 @@ export const SetupView: React.FC = () => {
                     e.target.value = '';
                   }}
                 />
-                <div style={{ width: '1px', height: '18px', background: 'var(--line)', margin: '0 2px' }} />
                 <button
                   type="button"
                   className={`btn sm ${showStructures ? 'pri' : ''}`}
@@ -744,13 +796,22 @@ export const SetupView: React.FC = () => {
                   disabled={resolvingStructures}
                   title="Auto-resolve SMILES and 2D structures from IUPAC or chemical names via PubChem"
                 >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '4px' }}>
+                    <circle cx="8" cy="8" r="3" />
+                    <circle cx="2" cy="5" r="1.5" />
+                    <circle cx="14" cy="5" r="1.5" />
+                    <circle cx="8" cy="14" r="1.5" />
+                    <line x1="3.5" y1="5.5" x2="5.5" y2="7" />
+                    <line x1="12.5" y1="5.5" x2="10.5" y2="7" />
+                    <line x1="8" y1="11" x2="8" y2="12.5" />
+                  </svg>
                   {resolvingStructures ? 'Resolving...' : 'Auto-resolve'}
                 </button>
                 {state.reagents.length < 12 && (
-                  <button type="button" className="btn sm pri" onClick={addReagent} style={{ marginLeft: 'auto' }}>
+                  <button type="button" className="btn sm pri" onClick={addReagent}>
                     <svg
-                      width="13"
-                      height="13"
+                      width="12"
+                      height="12"
                       viewBox="0 0 14 14"
                       fill="none"
                       stroke="currentColor"
@@ -776,16 +837,18 @@ export const SetupView: React.FC = () => {
               ))}
             </datalist>
 
-            <div className={`rw th ${showStructures ? 'has-struct' : ''}`}>
-              <div>Code</div>
-              {showStructures && <div>Structure</div>}
-              <div>Name &amp; formula</div>
-              <div>Molar mass</div>
-              <div>Density</div>
-              <div>Stock (mM)</div>
-              <div>Stock solvent</div>
-              <div>Order · save</div>
-            </div>
+            {reagentViewMode === 'table' && (
+              <div className={`rw th ${showStructures ? 'has-struct' : ''}`}>
+                <div>Code</div>
+                {showStructures && <div>Structure</div>}
+                <div>Name &amp; formula</div>
+                <div>Molar mass</div>
+                <div>Density</div>
+                <div>Stock (mM)</div>
+                <div>Stock solvent</div>
+                <div>Order · save</div>
+              </div>
+            )}
 
             {(() => {
               const reagent0Range = (() => {
@@ -823,285 +886,831 @@ export const SetupView: React.FC = () => {
                   }
                 }
 
-              return (
-                <div key={r.code + i} className="rrow" data-i={i}>
-                  <div className={`rw ${showStructures ? 'has-struct' : ''}`}>
-                    <input
-                      type="text"
-                      className="code code-in"
+                if (reagentViewMode === 'cards') {
+                  return (
+                    <div
+                      key={r.code + i}
+                      className="reagent-studio-card"
                       style={{
-                        background: c,
-                        fontSize:
-                          r.code.length <= 4
-                            ? 14
-                            : r.code.length <= 6
-                            ? 11
-                            : r.code.length <= 10
-                            ? 9
-                            : 7,
+                        borderLeftColor: c,
+                        borderLeftWidth: '4px',
                       }}
-                      defaultValue={r.code}
-                      onBlur={(e) => renameReagent(i, e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          renameReagent(i, (e.target as HTMLInputElement).value);
-                        }
-                      }}
-                      maxLength={24}
-                      autoComplete="off"
-                      spellCheck={false}
-                      aria-label={`Reagent ${i + 1} code`}
-                      title="Click to rename this code (letters, numbers, _ and -)."
-                    />
-                    {showStructures && (
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <ChemicalStructure
-                          smiles={r.smiles}
-                          iupac={r.iupac || r.name}
-                          name={r.name}
-                          width={54}
-                          height={38}
-                          allowZoom={true}
-                          onResolvedSmiles={(smiles, mw) => {
-                            setPath(`reagents.${i}.smiles`, smiles);
-                            if (mw && (!r.molarMass || +r.molarMass <= 0)) {
-                              setPath(`reagents.${i}.molarMass`, mw);
-                            }
-                          }}
-                        />
-                      </div>
-                    )}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
-                      <input
-                        type="text"
-                        className="f"
-                        list="libnames"
-                        value={r.name}
-                        onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
-                        onBlur={(e) => handleNameSelect(i, e.target.value)}
-                        placeholder="name (library suggests)"
-                        aria-label={`${r.code} name`}
-                      />
-                      {r.smiles && (
-                        <div
-                          style={{
-                            fontSize: '10px',
-                            color: 'var(--mut)',
-                            fontFamily: 'monospace',
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            paddingLeft: '2px',
-                          }}
-                          title={`SMILES: ${r.smiles}`}
-                        >
-                          {r.smiles}
-                        </div>
-                      )}
-                    </div>
-                    <input
-                      type="number"
-                      step="any"
-                      className="f mono"
-                      value={r.molarMass}
-                      onChange={(e) => setPath(`reagents.${i}.molarMass`, e.target.value)}
-                      aria-label={`${r.code} molar mass`}
-                    />
-                    <input
-                      type="number"
-                      step="any"
-                      className="f mono"
-                      value={r.density || ''}
-                      onChange={(e) => setPath(`reagents.${i}.density`, e.target.value)}
-                      placeholder="solid"
-                      aria-label={`${r.code} density`}
-                    />
-                    <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
-                      <input
-                        type="number"
-                        step="any"
-                        className={`f mono ${invalid.has(`reagents.${i}.stock`) ? 'inv' : ''}`}
-                        value={r.stock}
-                        onChange={(e) => setPath(`reagents.${i}.stock`, e.target.value)}
-                        aria-label={`${r.code} stock`}
-                        style={{ flex: 1, minWidth: '40px' }}
-                      />
-                      <button
-                        type="button"
-                        className="ib"
-                        style={{ height: '32px', width: '28px', padding: 0, fontSize: '13px' }}
-                        title={`Open mass & solution volume calculator for ${r.code}`}
-                        onClick={() => setCalcReagentIndex(i)}
-                      >
-                        🧮
-                      </button>
-                    </div>
-                    <select
-                      className="f"
-                      value={r.solvent}
-                      onChange={(e) => setPath(`reagents.${i}.solvent`, e.target.value)}
-                      aria-label={`${r.code} stock solvent`}
                     >
-                      {SUPPORTED_SOLVENTS.map((s) => (
-                        <option key={s} value={s}>
-                          {s}
-                        </option>
-                      ))}
-                    </select>
-                    <div className="racts">
-                      <button
-                        type="button"
-                        className="ib"
-                        onClick={() => moveReagent(i, -1)}
-                        disabled={i === 0}
-                        title="Add earlier"
-                      >
-                        ↑
-                      </button>
-                      <button
-                        type="button"
-                        className="ib"
-                        onClick={() => moveReagent(i, 1)}
-                        disabled={i === state.reagents.length - 1}
-                        title="Add later"
-                      >
-                        ↓
-                      </button>
-                      <button
-                        type="button"
-                        className="ib"
-                        onClick={async () => {
-                          if (!r.name) {
-                            toast('Give the reagent a name first.');
-                            return;
-                          }
-                          await putLib({
-                            id: Math.random().toString(36).slice(2, 10),
-                            name: r.name,
-                            molarMass: +r.molarMass || 0,
-                            density: +r.density || 0,
-                          });
-                          toast(r.name + ' saved to the library.');
+                      {/* Card Header: Reagent Code Badge, Name, SMILES preview, and Actions */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'flex-start',
+                          justifyContent: 'space-between',
+                          gap: '12px',
+                          marginBottom: '14px',
+                          flexWrap: 'wrap',
                         }}
-                        title="Save to library"
                       >
-                        ★
-                      </button>
-                      {state.reagents.length > 2 ? (
-                        <button
-                          type="button"
-                          className="ib"
-                          onClick={() => removeReagent(i)}
-                          title="Remove"
-                        >
-                          ✕
-                        </button>
-                      ) : (
-                        <span className="ib ph" />
-                      )}
-                    </div>
-                  </div>
-
-                  {inlineRanges && it && (
-                    <div className="rng" style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '8px' }}>
-                      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-                        <span className="l" style={{ fontWeight: 600 }}>Range in {unit}</span>
-                        {(['min', 'step', 'max'] as const).map((f) => (
-                          <label
-                            key={f}
-                            className="l"
-                            style={{ display: 'flex', gap: '6px', alignItems: 'center' }}
-                          >
-                            <span style={{ textTransform: 'capitalize' }}>{f}</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1, minWidth: '260px' }}>
+                          <input
+                            type="text"
+                            className="code code-in"
+                            style={{
+                              background: c,
+                              width: '42px',
+                              height: '42px',
+                              borderRadius: '10px',
+                              fontSize: r.code.length <= 4 ? 15 : r.code.length <= 6 ? 12 : 10,
+                              fontWeight: 700,
+                              color: '#fff',
+                              flexShrink: 0,
+                              boxShadow: '0 2px 6px rgba(0,0,0,0.18)',
+                            }}
+                            defaultValue={r.code}
+                            onBlur={(e) => renameReagent(i, e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                renameReagent(i, (e.target as HTMLInputElement).value);
+                              }
+                            }}
+                            maxLength={24}
+                            autoComplete="off"
+                            spellCheck={false}
+                            aria-label={`Reagent ${i + 1} code`}
+                            title="Click to rename reagent code"
+                          />
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, minWidth: 0 }}>
                             <input
-                              type="number"
-                              step="any"
-                              className={`f mono ${
-                                invalid.has(`sets.0.items.${i}.${f}`) ? 'inv' : ''
-                              }`}
-                              style={{ width: '84px' }}
-                              value={it[f]}
-                              onChange={(e) => setPath(`sets.0.items.${i}.${f}`, e.target.value)}
-                              aria-label={`${r.code} ${f}`}
+                              type="text"
+                              className="f"
+                              list="libnames"
+                              value={r.name}
+                              onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
+                              onBlur={(e) => handleNameSelect(i, e.target.value)}
+                              placeholder="Reagent chemical name (e.g. p-toluic acid, Pd(OAc)2)"
+                              aria-label={`${r.code} name`}
+                              style={{
+                                fontSize: '15px',
+                                fontWeight: 600,
+                                height: '36px',
+                                width: '100%',
+                              }}
                             />
-                          </label>
-                        ))}
-                        {dilutionTier && (
-                          <span
-                            className={`chip ${
-                              dilutionTier.tier === 'direct'
-                                ? 'ok'
-                                : dilutionTier.tier === 'sub'
-                                ? 'bad'
-                                : 'warn'
-                            }`}
-                            style={{ fontSize: '11px', height: '26px', padding: '0 9px', marginLeft: 'auto' }}
-                            title={dilutionTier.desc}
-                          >
-                            {dilutionTier.tier === 'direct' ? '✓ ' : dilutionTier.tier === 'sub' ? '⚠ ' : '⚙ '}
-                            {dilutionTier.label}
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Discrete Step Interval Preview */}
-                      {axValues && axValues.length > 0 && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                          <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 500 }}>
-                            {axValues.length} step{axValues.length === 1 ? '' : 's'}:
-                          </span>
-                          <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
-                            {axValues.slice(0, 8).map((val, vi) => (
-                              <span
-                                key={vi}
-                                className="mono"
-                                style={{
-                                  background: 'var(--soft)',
-                                  border: '1px solid var(--line)',
-                                  borderRadius: '4px',
-                                  padding: '2px 7px',
-                                  fontSize: '11px',
-                                  color: 'var(--fg)',
-                                  fontWeight: 500,
-                                }}
-                                title={`Condition step ${vi + 1}: ${nf(val, 3)} ${unit}`}
-                              >
-                                {nf(val, 2)}
-                              </span>
-                            ))}
-                            {axValues.length > 8 && (
-                              <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 500 }}>
-                                … {nf(axValues[axValues.length - 1], 2)} {unit}
-                              </span>
+                            {r.smiles ? (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
+                                <span style={{ fontWeight: 600, color: 'var(--fg)', letterSpacing: '0.02em' }}>SMILES:</span>
+                                <span
+                                  className="mono"
+                                  style={{
+                                    background: 'var(--soft)',
+                                    padding: '2px 8px',
+                                    borderRadius: '4px',
+                                    border: '1px solid var(--line)',
+                                    maxWidth: '360px',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                  title={r.smiles}
+                                >
+                                  {r.smiles}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{ height: '22px', padding: '0 6px', fontSize: '10px' }}
+                                  onClick={() => {
+                                    navigator.clipboard?.writeText(r.smiles || '');
+                                    toast(`Copied ${r.code} SMILES to clipboard`);
+                                  }}
+                                  title="Copy SMILES string"
+                                >
+                                  Copy
+                                </button>
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: '11px', color: 'var(--mut)', fontStyle: 'italic' }}>
+                                No SMILES defined · type IUPAC name to auto-resolve or click structure thumbnail
+                              </div>
                             )}
                           </div>
                         </div>
-                      )}
-                      {axError && <span className="rp e">{axError}</span>}
-                    </div>
-                  )}
 
-                  {state.mode === 'triplet' && (
-                    <div className="hint">
+                        {/* Action buttons */}
+                        <div className="racts">
+                          <button
+                            type="button"
+                            className="ib"
+                            onClick={() => moveReagent(i, -1)}
+                            disabled={i === 0}
+                            title="Add earlier"
+                            aria-label={`Move ${r.code} earlier`}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M8 12V4M4 8l4-4 4 4" />
+                            </svg>
+                          </button>
+                          <button
+                            type="button"
+                            className="ib"
+                            onClick={() => moveReagent(i, 1)}
+                            disabled={i === state.reagents.length - 1}
+                            title="Add later"
+                            aria-label={`Move ${r.code} later`}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M8 4v8m-4-4 4 4 4-4" />
+                            </svg>
+                          </button>
+                          <button
+                            type="button"
+                            className="ib"
+                            onClick={async () => {
+                              if (!r.name) {
+                                toast('Give the reagent a name first.');
+                                return;
+                              }
+                              await putLib({
+                                id: Math.random().toString(36).slice(2, 10),
+                                name: r.name,
+                                molarMass: +r.molarMass || 0,
+                                density: +r.density || 0,
+                                smiles: r.smiles || undefined,
+                                solvent: r.solvent || undefined,
+                              });
+                              toast(r.name + ' saved to library.');
+                            }}
+                            title="Save to library"
+                            aria-label={`Save ${r.code} to library`}
+                          >
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                              <polygon points="8 2 10.3 6.6 15.3 7.3 11.6 10.9 12.5 15.8 8 13.4 3.5 15.8 4.4 10.9 0.7 7.3 5.7 6.6 8 2" />
+                            </svg>
+                          </button>
+                          {state.reagents.length > 2 && (
+                            <button
+                              type="button"
+                              className="ib"
+                              style={{ color: 'var(--err, #ef4444)' }}
+                              onClick={() => removeReagent(i)}
+                              title="Remove reagent"
+                              aria-label={`Remove ${r.code}`}
+                            >
+                              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                <line x1="4" y1="4" x2="12" y2="12" />
+                                <line x1="12" y1="4" x2="4" y2="12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Card Content Grid: Structure, Physical & Stock, Screening Range (if active) */}
                       {(() => {
-                        const ai = (state.tri?.adds || []).findIndex((a) => a.code === r.code);
-                        const gs = (state.tri?.groups || [])
-                          .filter((g) => g.members.includes(r.code))
-                          .map((g) => g.name);
-                        return ai >= 0
-                          ? `Additive · ${nf(state.tri?.adds[ai].equiv, 3)} eq`
-                          : gs.length
-                          ? 'In ' + gs.join(', ')
-                          : 'Not used yet';
-                      })()}
-                    </div>
-                  )}
+                        const hasInlineRange = Boolean(inlineRanges && it);
+                        const triRole = (() => {
+                          if (state.mode !== 'triplet') return null;
+                          const ai = (state.tri?.adds || []).findIndex((a) => a.code === r.code);
+                          const gs = (state.tri?.groups || [])
+                            .filter((g) => g.members.includes(r.code))
+                            .map((g) => g.name);
+                          if (ai >= 0) return { type: 'additive' as const, label: `Additive · ${nf(state.tri?.adds[ai].equiv, 3)} eq` };
+                          if (gs.length) return { type: 'group' as const, label: `In ${gs.join(', ')}` };
+                          return { type: 'unused' as const, label: 'Not assigned yet · configure in Triplet Pattern below' };
+                        })();
 
-                  {dotsFor(i)}
-                </div>
-              );
-            });
-          })()}
+                        return (
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: showStructures
+                                ? hasInlineRange
+                                  ? '190px minmax(300px, 1.1fr) minmax(310px, 1.2fr)'
+                                  : '220px 1fr'
+                                : hasInlineRange
+                                ? 'minmax(300px, 1fr) minmax(310px, 1.2fr)'
+                                : '1fr',
+                              gap: '16px',
+                              alignItems: 'stretch',
+                            }}
+                          >
+                            {/* Col 1: Chemical Structure Canvas (enlarged for high visual clarity) */}
+                            {showStructures && (
+                              <div
+                                style={{
+                                  background: 'var(--soft)',
+                                  borderRadius: '8px',
+                                  border: '1px solid var(--line)',
+                                  padding: '10px',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  cursor: 'pointer',
+                                  minHeight: hasInlineRange ? '138px' : '148px',
+                                  transition: 'border-color 0.15s ease, background 0.15s ease',
+                                }}
+                                title="Click to zoom, inspect, or edit 2D chemical structure"
+                              >
+                                <ChemicalStructure
+                                  smiles={r.smiles}
+                                  iupac={r.iupac || r.name}
+                                  name={r.name}
+                                  width={hasInlineRange ? 170 : 200}
+                                  height={hasInlineRange ? 116 : 130}
+                                  allowZoom={true}
+                                  onResolvedSmiles={(smiles, mw) => {
+                                    setPath(`reagents.${i}.smiles`, smiles);
+                                    if (mw && (!r.molarMass || +r.molarMass <= 0)) {
+                                      setPath(`reagents.${i}.molarMass`, mw);
+                                    }
+                                  }}
+                                />
+                                <span style={{ fontSize: '9px', color: 'var(--mut)', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                                  Inspect / Edit
+                                </span>
+                              </div>
+                            )}
+
+                            {/* Col 2: Physical & Stock Solution */}
+                            <div
+                              style={{
+                                background: 'var(--soft)',
+                                borderRadius: '8px',
+                                border: '1px solid var(--line)',
+                                padding: '12px 16px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                justifyContent: 'space-between',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: hasInlineRange
+                                    ? 'repeat(2, minmax(0, 1fr))'
+                                    : 'repeat(auto-fit, minmax(170px, 1fr))',
+                                  gap: '12px 16px',
+                                }}
+                              >
+                                {/* Molar Mass */}
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                    <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg)' }}>Molar Mass</label>
+                                    <span style={{ fontSize: '10px', color: 'var(--mut)' }}>g/mol</span>
+                                  </div>
+                                  <input
+                                    type="number"
+                                    step="any"
+                                    className="f mono"
+                                    value={r.molarMass}
+                                    onChange={(e) => setPath(`reagents.${i}.molarMass`, e.target.value)}
+                                    aria-label={`${r.code} molar mass`}
+                                    style={{ width: '100%', height: '34px' }}
+                                    placeholder="e.g. 136.15"
+                                  />
+                                </div>
+
+                                {/* Density */}
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                    <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg)' }}>Density</label>
+                                    <span style={{ fontSize: '10px', color: 'var(--mut)' }}>g/mL</span>
+                                  </div>
+                                  <input
+                                    type="number"
+                                    step="any"
+                                    className="f mono"
+                                    value={r.density || ''}
+                                    onChange={(e) => setPath(`reagents.${i}.density`, e.target.value)}
+                                    placeholder="solid"
+                                    aria-label={`${r.code} density`}
+                                    style={{ width: '100%', height: '34px' }}
+                                  />
+                                </div>
+
+                                {/* Stock Conc */}
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                    <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg)' }}>Stock Conc.</label>
+                                    <span style={{ fontSize: '10px', color: 'var(--mut)' }}>mM</span>
+                                  </div>
+                                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      className={`f mono ${invalid.has(`reagents.${i}.stock`) ? 'inv' : ''}`}
+                                      value={r.stock}
+                                      onChange={(e) => setPath(`reagents.${i}.stock`, e.target.value)}
+                                      aria-label={`${r.code} stock`}
+                                      style={{ flex: 1, minWidth: '60px', height: '34px' }}
+                                      placeholder="e.g. 50"
+                                    />
+                                    <button
+                                      type="button"
+                                      className="ib"
+                                      style={{ height: '34px', width: '34px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                                      title={`Open mass & solution volume calculator for ${r.code}`}
+                                      onClick={() => setCalcReagentIndex(i)}
+                                    >
+                                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                        <rect x="2" y="2" width="12" height="12" rx="2" />
+                                        <line x1="5" y1="5" x2="11" y2="5" />
+                                        <circle cx="5" cy="8.5" r="0.7" fill="currentColor" />
+                                        <circle cx="8" cy="8.5" r="0.7" fill="currentColor" />
+                                        <circle cx="11" cy="8.5" r="0.7" fill="currentColor" />
+                                        <circle cx="5" cy="11.5" r="0.7" fill="currentColor" />
+                                        <circle cx="8" cy="11.5" r="0.7" fill="currentColor" />
+                                        <circle cx="11" cy="11.5" r="0.7" fill="currentColor" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Stock Solvent */}
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                    <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg)' }}>Stock Solvent</label>
+                                  </div>
+                                  <select
+                                    className="f"
+                                    value={r.solvent}
+                                    onChange={(e) => setPath(`reagents.${i}.solvent`, e.target.value)}
+                                    aria-label={`${r.code} stock solvent`}
+                                    style={{ width: '100%', height: '34px' }}
+                                  >
+                                    {SUPPORTED_SOLVENTS.map((s) => (
+                                      <option key={s} value={s}>
+                                        {s}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </div>
+
+                              {/* Mode-specific status summary strip when inline ranges are not active */}
+                              {!hasInlineRange && (
+                                <div style={{ marginTop: '12px' }}>
+                                  {triRole ? (
+                                    <div
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '8px',
+                                        background: 'var(--panel)',
+                                        border: '1px solid var(--line)',
+                                        borderRadius: '6px',
+                                        padding: '6px 12px',
+                                        fontSize: '12px',
+                                      }}
+                                    >
+                                      <span style={{ fontWeight: 600, color: 'var(--fg)', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+                                        <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+                                          <circle cx="8" cy="8" r="5" />
+                                        </svg>
+                                        Triplet role:
+                                      </span>
+                                      <span style={{ color: triRole.type === 'unused' ? 'var(--mut)' : 'var(--acc)', fontWeight: triRole.type === 'unused' ? 400 : 600 }}>
+                                        {triRole.label}
+                                      </span>
+                                    </div>
+                                  ) : (state.sets?.length || 0) > 1 ? (
+                                    <div
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '8px',
+                                        background: 'var(--panel)',
+                                        border: '1px solid var(--line)',
+                                        borderRadius: '6px',
+                                        padding: '6px 12px',
+                                        fontSize: '12px',
+                                      }}
+                                    >
+                                      <span style={{ fontWeight: 600, color: 'var(--fg)' }}>Vial sets:</span>
+                                      <span style={{ color: 'var(--mut)' }}>
+                                        Concentration ranges managed per-set in the Vial Sets section below
+                                      </span>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Col 3: Screening Range & Intervals (ONLY rendered when inline ranges exist) */}
+                            {hasInlineRange && it && (
+                              <div
+                                style={{
+                                  background: 'var(--soft)',
+                                  borderRadius: '8px',
+                                  border: '1px solid var(--line)',
+                                  padding: '12px 14px',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  justifyContent: 'space-between',
+                                  gap: '10px',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                                  <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--fg)' }}>
+                                    Screening Range <span style={{ color: 'var(--mut)', fontWeight: 400 }}>({unit})</span>
+                                  </span>
+                                  {dilutionTier && (
+                                    <span
+                                      className={`chip ${
+                                        dilutionTier.tier === 'direct'
+                                          ? 'ok'
+                                          : dilutionTier.tier === 'sub'
+                                          ? 'bad'
+                                          : 'warn'
+                                      }`}
+                                      style={{ fontSize: '11px', height: '24px', padding: '0 8px' }}
+                                      title={dilutionTier.desc}
+                                    >
+                                      {dilutionTier.tier === 'direct' ? '✓ ' : dilutionTier.tier === 'sub' ? '⚠ ' : '⚙ '}
+                                      {dilutionTier.label}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
+                                  {(['min', 'step', 'max'] as const).map((f) => (
+                                    <div key={f}>
+                                      <label style={{ display: 'block', fontSize: '10px', fontWeight: 600, textTransform: 'uppercase', color: 'var(--mut)', marginBottom: '3px' }}>
+                                        {f}
+                                      </label>
+                                      <input
+                                        type="number"
+                                        step="any"
+                                        className={`f mono ${invalid.has(`sets.0.items.${i}.${f}`) ? 'inv' : ''}`}
+                                        style={{ width: '100%', height: '32px' }}
+                                        value={it[f]}
+                                        onChange={(e) => setPath(`sets.0.items.${i}.${f}`, e.target.value)}
+                                        aria-label={`${r.code} ${f}`}
+                                        placeholder={f === 'min' ? '0' : f === 'step' ? '1' : '10'}
+                                      />
+                                    </div>
+                                  ))}
+                                </div>
+
+                                {axValues && axValues.length > 0 ? (
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', marginTop: '2px' }}>
+                                    <span style={{ fontSize: '10px', color: 'var(--mut)', fontWeight: 600, textTransform: 'uppercase' }}>
+                                      {axValues.length} step{axValues.length === 1 ? '' : 's'}:
+                                    </span>
+                                    <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                      {axValues.slice(0, 6).map((val, vi) => (
+                                        <span
+                                          key={vi}
+                                          className="mono"
+                                          style={{
+                                            background: 'var(--panel)',
+                                            border: '1px solid var(--line)',
+                                            borderRadius: '4px',
+                                            padding: '1px 6px',
+                                            fontSize: '11px',
+                                            color: 'var(--fg)',
+                                            fontWeight: 500,
+                                          }}
+                                          title={`Condition step ${vi + 1}: ${nf(val, 3)} ${unit}`}
+                                        >
+                                          {nf(val, 2)}
+                                        </span>
+                                      ))}
+                                      {axValues.length > 6 && (
+                                        <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 500 }}>
+                                          … {nf(axValues[axValues.length - 1], 2)} {unit}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                ) : axError ? (
+                                  <div style={{ fontSize: '11px', color: 'var(--err, #ef4444)' }}>{axError}</div>
+                                ) : (
+                                  <div style={{ fontSize: '11px', color: 'var(--mut)', fontStyle: 'italic' }}>
+                                    Enter Min, Step, Max to generate screening axis
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
+                      {dotsFor(i)}
+                    </div>
+                  );
+                }
+
+                {/* Compact Table View */}
+                return (
+                  <div key={r.code + i} className="rrow" data-i={i}>
+                    <div className={`rw ${showStructures ? 'has-struct' : ''}`}>
+                      <input
+                        type="text"
+                        className="code code-in"
+                        style={{
+                          background: c,
+                          fontSize:
+                            r.code.length <= 4
+                              ? 14
+                              : r.code.length <= 6
+                              ? 11
+                              : r.code.length <= 10
+                              ? 9
+                              : 7,
+                        }}
+                        defaultValue={r.code}
+                        onBlur={(e) => renameReagent(i, e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            renameReagent(i, (e.target as HTMLInputElement).value);
+                          }
+                        }}
+                        maxLength={24}
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-label={`Reagent ${i + 1} code`}
+                        title="Click to rename this code (letters, numbers, _ and -)."
+                      />
+                      {showStructures && (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <ChemicalStructure
+                            smiles={r.smiles}
+                            iupac={r.iupac || r.name}
+                            name={r.name}
+                            width={54}
+                            height={38}
+                            allowZoom={true}
+                            onResolvedSmiles={(smiles, mw) => {
+                              setPath(`reagents.${i}.smiles`, smiles);
+                              if (mw && (!r.molarMass || +r.molarMass <= 0)) {
+                                setPath(`reagents.${i}.molarMass`, mw);
+                              }
+                            }}
+                          />
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
+                        <input
+                          type="text"
+                          className="f"
+                          list="libnames"
+                          value={r.name}
+                          onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
+                          onBlur={(e) => handleNameSelect(i, e.target.value)}
+                          placeholder="name (library suggests)"
+                          aria-label={`${r.code} name`}
+                        />
+                        {r.smiles && (
+                          <div
+                            style={{
+                              fontSize: '10px',
+                              color: 'var(--mut)',
+                              fontFamily: 'monospace',
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              paddingLeft: '2px',
+                            }}
+                            title={`SMILES: ${r.smiles}`}
+                          >
+                            {r.smiles}
+                          </div>
+                        )}
+                      </div>
+                      <input
+                        type="number"
+                        step="any"
+                        className="f mono"
+                        value={r.molarMass}
+                        onChange={(e) => setPath(`reagents.${i}.molarMass`, e.target.value)}
+                        aria-label={`${r.code} molar mass`}
+                      />
+                      <input
+                        type="number"
+                        step="any"
+                        className="f mono"
+                        value={r.density || ''}
+                        onChange={(e) => setPath(`reagents.${i}.density`, e.target.value)}
+                        placeholder="solid"
+                        aria-label={`${r.code} density`}
+                      />
+                      <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
+                        <input
+                          type="number"
+                          step="any"
+                          className={`f mono ${invalid.has(`reagents.${i}.stock`) ? 'inv' : ''}`}
+                          value={r.stock}
+                          onChange={(e) => setPath(`reagents.${i}.stock`, e.target.value)}
+                          aria-label={`${r.code} stock`}
+                          style={{ flex: 1, minWidth: '40px' }}
+                        />
+                        <button
+                          type="button"
+                          className="ib"
+                          style={{ height: '32px', width: '28px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                          title={`Open mass & solution volume calculator for ${r.code}`}
+                          onClick={() => setCalcReagentIndex(i)}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                            <rect x="2" y="2" width="12" height="12" rx="2" />
+                            <line x1="5" y1="5" x2="11" y2="5" />
+                            <circle cx="5" cy="8.5" r="0.7" fill="currentColor" />
+                            <circle cx="8" cy="8.5" r="0.7" fill="currentColor" />
+                            <circle cx="11" cy="8.5" r="0.7" fill="currentColor" />
+                            <circle cx="5" cy="11.5" r="0.7" fill="currentColor" />
+                            <circle cx="8" cy="11.5" r="0.7" fill="currentColor" />
+                            <circle cx="11" cy="11.5" r="0.7" fill="currentColor" />
+                          </svg>
+                        </button>
+                      </div>
+                      <select
+                        className="f"
+                        value={r.solvent}
+                        onChange={(e) => setPath(`reagents.${i}.solvent`, e.target.value)}
+                        aria-label={`${r.code} stock solvent`}
+                      >
+                        {SUPPORTED_SOLVENTS.map((s) => (
+                          <option key={s} value={s}>
+                            {s}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="racts">
+                        <button
+                          type="button"
+                          className="ib"
+                          onClick={() => moveReagent(i, -1)}
+                          disabled={i === 0}
+                          title="Add earlier"
+                        >
+                          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M8 12V4M4 8l4-4 4 4" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="ib"
+                          onClick={() => moveReagent(i, 1)}
+                          disabled={i === state.reagents.length - 1}
+                          title="Add later"
+                        >
+                          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M8 4v8m-4-4 4 4 4-4" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="ib"
+                          onClick={async () => {
+                            if (!r.name) {
+                              toast('Give the reagent a name first.');
+                              return;
+                            }
+                            await putLib({
+                              id: Math.random().toString(36).slice(2, 10),
+                              name: r.name,
+                              molarMass: +r.molarMass || 0,
+                              density: +r.density || 0,
+                              smiles: r.smiles || undefined,
+                              solvent: r.solvent || undefined,
+                            });
+                            toast(r.name + ' saved to the library.');
+                          }}
+                          title="Save to library"
+                        >
+                          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                            <polygon points="8 2 10.3 6.6 15.3 7.3 11.6 10.9 12.5 15.8 8 13.4 3.5 15.8 4.4 10.9 0.7 7.3 5.7 6.6 8 2" />
+                          </svg>
+                        </button>
+                        {state.reagents.length > 2 ? (
+                          <button
+                            type="button"
+                            className="ib"
+                            onClick={() => removeReagent(i)}
+                            title="Remove"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                              <line x1="4" y1="4" x2="12" y2="12" />
+                              <line x1="12" y1="4" x2="4" y2="12" />
+                            </svg>
+                          </button>
+                        ) : (
+                          <span className="ib ph" />
+                        )}
+                      </div>
+                    </div>
+
+                    {inlineRanges && it && (
+                      <div
+                        className="rng"
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'stretch',
+                          gap: '8px',
+                          background: 'var(--soft)',
+                          border: '1px solid var(--line)',
+                          borderRadius: '8px',
+                          padding: '10px 14px',
+                          marginTop: '6px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                          <span className="l" style={{ fontWeight: 600 }}>Range in {unit}</span>
+                          {(['min', 'step', 'max'] as const).map((f) => (
+                            <label
+                              key={f}
+                              className="l"
+                              style={{ display: 'flex', gap: '6px', alignItems: 'center' }}
+                            >
+                              <span style={{ textTransform: 'capitalize' }}>{f}</span>
+                              <input
+                                type="number"
+                                step="any"
+                                className={`f mono ${
+                                  invalid.has(`sets.0.items.${i}.${f}`) ? 'inv' : ''
+                                }`}
+                                style={{ width: '84px' }}
+                                value={it[f]}
+                                onChange={(e) => setPath(`sets.0.items.${i}.${f}`, e.target.value)}
+                                aria-label={`${r.code} ${f}`}
+                              />
+                            </label>
+                          ))}
+                          {dilutionTier && (
+                            <span
+                              className={`chip ${
+                                dilutionTier.tier === 'direct'
+                                  ? 'ok'
+                                  : dilutionTier.tier === 'sub'
+                                  ? 'bad'
+                                  : 'warn'
+                              }`}
+                              style={{ fontSize: '11px', height: '26px', padding: '0 9px', marginLeft: 'auto' }}
+                              title={dilutionTier.desc}
+                            >
+                              {dilutionTier.tier === 'direct' ? '✓ ' : dilutionTier.tier === 'sub' ? '⚠ ' : '⚙ '}
+                              {dilutionTier.label}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Discrete Step Interval Preview */}
+                        {axValues && axValues.length > 0 && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 500 }}>
+                              {axValues.length} step{axValues.length === 1 ? '' : 's'}:
+                            </span>
+                            <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+                              {axValues.slice(0, 8).map((val, vi) => (
+                                <span
+                                  key={vi}
+                                  className="mono"
+                                  style={{
+                                    background: 'var(--panel)',
+                                    border: '1px solid var(--line)',
+                                    borderRadius: '4px',
+                                    padding: '2px 7px',
+                                    fontSize: '11px',
+                                    color: 'var(--fg)',
+                                    fontWeight: 500,
+                                  }}
+                                  title={`Condition step ${vi + 1}: ${nf(val, 3)} ${unit}`}
+                                >
+                                  {nf(val, 2)}
+                                </span>
+                              ))}
+                              {axValues.length > 8 && (
+                                <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 500 }}>
+                                  … {nf(axValues[axValues.length - 1], 2)} {unit}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        {axError && <span className="rp e">{axError}</span>}
+                      </div>
+                    )}
+
+                    {state.mode === 'triplet' && (
+                      <div className="hint">
+                        {(() => {
+                          const ai = (state.tri?.adds || []).findIndex((a) => a.code === r.code);
+                          const gs = (state.tri?.groups || [])
+                            .filter((g) => g.members.includes(r.code))
+                            .map((g) => g.name);
+                          return ai >= 0
+                            ? `Additive · ${nf(state.tri?.adds[ai].equiv, 3)} eq`
+                            : gs.length
+                            ? 'In ' + gs.join(', ')
+                            : 'Not used yet';
+                        })()}
+                      </div>
+                    )}
+
+                    {dotsFor(i)}
+                  </div>
+                );
+              });
+            })()}
 
             <div className="note" style={{ marginTop: '14px' }}>
               {state.mode === 'triplet'

@@ -1530,14 +1530,14 @@
 
     .rw {
       display: grid;
-      grid-template-columns: 48px minmax(120px, 1.6fr) 96px 84px 104px 128px 136px;
+      grid-template-columns: 48px minmax(140px, 1.6fr) 96px 94px 106px 128px 136px;
       gap: 10px;
       align-items: center
     }
 
     .rw.has-struct {
-      grid-template-columns: 44px 58px minmax(130px, 1.6fr) 92px 80px 100px 124px 132px;
-      gap: 8px;
+      grid-template-columns: 44px 62px minmax(150px, 1.6fr) 96px 94px 106px 126px 136px;
+      gap: 10px;
     }
 
     .rw.th {
@@ -1549,7 +1549,21 @@
     }
 
     .rrow {
-      margin-bottom: 10px
+      margin-bottom: 12px
+    }
+
+    .reagent-studio-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
+      box-shadow: var(--shadow);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .reagent-studio-card:hover {
+      box-shadow: var(--shadow-md);
     }
 
     .code {

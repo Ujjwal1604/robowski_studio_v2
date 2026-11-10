@@ -9,6 +9,7 @@ import {
   DeckView,
   ExportView,
   TlcView,
+  ElnView,
   RunsView,
   CompareView,
   PreviewModal,
@@ -53,6 +54,7 @@ export const App: React.FC = () => {
         <div style={{ display: view === 'tlc' ? 'block' : 'none' }}>
           <TlcView />
         </div>
+        {view === 'eln' && <ElnView />}
         {view === 'export' && <ExportView />}
         {view === 'runs' && <RunsView />}
         {view === 'compare' && <CompareView />}

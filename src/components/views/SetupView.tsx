@@ -52,6 +52,7 @@ export const SetupView: React.FC = () => {
     setVisited,
     inlineRanges,
     toast,
+    importRobotFile,
   } = useApp();
 
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -59,6 +60,7 @@ export const SetupView: React.FC = () => {
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
   const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
   const libFileInputRef = React.useRef<HTMLInputElement>(null);
+  const excelRunInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleImportLibraryFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -424,9 +426,9 @@ export const SetupView: React.FC = () => {
                 type="button"
                 className={state.mode === 'triplet' ? 'on' : ''}
                 onClick={() => {
-                  if (state.imported) {
-                    toast('Discard the imported vials first (Setup, Imported vials).');
-                    return;
+                  if (state.imported && state.mode !== 'triplet') {
+                    unimport();
+                    toast('Cleared imported concentration run for Triplet mode.');
                   }
                   if (state.reagents.every((r) => !r.name && (r.stock === '' || r.stock == null))) {
                     setState((prev) => {
@@ -634,6 +636,28 @@ export const SetupView: React.FC = () => {
                   accept=".csv,.tsv,.txt,.xlsx,.xlsm"
                   style={{ display: 'none' }}
                   onChange={handleImportLibraryFile}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    excelRunInputRef.current?.click();
+                  }}
+                  title="Import a previous run or robot workbook from Excel (.xlsx)"
+                >
+                  📂 Import Excel run
+                </button>
+                <input
+                  ref={excelRunInputRef}
+                  id="excelrunfileinput"
+                  type="file"
+                  accept=".xlsx,.xlsm"
+                  style={{ display: 'none' }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) importRobotFile(file);
+                    e.target.value = '';
+                  }}
                 />
                 {state.reagents.length < 12 && (
                   <button type="button" className="btn" onClick={addReagent}>
@@ -1589,7 +1613,8 @@ const VialSetsCard: React.FC = () => {
 
 // Triplet Pattern & Plates Editor
 const TripletPatternEditor: React.FC = () => {
-  const { state, setState, setPath, toast } = useApp();
+  const { state, setState, setPath, toast, unimport, importRobotFile } = useApp();
+  const triExcelInputRef = React.useRef<HTMLInputElement>(null);
   const t = state.tri || Tri.triDefault();
   const g = Tri.triGeom(state);
   const size = Tri.triSize(state);
@@ -1616,32 +1641,92 @@ const TripletPatternEditor: React.FC = () => {
 
   return (
     <div style={{ marginTop: '20px' }}>
+      {state.imported && (
+        <div
+          className="card pad"
+          style={{
+            marginBottom: '16px',
+            background: 'var(--soft, rgba(59,130,246,0.06))',
+            borderColor: 'var(--accent, #3b82f6)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: '10px',
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--fg, #0f172a)' }}>
+                📥 Imported Triplet Run: {state.imported.name}
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--mut, #64748b)', marginTop: '2px' }}>
+                {state.imported.rows.length} wells mapped from Excel with exact concentrations (including blank solvent wells).
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={unimport}
+              title="Discard imported lock to edit pattern and regenerate combinations"
+            >
+              Discard lock & edit pattern
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Pattern Card */}
       <div className="card pad">
         <div className="chead">
           <div className="ct">Plate pattern</div>
-          <select
-            className="f"
-            style={{ width: 'auto' }}
-            value={pre}
-            onChange={(e) => {
-              const val = e.target.value;
-              if (val !== 'custom') {
-                setState((prev) => {
-                  const next = JSON.parse(JSON.stringify(prev));
-                  next.tri.ratios = Tri.triPresetData(val).ratios;
-                  Tri.triSync(next);
-                  return next;
-                });
-              }
-            }}
-            aria-label="Pattern preset"
-          >
-            <option value="triplet">Triplet (3 reagents)</option>
-            <option value="doublet">Doublet (2 reagents)</option>
-            <option value="quartet">Quartet (4 reagents)</option>
-            {pre === 'custom' && <option value="custom">Custom (edited)</option>}
-          </select>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn sm"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+              onClick={() => triExcelInputRef.current?.click()}
+              title="Import a Triplet run from Excel (.xlsx)"
+            >
+              📥 Import from Excel
+            </button>
+            <input
+              ref={triExcelInputRef}
+              type="file"
+              accept=".xlsx,.xlsm"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) importRobotFile(file);
+                e.target.value = '';
+              }}
+            />
+            <select
+              className="f"
+              style={{ width: 'auto' }}
+              value={pre}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val !== 'custom') {
+                  setState((prev) => {
+                    const next = JSON.parse(JSON.stringify(prev));
+                    next.tri.ratios = Tri.triPresetData(val).ratios;
+                    Tri.triSync(next);
+                    return next;
+                  });
+                }
+              }}
+              aria-label="Pattern preset"
+            >
+              <option value="triplet">Triplet (3 reagents)</option>
+              <option value="doublet">Doublet (2 reagents)</option>
+              <option value="quartet">Quartet (4 reagents)</option>
+              {pre === 'custom' && <option value="custom">Custom (edited)</option>}
+            </select>
+          </div>
         </div>
         <p className="sub" style={{ marginTop: '-8px' }}>
           Every section of the plate holds one {gn}. Its columns are the ratios, its rows the

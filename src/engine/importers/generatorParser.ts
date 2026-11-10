@@ -48,7 +48,8 @@ export function parseGeneratorSheet(files: Record<string, Uint8Array>): any {
 
   const val = (a: string) => values[a] ?? null;
   const mode = (() => {
-    const label = String(val('A18') || '').toLowerCase();
+    const label = String(val('A18') || val('A1') || val('B1') || '').toLowerCase();
+    if (label.includes('triplet') || label.includes('triple')) return 'triplet';
     return label.includes('equiv') || label.includes('eqiv') ? 'equivalence' : 'concentration';
   })();
   const solvent = canonicalSolvent(val('C4') || 'ethanol');

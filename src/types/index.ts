@@ -99,6 +99,7 @@ export interface RunState {
   tri?: TripletSetup;
   product?: ProductInfo;
   imported?: ImportedVials;
+  eln?: HteElnRecord;
 }
 
 export interface Issue {
@@ -408,5 +409,64 @@ export interface TlcSet {
   edgePicks?: EdgePick[];
   edgeSettings?: Record<number, EdgeSetting>;
   spotProminence?: number;
+}
+
+export type WellOutcomeStatus =
+  | 'none'
+  | 'hit'             // ⭐ Top Hit / Best Condition
+  | 'clean'           // 🟢 Clean Conversion / Product
+  | 'partial'         // 🟡 Partial Conversion
+  | 'sm_only'         // ⚪ Starting Material Only
+  | 'decomp'          // 🔴 Decomposition / Complex Mixture
+  | 'precipitate'     // ⚠️ Precipitate / Insoluble
+  | 'blank';          // 🔘 Solvent / Negative Control
+
+export type CommonObservationTag =
+  | 'polymerized'
+  | 'precipitated'
+  | 'volume_decreased'
+  | 'gas_evolution'
+  | 'color_change'
+  | 'biphasic'
+  | 'viscous_gel'
+  | 'turbid'
+  | 'homogeneous';
+
+export interface WellObservation {
+  wellIndex: number;          // 0..53 (relative to plate)
+  plateIndex: number;         // 0, 1, 2
+  status?: WellOutcomeStatus;
+  tags?: string[];            // e.g. ['polymerized', 'precipitated', 'volume_decreased', 'gas_evolution']
+  notes?: string;             // Detailed freeform notes: e.g. "polymerized into solid plug", "volume decreased, possible gas evolution"
+  conversion?: number | null; // % conversion (0-100)
+  yield?: number | null;      // % yield (0-100)
+  colorAfter?: string;        // Observation of color after reaction
+  hitRank?: number | null;    // 1, 2, 3 for top candidates
+  scaleUpSelected?: boolean;  // Mark for scale-up calculation
+}
+
+export interface HteElnRecord {
+  campaignTitle?: string;
+  objective?: string;
+  chemist?: string;
+  date?: string;
+  reactionClass?: string;     // e.g. "Photoredox Cross-Coupling", "Buchwald-Hartwig", "Suzuki", "Alkylation"
+  targetProduct?: string;
+  // Physical & Reaction Execution Conditions
+  temperatureC?: number | string;
+  heatingApparatus?: string;  // e.g. "Aluminum heating block", "Oil bath", "Ambient 23°C", "Chilled 0°C"
+  reactionTimeHours?: number | string;
+  atmosphere?: string;        // "N2 Glovebox", "Argon Schlenk", "Ambient air", "Sealed septum cap"
+  agitation?: string;         // "Tumble stirrer 800 rpm", "Orbital shaker 1000 rpm", "Magnetic tumble", "Static"
+  illumination?: string;      // "Blue LED 450 nm, 40W, fan cooled", "UV 365 nm", "Dark / foil wrapped", "None"
+  plateSealType?: string;     // "Teflon silicone bonded mat", "Heat-sealed foil", "Slit septum", "Glass inserts"
+  postReactionNotes?: string; // General campaign-level observations
+  
+  // Well-level observations map: key is `${plateIndex}-${wellIndex}` or `${globalIndex}`
+  wells: Record<string, WellObservation>;
+  
+  // Scale-up target
+  selectedHitWell?: number | null; // globalIndex of selected well
+  scaleUpMmol?: number | null;     // e.g. 1.0 mmol
 }
 

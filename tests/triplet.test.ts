@@ -6,6 +6,10 @@ import {
   triDerive,
 } from '../src/engine/triplet';
 import { RunState } from '../src/types';
+import { buildRun } from '../src/engine/dilution';
+import { buildDataPayload } from '../src/context/runPayload';
+import { workbookSheets } from '../src/engine/exporters/xlsx';
+import { robotSheetsToRun } from '../src/engine/importers/robotParser';
 
 describe('Triplet Plate Mode', () => {
   const makeTripletState = (): RunState => ({
@@ -70,5 +74,43 @@ describe('Triplet Plate Mode', () => {
     expect(derived).not.toBeNull();
     expect(derived!.counts[2]).toBe(3); // 3 doublets from ABC: AB, AC, BC
     expect(derived!.counts[1]).toBe(3); // 3 singlets from ABC: A, B, C
+  });
+
+  it('exports to Excel and imports back with full Triplet mode and 54-well plate geometry preserved', () => {
+    const st = makeTripletState();
+    st.tri!.base = 10; // 10 mM base concentration so total < 100 mM stocks
+    st.reagents.forEach((r) => { r.stock = 200; }); // high enough stock so solvent is positive
+    st.tri!.groups = [
+      { id: 'g1', name: 'T1', members: ['A', 'B', 'C'] },
+    ];
+    st.tri!.plates = [{ sections: ['g1', '', '', '', '', '', '', '', ''] }, null, null];
+
+    const tb = triBuildRows(st);
+    expect(tb).not.toBeNull();
+    expect(tb!.rows.length).toBe(54);
+
+    const payload = buildDataPayload(st, tb!.rows, tb!.blank, tb!.meta);
+    const run = buildRun(payload);
+    expect(run.blockingIssues).toBe(0);
+
+    const sheets = workbookSheets(run, { ...payload, state: st });
+    expect(sheets.length).toBe(6);
+
+    // 1. Full import with robowski_meta
+    const importedWithMeta = robotSheetsToRun(sheets, 'triplet_run.xlsx');
+    expect(importedWithMeta.mode).toBe('triplet');
+    expect(importedWithMeta.rows.length).toBe(54); // All 54 wells preserved!
+    expect(importedWithMeta.blankRows.size).toBe(48); // Blank control wells preserved as 0-concentration
+    expect(importedWithMeta.savedState).not.toBeNull();
+    expect(importedWithMeta.savedState.mode).toBe('triplet');
+
+    // 2. Legacy / external import without robowski_meta (tests description parsing & mode detection)
+    const sheetsWithoutMeta = sheets.filter((s) => s.name !== 'robowski_meta');
+    const importedLegacy = robotSheetsToRun(sheetsWithoutMeta, 'legacy_triplet.xlsx');
+    expect(importedLegacy.mode).toBe('triplet');
+    expect(importedLegacy.rows.length).toBe(54);
+    expect(importedLegacy.blankRows.size).toBe(48);
+    expect(importedLegacy.tri).not.toBeNull();
+    expect(importedLegacy.tri!.groups.length).toBeGreaterThanOrEqual(1);
   });
 });

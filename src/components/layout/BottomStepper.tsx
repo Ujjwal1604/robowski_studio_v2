@@ -12,7 +12,8 @@ const STEPS: StepDef[] = [
   { id: 'combos', label: '2. Combinations', shortDesc: '54-Well Recipe Matrix' },
   { id: 'deck', label: '3. Deck Layout', shortDesc: 'Hood Positions & Tip Racks' },
   { id: 'tlc', label: '4. TLC Map', shortDesc: 'Plate Photos & Spot Densitometry' },
-  { id: 'export', label: '5. Export Package', shortDesc: 'Robot XLSX & Bench Sheets' },
+  { id: 'eln', label: '5. HTE Notebook', shortDesc: 'Hit Matrix & Observations' },
+  { id: 'export', label: '6. Export Package', shortDesc: 'Robot XLSX & Bench Sheets' },
 ];
 
 export const BottomStepper: React.FC = () => {

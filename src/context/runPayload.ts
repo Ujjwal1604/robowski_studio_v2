@@ -33,6 +33,19 @@ export function exampleState(): RunState {
     stockVolumeCheck: true,
     newTipEveryTransfer: false,
     reagents: [blankR('AA'), blankR('BB'), blankR('CC')],
+    eln: {
+      campaignTitle: '',
+      objective: '',
+      reactionClass: '',
+      temperatureC: 25,
+      reactionTimeHours: 16,
+      atmosphere: 'N2 Glovebox',
+      agitation: 'Tumble stirrer 800 rpm',
+      illumination: 'None',
+      plateSealType: 'Teflon silicone bonded mat',
+      postReactionNotes: '',
+      wells: {},
+    },
   };
 }
 
@@ -63,6 +76,23 @@ export function normalize(st: RunState): RunState {
   });
   if (!st.tri) st.tri = Core.triDefault();
   if (!st.product) st.product = { name: '', code: '', smiles: '' };
+  if (!st.eln) {
+    st.eln = {
+      campaignTitle: '',
+      objective: '',
+      reactionClass: '',
+      temperatureC: 25,
+      reactionTimeHours: 16,
+      atmosphere: 'N2 Glovebox',
+      agitation: 'Tumble stirrer 800 rpm',
+      illumination: 'None',
+      plateSealType: 'Teflon silicone bonded mat',
+      postReactionNotes: '',
+      wells: {},
+    };
+  } else if (!st.eln.wells) {
+    st.eln.wells = {};
+  }
   Core.triSync(st);
   return st;
 }
@@ -240,6 +270,16 @@ export function dataFor(st: RunState): any {
   const norm = normalize(JSON.parse(JSON.stringify(st)));
   if (norm.mode === 'triplet') {
     const tb = Core.triBuildRows(norm);
+    if (norm.imported && norm.imported.rows && norm.imported.rows.length) {
+      const rows = norm.imported.rows;
+      const blank = tb ? tb.blank : new Set<number>(rows.map((r, i) => r.every((c) => c === 0) ? i : -1).filter((i) => i >= 0));
+      const meta = tb && tb.meta.length === rows.length ? tb.meta : rows.map((r, i) => ({
+        plate: Math.floor(i / 54),
+        well: i % 54,
+        blank: r.every((c) => c === 0),
+      }));
+      return buildDataPayload(norm, rows, blank, meta);
+    }
     if (tb) {
       return buildDataPayload(norm, tb.rows, tb.blank, tb.meta);
     }

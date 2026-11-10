@@ -860,7 +860,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (kind === 'xlsx') {
           ok = await saveFileToDisk(
             'robowski_run.xlsx',
-            Core.workbookBytes(buildDataPayload(state, rowsCache, triBlank, triMeta), run)
+            Core.workbookBytes({ ...buildDataPayload(state, rowsCache, triBlank, triMeta), state }, run)
           );
         } else if (kind === 'bench') {
           ok = await saveFileToDisk(
@@ -1125,11 +1125,68 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const importRobotFile = useCallback(
     async (f: File) => {
       try {
-        const d = await Core.importRobotWorkbook(f);
+        let d: any;
+        let isGen = false;
+        try {
+          d = await Core.importRobotWorkbook(f);
+        } catch (robotErr: any) {
+          try {
+            d = await Core.importGenerator(f);
+            isGen = true;
+          } catch {
+            throw robotErr;
+          }
+        }
+
+        if (isGen) {
+          const st = exampleState();
+          Object.assign(
+            st,
+            { name: f.name.replace(/\.xlsx$/i, '') },
+            {
+              mode: d.mode,
+              vialVolume: d.vialVolume,
+              threshold: d.threshold,
+              dilutionFactor: d.dilutionFactor,
+              reactionSolvent: d.reactionSolvent,
+              reagents: d.reagents.map((r: any) => ({
+                code: r.code,
+                name: r.name,
+                molarMass: r.molarMass,
+                density: r.density,
+                stock: r.stock,
+                solvent: r.solvent,
+                min: r.min,
+                step: r.step,
+                max: r.max,
+                pipettingMode: 'empty',
+              })),
+            }
+          );
+          delete st.sets;
+          const normalized = normalize(st);
+          normalized.id = null;
+          setState(normalized);
+          setView('setup');
+          toast('Imported generator ' + f.name);
+          return;
+        }
+
+        // If savedState is present in robowski_meta, restore the exact full RunState verbatim!
+        if (d.savedState && typeof d.savedState === 'object') {
+          const normalizedState = normalize(d.savedState);
+          normalizedState.id = null;
+          setState(normalizedState);
+          setView('setup');
+          toast('Restored full run state from ' + f.name);
+          return;
+        }
+
         const st = exampleState();
+        const mode = d.mode || 'concentration';
         Object.assign(st, {
           name: d.name,
-          mode: 'concentration',
+          mode,
           vialVolume: d.vialVolume,
           threshold: d.threshold,
           dilutionFactor: d.dilutionFactor,
@@ -1141,64 +1198,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
         delete st.sets;
         if (d.deckPlates) st.deckPlates = d.deckPlates;
+        if (mode === 'triplet' && d.tri) {
+          st.tri = d.tri;
+        }
         const normalizedState = normalize(st);
         normalizedState.id = null;
         setState(normalizedState);
         setView('setup');
-        toast('Opened ' + f.name);
+        toast(`Opened ${f.name} (${mode} mode, ${d.rows.length} wells)`);
       } catch (e: any) {
-        toast('Could not read that workbook: ' + e.message);
+        toast('Could not read that workbook: ' + (e?.message || e));
       }
     },
-    [toast]
+    [toast, setState, setView]
   );
 
   const importGeneratorFile = useCallback(
     async (f: File) => {
-      let isRobot = false;
-      try {
-        await Core.importRobotWorkbook(f);
-        isRobot = true;
-      } catch (e) {}
-      if (isRobot) return importRobotFile(f);
-
-      try {
-        const d = await Core.importGenerator(f);
-        const st = exampleState();
-        Object.assign(
-          st,
-          { name: f.name.replace(/\.xlsx$/i, '') },
-          {
-            mode: d.mode,
-            vialVolume: d.vialVolume,
-            threshold: d.threshold,
-            dilutionFactor: d.dilutionFactor,
-            reactionSolvent: d.reactionSolvent,
-            reagents: d.reagents.map((r: any) => ({
-              code: r.code,
-              name: r.name,
-              molarMass: r.molarMass,
-              density: r.density,
-              stock: r.stock,
-              solvent: r.solvent,
-              min: r.min,
-              step: r.step,
-              max: r.max,
-              pipettingMode: 'empty',
-            })),
-          }
-        );
-        delete st.sets;
-        const normalized = normalize(st);
-        normalized.id = null;
-        setState(normalized);
-        setView('setup');
-        toast('Imported ' + f.name);
-      } catch (e: any) {
-        toast('Could not read that workbook: ' + e.message);
-      }
+      return importRobotFile(f);
     },
-    [importRobotFile, toast]
+    [importRobotFile]
   );
 
   const inlineRanges = !state.imported && state.mode !== 'triplet' && (state.sets?.length || 0) === 1;

@@ -6,6 +6,7 @@ const TABS: [string, string][] = [
   ['combos', 'Combinations'],
   ['deck', 'Deck'],
   ['tlc', 'TLC Map'],
+  ['eln', 'HTE Notebook'],
   ['export', 'Export'],
 ];
 
@@ -27,6 +28,9 @@ export const StepsNav: React.FC = () => {
     }
     if (id === 'tlc') {
       return visited.tlc ? 'done' : '';
+    }
+    if (id === 'eln') {
+      return visited.eln ? 'done' : '';
     }
     if (id === 'export') {
       return !run || run.blockingIssues > 0 ? 'lock' : status === 'exported' ? 'done' : '';

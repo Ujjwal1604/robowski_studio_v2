@@ -206,11 +206,23 @@ export const CommandPalette: React.FC = () => {
       },
     },
     {
+      id: 'nav-eln',
+      category: 'Navigation',
+      title: 'Go to 5. HTE Notebook',
+      subtitle: '54-well physical observations, hit matrix, polymer/gas tags, and scale-up',
+      badge: 'Step 5',
+      icon: '📓',
+      action: () => {
+        setVisited((v) => ({ ...v, eln: true }));
+        setView('eln');
+      },
+    },
+    {
       id: 'nav-export',
       category: 'Navigation',
-      title: 'Go to 5. Export Package',
+      title: 'Go to 6. Export Package',
       subtitle: 'Robot input workbook (.xlsx), HTML bench sheet and archive',
-      badge: 'Step 5',
+      badge: 'Step 6',
       icon: '📦',
       action: () => {
         setVisited((v) => ({ ...v, export: true }));

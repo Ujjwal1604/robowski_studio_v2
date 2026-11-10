@@ -3,7 +3,7 @@ import { useApp } from '../../context/AppContext';
 import { PAL } from '../../engine';
 
 export const SummaryStrip: React.FC = () => {
-  const { state, run, err, missing, allEmpty, triPending, triMeta } = useApp();
+  const { state, run, err, missing, allEmpty, triPending, triMeta, setView } = useApp();
 
   const bad = run ? run.blockingIssues : 0;
   const warn = run ? run.warningCount : 0;
@@ -96,6 +96,15 @@ export const SummaryStrip: React.FC = () => {
             </span>
           ))}
         </span>
+        {state.eln && Object.values(state.eln.wells || {}).some((w) => (w.tags && w.tags.length > 0) || Boolean(w.notes) || (w.status && w.status !== 'none')) && (
+          <span
+            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+            onClick={() => setView('eln')}
+            title="View HTE Notebook observations and hit matrix"
+          >
+            📓 <b>{Object.values(state.eln.wells || {}).filter((w) => (w.tags && w.tags.length > 0) || Boolean(w.notes)).length}</b> obs
+          </span>
+        )}
         {renderChip()}
       </div>
     </div>

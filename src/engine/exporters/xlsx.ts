@@ -84,7 +84,7 @@ export function descChem(run: RunResult, row: RunRow): (string | null)[] {
   ];
 }
 
-export function workbookSheets(run: RunResult): Array<{ name: string; rows: any[][] }> {
+export function workbookSheets(run: RunResult, data?: any): Array<{ name: string; rows: any[][] }> {
   if (run && run.blockingIssues > 0) {
     throw new Error(`Robot workbook blocked: resolve ${run.blockingIssues} blocking validation issue(s) before export.`);
   }
@@ -188,22 +188,52 @@ export function workbookSheets(run: RunResult): Array<{ name: string; rows: any[
       row.combo_index,
     ]),
   ];
-  const verRows = [[1.02]];
+  const detectedMode =
+    data?.state?.mode ||
+    data?.modeLabel ||
+    (run.mode && run.mode !== 'concentration' ? run.mode : null) ||
+    data?.mode ||
+    run.mode ||
+    'concentration';
+  const verRows = [
+    ['version', 1.03],
+    ['mode', detectedMode],
+    ['format', 'robowski-run-workbook'],
+  ];
+
+  const rawState = data?.state || data?.rawState || (data?.reagents ? data : null);
+  const triData = data?.tri || data?.state?.tri || null;
+  const metaRows = [
+    ['key', 'value'],
+    ['format', 'robowski-run-workbook'],
+    ['version', 1.03],
+    ['mode', detectedMode],
+    ['run_name', run.runName || data?.name || ''],
+    ['reactions', run.reactions],
+    ['plates', run.plates],
+    ['vial_volume_uL', run.vialVolume],
+    ['dilution_factor', run.dilutionFactor],
+    ['reaction_solvent', run.reactionSolvent],
+    ['run_state_json', rawState ? JSON.stringify(rawState) : ''],
+    ['tri_setup_json', triData ? JSON.stringify(triData) : ''],
+  ];
+
   const names = [
     'reactions_with_run_info',
     'stock_solutions',
     'stock_solution_concentration',
     'description',
     'version',
+    'robowski_meta',
   ];
   return names.map((n, i) => ({
     name: n,
-    rows: [reactionRows, stockRows, concRows, descRows, verRows][i],
+    rows: [reactionRows, stockRows, concRows, descRows, verRows, metaRows][i],
   }));
 }
 
-export function workbookBytes(_data: any, run: RunResult): Uint8Array {
-  const sheetsData = workbookSheets(run);
+export function workbookBytes(data: any, run: RunResult): Uint8Array {
+  const sheetsData = workbookSheets(run, data);
   const names = sheetsData.map((s) => s.name);
   const sheets: Record<string, string> = {};
   sheetsData.forEach(

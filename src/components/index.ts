@@ -11,6 +11,7 @@ export { CombinationsView } from './views/CombinationsView';
 export { DeckView } from './views/DeckView';
 export { ExportView } from './views/ExportView';
 export { TlcView } from './views/TlcView';
+export { ElnView } from './views/ElnView';
 export { RunsView } from './views/RunsView';
 export { CompareView } from './views/CompareView';
 

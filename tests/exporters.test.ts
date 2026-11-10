@@ -44,13 +44,14 @@ describe('Exporters & Safety', () => {
     });
 
     const sheets = workbookSheets(run);
-    expect(sheets.length).toBe(5);
+    expect(sheets.length).toBe(6);
     expect(sheets.map((s) => s.name)).toEqual([
       'reactions_with_run_info',
       'stock_solutions',
       'stock_solution_concentration',
       'description',
       'version',
+      'robowski_meta',
     ]);
   });
 

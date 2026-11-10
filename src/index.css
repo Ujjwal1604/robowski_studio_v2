@@ -1535,6 +1535,11 @@
       align-items: center
     }
 
+    .rw.has-struct {
+      grid-template-columns: 44px 58px minmax(130px, 1.6fr) 92px 80px 100px 124px 132px;
+      gap: 8px;
+    }
+
     .rw.th {
       font-size: 12px;
       font-weight: 500;

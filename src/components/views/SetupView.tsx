@@ -14,6 +14,7 @@ import * as Tri from '../../engine';
 import { exampleState } from '../../context/runPayload';
 import { FixDiffModal } from '../ui/FixDiffModal';
 import { StockCalculatorModal } from '../ui/StockCalculatorModal';
+import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
 
 export const SetupView: React.FC = () => {
   const {
@@ -57,10 +58,48 @@ export const SetupView: React.FC = () => {
 
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [presetsOpen, setPresetsOpen] = useState(false);
+  const [showStructures, setShowStructures] = useState(true);
+  const [resolvingStructures, setResolvingStructures] = useState(false);
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
   const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
   const libFileInputRef = React.useRef<HTMLInputElement>(null);
   const excelRunInputRef = React.useRef<HTMLInputElement>(null);
+
+  const handleResolveAllStructures = async () => {
+    const candidates = state.reagents
+      .map((r, i) => ({ r, i }))
+      .filter(({ r }) => !r.smiles && Boolean((r.iupac || r.name || '').trim()));
+
+    if (!candidates.length) {
+      toast('All reagents already have 2D structures or are missing names.');
+      return;
+    }
+
+    setResolvingStructures(true);
+    toast(`Looking up chemical structures for ${candidates.length} reagent(s)...`);
+    let resolvedCount = 0;
+    try {
+      for (const { r, i } of candidates) {
+        const q = (r.iupac || r.name || '').trim();
+        const res = await resolveChemicalNameToSmiles(q);
+        if (res?.smiles) {
+          setPath(`reagents.${i}.smiles`, res.smiles);
+          if (res.mw && (!r.molarMass || +r.molarMass <= 0)) {
+            setPath(`reagents.${i}.molarMass`, res.mw);
+          }
+          if (res.iupac && !r.iupac) {
+            setPath(`reagents.${i}.iupac`, res.iupac);
+          }
+          resolvedCount++;
+        }
+      }
+      toast(`Resolved ${resolvedCount} chemical structure(s) from chemical names!`);
+    } catch {
+      toast(`Resolved ${resolvedCount} structure(s).`);
+    } finally {
+      setResolvingStructures(false);
+    }
+  };
 
   const handleImportLibraryFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -86,8 +125,9 @@ export const SetupView: React.FC = () => {
       const solvCol = findCol('solvent');
       const stockCol = findCol('stock', 'conc');
       const casCol = findCol('cas');
-      const smilesCol = findCol('smiles');
-      const noteCol = findCol('note');
+      const smilesCol = findCol('smiles', 'structure', 'canonical_smiles', 'canonical smiles', 'isomeric_smiles');
+      const iupacCol = findCol('iupac', 'iupac_name', 'systematic_name', 'chemical_name');
+      const noteCol = findCol('note', 'notes');
 
       if (nameCol < 0) {
         toast('Could not find a "name" or "reagent" column in the table.');
@@ -96,6 +136,7 @@ export const SetupView: React.FC = () => {
 
       let added = 0;
       let updated = 0;
+      const importedMap = new Map<string, { smiles?: string; iupac?: string; molarMass?: number }>();
 
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
@@ -111,7 +152,10 @@ export const SetupView: React.FC = () => {
         const stock = Number.isFinite(stockVal) && stockVal > 0 ? stockVal : undefined;
         const cas = casCol >= 0 && r[casCol] ? String(r[casCol]).trim() : undefined;
         const smiles = smilesCol >= 0 && r[smilesCol] ? String(r[smilesCol]).trim() : undefined;
+        const iupac = iupacCol >= 0 && r[iupacCol] ? String(r[iupacCol]).trim() : undefined;
         const note = noteCol >= 0 && r[noteCol] ? String(r[noteCol]).trim() : undefined;
+
+        importedMap.set(name.toLowerCase(), { smiles, iupac, molarMass });
 
         const existing = lib.find((x) => x.name.toLowerCase() === name.toLowerCase());
         const id = existing ? existing.id : Math.random().toString(36).slice(2, 10);
@@ -127,9 +171,34 @@ export const SetupView: React.FC = () => {
           stock,
           cas,
           smiles,
+          iupac,
           note,
         });
       }
+
+      // If active reagents match imported reagents by name, immediately populate their SMILES & structures!
+      setState((prev) => {
+        const next = JSON.parse(JSON.stringify(prev));
+        let changed = false;
+        next.reagents.forEach((rg: any) => {
+          const match = importedMap.get(rg.name?.trim().toLowerCase());
+          if (match) {
+            if (match.smiles && !rg.smiles) {
+              rg.smiles = match.smiles;
+              changed = true;
+            }
+            if (match.iupac && !rg.iupac) {
+              rg.iupac = match.iupac;
+              changed = true;
+            }
+            if (match.molarMass && (!rg.molarMass || +rg.molarMass <= 0)) {
+              rg.molarMass = match.molarMass;
+              changed = true;
+            }
+          }
+        });
+        return changed ? next : prev;
+      });
 
       toast(`Library import: ${added} added, ${updated} updated from ${file.name}.`);
     } catch (err: any) {
@@ -639,13 +708,13 @@ export const SetupView: React.FC = () => {
                 />
                 <button
                   type="button"
-                  className="btn"
+                  className="btn sm"
                   onClick={() => {
                     excelRunInputRef.current?.click();
                   }}
                   title="Import a previous run or robot workbook from Excel (.xlsx)"
                 >
-                  📂 Import Excel run
+                  Import Excel run
                 </button>
                 <input
                   ref={excelRunInputRef}
@@ -659,15 +728,33 @@ export const SetupView: React.FC = () => {
                     e.target.value = '';
                   }}
                 />
+                <div style={{ width: '1px', height: '18px', background: 'var(--line)', margin: '0 2px' }} />
+                <button
+                  type="button"
+                  className={`btn sm ${showStructures ? 'pri' : ''}`}
+                  onClick={() => setShowStructures((v) => !v)}
+                  title="Toggle 2D chemical structure thumbnails"
+                >
+                  {showStructures ? 'Hide structures' : '2D structures'}
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={handleResolveAllStructures}
+                  disabled={resolvingStructures}
+                  title="Auto-resolve SMILES and 2D structures from IUPAC or chemical names via PubChem"
+                >
+                  {resolvingStructures ? 'Resolving...' : 'Auto-resolve'}
+                </button>
                 {state.reagents.length < 12 && (
-                  <button type="button" className="btn" onClick={addReagent}>
+                  <button type="button" className="btn sm pri" onClick={addReagent} style={{ marginLeft: 'auto' }}>
                     <svg
-                      width="14"
-                      height="14"
+                      width="13"
+                      height="13"
                       viewBox="0 0 14 14"
                       fill="none"
                       stroke="currentColor"
-                      strokeWidth="1.8"
+                      strokeWidth="2"
                       strokeLinecap="round"
                       aria-hidden="true"
                     >
@@ -689,9 +776,10 @@ export const SetupView: React.FC = () => {
               ))}
             </datalist>
 
-            <div className="rw th">
+            <div className={`rw th ${showStructures ? 'has-struct' : ''}`}>
               <div>Code</div>
-              <div>Name</div>
+              {showStructures && <div>Structure</div>}
+              <div>Name &amp; formula</div>
               <div>Molar mass</div>
               <div>Density</div>
               <div>Stock (mM)</div>
@@ -737,7 +825,7 @@ export const SetupView: React.FC = () => {
 
               return (
                 <div key={r.code + i} className="rrow" data-i={i}>
-                  <div className="rw">
+                  <div className={`rw ${showStructures ? 'has-struct' : ''}`}>
                     <input
                       type="text"
                       className="code code-in"
@@ -765,16 +853,52 @@ export const SetupView: React.FC = () => {
                       aria-label={`Reagent ${i + 1} code`}
                       title="Click to rename this code (letters, numbers, _ and -)."
                     />
-                    <input
-                      type="text"
-                      className="f"
-                      list="libnames"
-                      value={r.name}
-                      onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
-                      onBlur={(e) => handleNameSelect(i, e.target.value)}
-                      placeholder="name (library suggests)"
-                      aria-label={`${r.code} name`}
-                    />
+                    {showStructures && (
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <ChemicalStructure
+                          smiles={r.smiles}
+                          iupac={r.iupac || r.name}
+                          name={r.name}
+                          width={54}
+                          height={38}
+                          allowZoom={true}
+                          onResolvedSmiles={(smiles, mw) => {
+                            setPath(`reagents.${i}.smiles`, smiles);
+                            if (mw && (!r.molarMass || +r.molarMass <= 0)) {
+                              setPath(`reagents.${i}.molarMass`, mw);
+                            }
+                          }}
+                        />
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
+                      <input
+                        type="text"
+                        className="f"
+                        list="libnames"
+                        value={r.name}
+                        onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
+                        onBlur={(e) => handleNameSelect(i, e.target.value)}
+                        placeholder="name (library suggests)"
+                        aria-label={`${r.code} name`}
+                      />
+                      {r.smiles && (
+                        <div
+                          style={{
+                            fontSize: '10px',
+                            color: 'var(--mut)',
+                            fontFamily: 'monospace',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            paddingLeft: '2px',
+                          }}
+                          title={`SMILES: ${r.smiles}`}
+                        >
+                          {r.smiles}
+                        </div>
+                      )}
+                    </div>
                     <input
                       type="number"
                       step="any"

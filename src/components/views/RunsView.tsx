@@ -3,6 +3,7 @@ import { useApp } from '../../context/AppContext';
 import { SavedRun } from '../../types';
 import { buildRun, localDate } from '../../engine';
 import { dataFor } from '../../context/AppContext';
+import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
 
 export const RunsView: React.FC = () => {
   const {
@@ -34,6 +35,8 @@ export const RunsView: React.FC = () => {
   const [newName, setNewName] = useState('');
   const [newMm, setNewMm] = useState('');
   const [newDens, setNewDens] = useState('');
+  const [newSmiles, setNewSmiles] = useState('');
+  const [newIupac, setNewIupac] = useState('');
 
   const robotFileInputRef = useRef<HTMLInputElement>(null);
   const genFileInputRef = useRef<HTMLInputElement>(null);
@@ -63,15 +66,35 @@ export const RunsView: React.FC = () => {
 
   const handleAddLib = async () => {
     if (!newName.trim()) return;
+    let smiles = newSmiles.trim();
+    let iupac = newIupac.trim();
+    let mm = parseFloat(newMm) || 0;
+
+    // If SMILES was not supplied but name or IUPAC was, try resolving via PubChem
+    if (!smiles && (iupac || newName.trim())) {
+      try {
+        const resolved = await resolveChemicalNameToSmiles(iupac || newName.trim());
+        if (resolved?.smiles) {
+          smiles = resolved.smiles;
+          if (!mm && resolved.mw) mm = resolved.mw;
+          if (!iupac && resolved.iupac) iupac = resolved.iupac;
+        }
+      } catch {}
+    }
+
     await putLib({
       id: Math.random().toString(36).slice(2, 10),
       name: newName.trim(),
-      molarMass: parseFloat(newMm) || 0,
+      molarMass: mm,
       density: parseFloat(newDens) || 0,
+      smiles: smiles || undefined,
+      iupac: iupac || undefined,
     });
     setNewName('');
     setNewMm('');
     setNewDens('');
+    setNewSmiles('');
+    setNewIupac('');
     toast(`Added "${newName.trim()}" to the library.`);
   };
 
@@ -100,9 +123,9 @@ export const RunsView: React.FC = () => {
 
   const handleLibTemplate = () => {
     const rows = [
-      ['name', 'molar_mass_g_mol', 'density_g_mL', 'stock_solvent', 'stock_mM', 'cas', 'notes'],
-      ['ethyl acetoacetate', '130.14', '1.03', 'ethanol', '', '141-97-9', 'liquid: give density'],
-      ['p-toluic acid', '136.15', '', 'ethanol', '', '99-94-5', 'solid: leave density empty'],
+      ['name', 'molar_mass_g_mol', 'density_g_mL', 'stock_solvent', 'stock_mM', 'cas', 'smiles', 'iupac_name', 'notes'],
+      ['ethyl acetoacetate', '130.14', '1.03', 'ethanol', '', '141-97-9', 'CCOC(=O)CC(=O)C', 'ethyl 3-oxobutanoate', 'liquid: give density'],
+      ['p-toluic acid', '136.15', '', 'ethanol', '', '99-94-5', 'Cc1ccc(C(=O)O)cc1', '4-methylbenzoic acid', 'solid: leave density empty'],
     ];
     const csv = '\ufeff' + rows.map((r) => r.join(',')).join('\r\n') + '\r\n';
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -661,14 +684,50 @@ export const RunsView: React.FC = () => {
               </button>
             </div>
 
-            <div className="list" style={{ maxHeight: '300px', overflowY: 'auto' }}>
+            <div className="list" style={{ maxHeight: '340px', overflowY: 'auto' }}>
               {lib.length ? (
                 lib.map((x) => (
-                  <div key={x.id}>
+                  <div key={x.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 0', borderBottom: '1px solid var(--line, rgba(0,0,0,0.06))' }}>
+                    <ChemicalStructure
+                      smiles={x.smiles}
+                      iupac={x.iupac || x.name}
+                      name={x.name}
+                      width={56}
+                      height={40}
+                      allowZoom={true}
+                      onResolvedSmiles={(smiles, mw) => {
+                        putLib({
+                          ...x,
+                          smiles,
+                          molarMass: (!x.molarMass || +x.molarMass <= 0) && mw ? mw : x.molarMass,
+                        });
+                      }}
+                    />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <b>{x.name}</b>
-                      <div className="hint mono" style={{ margin: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                        <b>{x.name}</b>
+                        {x.smiles && (
+                          <span
+                            className="chip mut"
+                            style={{ fontSize: '10px', height: '18px', padding: '0 6px', fontFamily: 'monospace' }}
+                            title={x.smiles}
+                          >
+                            SMILES
+                          </span>
+                        )}
+                        {x.iupac && (
+                          <span
+                            style={{ fontSize: '10px', color: 'var(--mut)', maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                            title={x.iupac}
+                          >
+                            {x.iupac}
+                          </span>
+                        )}
+                      </div>
+                      <div className="hint mono" style={{ margin: 0, fontSize: '11px' }}>
                         {nf(x.molarMass, 3)} g/mol · {x.density ? x.density + ' g/mL' : 'solid'}
+                        {x.solvent ? ` · ${x.solvent}` : ''}
+                        {x.cas ? ` · CAS ${x.cas}` : ''}
                       </div>
                     </div>
                     <button
@@ -693,6 +752,7 @@ export const RunsView: React.FC = () => {
                 <input
                   type="text"
                   className="f"
+                  placeholder="e.g. Benzaldehyde"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                 />
@@ -715,6 +775,26 @@ export const RunsView: React.FC = () => {
                   className="f mono"
                   value={newDens}
                   onChange={(e) => setNewDens(e.target.value)}
+                />
+              </div>
+              <div className="fld" style={{ gridColumn: 'span 2' }}>
+                <label className="lbl">SMILES (optional)</label>
+                <input
+                  type="text"
+                  className="f mono"
+                  placeholder="e.g. c1ccccc1C=O"
+                  value={newSmiles}
+                  onChange={(e) => setNewSmiles(e.target.value)}
+                />
+              </div>
+              <div className="fld" style={{ gridColumn: 'span 2' }}>
+                <label className="lbl">IUPAC name (optional)</label>
+                <input
+                  type="text"
+                  className="f"
+                  placeholder="e.g. benzaldehyde"
+                  value={newIupac}
+                  onChange={(e) => setNewIupac(e.target.value)}
                 />
               </div>
             </div>

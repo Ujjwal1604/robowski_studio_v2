@@ -23,3 +23,4 @@ export { FixDiffModal } from './ui/FixDiffModal';
 export { StockCalculatorModal } from './ui/StockCalculatorModal';
 export { CommandPalette } from './ui/CommandPalette';
 export { BottomStepper } from './layout/BottomStepper';
+export { ChemicalStructure, resolveChemicalNameToSmiles } from './ui/ChemicalStructure';

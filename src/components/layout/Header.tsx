@@ -75,7 +75,20 @@ export const Header: React.FC = () => {
               color: 'var(--mut)',
             }}
           >
-            <span>🔍 Search</span>
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <circle cx="7" cy="7" r="5" />
+              <path d="M11 11l3 3" />
+            </svg>
+            <span>Search</span>
             <kbd
               style={{
                 fontSize: '10px',

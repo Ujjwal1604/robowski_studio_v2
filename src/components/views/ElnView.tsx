@@ -242,13 +242,12 @@ export const ElnView: React.FC = () => {
       <div className="card pad" style={{ marginBottom: '16px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '14px' }}>
           <div style={{ flex: '1 1 400px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-              <span style={{ fontSize: '18px' }}>📓</span>
-              <h1 style={{ fontSize: '18px', fontWeight: 700, margin: 0, color: 'var(--fg)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+              <h1 style={{ fontSize: '18px', fontWeight: 600, margin: 0, color: 'var(--fg)', letterSpacing: '-0.01em' }}>
                 HTE Electronic Lab Notebook
               </h1>
-              <span className="pill" style={{ background: 'var(--soft)', fontSize: '11px', fontWeight: 600 }}>
-                {run?.reactions || rowsCache.length || 54} Wells · {numPlates} Plate{numPlates === 1 ? '' : 's'}
+              <span style={{ color: 'var(--mut)', fontSize: '12px' }}>
+                · {run?.reactions || rowsCache.length || 54} Wells · {numPlates} Plate{numPlates === 1 ? '' : 's'}
               </span>
             </div>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
@@ -283,37 +282,37 @@ export const ElnView: React.FC = () => {
           <div
             style={{
               display: 'flex',
-              gap: '12px',
+              gap: '14px',
               flexWrap: 'wrap',
               background: 'var(--soft)',
-              padding: '10px 14px',
-              borderRadius: '8px',
+              padding: '10px 18px',
+              borderRadius: '9px',
               border: '1px solid var(--line)',
             }}
           >
             <div style={{ textAlign: 'center', minWidth: '60px' }}>
-              <div style={{ fontSize: '18px', fontWeight: 700, color: '#059669' }}>{stats.hits}</div>
-              <div style={{ fontSize: '10px', color: 'var(--mut)', textTransform: 'uppercase' }}>⭐ Hits</div>
+              <div style={{ fontSize: '19px', fontWeight: 700, fontFamily: 'monospace', color: '#059669' }}>{stats.hits}</div>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Hits</div>
             </div>
             <div style={{ width: '1px', background: 'var(--line)' }} />
             <div style={{ textAlign: 'center', minWidth: '60px' }}>
-              <div style={{ fontSize: '18px', fontWeight: 700, color: '#10b981' }}>{stats.clean}</div>
-              <div style={{ fontSize: '10px', color: 'var(--mut)', textTransform: 'uppercase' }}>🟢 Clean</div>
+              <div style={{ fontSize: '19px', fontWeight: 700, fontFamily: 'monospace', color: '#10b981' }}>{stats.clean}</div>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Clean</div>
             </div>
             <div style={{ width: '1px', background: 'var(--line)' }} />
             <div style={{ textAlign: 'center', minWidth: '60px' }}>
-              <div style={{ fontSize: '18px', fontWeight: 700, color: '#8b5cf6' }}>{stats.poly}</div>
-              <div style={{ fontSize: '10px', color: 'var(--mut)', textTransform: 'uppercase' }}>🧪 Poly</div>
+              <div style={{ fontSize: '19px', fontWeight: 700, fontFamily: 'monospace', color: '#8b5cf6' }}>{stats.poly}</div>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Polymer</div>
             </div>
             <div style={{ width: '1px', background: 'var(--line)' }} />
             <div style={{ textAlign: 'center', minWidth: '60px' }}>
-              <div style={{ fontSize: '18px', fontWeight: 700, color: '#f59e0b' }}>{stats.precip}</div>
-              <div style={{ fontSize: '10px', color: 'var(--mut)', textTransform: 'uppercase' }}>❄️ Precip</div>
+              <div style={{ fontSize: '19px', fontWeight: 700, fontFamily: 'monospace', color: '#d97706' }}>{stats.precip}</div>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Precip</div>
             </div>
             <div style={{ width: '1px', background: 'var(--line)' }} />
             <div style={{ textAlign: 'center', minWidth: '60px' }}>
-              <div style={{ fontSize: '18px', fontWeight: 700, color: '#0ea5e9' }}>{stats.volLoss}</div>
-              <div style={{ fontSize: '10px', color: 'var(--mut)', textTransform: 'uppercase' }}>📉 Vol Loss</div>
+              <div style={{ fontSize: '19px', fontWeight: 700, fontFamily: 'monospace', color: '#0284c7' }}>{stats.volLoss}</div>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Vol Loss</div>
             </div>
           </div>
         </div>
@@ -477,7 +476,7 @@ export const ElnView: React.FC = () => {
               style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'hit' ? '#059669' : 'var(--soft)', color: tagFilter === 'hit' ? '#fff' : 'inherit' }}
               onClick={() => setTagFilter('hit')}
             >
-              ⭐ Top Hits
+              Top Hits
             </button>
             <button
               type="button"
@@ -485,23 +484,23 @@ export const ElnView: React.FC = () => {
               style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'polymerized' ? '#8b5cf6' : 'var(--soft)', color: tagFilter === 'polymerized' ? '#fff' : 'inherit' }}
               onClick={() => setTagFilter('polymerized')}
             >
-              🧪 Polymerized
+              Polymerized
             </button>
             <button
               type="button"
               className={`pill ${tagFilter === 'precipitated' ? 'on' : ''}`}
-              style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'precipitated' ? '#f59e0b' : 'var(--soft)', color: tagFilter === 'precipitated' ? '#fff' : 'inherit' }}
+              style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'precipitated' ? '#d97706' : 'var(--soft)', color: tagFilter === 'precipitated' ? '#fff' : 'inherit' }}
               onClick={() => setTagFilter('precipitated')}
             >
-              ❄️ Precipitated
+              Precipitated
             </button>
             <button
               type="button"
               className={`pill ${tagFilter === 'volume_decreased' ? 'on' : ''}`}
-              style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'volume_decreased' ? '#0ea5e9' : 'var(--soft)', color: tagFilter === 'volume_decreased' ? '#fff' : 'inherit' }}
+              style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'volume_decreased' ? '#0284c7' : 'var(--soft)', color: tagFilter === 'volume_decreased' ? '#fff' : 'inherit' }}
               onClick={() => setTagFilter('volume_decreased')}
             >
-              📉 Vol Loss / Gas
+              Volume Loss
             </button>
             <button
               type="button"
@@ -509,7 +508,7 @@ export const ElnView: React.FC = () => {
               style={{ cursor: 'pointer', border: '1px solid var(--line)', background: tagFilter === 'has_notes' ? 'var(--acc)' : 'var(--soft)', color: tagFilter === 'has_notes' ? '#fff' : 'inherit' }}
               onClick={() => setTagFilter('has_notes')}
             >
-              📝 With Notes
+              With Notes
             </button>
           </div>
 
@@ -526,7 +525,7 @@ export const ElnView: React.FC = () => {
                 justifyContent: 'space-between',
                 flexWrap: 'wrap',
                 gap: '8px',
-                border: '1px dashed var(--acc)',
+                border: '1px dashed var(--line)',
               }}
             >
               <div style={{ fontSize: '12px', fontWeight: 600 }}>
@@ -539,23 +538,23 @@ export const ElnView: React.FC = () => {
                   style={{ background: '#8b5cf6', color: '#fff', fontSize: '11px' }}
                   onClick={() => applyBatchObservation('polymerized')}
                 >
-                  🧪 Tag Polymerized
+                  Tag Polymerized
                 </button>
                 <button
                   type="button"
                   className="btn sm"
-                  style={{ background: '#f59e0b', color: '#fff', fontSize: '11px' }}
+                  style={{ background: '#d97706', color: '#fff', fontSize: '11px' }}
                   onClick={() => applyBatchObservation('precipitated')}
                 >
-                  ❄️ Tag Precipitated
+                  Tag Precipitated
                 </button>
                 <button
                   type="button"
                   className="btn sm"
-                  style={{ background: '#0ea5e9', color: '#fff', fontSize: '11px' }}
+                  style={{ background: '#0284c7', color: '#fff', fontSize: '11px' }}
                   onClick={() => applyBatchObservation('volume_decreased')}
                 >
-                  📉 Tag Vol Loss
+                  Tag Volume Loss
                 </button>
                 <button
                   type="button"
@@ -563,7 +562,7 @@ export const ElnView: React.FC = () => {
                   style={{ background: '#059669', color: '#fff', fontSize: '11px' }}
                   onClick={() => applyBatchStatus('hit')}
                 >
-                  ⭐ Mark Hits
+                  Mark as Hits
                 </button>
                 <button
                   type="button"
@@ -649,28 +648,28 @@ export const ElnView: React.FC = () => {
                     if (obs.status === 'hit') {
                       bg = 'rgba(16, 185, 129, 0.2)';
                       border = isSelected ? '2px solid #059669' : '1px solid #10b981';
-                      badgeIcon = '⭐';
+                      badgeIcon = 'HIT';
                     } else if (obs.tags?.includes('polymerized')) {
                       bg = 'rgba(139, 92, 246, 0.16)';
                       border = isSelected ? '2px solid #7c3aed' : '1px solid #8b5cf6';
-                      badgeIcon = '🧪';
+                      badgeIcon = 'POLY';
                     } else if (obs.tags?.includes('precipitated')) {
                       bg = 'rgba(245, 158, 11, 0.16)';
                       border = isSelected ? '2px solid #d97706' : '1px solid #f59e0b';
-                      badgeIcon = '❄️';
+                      badgeIcon = 'PPT';
                     } else if (obs.tags?.includes('volume_decreased') || obs.tags?.includes('gas_evolution')) {
                       bg = 'rgba(14, 165, 233, 0.16)';
                       border = isSelected ? '2px solid #0284c7' : '1px solid #0ea5e9';
-                      badgeIcon = obs.tags?.includes('gas_evolution') ? '💨' : '📉';
+                      badgeIcon = obs.tags?.includes('gas_evolution') ? 'GAS' : 'VOL';
                     } else if (obs.status === 'clean') {
                       bg = 'rgba(16, 185, 129, 0.1)';
-                      badgeIcon = '🟢';
+                      badgeIcon = 'OK';
                     } else if (obs.status === 'decomp') {
                       bg = 'rgba(239, 68, 68, 0.12)';
-                      badgeIcon = '🔴';
+                      badgeIcon = 'DEC';
                     } else if (isBlank) {
                       bg = 'var(--soft)';
-                      badgeIcon = '🔘';
+                      badgeIcon = 'BLK';
                     }
 
                     if (isBatchSelected) {
@@ -811,7 +810,7 @@ export const ElnView: React.FC = () => {
                 }
               }}
             >
-              ⭐ {currentWellObs.status === 'hit' ? 'Top Hit Selected' : 'Mark Top Hit'}
+              {currentWellObs.status === 'hit' ? 'Top Hit Selected' : 'Mark as Top Hit'}
             </button>
           </div>
 

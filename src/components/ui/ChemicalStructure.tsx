@@ -1,5 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import SmilesDrawer from 'smiles-drawer';
+import { getRDKitInstance, drawSmilesWithRDKit, computeMolecularWeightFromSmiles } from '../../utils/rdkit';
+
+export interface ChemicalResolutionResult {
+  smiles: string;
+  mw?: number;
+  density?: number;
+  iupac?: string;
+  cid?: number;
+}
 
 interface ChemicalStructureProps {
   smiles?: string | null;
@@ -9,15 +18,15 @@ interface ChemicalStructureProps {
   height?: number;
   className?: string;
   allowZoom?: boolean;
-  onResolvedSmiles?: (smiles: string, mw?: number) => void;
+  onResolvedSmiles?: (smiles: string, mw?: number, density?: number, iupac?: string) => void;
 }
 
 // In-memory cache for resolved chemical names to avoid redundant network calls
-const RESOLVED_NAME_CACHE = new Map<string, { smiles: string; mw?: number; iupac?: string }>();
+const RESOLVED_NAME_CACHE = new Map<string, ChemicalResolutionResult>();
 
 export async function resolveChemicalNameToSmiles(
   query: string
-): Promise<{ smiles: string; mw?: number; iupac?: string } | null> {
+): Promise<ChemicalResolutionResult | null> {
   const clean = query.trim();
   if (!clean || clean.length < 2) return null;
   const key = clean.toLowerCase();
@@ -27,16 +36,67 @@ export async function resolveChemicalNameToSmiles(
 
   // 1. Try PubChem PUG REST API
   try {
-    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(clean)}/property/CanonicalSMILES,MolecularWeight,IUPACName/JSON`;
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(clean)}/property/CID,CanonicalSMILES,ConnectivitySMILES,IsomericSMILES,MolecularWeight,IUPACName/JSON`;
     const res = await fetch(url);
     if (res.ok) {
       const data = await res.json();
       const props = data?.PropertyTable?.Properties?.[0];
-      if (props?.CanonicalSMILES) {
-        const result = {
-          smiles: props.CanonicalSMILES,
-          mw: props.MolecularWeight ? Number(props.MolecularWeight) : undefined,
-          iupac: props.IUPACName,
+      const smiles =
+        props?.CanonicalSMILES ||
+        props?.ConnectivitySMILES ||
+        props?.IsomericSMILES ||
+        props?.SMILES;
+
+      if (smiles) {
+        let mw = props?.MolecularWeight ? Number(props.MolecularWeight) : undefined;
+        let density: number | undefined = undefined;
+
+        // Try extracting experimental density from PubChem if CID is available
+        if (props?.CID) {
+          try {
+            const densityUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${props.CID}/JSON?heading=Density`;
+            const densityRes = await fetch(densityUrl);
+            if (densityRes.ok) {
+              const viewData = await densityRes.json();
+              const infoList =
+                viewData?.Record?.Section?.[0]?.Section?.[0]?.Section?.[0]?.Information || [];
+              for (const item of infoList) {
+                for (const swm of item?.Value?.StringWithMarkup || []) {
+                  const str = swm?.String || '';
+                  const m =
+                    str.match(/([0-9]+\.[0-9]+)\s*(?:g\/cm3|g\/ml|at|@|\(|$)/i) ||
+                    str.match(/^([0-9]+\.[0-9]+)$/);
+                  if (m) {
+                    const parsed = parseFloat(m[1]);
+                    if (parsed >= 0.4 && parsed <= 3.8) {
+                      density = parsed;
+                      break;
+                    }
+                  }
+                }
+                if (density !== undefined) break;
+              }
+            }
+          } catch {}
+        }
+
+        // If MW was not provided by PubChem, compute directly from SMILES using RDKit
+        if (!mw) {
+          try {
+            const rdkit = await getRDKitInstance();
+            if (rdkit) {
+              const computed = computeMolecularWeightFromSmiles(rdkit, smiles);
+              if (computed) mw = computed;
+            }
+          } catch {}
+        }
+
+        const result: ChemicalResolutionResult = {
+          smiles,
+          mw,
+          density,
+          iupac: props?.IUPACName,
+          cid: props?.CID,
         };
         RESOLVED_NAME_CACHE.set(key, result);
         return result;
@@ -52,7 +112,16 @@ export async function resolveChemicalNameToSmiles(
       const text = await res.text();
       const smiles = text.trim();
       if (smiles && !smiles.includes('<!DOCTYPE') && !smiles.includes('Page not found')) {
-        const result = { smiles };
+        let mw: number | undefined = undefined;
+        try {
+          const rdkit = await getRDKitInstance();
+          if (rdkit) {
+            const computed = computeMolecularWeightFromSmiles(rdkit, smiles);
+            if (computed) mw = computed;
+          }
+        } catch {}
+
+        const result: ChemicalResolutionResult = { smiles, mw };
         RESOLVED_NAME_CACHE.set(key, result);
         return result;
       }
@@ -78,6 +147,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
   const [modalInputSmiles, setModalInputSmiles] = useState<string>('');
   const [resolving, setResolving] = useState(false);
   const [renderError, setRenderError] = useState(false);
+  const [rdkitSvg, setRdkitSvg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   // Sync external smiles prop
@@ -111,84 +181,117 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
     }
   }, [activeSmiles, iupac, name, onResolvedSmiles]);
 
-  // Render SMILES to SVG using SmilesDrawer.SvgDrawer
+  // Render SMILES to publication-quality SVG using RDKit WebAssembly (with SmilesDrawer as graceful fallback)
   useEffect(() => {
-    if (!svgRef.current) return;
+    let isCancelled = false;
     if (!activeSmiles) {
+      setRdkitSvg(null);
       setRenderError(false);
       return;
     }
 
-    try {
-      const isDark =
-        document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (window.matchMedia &&
-          window.matchMedia('(prefers-color-scheme: dark)').matches &&
-          document.documentElement.getAttribute('data-theme') !== 'light');
+    const isDark =
+      document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (window.matchMedia &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches &&
+        document.documentElement.getAttribute('data-theme') !== 'light');
 
-      while (svgRef.current.firstChild) {
-        svgRef.current.removeChild(svgRef.current.firstChild);
-      }
-
-      const options = {
-        width,
-        height,
-        bondThickness: 1.1,
-        bondLength: 13,
-        shortBondLength: 0.85,
-        bondSpacing: 0.18 * 13,
-        atomVisualization: 'default',
-        isomeric: true,
-        compactDrawing: true,
-        themes: {
-          light: {
-            C: '#14211e',
-            O: '#dc2626',
-            N: '#2563eb',
-            F: '#059669',
-            CL: '#16a34a',
-            BR: '#b45309',
-            I: '#c2410c',
-            P: '#ea580c',
-            S: '#d97706',
-            B: '#ca8a04',
-            SI: '#ca8a04',
-            H: '#4b5563',
-            BACKGROUND: 'transparent',
-          },
-          dark: {
-            C: '#e8f0ec',
-            O: '#f87171',
-            N: '#60a5fa',
-            F: '#34d399',
-            CL: '#4ade80',
-            BR: '#fb923c',
-            I: '#f97316',
-            P: '#fb923c',
-            S: '#fbbf24',
-            B: '#fde047',
-            SI: '#fde047',
-            H: '#9ca3af',
-            BACKGROUND: 'transparent',
-          },
-        },
-      };
-
-      const drawer = new SmilesDrawer.SvgDrawer(options);
-      SmilesDrawer.parse(
-        activeSmiles,
-        (tree: any) => {
-          if (!svgRef.current) return;
-          drawer.draw(tree, svgRef.current, isDark ? 'dark' : 'light');
-          setRenderError(false);
-        },
-        () => {
-          setRenderError(true);
+    // 1. Try RDKit WebAssembly engine first (standard Python/C++ publication layout)
+    getRDKitInstance()
+      .then((rdkit) => {
+        if (isCancelled) return;
+        if (rdkit) {
+          const svg = drawSmilesWithRDKit(rdkit, activeSmiles, {
+            width,
+            height,
+            isDark,
+            bondLineWidth: 1.8,
+          });
+          if (svg) {
+            const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
+            setRdkitSvg(clean);
+            setRenderError(false);
+            return;
+          }
         }
-      );
-    } catch {
-      setRenderError(true);
+        renderSmilesDrawerFallback();
+      })
+      .catch(() => {
+        if (!isCancelled) renderSmilesDrawerFallback();
+      });
+
+    function renderSmilesDrawerFallback() {
+      if (!svgRef.current || isCancelled) return;
+      try {
+        while (svgRef.current.firstChild) {
+          svgRef.current.removeChild(svgRef.current.firstChild);
+        }
+
+        const options = {
+          width,
+          height,
+          bondThickness: 1.2,
+          bondLength: 14,
+          shortBondLength: 0.85,
+          bondSpacing: 0.18 * 14,
+          atomVisualization: 'default',
+          isomeric: true,
+          compactDrawing: true,
+          themes: {
+            light: {
+              C: '#14211e',
+              O: '#dc2626',
+              N: '#2563eb',
+              F: '#059669',
+              CL: '#16a34a',
+              BR: '#b45309',
+              I: '#c2410c',
+              P: '#ea580c',
+              S: '#d97706',
+              B: '#ca8a04',
+              SI: '#ca8a04',
+              H: '#4b5563',
+              BACKGROUND: 'transparent',
+            },
+            dark: {
+              C: '#e8f0ec',
+              O: '#f87171',
+              N: '#60a5fa',
+              F: '#34d399',
+              CL: '#4ade80',
+              BR: '#fb923c',
+              I: '#f97316',
+              P: '#fb923c',
+              S: '#fbbf24',
+              B: '#fde047',
+              SI: '#fde047',
+              H: '#9ca3af',
+              BACKGROUND: 'transparent',
+            },
+          },
+        };
+
+        const drawer = new SmilesDrawer.SvgDrawer(options);
+        SmilesDrawer.parse(
+          activeSmiles,
+          (tree: any) => {
+            if (!svgRef.current || isCancelled) return;
+            drawer.draw(tree, svgRef.current, isDark ? 'dark' : 'light');
+            setRdkitSvg(null);
+            setRenderError(false);
+          },
+          () => {
+            if (!isCancelled) setRenderError(true);
+          }
+        );
+      } catch {
+        if (!isCancelled) setRenderError(true);
+      }
     }
+
+    return () => {
+      isCancelled = true;
+    };
   }, [activeSmiles, width, height]);
 
   const handleManualResolve = async (e: React.MouseEvent) => {
@@ -357,6 +460,19 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
               <line x1="12" y1="16" x2="12.01" y2="16" />
             </svg>
           </div>
+        ) : rdkitSvg ? (
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              overflow: 'hidden',
+              pointerEvents: 'none',
+            }}
+            dangerouslySetInnerHTML={{ __html: rdkitSvg }}
+          />
         ) : (
           <svg
             ref={svgRef}
@@ -572,75 +688,128 @@ const ModalEnlargedStructure: React.FC<{ smiles: string; width: number; height: 
   height,
 }) => {
   const modalSvgRef = useRef<SVGSVGElement | null>(null);
+  const [modalRdkitSvg, setModalRdkitSvg] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!modalSvgRef.current || !smiles) return;
-    try {
-      const isDark =
-        document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (window.matchMedia &&
-          window.matchMedia('(prefers-color-scheme: dark)').matches &&
-          document.documentElement.getAttribute('data-theme') !== 'light');
+    let isCancelled = false;
+    if (!smiles) {
+      setModalRdkitSvg(null);
+      return;
+    }
 
-      while (modalSvgRef.current.firstChild) {
-        modalSvgRef.current.removeChild(modalSvgRef.current.firstChild);
-      }
+    const isDark =
+      document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (window.matchMedia &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches &&
+        document.documentElement.getAttribute('data-theme') !== 'light');
 
-      const options = {
-        width,
-        height,
-        bondThickness: 1.5,
-        bondLength: 20,
-        shortBondLength: 0.85,
-        bondSpacing: 0.18 * 20,
-        atomVisualization: 'default',
-        isomeric: true,
-        compactDrawing: false,
-        themes: {
-          light: {
-            C: '#14211e',
-            O: '#dc2626',
-            N: '#2563eb',
-            F: '#059669',
-            CL: '#16a34a',
-            BR: '#b45309',
-            I: '#c2410c',
-            P: '#ea580c',
-            S: '#d97706',
-            B: '#ca8a04',
-            SI: '#ca8a04',
-            H: '#4b5563',
-            BACKGROUND: 'transparent',
+    // Try RDKit WebAssembly engine first
+    getRDKitInstance()
+      .then((rdkit) => {
+        if (isCancelled) return;
+        if (rdkit) {
+          const svg = drawSmilesWithRDKit(rdkit, smiles, {
+            width,
+            height,
+            isDark,
+            bondLineWidth: 2.0,
+          });
+          if (svg) {
+            const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
+            setModalRdkitSvg(clean);
+            return;
+          }
+        }
+        renderFallback();
+      })
+      .catch(() => {
+        if (!isCancelled) renderFallback();
+      });
+
+    function renderFallback() {
+      if (!modalSvgRef.current || isCancelled) return;
+      try {
+        while (modalSvgRef.current.firstChild) {
+          modalSvgRef.current.removeChild(modalSvgRef.current.firstChild);
+        }
+
+        const options = {
+          width,
+          height,
+          bondThickness: 1.5,
+          bondLength: 20,
+          shortBondLength: 0.85,
+          bondSpacing: 0.18 * 20,
+          atomVisualization: 'default',
+          isomeric: true,
+          compactDrawing: false,
+          themes: {
+            light: {
+              C: '#14211e',
+              O: '#dc2626',
+              N: '#2563eb',
+              F: '#059669',
+              CL: '#16a34a',
+              BR: '#b45309',
+              I: '#c2410c',
+              P: '#ea580c',
+              S: '#d97706',
+              B: '#ca8a04',
+              SI: '#ca8a04',
+              H: '#4b5563',
+              BACKGROUND: 'transparent',
+            },
+            dark: {
+              C: '#e8f0ec',
+              O: '#f87171',
+              N: '#60a5fa',
+              F: '#34d399',
+              CL: '#4ade80',
+              BR: '#fb923c',
+              I: '#f97316',
+              P: '#fb923c',
+              S: '#fbbf24',
+              B: '#fde047',
+              SI: '#fde047',
+              H: '#9ca3af',
+              BACKGROUND: 'transparent',
+            },
           },
-          dark: {
-            C: '#e8f0ec',
-            O: '#f87171',
-            N: '#60a5fa',
-            F: '#34d399',
-            CL: '#4ade80',
-            BR: '#fb923c',
-            I: '#f97316',
-            P: '#fb923c',
-            S: '#fbbf24',
-            B: '#fde047',
-            SI: '#fde047',
-            H: '#9ca3af',
-            BACKGROUND: 'transparent',
-          },
-        },
-      };
+        };
 
-      const drawer = new SmilesDrawer.SvgDrawer(options);
-      SmilesDrawer.parse(
-        smiles,
-        (tree: any) => {
-          if (!modalSvgRef.current) return;
-          drawer.draw(tree, modalSvgRef.current, isDark ? 'dark' : 'light');
-        },
-        () => {}
-      );
-    } catch {}
+        const drawer = new SmilesDrawer.SvgDrawer(options);
+        SmilesDrawer.parse(
+          smiles,
+          (tree: any) => {
+            if (!modalSvgRef.current || isCancelled) return;
+            drawer.draw(tree, modalSvgRef.current, isDark ? 'dark' : 'light');
+            setModalRdkitSvg(null);
+          },
+          () => {}
+        );
+      } catch {}
+    }
+
+    return () => {
+      isCancelled = true;
+    };
   }, [smiles, width, height]);
+
+  if (modalRdkitSvg) {
+    return (
+      <div
+        style={{
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          overflow: 'hidden',
+        }}
+        dangerouslySetInnerHTML={{ __html: modalRdkitSvg }}
+      />
+    );
+  }
 
   return (
     <svg

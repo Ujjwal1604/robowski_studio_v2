@@ -6,6 +6,7 @@ import {
   HteElnRecord,
   RecipeItem,
 } from '../../types';
+import { AiSynthesisReport } from '../ui/AiSynthesisReport';
 
 const PLATE_SIZE = 54;
 const ROWS = 6;
@@ -235,6 +236,73 @@ export const ElnView: React.FC = () => {
 
     return txt;
   }, [scaleUpCalculations, scaleUpScaleMmol, state.reactionSolvent, eln, scaleUpHitWellIdx]);
+
+  // Aggregated data for AI Synthesis Report
+  const aiReportData = useMemo(() => {
+    const totalWells = rowsCache.length || 54;
+    let hits = 0;
+    let moderate = 0;
+    let low = 0;
+    let failed = 0;
+
+    const topHitsList: any[] = [];
+    const problemWellsList: any[] = [];
+
+    const wellEntries = Object.entries(eln.wells || {});
+    wellEntries.forEach(([key, obs]) => {
+      const [pStr, wStr] = key.split('-');
+      const pIdx = parseInt(pStr, 10);
+      const wIdx = parseInt(wStr, 10);
+      const globalIdx = pIdx * PLATE_SIZE + wIdx;
+      const rowData = run?.rows ? run.rows[globalIdx] : null;
+      const recipeStr = (rowData && 'recipe' in rowData ? (rowData as any).recipe : '') || `Plate ${pIdx + 1} Well ${wIdx + 1}`;
+      const conv =
+        obs.conversion ??
+        (obs.status === 'hit' ? 95 : obs.status === 'clean' ? 85 : undefined);
+
+      if (obs.status === 'hit' || (conv !== undefined && conv >= 75)) {
+        hits++;
+        if (topHitsList.length < 8) {
+          topHitsList.push({
+            well: `P${pIdx + 1}_${ROW_LETTERS[Math.floor(wIdx / COLS)]}${(wIdx % COLS) + 1}`,
+            recipe: recipeStr,
+            conversion: conv ?? undefined,
+            yield: obs.yield ?? undefined,
+            notes: obs.notes,
+          });
+        }
+      } else if (obs.status === 'partial' || (conv !== undefined && conv >= 30 && conv < 75)) {
+        moderate++;
+      } else if (obs.status === 'sm_only' || (conv !== undefined && conv < 30)) {
+        low++;
+      } else if (
+        obs.status === 'decomp' ||
+        obs.status === 'precipitate' ||
+        obs.tags?.includes('polymerized')
+      ) {
+        failed++;
+        if (problemWellsList.length < 8) {
+          problemWellsList.push({
+            well: `P${pIdx + 1}_${ROW_LETTERS[Math.floor(wIdx / COLS)]}${(wIdx % COLS) + 1}`,
+            recipe: recipeStr,
+            notes: obs.notes || obs.tags?.join(', '),
+          });
+        }
+      }
+    });
+
+    return {
+      wellStats: {
+        total: totalWells,
+        hits,
+        moderate,
+        low,
+        failed,
+      },
+      topHits: topHitsList,
+      problemWells: problemWellsList,
+    };
+  }, [rowsCache, run, eln.wells]);
 
   return (
     <div className="wrap" style={{ maxWidth: '1360px', margin: '0 auto', padding: '16px 20px 80px' }}>
@@ -1135,6 +1203,28 @@ export const ElnView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* AI Synthesis & Campaign Executive Report (Option 5) */}
+      <AiSynthesisReport
+        campaignTitle={eln.campaignTitle}
+        reactionClass={eln.reactionClass}
+        objective={eln.objective}
+        postReactionNotes={eln.postReactionNotes}
+        reagents={state.reagents}
+        wellStats={aiReportData.wellStats}
+        topHits={aiReportData.topHits}
+        problemWells={aiReportData.problemWells}
+        onAppendNotes={(text) => {
+          updateEln({
+            postReactionNotes: (eln.postReactionNotes ? eln.postReactionNotes + '\n\n' : '') + text,
+          });
+          toast('Appended AI Synthesis Report to Campaign Notes.');
+        }}
+        onReplaceNotes={(text) => {
+          updateEln({ postReactionNotes: text });
+          toast('Updated Campaign Notes with AI Synthesis Report.');
+        }}
+      />
 
       {/* Campaign Post-Reaction Summary Notes */}
       <div className="card pad" style={{ marginTop: '20px' }}>

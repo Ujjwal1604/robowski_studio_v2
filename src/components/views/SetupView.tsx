@@ -14,7 +14,9 @@ import * as Tri from '../../engine';
 import { exampleState } from '../../context/runPayload';
 import { FixDiffModal } from '../ui/FixDiffModal';
 import { StockCalculatorModal } from '../ui/StockCalculatorModal';
+import { AiDiagnosticsModal } from '../ui/AiDiagnosticsModal';
 import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
+import { getRDKitInstance, computeMolecularWeightFromSmiles } from '../../utils/rdkit';
 
 export const SetupView: React.FC = () => {
   const {
@@ -63,38 +65,63 @@ export const SetupView: React.FC = () => {
   const [resolvingStructures, setResolvingStructures] = useState(false);
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
   const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
+  const [aiDiagnosticsOpen, setAiDiagnosticsOpen] = useState(false);
   const libFileInputRef = React.useRef<HTMLInputElement>(null);
   const excelRunInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleResolveAllStructures = async () => {
     const candidates = state.reagents
       .map((r, i) => ({ r, i }))
-      .filter(({ r }) => !r.smiles && Boolean((r.iupac || r.name || '').trim()));
+      .filter(({ r }) => Boolean((r.name || r.iupac || '').trim()));
 
     if (!candidates.length) {
-      toast('All reagents already have 2D structures or are missing names.');
+      toast('Add reagent chemical names first to resolve structures and properties.');
       return;
     }
 
     setResolvingStructures(true);
-    toast(`Looking up chemical structures for ${candidates.length} reagent(s)...`);
+    toast(`Looking up chemical data for ${candidates.length} reagent(s)...`);
     let resolvedCount = 0;
     try {
+      const rdkit = await getRDKitInstance();
       for (const { r, i } of candidates) {
-        const q = (r.iupac || r.name || '').trim();
+        const q = (r.name || r.iupac || '').trim();
         const res = await resolveChemicalNameToSmiles(q);
         if (res?.smiles) {
-          setPath(`reagents.${i}.smiles`, res.smiles);
-          if (res.mw && (!r.molarMass || +r.molarMass <= 0)) {
-            setPath(`reagents.${i}.molarMass`, res.mw);
-          }
-          if (res.iupac && !r.iupac) {
-            setPath(`reagents.${i}.iupac`, res.iupac);
-          }
+          setState((prev) => {
+            const next = JSON.parse(JSON.stringify(prev));
+            const reg = next.reagents[i];
+            reg.smiles = res.smiles;
+            if (res.iupac) reg.iupac = res.iupac;
+            if (res.mw) reg.molarMass = res.mw;
+            if (res.density !== undefined) {
+              reg.density = res.density;
+            } else if (!reg.density) {
+              reg.density = 0; // solid
+            }
+            return next;
+          });
           resolvedCount++;
+        } else if (/^[CNOPSFIBrclH0-9=\-#+()\[\]\\/@:]+$/.test(q) && q.length > 2) {
+          // If the name itself is a SMILES string
+          if (rdkit) {
+            const mw = computeMolecularWeightFromSmiles(rdkit, q);
+            setState((prev) => {
+              const next = JSON.parse(JSON.stringify(prev));
+              const reg = next.reagents[i];
+              reg.smiles = q;
+              if (mw) reg.molarMass = mw;
+              return next;
+            });
+            resolvedCount++;
+          }
         }
       }
-      toast(`Resolved ${resolvedCount} chemical structure(s) from chemical names!`);
+      toast(
+        resolvedCount > 0
+          ? `Auto-resolved ${resolvedCount} reagent(s) with 2D structures, molar mass & density!`
+          : `Could not find chemical data for these names on PubChem.`
+      );
     } catch {
       toast(`Resolved ${resolvedCount} structure(s).`);
     } finally {
@@ -232,9 +259,14 @@ export const SetupView: React.FC = () => {
 
   const rcol = (i: number) => PAL[i % PAL.length];
 
-  const handleNameSelect = (i: number, nameVal: string) => {
-    const trimmed = nameVal.trim().toLowerCase();
-    const item = lib.find((l) => l.name.trim().toLowerCase() === trimmed);
+  const handleNameSelect = async (i: number, nameVal: string) => {
+    const trimmed = nameVal.trim();
+    if (!trimmed) {
+      setPath(`reagents.${i}.name`, '');
+      return;
+    }
+
+    const item = lib.find((l) => l.name.trim().toLowerCase() === trimmed.toLowerCase());
     if (item) {
       setState((prev) => {
         const next = JSON.parse(JSON.stringify(prev));
@@ -242,8 +274,8 @@ export const SetupView: React.FC = () => {
         r.name = item.name;
         r.molarMass = item.molarMass || '';
         r.density = item.density || 0;
-        r.smiles = item.smiles || r.smiles || '';
-        r.iupac = item.iupac || r.iupac || '';
+        r.smiles = item.smiles || '';
+        r.iupac = item.iupac || '';
         if (item.solvent && SUPPORTED_SOLVENTS.includes(item.solvent)) {
           r.solvent = item.solvent;
         }
@@ -258,7 +290,66 @@ export const SetupView: React.FC = () => {
         }.`
       );
     } else {
-      setPath(`reagents.${i}.name`, nameVal);
+      const prevReagent = state.reagents[i];
+      const isNameChanged = (prevReagent?.name || '').trim().toLowerCase() !== trimmed.toLowerCase();
+
+      // If user changed the name to something new, clear the old structure & properties immediately
+      if (isNameChanged) {
+        setState((prev) => {
+          const next = JSON.parse(JSON.stringify(prev));
+          const r = next.reagents[i];
+          r.name = trimmed;
+          r.smiles = '';
+          r.iupac = '';
+          return next;
+        });
+      } else {
+        setPath(`reagents.${i}.name`, trimmed);
+      }
+
+      // Automatically query PubChem/NCI/RDKit to fetch SMILES, Molar Mass, and Density!
+      toast(`Looking up chemical properties for "${trimmed}"...`);
+      try {
+        const res = await resolveChemicalNameToSmiles(trimmed);
+        if (res?.smiles) {
+          setState((prev) => {
+            const next = JSON.parse(JSON.stringify(prev));
+            const r = next.reagents[i];
+            // Ensure the user hasn't edited the name again in the meantime
+            if (r.name.trim().toLowerCase() === trimmed.toLowerCase()) {
+              r.smiles = res.smiles;
+              if (res.iupac) r.iupac = res.iupac;
+              if (res.mw) r.molarMass = res.mw;
+              if (res.density !== undefined) {
+                r.density = res.density;
+              } else {
+                r.density = 0; // Solid
+              }
+            }
+            return next;
+          });
+          toast(
+            `Resolved "${trimmed}": ${res.mw ? nf(res.mw, 2) + ' g/mol' : ''}${
+              res.density ? ' · ' + res.density + ' g/mL' : ' · solid'
+            }`
+          );
+        } else {
+          // Check if user entered a raw SMILES string into the name box
+          if (/^[CNOPSFIBrclH0-9=\-#+()\[\]\\/@:]+$/.test(trimmed) && trimmed.length > 2) {
+            setPath(`reagents.${i}.smiles`, trimmed);
+            const rdkit = await getRDKitInstance();
+            if (rdkit) {
+              const mw = computeMolecularWeightFromSmiles(rdkit, trimmed);
+              if (mw) {
+                setPath(`reagents.${i}.molarMass`, mw);
+                toast(`Calculated molecular weight from SMILES: ${nf(mw, 2)} g/mol`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Auto lookup failed:', err);
+      }
     }
   };
 
@@ -936,22 +1027,40 @@ export const SetupView: React.FC = () => {
                             title="Click to rename reagent code"
                           />
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, minWidth: 0 }}>
-                            <input
-                              type="text"
-                              className="f"
-                              list="libnames"
-                              value={r.name}
-                              onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
-                              onBlur={(e) => handleNameSelect(i, e.target.value)}
-                              placeholder="Reagent chemical name (e.g. p-toluic acid, Pd(OAc)2)"
-                              aria-label={`${r.code} name`}
-                              style={{
-                                fontSize: '15px',
-                                fontWeight: 600,
-                                height: '36px',
-                                width: '100%',
-                              }}
-                            />
+                            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                              <input
+                                type="text"
+                                className="f"
+                                list="libnames"
+                                value={r.name}
+                                onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
+                                onBlur={(e) => handleNameSelect(i, e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    handleNameSelect(i, (e.target as HTMLInputElement).value);
+                                  }
+                                }}
+                                placeholder="Reagent chemical name (e.g. p-toluic acid, Pd(OAc)2)"
+                                aria-label={`${r.code} name`}
+                                style={{
+                                  fontSize: '15px',
+                                  fontWeight: 600,
+                                  height: '36px',
+                                  flex: 1,
+                                }}
+                              />
+                              {r.name && (
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{ height: '36px', padding: '0 10px', fontSize: '11px', whiteSpace: 'nowrap' }}
+                                  onClick={() => handleNameSelect(i, r.name)}
+                                  title="Look up SMILES, 2D structure, molar mass, and density for this name via PubChem"
+                                >
+                                  Fetch info
+                                </button>
+                              )}
+                            </div>
                             {r.smiles ? (
                               <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
                                 <span style={{ fontWeight: 600, color: 'var(--fg)', letterSpacing: '0.02em' }}>SMILES:</span>
@@ -986,7 +1095,7 @@ export const SetupView: React.FC = () => {
                               </div>
                             ) : (
                               <div style={{ fontSize: '11px', color: 'var(--mut)', fontStyle: 'italic' }}>
-                                No SMILES defined · type IUPAC name to auto-resolve or click structure thumbnail
+                                {r.name ? 'Press Enter or click "Fetch info" to auto-fetch structure & properties' : 'Type a name or IUPAC to auto-resolve structure, molar mass, and density'}
                               </div>
                             )}
                           </div>
@@ -1115,11 +1224,16 @@ export const SetupView: React.FC = () => {
                                   width={hasInlineRange ? 170 : 200}
                                   height={hasInlineRange ? 116 : 130}
                                   allowZoom={true}
-                                  onResolvedSmiles={(smiles, mw) => {
-                                    setPath(`reagents.${i}.smiles`, smiles);
-                                    if (mw && (!r.molarMass || +r.molarMass <= 0)) {
-                                      setPath(`reagents.${i}.molarMass`, mw);
-                                    }
+                                  onResolvedSmiles={(smiles, mw, density, iupac) => {
+                                    setState((prev) => {
+                                      const next = JSON.parse(JSON.stringify(prev));
+                                      const reg = next.reagents[i];
+                                      reg.smiles = smiles;
+                                      if (mw) reg.molarMass = mw;
+                                      if (density !== undefined) reg.density = density;
+                                      if (iupac) reg.iupac = iupac;
+                                      return next;
+                                    });
                                   }}
                                 />
                                 <span style={{ fontSize: '9px', color: 'var(--mut)', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
@@ -1438,11 +1552,16 @@ export const SetupView: React.FC = () => {
                             width={54}
                             height={38}
                             allowZoom={true}
-                            onResolvedSmiles={(smiles, mw) => {
-                              setPath(`reagents.${i}.smiles`, smiles);
-                              if (mw && (!r.molarMass || +r.molarMass <= 0)) {
-                                setPath(`reagents.${i}.molarMass`, mw);
-                              }
+                            onResolvedSmiles={(smiles, mw, density, iupac) => {
+                              setState((prev) => {
+                                const next = JSON.parse(JSON.stringify(prev));
+                                const reg = next.reagents[i];
+                                reg.smiles = smiles;
+                                if (mw) reg.molarMass = mw;
+                                if (density !== undefined) reg.density = density;
+                                if (iupac) reg.iupac = iupac;
+                                return next;
+                              });
                             }}
                           />
                         </div>
@@ -1455,6 +1574,11 @@ export const SetupView: React.FC = () => {
                           value={r.name}
                           onChange={(e) => setPath(`reagents.${i}.name`, e.target.value)}
                           onBlur={(e) => handleNameSelect(i, e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              handleNameSelect(i, (e.target as HTMLInputElement).value);
+                            }
+                          }}
                           placeholder="name (library suggests)"
                           aria-label={`${r.code} name`}
                         />
@@ -2115,6 +2239,25 @@ export const SetupView: React.FC = () => {
                     ? `Fits across ${run.plates} plate${run.plates === 1 ? '' : 's'} · ${nf(run.solventRecommendedMl, 1)} mL ${state.reactionSolvent} required. Ready to review 2D conditions.`
                     : 'Adjust concentrations or apply verified fixes above to proceed.'}
                 </div>
+                {run.blockingIssues > 0 && (
+                  <button
+                    type="button"
+                    className="btn sm"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      marginTop: '8px',
+                      fontSize: '11px',
+                      height: '28px',
+                      fontWeight: 600,
+                    }}
+                    onClick={() => setAiDiagnosticsOpen(true)}
+                    title="Ask Gemini to diagnose robot volume and stock concentration errors"
+                  >
+                    <span>✦</span> AI Diagnostic Advisor
+                  </button>
+                )}
               </div>
             </div>
             {run.blockingIssues === 0 && (
@@ -2176,6 +2319,19 @@ export const SetupView: React.FC = () => {
           setInspectFixIndex(null);
         }}
         onClose={() => setInspectFixIndex(null)}
+      />
+
+      <AiDiagnosticsModal
+        isOpen={aiDiagnosticsOpen}
+        onClose={() => setAiDiagnosticsOpen(false)}
+        runName={state.name}
+        totalVials={run?.reactions || 0}
+        vialVolume={state.vialVolume}
+        threshold={state.threshold}
+        solvent={state.reactionSolvent}
+        reagents={state.reagents}
+        issues={run?.blockingIssues ? cs.filter((c) => !c.okMin || !c.okMax || c.neg) : []}
+        deckWarnings={run?.deck?.warnings || []}
       />
 
       {calcReagentIndex !== null && state.reagents[calcReagentIndex] && (

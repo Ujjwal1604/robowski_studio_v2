@@ -2331,7 +2331,7 @@ export const SetupView: React.FC = () => {
         solvent={state.reactionSolvent}
         reagents={state.reagents}
         issues={run?.blockingIssues ? cs.filter((c) => !c.okMin || !c.okMax || c.neg) : []}
-        deckWarnings={run?.deck?.warnings || []}
+        deckWarnings={run?.deck?.positions_fit === false && run?.deck?.positions_message ? [run.deck.positions_message] : []}
       />
 
       {calcReagentIndex !== null && state.reagents[calcReagentIndex] && (

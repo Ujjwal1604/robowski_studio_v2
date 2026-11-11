@@ -1,6 +1,6 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 const app = express();
 const port = 3000;
@@ -22,6 +22,87 @@ const getGenAIClient = () => {
     },
   });
 };
+
+/**
+ * Robust, high-speed AI content generation:
+ * 1. gemini-3.1-flash-lite (high free quota, fast response)
+ * 2. gemini-3.5-flash-lite (seamless fallback if 3.1 experiences demand spikes)
+ * 3. gemini-3.8-flash (thinking LOW)
+ * Handles transient 503 spikes with exponential backoff before falling over.
+ */
+async function generateAiContent(ai: GoogleGenAI, prompt: string): Promise<string> {
+  const modelsToTry = [
+    { name: 'gemini-3.1-flash-lite', config: {} },
+    { name: 'gemini-3.5-flash-lite', config: {} },
+    { name: 'gemini-3.8-flash', config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } },
+  ];
+
+  let lastError: any = null;
+
+  for (const { name, config } of modelsToTry) {
+    // Up to 2 attempts per model for transient 503 errors
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model: name,
+            contents: prompt,
+            config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout after 25s on ${name}`)), 25000)
+          ),
+        ]);
+
+        if (response?.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        lastError = err;
+        // If it's a 503 spike, wait 1 second and retry once on the same model
+        if (errMsg.includes('503') && attempt === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          continue;
+        }
+        // If quota 429 or other error, break to next model
+        break;
+      }
+    }
+  }
+
+  throw lastError || new Error('All AI model attempts timed out or failed.');
+}
+
+function cleanErrorMessage(err: any): string {
+  if (!err) return 'Unknown error occurred.';
+  const msg = err?.message || String(err);
+  try {
+    const parsed = JSON.parse(msg);
+    if (parsed?.error?.message) {
+      return parsed.error.message;
+    }
+  } catch {}
+  if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+    return 'Gemini Free Tier daily quota exceeded for this model. You can add or update your API key in Settings > Secrets.';
+  }
+  if (msg.includes('503') || msg.includes('high demand') || msg.includes('UNAVAILABLE')) {
+    return 'The AI service is temporarily experiencing high traffic. Please retry in a few moments.';
+  }
+  if (msg.includes('Timeout')) {
+    return 'The AI request timed out. Please try again.';
+  }
+  return msg;
+}
+
+// Health check & status endpoint
+app.get('/api/ai/status', (_req, res) => {
+  res.json({
+    status: 'ok',
+    hasKey: Boolean(process.env.GEMINI_API_KEY),
+    model: 'gemini-3.1-flash-lite',
+  });
+});
 
 // 1. AI HTE Campaign Synthesis Report Generator (Option 5)
 app.post('/api/ai/synthesis-report', async (req, res) => {
@@ -54,7 +135,7 @@ CAMPAIGN METADATA:
 - Existing Chemist Observations: ${postReactionNotes || 'None recorded yet.'}
 
 REAGENTS & LIBRARIES IN SCREEN:
-${JSON.stringify(reagents || [], null, 2)}
+${(reagents || []).map((r: any) => `- ${r.code}: ${r.name || 'reagent'}${r.smiles ? ' (SMILES: ' + r.smiles + ')' : ''} · Stock: ${r.stock || '-'} mM`).join('\n')}
 
 SCREENING STATISTICS & DATA SUMMARY:
 - Total Wells Screened: ${wellStats?.total || 0}
@@ -64,41 +145,31 @@ SCREENING STATISTICS & DATA SUMMARY:
 - Failed / Decomposed / Polymerized: ${wellStats?.failed || 0}
 
 TOP PERFORMING REACTION HITS:
-${JSON.stringify(topHits || [], null, 2)}
+${JSON.stringify((topHits || []).slice(0, 6), null, 1)}
 
 ANOMALOUS / FAILED WELLS:
-${JSON.stringify(problemWells || [], null, 2)}
+${JSON.stringify((problemWells || []).slice(0, 6), null, 1)}
 
 TASK:
-Write a rigorous, professional, publication-grade HTE Synthesis & Campaign Summary Report.
+Write a concise, authoritative, publication-grade HTE Synthesis & Campaign Summary Report (under 400 words).
 Structure your report with the following clear markdown sections:
 ### 1. Executive Summary & Hit Highlights
-Highlight the winning conditions, best reagent/catalyst combinations, and highest conversion wells.
-
 ### 2. Structure-Activity Relationships (SAR) & Reaction Trends
-Analyze mechanistic patterns: which ligands/bases/additives favored product formation, solvent compatibility, stoichiometry sensitivities, and why certain reagent pairs outperformed others.
-
 ### 3. Failure Mode & Anomaly Analysis
-Diagnose what went wrong in inactive or decomposed wells (e.g. catalyst precipitation, steric hindrance, solubility bottlenecks, insolubility of inorganic base, or volume loss).
-
 ### 4. Actionable Next Steps & Scale-up Recommendations
-Provide concrete, prioritized recommendations for a follow-up 24/54-well focus screen or 10x bench scale-up (e.g., tight equivalence window, temperature re-optimization, or alternate counter-ions).
 
 Keep the tone concise, authoritative, and scientifically precise. Use chemistry nomenclature accurately.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
+    const report = await generateAiContent(ai, prompt);
 
     res.json({
       success: true,
-      report: response.text || 'Unable to generate synthesis report.',
+      report,
     });
   } catch (err: any) {
     console.error('Error generating AI synthesis report:', err);
     res.status(500).json({
-      error: err?.message || 'Failed to generate AI synthesis report.',
+      error: cleanErrorMessage(err),
     });
   }
 });
@@ -146,19 +217,16 @@ Include:
 
 Format your response in clean markdown with bullet points and bold highlights.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
+    const advice = await generateAiContent(ai, prompt);
 
     res.json({
       success: true,
-      advice: response.text || 'No diagnostic advice could be generated.',
+      advice,
     });
   } catch (err: any) {
     console.error('Error generating AI diagnostics:', err);
     res.status(500).json({
-      error: err?.message || 'Failed to generate diagnostic advice.',
+      error: cleanErrorMessage(err),
     });
   }
 });
@@ -180,33 +248,30 @@ app.post('/api/ai/tlc-interpret', async (req, res) => {
 
 LANE DATA:
 - Sample: ${laneLabel || 'Reaction Well'}
-- Mobile Phase: ${mobilePhase || 'e.g. 30% EtOAc / 70% Hexanes'}
-- Visualization Stain / UV: ${stain || 'UV 254 nm + Vanillin'}
+- Mobile Phase: ${mobilePhase || '30% EtOAc / 70% Hexanes'}
+- Visualization Stain / UV: ${stain || 'UV 254 nm'}
 - Reaction Recipe Components: ${JSON.stringify(wellRecipe || {})}
 - Detected Spots (Rf & Relative Intensities):
-${JSON.stringify(spots || [], null, 2)}
+${(spots || []).map((s: any) => `- Rf ${Number(s.rf).toFixed(2)} (${s.note || 'peak'}, strength: ${s.intensity || 'mid'})`).join('\n')}
 
 TASK:
-Provide a rapid chromatographic assessment:
-1. **Spot Assignment**: Identify probable starting material(s), desired product, and baseline or polar impurities based on Rf values and polarity.
+Provide a rapid chromatographic assessment (under 200 words):
+1. **Spot Assignment**: Identify probable starting material(s), desired product, and baseline or polar impurities based on Rf values.
 2. **Estimated Conversion & Cleanliness**: Evaluate whether reaction reached completion, stalled, or produced significant side-products.
-3. **Chromatographic Optimization**: Suggest ideal Rf adjustments (e.g. increase or decrease polarity, additive such as 1% AcOH or 1% TEA to reduce tailing).
+3. **Chromatographic Optimization**: Suggest ideal Rf adjustments or mobile phase tweaks.
 
 Keep it concise, actionable, and formatted in clean markdown.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
+    const interpretation = await generateAiContent(ai, prompt);
 
     res.json({
       success: true,
-      interpretation: response.text || 'No interpretation generated.',
+      interpretation,
     });
   } catch (err: any) {
     console.error('Error interpreting TLC lane:', err);
     res.status(500).json({
-      error: err?.message || 'Failed to interpret TLC data.',
+      error: cleanErrorMessage(err),
     });
   }
 });

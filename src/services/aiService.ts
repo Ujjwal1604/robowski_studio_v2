@@ -52,43 +52,67 @@ export interface TlcInterpretationPayload {
 }
 
 export async function fetchAiSynthesisReport(payload: SynthesisReportPayload): Promise<string> {
-  const res = await fetch('/api/ai/synthesis-report', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const res = await fetch('/api/ai/synthesis-report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45000),
+    });
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error || `Server error: ${res.status}`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || `Server error: ${res.status}`);
+    }
+    return data.report;
+  } catch (err: any) {
+    if (err.name === 'TimeoutError' || err.message?.includes('aborted')) {
+      throw new Error('AI analysis timed out after 45 seconds. Please try again.');
+    }
+    throw err;
   }
-  return data.report;
 }
 
 export async function fetchAiDiagnostics(payload: DiagnosticsPayload): Promise<string> {
-  const res = await fetch('/api/ai/diagnostics', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const res = await fetch('/api/ai/diagnostics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45000),
+    });
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error || `Server error: ${res.status}`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || `Server error: ${res.status}`);
+    }
+    return data.advice;
+  } catch (err: any) {
+    if (err.name === 'TimeoutError' || err.message?.includes('aborted')) {
+      throw new Error('AI diagnostics timed out after 45 seconds. Please try again.');
+    }
+    throw err;
   }
-  return data.advice;
 }
 
 export async function fetchAiTlcInterpretation(payload: TlcInterpretationPayload): Promise<string> {
-  const res = await fetch('/api/ai/tlc-interpret', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const res = await fetch('/api/ai/tlc-interpret', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45000),
+    });
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error || `Server error: ${res.status}`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || `Server error: ${res.status}`);
+    }
+    return data.interpretation;
+  } catch (err: any) {
+    if (err.name === 'TimeoutError' || err.message?.includes('aborted')) {
+      throw new Error('TLC interpretation timed out after 45 seconds. Please try again.');
+    }
+    throw err;
   }
-  return data.interpretation;
 }

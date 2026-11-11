@@ -57,6 +57,7 @@ import {
 import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
 import { TlcFullPlateView } from './TlcFullPlateView';
 import { parseWellQuery } from '../ui/CommandPalette';
+import { AiTlcInterpreter } from '../ui/AiTlcInterpreter';
 
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
@@ -408,6 +409,7 @@ export const TlcView: React.FC = () => {
     view,
     spotProminence,
     setSpotProminence,
+    setState,
   } = useApp();
 
   const [cur, setCur] = useState<number>(0);
@@ -3953,6 +3955,34 @@ export const TlcView: React.FC = () => {
                       </div>
                     )}
                   </div>
+
+                  {/* AI TLC Reaction & Spot Interpreter (Option 4) */}
+                  <AiTlcInterpreter
+                    laneLabel={`Well ${wellLabel(inspectWell)} (Lane ${tlcLane(inspectWell, 'column')}) · Plate ${plate + 1}`}
+                    spots={activeDens?.spots ? activeDens.spots.map((s) => ({ rf: s.rf, intensity: s.strength, note: s.source })) : []}
+                    wellRecipe={(() => {
+                      const row = run?.rows?.find(
+                        (r: any) => r.plate_number === plate && r.container_id === inspectWell
+                      );
+                      return row ? row.recipe : undefined;
+                    })()}
+                    mobilePhase="30% EtOAc / 70% Hexanes"
+                    stain={densViewMode === 'White' ? 'Visible Stain' : 'UV 254 nm'}
+                    onSaveToElnNotes={(analysisText) => {
+                      if (inspectWell === null) return;
+                      const key = `${plate}-${inspectWell}`;
+                      setState((prev) => {
+                        const next = JSON.parse(JSON.stringify(prev));
+                        const curWells = next.eln?.wells || {};
+                        const curObs = curWells[key] || { wellIndex: inspectWell, plateIndex: plate, status: 'none', tags: [] };
+                        curObs.notes = (curObs.notes ? curObs.notes + '\n\n' : '') + `[TLC AI Analysis]:\n${analysisText}`;
+                        curWells[key] = curObs;
+                        next.eln = { ...(next.eln || {}), wells: curWells };
+                        return next;
+                      });
+                      toast(`Saved TLC AI interpretation to Well ${wellLabel(inspectWell)} in ELN.`);
+                    }}
+                  />
 
                   {/* Custom Pinned Markers Bar */}
                   <div

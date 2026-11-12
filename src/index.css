@@ -1799,14 +1799,21 @@
     /* Bench printing (Deck and Export screens): drop the app chrome, one column, no shadows */
     /* Printing the page itself (hides the header and buttons). The separate bench_sheet.html has its own print rules in engine/45. */
     @media print {
-      @page { margin: 12mm }
-      .top, .stepsbar, .sband, .toast, .tip, .modal-overlay, button, .btn, .seg, .runsl { display: none !important }
+      @page { margin: 12mm; size: auto; }
+      .top, .stepsbar, .sband, .toast, .tip, button, .btn, .seg, .runsl { display: none !important }
       html, body { background: #fff !important; background-image: none !important; color: #000 !important }
       .bodyw { max-width: none !important; padding: 0 !important; display: block !important }
       .grid, .grid.two, .grid.eq, .lcol, .rcol { display: block !important }
       .card, .rcard, .prow { box-shadow: none !important; border: 1px solid #bbb !important; break-inside: avoid; margin-bottom: 10px !important }
       .list > div { break-inside: avoid }
       a { color: inherit !important }
+      #printable-dossier {
+        box-shadow: none !important;
+        border: none !important;
+        padding: 0 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+      }
     }
 
     @media (prefers-reduced-motion: reduce) {

@@ -7,6 +7,7 @@ import {
   RecipeItem,
 } from '../../types';
 import { AiSynthesisReport } from '../ui/AiSynthesisReport';
+import { CampaignReportModal } from '../ui/CampaignReportModal';
 
 const PLATE_SIZE = 54;
 const ROWS = 6;
@@ -45,6 +46,7 @@ export const ElnView: React.FC = () => {
   const [batchSelection, setBatchSelection] = useState<number[]>([]);
   const [batchMode, setBatchMode] = useState<boolean>(false);
   const [scaleUpScaleMmol, setScaleUpScaleMmol] = useState<number>(1.0);
+  const [showReportModal, setShowReportModal] = useState<boolean>(false);
 
   // Safely get or initialize ELN record
   const eln: HteElnRecord = useMemo(() => {
@@ -317,6 +319,27 @@ export const ElnView: React.FC = () => {
               <span style={{ color: 'var(--mut)', fontSize: '12px' }}>
                 · {run?.reactions || rowsCache.length || 54} Wells · {numPlates} Plate{numPlates === 1 ? '' : 's'}
               </span>
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => setShowReportModal(true)}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '3px 10px',
+                  fontSize: '11px',
+                  background: 'rgba(2, 132, 199, 0.12)',
+                  borderColor: 'rgba(2, 132, 199, 0.4)',
+                  color: '#38bdf8',
+                  fontWeight: 600,
+                  marginLeft: 'auto',
+                }}
+                title="Generate Publication PDF / Dossier & 16:9 Executive Presentation Slides"
+              >
+                <span>📄</span>
+                <span>Export Report &amp; Slides</span>
+              </button>
             </div>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
               <input
@@ -1248,6 +1271,16 @@ export const ElnView: React.FC = () => {
           onChange={(e) => updateEln({ postReactionNotes: e.target.value })}
         />
       </div>
+
+      {/* Campaign Publication PDF & Presentation Slides Modal */}
+      <CampaignReportModal
+        isOpen={showReportModal}
+        onClose={() => setShowReportModal(false)}
+        state={state}
+        run={run}
+        tlcSets={tlcSets}
+        toast={toast}
+      />
     </div>
   );
 };

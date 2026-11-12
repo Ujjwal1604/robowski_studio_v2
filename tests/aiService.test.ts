@@ -80,4 +80,58 @@ describe('AI Services Integration', () => {
       fetchAiSynthesisReport({ campaignTitle: 'Error test' })
     ).rejects.toThrow('Gemini API key is not configured.');
   });
+
+  it('fetches AI TLC solvent system suggestions and parses best recommendation', async () => {
+    const mockData = {
+      reactionSummary: 'Amide coupling of acid and amine leads to less polar amide.',
+      systems: [
+        {
+          name: '30% Ethyl Acetate / 70% Hexanes',
+          ratio: '3:7 (v/v) EtOAc / Hexanes',
+          isBest: true,
+          tag: 'Top Choice',
+          polarityRating: 'Medium Polarity',
+          chamberPrep: 'For 20 mL chamber: 6.0 mL EtOAc + 14.0 mL Hexanes',
+          predictedRf: { product: 0.38, substrateA: { name: 'Acid', rf: 0.1 }, substrateB: { name: 'Amine', rf: 0.05 } },
+          resolutionDelta: 'ΔRf = 0.28 (Baseline separation)',
+          rationale: 'Optimal Rf for target amide isolation.',
+        },
+        {
+          name: '20% Acetone / 80% Heptane',
+          ratio: '2:8 (v/v)',
+          isBest: false,
+          tag: 'Orthogonal / Green',
+          polarityRating: 'Low Polarity',
+          chamberPrep: 'For 20 mL chamber: 4.0 mL Acetone + 16.0 mL Heptane',
+          predictedRf: { product: 0.28 },
+          resolutionDelta: 'ΔRf = 0.20',
+          rationale: 'Green replacement.',
+        },
+      ],
+      visualization: {
+        primaryStain: 'UV 254 nm',
+        secondaryStain: 'KMnO4 dip / heat',
+        stainNotes: 'Highlights aromatic and oxidizable groups.',
+      },
+      coSpottingProtocol: ['Lane 1: SM-A', 'Lane 2: Co-spot', 'Lane 3: Reaction Crude', 'Lane 4: SM-B'],
+    };
+
+    const fakeFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, data: mockData }),
+    });
+    vi.stubGlobal('fetch', fakeFetch);
+
+    const { fetchAiSolventSystems } = await import('../src/services/aiService');
+    const result = await fetchAiSolventSystems({
+      substrates: [{ code: 'AA', name: 'p-toluic acid' }, { code: 'BB', name: 'benzylamine' }],
+      expectedProduct: 'N-benzyl-4-methylbenzamide',
+      reactionClass: 'Amide Coupling',
+    });
+
+    expect(result.systems).toHaveLength(2);
+    expect(result.systems[0].isBest).toBe(true);
+    expect(result.systems[0].name).toBe('30% Ethyl Acetate / 70% Hexanes');
+    expect(fakeFetch).toHaveBeenCalledWith('/api/ai/solvent-systems', expect.anything());
+  });
 });

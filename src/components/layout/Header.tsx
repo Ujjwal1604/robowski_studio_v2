@@ -1,8 +1,16 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
+import { CampaignReportModal } from '../ui/CampaignReportModal';
 
 export const Header: React.FC = () => {
-  const { state, setPath, view, setView, toggleTheme, theme, draftSavedAt } = useApp();
+  const { state, setPath, view, setView, toggleTheme, theme, draftSavedAt, run, tlcSets, toast } = useApp();
+  const [showReportModal, setShowReportModal] = useState(false);
+
+  useEffect(() => {
+    const handleOpen = () => setShowReportModal(true);
+    window.addEventListener('robowski:open-report', handleOpen);
+    return () => window.removeEventListener('robowski:open-report', handleOpen);
+  }, []);
 
   return (
     <div className="top">
@@ -102,6 +110,28 @@ export const Header: React.FC = () => {
             </kbd>
           </button>
 
+          {/* Export Campaign Report & Presentation Slides */}
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => setShowReportModal(true)}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '5px',
+              padding: '4px 10px',
+              fontSize: '11px',
+              background: 'rgba(2, 132, 199, 0.12)',
+              borderColor: 'rgba(2, 132, 199, 0.4)',
+              color: '#38bdf8',
+              fontWeight: 600,
+            }}
+            title="Generate Publication PDF / Dossier & 16:9 Executive Presentation Slides"
+          >
+            <span>📄</span>
+            <span>Report &amp; Slides</span>
+          </button>
+
           <button
             type="button"
             className={`runsl ${view === 'runs' ? 'on' : ''}`}
@@ -139,6 +169,16 @@ export const Header: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Campaign Publication PDF & Slides Modal */}
+      <CampaignReportModal
+        isOpen={showReportModal}
+        onClose={() => setShowReportModal(false)}
+        state={state}
+        run={run}
+        tlcSets={tlcSets}
+        toast={toast}
+      />
     </div>
   );
 };

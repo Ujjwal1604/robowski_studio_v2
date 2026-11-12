@@ -17,6 +17,7 @@ import { StockCalculatorModal } from '../ui/StockCalculatorModal';
 import { AiDiagnosticsModal } from '../ui/AiDiagnosticsModal';
 import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
 import { getRDKitInstance, computeMolecularWeightFromSmiles } from '../../utils/rdkit';
+import { AiSolventAdvisorModal } from '../ui/AiSolventAdvisorModal';
 
 export const SetupView: React.FC = () => {
   const {
@@ -56,6 +57,8 @@ export const SetupView: React.FC = () => {
     inlineRanges,
     toast,
     importRobotFile,
+    tlcSets,
+    setTlcSets,
   } = useApp();
 
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -66,6 +69,7 @@ export const SetupView: React.FC = () => {
   const [inspectFixIndex, setInspectFixIndex] = useState<number | null>(null);
   const [calcReagentIndex, setCalcReagentIndex] = useState<number | null>(null);
   const [aiDiagnosticsOpen, setAiDiagnosticsOpen] = useState(false);
+  const [showSolventAdvisor, setShowSolventAdvisor] = useState(false);
   const libFileInputRef = React.useRef<HTMLInputElement>(null);
   const excelRunInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -897,6 +901,23 @@ export const SetupView: React.FC = () => {
                     <line x1="8" y1="11" x2="8" y2="12.5" />
                   </svg>
                   {resolvingStructures ? 'Resolving...' : 'Auto-resolve'}
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => setShowSolventAdvisor(true)}
+                  style={{
+                    color: '#10b981',
+                    borderColor: 'rgba(16, 185, 129, 0.4)',
+                    background: 'rgba(16, 185, 129, 0.08)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                  }}
+                  title="AI suggests 2-3 solvent systems to monitor the reaction, identifying the best one based on substrates and expected product"
+                >
+                  <span style={{ fontSize: '11px', color: '#10b981' }}>✦</span>
+                  AI Solvent Advisor
                 </button>
                 {state.reagents.length < 12 && (
                   <button type="button" className="btn sm pri" onClick={addReagent}>
@@ -2332,6 +2353,43 @@ export const SetupView: React.FC = () => {
         reagents={state.reagents}
         issues={run?.blockingIssues ? cs.filter((c) => !c.okMin || !c.okMax || c.neg) : []}
         deckWarnings={run?.deck?.positions_fit === false && run?.deck?.positions_message ? [run.deck.positions_message] : []}
+      />
+
+      <AiSolventAdvisorModal
+        isOpen={showSolventAdvisor}
+        onClose={() => setShowSolventAdvisor(false)}
+        initialSubstrates={(state.reagents || [])
+          .filter((r) => r.name && r.name.trim() !== '')
+          .map((r) => ({
+            code: r.code,
+            name: r.name,
+            smiles: r.smiles,
+            role: r.code,
+          }))}
+        reactionClass={state.name || 'Organic Synthesis Screen'}
+        onApplyToCurrentSet={(name) => {
+          setTlcSets((prev) => {
+            const next = [...prev];
+            if (next[0]) {
+              next[0] = { ...next[0], name };
+            }
+            return next;
+          });
+        }}
+        onCreateNewSet={(name) => {
+          setTlcSets((prev) => [
+            ...prev,
+            {
+              uid: 's' + Math.random().toString(36).slice(2, 8),
+              name,
+              cfg: null,
+              cfgName: '',
+              frameW: 800,
+              imgs: {},
+            },
+          ]);
+        }}
+        toast={toast}
       />
 
       {calcReagentIndex !== null && state.reagents[calcReagentIndex] && (

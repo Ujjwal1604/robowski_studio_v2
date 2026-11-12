@@ -32,6 +32,7 @@ import {
   createDemoTlcDataSet,
   exportLaneConfigCsv,
   getEffectiveLaneSpots,
+  renderFalseColorLane,
 } from '../../engine';
 import {
   fitEdgeCurve,
@@ -58,6 +59,7 @@ import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcS
 import { TlcFullPlateView } from './TlcFullPlateView';
 import { parseWellQuery } from '../ui/CommandPalette';
 import { AiTlcInterpreter } from '../ui/AiTlcInterpreter';
+import { AiSolventAdvisorModal } from '../ui/AiSolventAdvisorModal';
 
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
@@ -179,7 +181,8 @@ function drawLanePanels(
   panels: LanePanel[],
   k: number,
   filters?: ImageFilters,
-  showSpots: boolean = true
+  showSpots: boolean = true,
+  compositeFalseColor: boolean = false
 ) {
   if (!panels.length) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -201,27 +204,43 @@ function drawLanePanels(
   panels.forEach((p, j) => {
     const im = p.s.imgs[p.key];
     const l = p.lane;
-    const m = laneMatrix(l, im.bmp.width / (p.s.frameW || LANE_FRAME_WIDTH), k);
     const top = ph - k * l.length;
     const w = ws[j];
+    const h = k * l.length;
 
-    ctx.save();
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.beginPath();
-    ctx.rect(x, top, w, k * l.length);
-    ctx.clip();
+    // Check if dual-channel false color composite can be rendered
+    let renderedFalseColor = false;
+    if (compositeFalseColor && p.s.imgs?.UV254?.bmp && p.s.imgs?.UV366?.bmp) {
+      const fc = renderFalseColorLane(p.s, l, w, h);
+      if (fc) {
+        ctx.save();
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.drawImage(fc, x, top, w, h);
+        ctx.restore();
+        renderedFalseColor = true;
+      }
+    }
 
-    ctx.setTransform(
-      dpr * m[0],
-      dpr * m[1],
-      dpr * m[2],
-      dpr * m[3],
-      dpr * (m[4] + x),
-      dpr * (m[5] + top)
-    );
+    if (!renderedFalseColor && im?.bmp) {
+      const m = laneMatrix(l, im.bmp.width / (p.s.frameW || LANE_FRAME_WIDTH), k);
+      ctx.save();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.beginPath();
+      ctx.rect(x, top, w, h);
+      ctx.clip();
 
-    ctx.drawImage(im.bmp, 0, 0);
-    ctx.restore();
+      ctx.setTransform(
+        dpr * m[0],
+        dpr * m[1],
+        dpr * m[2],
+        dpr * m[3],
+        dpr * (m[4] + x),
+        dpr * (m[5] + top)
+      );
+
+      ctx.drawImage(im.bmp, 0, 0);
+      ctx.restore();
+    }
 
     ctx.save();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -399,6 +418,7 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
 
 export const TlcView: React.FC = () => {
   const {
+    state,
     run,
     toast,
     tlcSets: sets,
@@ -413,6 +433,7 @@ export const TlcView: React.FC = () => {
   } = useApp();
 
   const [cur, setCur] = useState<number>(0);
+  const [showSolventAdvisor, setShowSolventAdvisor] = useState<boolean>(false);
   const [compare, setCompare] = useState<boolean>(false);
   const [cmpKey, setCmpKey] = useState<TlcChannelKey>('UV254');
   const [zoom, setZoom] = useState<number>(0.45);
@@ -961,7 +982,8 @@ export const TlcView: React.FC = () => {
 
   useEffect(() => {
     if (inspectWell !== null && bigCanvasRef.current && inspectPanels.length > 0) {
-      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots);
+      const isDualComposite = densViewMode === 'overlay' && Boolean(currentSet.imgs?.UV254?.bmp && currentSet.imgs?.UV366?.bmp);
+      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, isDualComposite);
 
       // Extract distinct densitograms for all available channels
       const newDens: { UV254?: TlcDensitogramData; UV366?: TlcDensitogramData; White?: TlcDensitogramData } = {};
@@ -1783,6 +1805,23 @@ export const TlcView: React.FC = () => {
           ))}
           <button type="button" className="btn sm" onClick={handleAddSet}>
             + Add Solvent Set
+          </button>
+          <button
+            type="button"
+            className="btn sm pri"
+            onClick={() => setShowSolventAdvisor(true)}
+            style={{
+              background: '#10b981',
+              borderColor: '#059669',
+              color: '#fff',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontWeight: 600,
+            }}
+            title="AI recommends 2-3 solvent systems and designates the best one based on substrates and expected product"
+          >
+            ✦ AI Solvent Advisor
           </button>
         </div>
 
@@ -2931,6 +2970,34 @@ export const TlcView: React.FC = () => {
                           </div>
                         ))}
                       </div>
+
+                      {/* Dual-Channel False-Color Legend */}
+                      {densViewMode === 'overlay' && currentSet.imgs?.UV254?.bmp && currentSet.imgs?.UV366?.bmp && (
+                        <div
+                          style={{
+                            marginTop: '8px',
+                            padding: '6px 10px',
+                            background: 'rgba(0, 0, 0, 0.45)',
+                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            borderRadius: '4px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '12px',
+                            fontSize: '10px',
+                            fontFamily: 'monospace',
+                          }}
+                        >
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24', fontWeight: 600 }}>
+                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#fbbf24' }} />
+                            Amber: UV 254 (Quenching)
+                          </span>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#22d3ee', fontWeight: 600 }}>
+                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#22d3ee' }} />
+                            Cyan: UV 365 (Fluorescent Product)
+                          </span>
+                        </div>
+                      )}
                     </div>
 
                     {/* Pixel-Matched Parallel Densitometer SVG (Base to Solvent Front) */}
@@ -3820,6 +3887,32 @@ export const TlcView: React.FC = () => {
                                       Auto
                                     </span>
                                   )}
+                                  {(() => {
+                                    if (channelDensitograms.UV366) {
+                                      const pts = channelDensitograms.UV366.points;
+                                      const pt = pts[sp.pos];
+                                      const emSignal = pt?.signal || 0;
+                                      if (emSignal > 30) {
+                                        return (
+                                          <span
+                                            style={{
+                                              background: 'rgba(6, 182, 212, 0.2)',
+                                              color: '#22d3ee',
+                                              border: '1px solid rgba(6, 182, 212, 0.5)',
+                                              padding: '1px 5px',
+                                              borderRadius: '3px',
+                                              fontSize: '10px',
+                                              fontWeight: 700,
+                                            }}
+                                            title="Strong UV 365 nm fluorescent emission detected at this peak"
+                                          >
+                                            ✨ Fluorescent
+                                          </span>
+                                        );
+                                      }
+                                    }
+                                    return null;
+                                  })()}
                                   <span style={{ fontSize: '11px', color: 'var(--mut)', textTransform: 'capitalize' }}>
                                     ({sp.strength > 0.5 ? 'strong' : sp.strength > 0.2 ? 'medium' : 'weak'} · {sp.areaPct || 0}% area)
                                   </span>
@@ -3966,7 +4059,7 @@ export const TlcView: React.FC = () => {
                       );
                       return row ? row.recipe : undefined;
                     })()}
-                    mobilePhase="30% EtOAc / 70% Hexanes"
+                    mobilePhase={currentSet.name || '30% EtOAc / 70% Hexanes'}
                     stain={densViewMode === 'White' ? 'Visible Stain' : 'UV 254 nm'}
                     onSaveToElnNotes={(analysisText) => {
                       if (inspectWell === null) return;
@@ -3983,6 +4076,27 @@ export const TlcView: React.FC = () => {
                       toast(`Saved TLC AI interpretation to Well ${wellLabel(inspectWell)} in ELN.`);
                     }}
                   />
+
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '6px' }}>
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={() => setShowSolventAdvisor(true)}
+                      style={{
+                        fontSize: '11px',
+                        color: '#10b981',
+                        borderColor: 'rgba(16, 185, 129, 0.4)',
+                        background: 'rgba(16, 185, 129, 0.08)',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '5px',
+                        cursor: 'pointer',
+                      }}
+                      title="Ask AI to recommend 2-3 solvent systems for separating the product from the substrates in this well"
+                    >
+                      ✦ Suggest Best Solvent Systems for this Well / Reaction
+                    </button>
+                  </div>
 
                   {/* Custom Pinned Markers Bar */}
                   <div
@@ -4107,6 +4221,37 @@ export const TlcView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* AI TLC Solvent System Advisor Modal */}
+      <AiSolventAdvisorModal
+        isOpen={showSolventAdvisor}
+        onClose={() => setShowSolventAdvisor(false)}
+        initialSubstrates={(state?.reagents || [])
+          .filter((r) => r.name && r.name.trim() !== '')
+          .map((r) => ({
+            code: r.code,
+            name: r.name,
+            smiles: r.smiles,
+            role: r.code,
+          }))}
+        reactionClass={state?.name || 'Amide Coupling'}
+        onApplyToCurrentSet={(systemName) => {
+          setSets((prev) => {
+            const next = [...prev];
+            if (next[cur]) {
+              next[cur] = { ...next[cur], name: systemName };
+            }
+            return next;
+          });
+        }}
+        onCreateNewSet={(systemName) => {
+          const newSet = tlcNewSet(sets.length + 1);
+          newSet.name = systemName;
+          setSets((prev) => [...prev, newSet]);
+          setCur(sets.length);
+        }}
+        toast={toast}
+      />
     </div>
   );
 };

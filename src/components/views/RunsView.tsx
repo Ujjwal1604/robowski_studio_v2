@@ -4,6 +4,7 @@ import { SavedRun } from '../../types';
 import { buildRun, localDate } from '../../engine';
 import { dataFor } from '../../context/AppContext';
 import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
+import { GroupMeetingSlideModal } from '../ui/GroupMeetingSlideModal';
 
 export const RunsView: React.FC = () => {
   const {
@@ -37,6 +38,8 @@ export const RunsView: React.FC = () => {
   const [newDens, setNewDens] = useState('');
   const [newSmiles, setNewSmiles] = useState('');
   const [newIupac, setNewIupac] = useState('');
+  const [showSlideModal, setShowSlideModal] = useState<boolean>(false);
+  const [selectedForSlide, setSelectedForSlide] = useState<SavedRun[]>([]);
 
   const robotFileInputRef = useRef<HTMLInputElement>(null);
   const genFileInputRef = useRef<HTMLInputElement>(null);
@@ -313,64 +316,105 @@ export const RunsView: React.FC = () => {
               >
                 Import generator .xlsx
               </button>
+              <button
+                type="button"
+                className="btn"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  color: '#0284c7',
+                  borderColor: 'rgba(2, 132, 199, 0.4)',
+                  background: 'rgba(2, 132, 199, 0.08)',
+                  fontWeight: 600,
+                }}
+                onClick={() => {
+                  const toUse = compareIds.length > 0
+                    ? (compareIds.map((id) => runsList.find((r) => r.id === id)).filter(Boolean) as SavedRun[])
+                    : (shown.slice(0, 3) || runsList.slice(0, 3));
+                  if (toUse.length === 0) {
+                    toast('No runs available to export slide.');
+                    return;
+                  }
+                  setSelectedForSlide(toUse);
+                  setShowSlideModal(true);
+                }}
+                title="Export high-resolution 16:9 presentation slide of selected or recent runs for weekly group meeting"
+              >
+                📊 Group Meeting Slide Export
+              </button>
               <button type="button" className="btn pri" onClick={startNewRun}>
                 New run
               </button>
             </div>
           </div>
 
-          {/* Comparison banner */}
-          {compareIds.length === 2 ? (
+          {/* Selection & Group Meeting Export banner */}
+          {compareIds.length > 0 && (
             <div
               className="cmp-bar"
               style={{
                 display: 'flex',
                 alignItems: 'center',
+                flexWrap: 'wrap',
                 gap: '12px',
                 padding: '10px 16px',
-                marginBottom: '4px',
+                marginBottom: '6px',
+                background: 'var(--soft)',
+                border: '1px solid var(--line)',
+                borderRadius: '8px',
               }}
             >
-              <b>2 runs selected</b>
+              <b style={{ color: 'var(--fg)', fontSize: '13px' }}>
+                {compareIds.length} run{compareIds.length === 1 ? '' : 's'} selected
+              </b>
+
               <button
                 type="button"
                 className="btn sm pri"
-                onClick={() => {
-                  setView('compare');
-                  window.scrollTo(0, 0);
+                style={{
+                  background: '#0284c7',
+                  borderColor: '#0369a1',
+                  color: '#fff',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  fontWeight: 600,
                 }}
+                onClick={() => {
+                  const toUse = compareIds
+                    .map((id) => runsList.find((r) => r.id === id))
+                    .filter(Boolean) as SavedRun[];
+                  setSelectedForSlide(toUse);
+                  setShowSlideModal(true);
+                }}
+                title="Export 16:9 presentation slide for selected runs to paste directly into PowerPoint or Google Slides"
               >
-                Compare them
+                📊 Export Group Meeting Slide ({compareIds.length})
               </button>
+
+              {compareIds.length === 2 && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => {
+                    setView('compare');
+                    window.scrollTo(0, 0);
+                  }}
+                >
+                  Compare them
+                </button>
+              )}
+
               <button
                 type="button"
                 className="btn sm"
                 onClick={() => setCompareIds([])}
               >
-                Clear
+                Clear Selection
               </button>
             </div>
-          ) : compareIds.length === 1 ? (
-            <div
-              className="cmp-bar"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '12px',
-                padding: '10px 16px',
-                marginBottom: '4px',
-              }}
-            >
-              <span className="hint">Select one more run to compare.</span>
-              <button
-                type="button"
-                className="btn sm"
-                onClick={() => setCompareIds([])}
-              >
-                Cancel
-              </button>
-            </div>
-          ) : null}
+          )}
 
           {/* Runs Grid or Empty State */}
           {shown.length ? (
@@ -542,6 +586,18 @@ export const RunsView: React.FC = () => {
                           className="btn sm"
                           style={{ flex: 1 }}
                           onClick={() => {
+                            setSelectedForSlide([r]);
+                            setShowSlideModal(true);
+                          }}
+                          title="Export 16:9 presentation slide for this run to paste into PowerPoint or Google Slides"
+                        >
+                          📊 Slide
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ flex: 1 }}
+                          onClick={() => {
                             try {
                               const calc = buildRun(dataFor(r.state));
                               openPreview('nb', {
@@ -554,22 +610,28 @@ export const RunsView: React.FC = () => {
                             }
                           }}
                         >
-                          Notebook card
+                          Notebook
                         </button>
                         <button
                           type="button"
                           className="btn sm"
-                          style={{ flex: 1 }}
+                          style={{
+                            flex: 1,
+                            background: sel ? 'rgba(2, 132, 199, 0.15)' : undefined,
+                            borderColor: sel ? '#0284c7' : undefined,
+                            color: sel ? '#0284c7' : undefined,
+                            fontWeight: sel ? 600 : 400,
+                          }}
                           onClick={() => {
                             setCompareIds((prev) => {
                               const idx = prev.indexOf(r.id);
                               if (idx >= 0) return prev.filter((x) => x !== r.id);
-                              if (prev.length < 2) return [...prev, r.id];
-                              return prev;
+                              return [...prev, r.id];
                             });
                           }}
+                          title={sel ? 'Unselect this run' : 'Select run for group meeting slide export or comparison'}
                         >
-                          {sel ? 'Selected' : 'Compare'}
+                          {sel ? '✓ Selected' : 'Select'}
                         </button>
                       </div>
                     </div>
@@ -809,6 +871,13 @@ export const RunsView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      <GroupMeetingSlideModal
+        isOpen={showSlideModal}
+        onClose={() => setShowSlideModal(false)}
+        selectedRuns={selectedForSlide}
+        toast={toast}
+      />
     </div>
   );
 };

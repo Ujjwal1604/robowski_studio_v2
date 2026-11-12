@@ -705,5 +705,49 @@ describe('exportTlcAnalysisCsv and exportTlcAnalysisJson', () => {
     const restoredEffective = getEffectiveLaneSpots(lane, autoSpots);
     expect(restoredEffective).toEqual(autoSpots);
   });
+
+  it('computes dual-channel false-color composite blending UV254 quenching in amber and UV366 fluorescence in cyan', () => {
+    // 4 pixels:
+    // Pixel 0: Baseline background (UV254 green bright ~180, UV366 dark ~10)
+    // Pixel 1: Pure UV254 quenching (UV254 green low ~30, UV366 dark ~10)
+    // Pixel 2: Pure UV366 fluorescence (UV254 green bright ~180, UV366 bright cyan ~220)
+    // Pixel 3: Dual active (UV254 quenching + UV366 fluorescent product)
+    const uv254 = new Uint8ClampedArray([
+      160, 180, 160, 255,
+      30,  30,  30,  255,
+      160, 180, 160, 255,
+      30,  30,  30,  255,
+    ]);
+    const uv366 = new Uint8ClampedArray([
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+      60,  210, 240, 255,
+      60,  210, 240, 255,
+    ]);
+
+    const out = computeFalseColorComposite(uv254, uv366, 2, 2, 1.4);
+    expect(out.length).toBe(16);
+
+    // Pixel 0 (baseline): dark matrix background ~ [12, 18, 30]
+    expect(out[0]).toBeLessThan(60);
+    expect(out[1]).toBeLessThan(60);
+    expect(out[2]).toBeLessThan(60);
+    expect(out[3]).toBe(255);
+
+    // Pixel 1 (UV254 quenching): Amber/Gold (high Red & Green, low Blue)
+    expect(out[4]).toBeGreaterThan(180); // Red high
+    expect(out[5]).toBeGreaterThan(120); // Green moderate-to-high
+    expect(out[6]).toBeLessThan(60);     // Blue low
+
+    // Pixel 2 (UV366 fluorescence): Laser Cyan (high Blue & Green)
+    expect(out[9]).toBeGreaterThan(150);  // Green high
+    expect(out[10]).toBeGreaterThan(200); // Blue very high
+
+    // Pixel 3 (Both): High Red from quenching + High Blue & Green from fluorescence
+    expect(out[12]).toBeGreaterThan(180);
+    expect(out[13]).toBeGreaterThan(180);
+    expect(out[14]).toBeGreaterThan(180);
+  });
 });
+
 

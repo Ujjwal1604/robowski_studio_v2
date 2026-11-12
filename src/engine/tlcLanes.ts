@@ -1160,3 +1160,54 @@ export function computeFalseColorComposite(
   }
   return out;
 }
+
+/**
+ * Renders an upright false-color composite lane canvas combining UV 254 nm quenching (gold/amber)
+ * and UV 365 nm fluorescence (laser cyan).
+ */
+export function renderFalseColorLane(
+  set: TlcSet,
+  lane: TlcLane,
+  width?: number,
+  height?: number,
+  gain: number = 1.4
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined') return null;
+  const im254 = set.imgs?.UV254;
+  const im366 = set.imgs?.UV366;
+  if (!im254?.bmp || !im366?.bmp) return null;
+
+  const W = Math.max(1, Math.round(width || lane.width));
+  const L = Math.max(1, Math.round(height || lane.length));
+
+  const c1 = document.createElement('canvas');
+  c1.width = W;
+  c1.height = L;
+  const ctx = c1.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+
+  // 1. Render UV254 lane upright
+  const m254 = laneMatrix(lane, im254.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  ctx.setTransform(m254[0], m254[1], m254[2], m254[3], m254[4], m254[5]);
+  ctx.drawImage(im254.bmp, 0, 0);
+  const data254 = ctx.getImageData(0, 0, W, L);
+
+  // 2. Render UV366 lane upright
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, L);
+  const m366 = laneMatrix(lane, im366.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  ctx.setTransform(m366[0], m366[1], m366[2], m366[3], m366[4], m366[5]);
+  ctx.drawImage(im366.bmp, 0, 0);
+  const data366 = ctx.getImageData(0, 0, W, L);
+
+  // 3. Compute composite pixels
+  const compositeBytes = computeFalseColorComposite(data254.data, data366.data, W, L, gain);
+  const imgData = ctx.createImageData(W, L);
+  imgData.data.set(compositeBytes);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.putImageData(imgData, 0, 0);
+
+  return c1;
+}
+

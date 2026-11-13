@@ -236,17 +236,6 @@ export const CommandPalette: React.FC = () => {
       subtitle: 'Browse saved runs, chemical catalog and backup files',
       icon: '📚',
       action: () => setView('runs'),
-    },
-    {
-      id: 'export-report',
-      category: 'Actions',
-      title: 'Export Campaign Dossier (PDF) & Executive Presentation Slides',
-      subtitle: 'Print publication-grade summary report or download 16:9 interactive presentation slides',
-      badge: 'Report',
-      icon: '📄',
-      action: () => {
-        window.dispatchEvent(new CustomEvent('robowski:open-report'));
-      },
     }
   );
 

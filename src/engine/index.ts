@@ -23,6 +23,7 @@ export * from './tlcLanes';
 export * from './tlcEdge';
 export * from './barcode';
 export * from './demoTlc';
+export * from './elnSpreadsheet';
 
 import * as constants from './constants';
 import * as combinations from './combinations';

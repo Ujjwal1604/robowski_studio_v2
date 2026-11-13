@@ -966,6 +966,10 @@
     }
 
     .modal-foot {
+      position: sticky;
+      bottom: 0;
+      background: var(--panel);
+      z-index: 25;
       display: flex;
       gap: 10px;
       justify-content: flex-end;

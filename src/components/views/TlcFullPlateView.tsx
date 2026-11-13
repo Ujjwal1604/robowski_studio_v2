@@ -1495,14 +1495,11 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       {selectedLane && onUpdateLane ? (
         <div
           style={{
-            position: hudPosition === 'top' ? 'sticky' : 'fixed',
-            top: hudPosition === 'top' ? '56px' : undefined,
-            bottom: hudPosition === 'bottom' ? '14px' : undefined,
-            left: hudPosition === 'bottom' ? '50%' : undefined,
-            transform: hudPosition === 'bottom' ? 'translateX(-50%)' : undefined,
-            width: hudPosition === 'bottom' ? 'min(1200px, calc(100vw - 32px))' : '100%',
+            position: hudPosition === 'bottom' ? 'sticky' : 'relative',
+            bottom: hudPosition === 'bottom' ? '12px' : undefined,
+            width: '100%',
             maxWidth: '1200px',
-            marginBottom: hudPosition === 'top' ? '12px' : '0px',
+            marginBottom: '12px',
             padding: activeHudModule === 'none' ? '6px 14px' : '10px 14px',
             background: 'rgba(15, 23, 42, 0.96)',
             backdropFilter: 'blur(12px)',
@@ -1514,7 +1511,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             display: 'flex',
             flexDirection: 'column',
             gap: activeHudModule === 'none' ? '0px' : '8px',
-            zIndex: 70,
+            zIndex: hudPosition === 'bottom' ? 25 : 10,
             transition: 'padding 0.15s ease, gap 0.15s ease',
           }}
         >
@@ -1852,9 +1849,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                   borderColor: hudPosition === 'bottom' ? '#14b8a6' : '#475569',
                 }}
                 onClick={() => setHudPosition((pos) => (pos === 'top' ? 'bottom' : 'top'))}
-                title={hudPosition === 'top' ? 'Dock HUD to bottom of screen' : 'Dock HUD to top of screen'}
+                title={hudPosition === 'top' ? 'Dock toolbar to bottom of viewport (Sticky)' : 'Position toolbar at top above plate'}
               >
-                📌 {hudPosition === 'top' ? 'Bottom' : 'Top'}
+                📌 {hudPosition === 'top' ? 'Sticky Bottom' : 'Top'}
               </button>
 
               <button
@@ -2814,9 +2811,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       ) : (
         <div
           style={{
-            position: 'sticky',
-            top: '56px',
-            zIndex: 40,
+            position: 'relative',
+            zIndex: 10,
             width: '100%',
             maxWidth: '1200px',
             marginBottom: '10px',

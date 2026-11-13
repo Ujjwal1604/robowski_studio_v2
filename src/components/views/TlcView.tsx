@@ -210,7 +210,8 @@ function drawLanePanels(
 
     // Check if dual-channel false color composite can be rendered
     let renderedFalseColor = false;
-    if (compositeFalseColor && p.s.imgs?.UV254?.bmp && p.s.imgs?.UV366?.bmp) {
+    const isExplicitComposite = (p as any).isComposite || (compositeFalseColor && panels.length === 1);
+    if (isExplicitComposite && p.s.imgs?.UV254?.bmp && p.s.imgs?.UV366?.bmp) {
       const fc = renderFalseColorLane(p.s, l, w, h);
       if (fc) {
         ctx.save();
@@ -958,12 +959,106 @@ export const TlcView: React.FC = () => {
     [compare, isMultiSet, sets, cmpKey, currentSet, cur, show, markSpots, getSpotsForLane]
   );
 
-  // Big modal inspection drawing & multi-channel densitogram calculation
+  // Big modal inspection drawing: UV 254, UV 365 Fluorescence, and Composite side by side
   const inspectPanels = useMemo(() => {
-    if (inspectWell === null) return [];
+    if (inspectWell === null || !currentSet.cfg) return [];
     const t = tlcLane(inspectWell, 'column');
-    return getPanelsForLane(t);
-  }, [inspectWell, getPanelsForLane]);
+    const lane = currentSet.cfg.lanes.find((l) => l.id === t);
+    if (!lane) return [];
+
+    // Individual channel view (if user explicitly chooses only one channel)
+    if (densViewMode === 'UV254' && currentSet.imgs.UV254) {
+      return [{
+        s: currentSet,
+        i: cur,
+        key: 'UV254' as TlcChannelKey,
+        lane,
+        label: 'UV 254 nm',
+        channelTitle: 'UV 254 (Absorbance)',
+        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+      }];
+    }
+    if (densViewMode === 'UV366' && currentSet.imgs.UV366) {
+      return [{
+        s: currentSet,
+        i: cur,
+        key: 'UV366' as TlcChannelKey,
+        lane,
+        label: 'UV 365 nm',
+        channelTitle: 'UV 365 (Fluorescence)',
+        spots: markSpots ? getSpotsForLane(currentSet, 'UV366', lane) : null,
+      }];
+    }
+    if (densViewMode === 'White' && currentSet.imgs.White) {
+      return [{
+        s: currentSet,
+        i: cur,
+        key: 'White' as TlcChannelKey,
+        lane,
+        label: 'Visible',
+        channelTitle: 'Visible Stain',
+        spots: markSpots ? getSpotsForLane(currentSet, 'White', lane) : null,
+      }];
+    }
+
+    // Default Side-by-Side: UV 254 (Absorbance), UV 365 (Fluorescence), and Composite
+    const panels: Array<LanePanel & { isComposite?: boolean; channelTitle?: string }> = [];
+
+    // 1. UV 254 nm Absorbance (Quenching)
+    if (currentSet.imgs.UV254) {
+      panels.push({
+        s: currentSet,
+        i: cur,
+        key: 'UV254',
+        lane,
+        label: 'UV 254 nm',
+        channelTitle: 'UV 254 (Absorbance)',
+        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+      });
+    }
+
+    // 2. UV 365 nm Fluorescence
+    if (currentSet.imgs.UV366) {
+      panels.push({
+        s: currentSet,
+        i: cur,
+        key: 'UV366',
+        lane,
+        label: 'UV 365 nm',
+        channelTitle: 'UV 365 (Fluorescence)',
+        spots: markSpots ? getSpotsForLane(currentSet, 'UV366', lane) : null,
+      });
+    }
+
+    // 3. Dual-Channel False-Color Composite Overlay
+    if (currentSet.imgs.UV254 && currentSet.imgs.UV366) {
+      panels.push({
+        s: currentSet,
+        i: cur,
+        key: 'UV254',
+        lane,
+        label: '✨ Composite',
+        channelTitle: '✨ Composite (Overlay)',
+        isComposite: true,
+        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+      });
+    }
+
+    // 4. Visible Light / Stain (if present)
+    if (currentSet.imgs.White) {
+      panels.push({
+        s: currentSet,
+        i: cur,
+        key: 'White',
+        lane,
+        label: 'Visible',
+        channelTitle: 'Visible (Stain)',
+        spots: markSpots ? getSpotsForLane(currentSet, 'White', lane) : null,
+      });
+    }
+
+    return panels.length > 0 ? panels : getPanelsForLane(t);
+  }, [inspectWell, currentSet, cur, densViewMode, markSpots, getSpotsForLane, getPanelsForLane]);
 
   // Memoized panels for all 54 wells in the plate grid (only computed when viewing 54-well grid)
   const allPanels = useMemo(() => {
@@ -982,8 +1077,7 @@ export const TlcView: React.FC = () => {
 
   useEffect(() => {
     if (inspectWell !== null && bigCanvasRef.current && inspectPanels.length > 0) {
-      const isDualComposite = densViewMode === 'overlay' && Boolean(currentSet.imgs?.UV254?.bmp && currentSet.imgs?.UV366?.bmp);
-      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, isDualComposite);
+      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, false);
 
       // Extract distinct densitograms for all available channels
       const newDens: { UV254?: TlcDensitogramData; UV366?: TlcDensitogramData; White?: TlcDensitogramData } = {};
@@ -2595,11 +2689,22 @@ export const TlcView: React.FC = () => {
               </div>
               <button
                 type="button"
-                className="ib"
+                className="btn sm"
                 onClick={() => setInspectWell(null)}
-                title="Close"
+                title="Close modal (Esc)"
+                style={{
+                  background: 'var(--soft)',
+                  border: '1px solid var(--line)',
+                  color: 'var(--fg)',
+                  fontWeight: 600,
+                  fontSize: '12px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  cursor: 'pointer',
+                }}
               >
-                ✕
+                ✕ Close (Esc)
               </button>
             </div>
 
@@ -2623,7 +2728,7 @@ export const TlcView: React.FC = () => {
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <span style={{ fontWeight: 600 }}>Densitogram Channel:</span>
+                      <span style={{ fontWeight: 600 }}>Channel View:</span>
                       <div className="tlcsets" style={{ display: 'inline-flex', gap: '4px', margin: 0 }}>
                         {channelDensitograms.UV254 && channelDensitograms.UV366 && (
                           <button
@@ -2631,8 +2736,9 @@ export const TlcView: React.FC = () => {
                             className={`tlcsetbtn ${densViewMode === 'overlay' ? 'on' : ''}`}
                             onClick={() => setDensViewMode('overlay')}
                             style={{ fontSize: '11px', padding: '3px 8px' }}
+                            title="Show UV 254 nm, UV 365 nm Fluorescence, and Composite Overlay side by side"
                           >
-                            Dual Overlay (254 + 365 nm)
+                            Side-by-Side (254 + 365 + Composite)
                           </button>
                         )}
                         {channelDensitograms.UV254 && (
@@ -2641,8 +2747,9 @@ export const TlcView: React.FC = () => {
                             className={`tlcsetbtn ${densViewMode === 'UV254' ? 'on' : ''}`}
                             onClick={() => setDensViewMode('UV254')}
                             style={{ fontSize: '11px', padding: '3px 8px', color: '#10b981' }}
+                            title="Show UV 254 nm strip only"
                           >
-                            ● UV 254 nm (Quenching)
+                            ● UV 254 Only
                           </button>
                         )}
                         {channelDensitograms.UV366 && (
@@ -2650,9 +2757,10 @@ export const TlcView: React.FC = () => {
                             type="button"
                             className={`tlcsetbtn ${densViewMode === 'UV366' ? 'on' : ''}`}
                             onClick={() => setDensViewMode('UV366')}
-                            style={{ fontSize: '11px', padding: '3px 8px', color: '#a855f7' }}
+                            style={{ fontSize: '11px', padding: '3px 8px', color: '#c084fc' }}
+                            title="Show UV 365 nm fluorescence strip only"
                           >
-                            ● UV 365 nm (Fluorescence)
+                            ● UV 365 Only
                           </button>
                         )}
                         {channelDensitograms.White && (
@@ -2661,8 +2769,9 @@ export const TlcView: React.FC = () => {
                             className={`tlcsetbtn ${densViewMode === 'White' ? 'on' : ''}`}
                             onClick={() => setDensViewMode('White')}
                             style={{ fontSize: '11px', padding: '3px 8px', color: '#f59e0b' }}
+                            title="Show Visible stain strip only"
                           >
-                            ● Visible (Stain)
+                            ● Visible Only
                           </button>
                         )}
                       </div>
@@ -2698,12 +2807,10 @@ export const TlcView: React.FC = () => {
                       alignItems: 'flex-start',
                     }}
                   >
-                    {/* Left Sticky Column: Physical Canvas & Densitometer (Always in View!) */}
+                    {/* Left Column: Physical Canvas & Densitometer */}
                     <div
                       style={{
-                        position: 'sticky',
-                        top: 0,
-                        zIndex: 10,
+                        position: 'relative',
                         flex: '0 0 auto',
                         maxWidth: '100%',
                       }}
@@ -2722,19 +2829,67 @@ export const TlcView: React.FC = () => {
                           overflowX: 'auto',
                         }}
                       >
-                    {/* Enlarged Physical TLC Canvas */}
+                    {/* Enlarged Physical TLC Canvas: Side-by-Side Channels */}
                     <div>
+                      {/* Side-by-side Channel Header Badges */}
                       <div
                         style={{
-                          fontSize: '10px',
-                          fontWeight: 700,
-                          color: '#94a3b8',
-                          marginBottom: '4px',
-                          textAlign: 'center',
-                          textTransform: 'uppercase',
+                          display: 'flex',
+                          gap: '6px',
+                          marginBottom: '6px',
+                          alignItems: 'center',
+                          justifyContent: 'center',
                         }}
                       >
-                        TLC Plate Lane
+                        {inspectPanels.map((p, idx) => {
+                          const isComp = (p as any).isComposite;
+                          const title = (p as any).channelTitle || p.label || p.key;
+                          const color = isComp
+                            ? '#22d3ee'
+                            : p.key === 'UV254'
+                            ? '#10b981'
+                            : p.key === 'UV366'
+                            ? '#c084fc'
+                            : '#fbbf24';
+                          const bg = isComp
+                            ? 'rgba(34, 211, 238, 0.15)'
+                            : p.key === 'UV254'
+                            ? 'rgba(16, 185, 129, 0.15)'
+                            : p.key === 'UV366'
+                            ? 'rgba(192, 132, 252, 0.15)'
+                            : 'rgba(251, 191, 36, 0.15)';
+                          const border = isComp
+                            ? 'rgba(34, 211, 238, 0.35)'
+                            : p.key === 'UV254'
+                            ? 'rgba(16, 185, 129, 0.35)'
+                            : p.key === 'UV366'
+                            ? 'rgba(192, 132, 252, 0.35)'
+                            : 'rgba(251, 191, 36, 0.35)';
+                          const pw = Math.round(1.0 * p.lane.width);
+                          return (
+                            <div
+                              key={idx}
+                              style={{
+                                width: `${pw}px`,
+                                minWidth: '40px',
+                                textAlign: 'center',
+                                padding: '3px 2px',
+                                background: bg,
+                                border: `1px solid ${border}`,
+                                borderRadius: '4px',
+                                fontSize: '10px',
+                                fontWeight: 700,
+                                color,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}
+                              title={title}
+                            >
+                              {title}
+                            </div>
+                          );
+                        })}
                       </div>
                       <div style={{ position: 'relative', display: 'inline-block' }}>
                         <canvas
@@ -4195,7 +4350,23 @@ export const TlcView: React.FC = () => {
               )}
             </div>
 
-            <div className="modal-foot" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div
+              className="modal-foot"
+              style={{
+                position: 'sticky',
+                bottom: 0,
+                zIndex: 35,
+                background: 'var(--panel)',
+                backdropFilter: 'blur(10px)',
+                WebkitBackdropFilter: 'blur(10px)',
+                borderTop: '1px solid var(--line2)',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                boxShadow: '0 -4px 14px rgba(0,0,0,0.18)',
+                padding: '12px 20px',
+              }}
+            >
               <div style={{ display: 'flex', gap: '8px' }}>
                 <button
                   type="button"

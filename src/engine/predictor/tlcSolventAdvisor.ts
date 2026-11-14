@@ -471,6 +471,7 @@ export interface PlateSolventPlanOptions {
   cachedPredictions?: Record<string, WellPredictionResult>;
   includeSpeculative?: boolean;
   onProgress?: (done: number, total: number) => void;
+  signal?: AbortSignal;
 }
 
 const TLCMOTIF_SMARTS: Array<[keyof Pick<TlcMolProfile, 'aliphAmineCount' | 'azoleCount' | 'pyridineCount' | 'carboxylicAcidCount'>, string]> = [
@@ -952,8 +953,33 @@ export async function optimizePlateTlcSolvents(
     activeIndices.push(w);
   }
 
+  const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let lastYield = nowMs();
+  const yieldIfFrameExceeded = async (force = false) => {
+    if (options.signal?.aborted) {
+      const err = new Error('TLC solvent optimization cancelled');
+      err.name = 'AbortError';
+      throw err;
+    }
+    const elapsed = nowMs() - lastYield;
+    if (force || elapsed >= 16) {
+      await new Promise((res) => setTimeout(res, 0));
+      lastYield = nowMs();
+      if (options.signal?.aborted) {
+        const err = new Error('TLC solvent optimization cancelled');
+        err.name = 'AbortError';
+        throw err;
+      }
+    }
+  };
+
   // 1. Gather or compute predictions for every active well on this 54-well plate
   for (let i = 0; i < activeIndices.length; i++) {
+    if (options.signal?.aborted) {
+      const err = new Error('TLC solvent optimization cancelled');
+      err.name = 'AbortError';
+      throw err;
+    }
     const w = activeIndices[i];
     const r = rowMap.get(w) ?? run?.rows?.[plateIndex * PLATE_SIZE + w];
     const cacheKey = `${plateIndex}-${w}`;
@@ -1045,9 +1071,7 @@ export async function optimizePlateTlcSolvents(
     });
 
     options.onProgress?.(i + 1, activeIndices.length);
-    if ((i + 1) % 4 === 0) {
-      await new Promise((res) => setTimeout(res, 0));
-    }
+    await yieldIfFrameExceeded();
   }
 
   // 2. Score every system in TLC_SOLVENT_LIBRARY across every active well
@@ -1062,6 +1086,7 @@ export async function optimizePlateTlcSolvents(
       m.set(w.wellIndex, evaluateWellInSolvent(w, sys));
     }
     evalMatrix.set(sys.id, m);
+    await yieldIfFrameExceeded();
   }
 
   // 3. Filter candidate search pool by poolMode, then run exact complementary set cover
@@ -1070,55 +1095,123 @@ export async function optimizePlateTlcSolvents(
       ? TLC_SOLVENT_LIBRARY.filter((s) => s.preferenceTier === 'primary')
       : TLC_SOLVENT_LIBRARY;
 
-  const totalImportance = activeWells.reduce((acc, w) => acc + w.importanceWeight, 0) || 1;
-  const effK = Math.min(requestedK, searchPool.length);
-  const combos = generateCombinations(searchPool.length, effK);
+  const numActive = activeWells.length;
+  const importanceArr = new Float64Array(numActive);
+  let totalImportance = 0;
+  for (let wi = 0; wi < numActive; wi++) {
+    const imp = activeWells[wi].importanceWeight;
+    importanceArr[wi] = imp;
+    totalImportance += imp;
+  }
+  if (totalImportance <= 0) totalImportance = 1;
+
+  const poolLen = searchPool.length;
+  const scoreGrid: Float64Array[] = searchPool.map((sys) => {
+    const sysMap = evalMatrix.get(sys.id)!;
+    const arr = new Float64Array(numActive);
+    for (let wi = 0; wi < numActive; wi++) {
+      arr[wi] = sysMap.get(activeWells[wi].wellIndex)!.score;
+    }
+    return arr;
+  });
+
+  const famIndexMap = new Map<string, number>();
+  const bandIndexMap = new Map<string, number>();
+  const famBit = new Int32Array(poolLen);
+  const bandBit = new Int32Array(poolLen);
+  const primaryFlag = new Uint8Array(poolLen);
+
+  for (let sIdx = 0; sIdx < poolLen; sIdx++) {
+    const sys = searchPool[sIdx];
+    let fi = famIndexMap.get(sys.family);
+    if (fi === undefined) {
+      fi = famIndexMap.size;
+      famIndexMap.set(sys.family, fi);
+    }
+    famBit[sIdx] = 1 << fi;
+
+    const bKey = polarityBand(sys);
+    let bi = bandIndexMap.get(bKey);
+    if (bi === undefined) {
+      bi = bandIndexMap.size;
+      bandIndexMap.set(bKey, bi);
+    }
+    bandBit[sIdx] = 1 << bi;
+    primaryFlag[sIdx] = sys.preferenceTier === 'primary' ? 1 : 0;
+  }
+
+  const pairPenalty = new Float64Array(poolLen * poolLen);
+  for (let i = 0; i < poolLen; i++) {
+    const a = searchPool[i];
+    for (let j = i + 1; j < poolLen; j++) {
+      const b = searchPool[j];
+      let pen = 0;
+      if (a.family === b.family && Math.abs(a.strength - b.strength) < 0.16) {
+        pen = 0.065;
+      } else if (a.stationaryPhase === 'C18' && b.stationaryPhase === 'C18' && Math.abs(a.strength - b.strength) < 0.25) {
+        pen = 0.05;
+      }
+      pairPenalty[i * poolLen + j] = pen;
+    }
+  }
+
+  const popCount = (mask: number): number => {
+    let m = mask;
+    let c = 0;
+    while (m) {
+      c += m & 1;
+      m >>>= 1;
+    }
+    return c;
+  };
+
+  const effK = Math.min(requestedK, poolLen);
+  const combos = generateCombinations(poolLen, effK);
 
   let bestComboIdx: number[] = [0];
   let bestObjective = -1e9;
+  const assignedCounts = new Int32Array(effK);
 
-  for (const combo of combos) {
+  for (let cNum = 0; cNum < combos.length; cNum++) {
+    const combo = combos[cNum];
+    assignedCounts.fill(0);
     let weightedSum = 0;
-    const assignedCounts = new Array(combo.length).fill(0);
-    const systems = combo.map((idx) => searchPool[idx]);
 
-    for (const w of activeWells) {
+    for (let wi = 0; wi < numActive; wi++) {
       let bestW = -1;
       let bestOwner = 0;
-      for (let cIdx = 0; cIdx < systems.length; cIdx++) {
-        const sc = evalMatrix.get(systems[cIdx].id)!.get(w.wellIndex)!.score;
+      for (let cIdx = 0; cIdx < effK; cIdx++) {
+        const sc = scoreGrid[combo[cIdx]][wi];
         if (sc > bestW) {
           bestW = sc;
           bestOwner = cIdx;
         }
       }
       if (bestW > 0.35) assignedCounts[bestOwner]++;
-      weightedSum += w.importanceWeight * Math.max(0, bestW);
+      if (bestW > 0) weightedSum += importanceArr[wi] * bestW;
     }
 
-    // Active utility term
-    const activeSystemsUsed = assignedCounts.filter((c) => c > 0).length;
-
-    // Complementarity & redundancy terms across selected solvent set
-    const distinctFamilies = new Set(systems.map((s) => s.family)).size;
-    const distinctBands = new Set(systems.map((s) => polarityBand(s))).size;
+    let activeSystemsUsed = 0;
+    let famMask = 0;
+    let bandMask = 0;
+    let primaryCount = 0;
     let redundancyPenalty = 0;
-    for (let i = 0; i < systems.length; i++) {
-      for (let j = i + 1; j < systems.length; j++) {
-        const a = systems[i];
-        const b = systems[j];
-        if (a.family === b.family && Math.abs(a.strength - b.strength) < 0.16) {
-          redundancyPenalty += 0.065;
-        } else if (a.stationaryPhase === 'C18' && b.stationaryPhase === 'C18' && Math.abs(a.strength - b.strength) < 0.25) {
-          redundancyPenalty += 0.05;
-        }
+
+    for (let i = 0; i < effK; i++) {
+      const si = combo[i];
+      if (assignedCounts[i] > 0) activeSystemsUsed++;
+      famMask |= famBit[si];
+      bandMask |= bandBit[si];
+      primaryCount += primaryFlag[si];
+      for (let j = i + 1; j < effK; j++) {
+        redundancyPenalty += pairPenalty[si * poolLen + combo[j]];
       }
     }
 
-    // Preference bonus for EtOAc/Hexanes, MeOH/DCM, Et3N & 2M NH3-MeOH systems
-    const primaryCount = systems.filter((s) => s.preferenceTier === 'primary').length;
+    const distinctFamilies = popCount(famMask);
+    const distinctBands = popCount(bandMask);
     const primaryBonus =
-      poolMode === 'prefer_primary' ? 0.055 * (primaryCount / systems.length) : 0;
+      poolMode === 'prefer_primary' ? 0.055 * (primaryCount / effK) : 0;
 
     const obj =
       weightedSum / totalImportance +
@@ -1131,6 +1224,10 @@ export async function optimizePlateTlcSolvents(
     if (obj > bestObjective) {
       bestObjective = obj;
       bestComboIdx = combo;
+    }
+
+    if ((cNum & 1023) === 1023) {
+      await yieldIfFrameExceeded();
     }
   }
 

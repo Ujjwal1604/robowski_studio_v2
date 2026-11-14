@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchAiSolventSystems,
   SolventAdvisorPayload,
@@ -113,6 +113,23 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [response, setResponse] = useState<SolventSuggestionResponse | null>(null);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
 
+  const abortRef = useRef<AbortController | null>(null);
+  const runSeqRef = useRef<number>(0);
+  const predCacheRef = useRef<{
+    sig: string;
+    preds: Record<string, WellPredictionResult>;
+  }>({ sig: '', preds: {} });
+
+  const cacheSignature = useMemo(() => {
+    const reagentSig = (state.reagents || [])
+      .map((r) => `${r.code}:${r.smiles || ''}:${r.molarMass || ''}`)
+      .join('|');
+    const ovSig = conditionOverrides
+      ? `${conditionOverrides.medium || ''}:${conditionOverrides.temperatureC ?? ''}:${conditionOverrides.waterPct ?? ''}`
+      : '';
+    return `${run?.rows?.length || 0}::${state.mode}::${reagentSig}::${ovSig}::spec=${includeSpeculative}`;
+  }, [run?.rows?.length, state.mode, state.reagents, conditionOverrides, includeSpeculative]);
+
   useEffect(() => {
     if (isOpen && hasPlateRun) {
       setAdvisorMode('plate54');
@@ -124,6 +141,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   useEffect(() => {
     setPlateIdx(initialPlateIndex);
   }, [initialPlateIndex]);
+
+  const initSubsSig = useMemo(
+    () =>
+      initialSubstrates
+        .map((s) => `${s.code || ''}:${s.name}:${s.smiles || ''}`)
+        .join('|'),
+    [initialSubstrates]
+  );
 
   useEffect(() => {
     if (initialSubstrates.length > 0) {
@@ -147,46 +172,104 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
         setExpectedProduct('N-benzyl-4-methylbenzamide (amide product)');
       }
     }
-  }, [initialSubstrates]);
+  }, [initSubsSig]);
 
   const run54WellOptimization = useCallback(async () => {
     if (!run || !run.rows.length) return;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = ++runSeqRef.current;
+
     setPlateLoading(true);
     setPlateError(null);
+    setPlateProgress({ done: 0, total: Math.min(54, run.rows.length) });
+
     try {
       const rdkit = await getRDKitInstance();
+      if (controller.signal.aborted || runSeqRef.current !== seq) return;
       if (!rdkit) {
         setPlateError('Chemistry engine is still initializing — please try again in a moment.');
         return;
       }
+
+      if (predCacheRef.current.sig !== cacheSignature) {
+        predCacheRef.current = { sig: cacheSignature, preds: {} };
+      }
+
+      const mergedCached: Record<string, WellPredictionResult> = {
+        ...predCacheRef.current.preds,
+        ...(cachedPlatePredictions || {}),
+      };
+
       const plan = await optimizePlateTlcSolvents(rdkit, state, run, triMeta, {
         plateIndex: plateIdx,
         maxSystems: numSystems,
         poolMode,
         conditionOverrides,
-        cachedPredictions: cachedPlatePredictions,
+        cachedPredictions: mergedCached,
         includeSpeculative,
-        onProgress: (done, total) => setPlateProgress({ done, total }),
+        signal: controller.signal,
+        onProgress: (done, total) => {
+          if (runSeqRef.current === seq) {
+            setPlateProgress({ done, total });
+          }
+        },
       });
+
+      if (controller.signal.aborted || runSeqRef.current !== seq) return;
+
+      // Save computed well predictions into session cache so toggling 2/3/4 Systems or Preference is instant
+      if (plan.wellPredictions) {
+        for (const [wIdxStr, wp] of Object.entries(plan.wellPredictions)) {
+          predCacheRef.current.preds[`${plateIdx}-${wIdxStr}`] = wp;
+        }
+      }
+
       setPlatePlan(plan);
       const firstSys = plan.recommendedSystems[0];
       if (firstSys) {
         setSelectedSystemId(firstSys.system.id);
-        const firstAssigned = firstSys.assignedWellIndices[0] ?? firstSys.lanes.find((l) => !l.isBlank)?.wellIndex ?? 0;
+        const firstAssigned =
+          firstSys.assignedWellIndices[0] ??
+          firstSys.lanes.find((l) => !l.isBlank)?.wellIndex ??
+          0;
         setSelectedLaneIdx(firstAssigned);
       }
     } catch (e: any) {
+      if (e?.name === 'AbortError' || controller.signal.aborted || runSeqRef.current !== seq) {
+        return;
+      }
       setPlateError(e?.message || 'Failed to compute 54-well TLC optimization.');
     } finally {
-      setPlateLoading(false);
+      if (runSeqRef.current === seq) {
+        setPlateLoading(false);
+      }
     }
-  }, [run, state, triMeta, plateIdx, numSystems, poolMode, conditionOverrides, cachedPlatePredictions, includeSpeculative]);
+  }, [
+    run,
+    state,
+    triMeta,
+    plateIdx,
+    numSystems,
+    poolMode,
+    conditionOverrides,
+    cachedPlatePredictions,
+    includeSpeculative,
+    cacheSignature,
+  ]);
 
-  // Auto-run 54-well optimizer when modal opens in 54-well mode cleanly
+  // Auto-run 54-well optimizer when modal opens in 54-well mode cleanly, and abort on close/change
   useEffect(() => {
-    if (!isOpen || advisorMode !== 'plate54' || !hasPlateRun) return;
+    if (!isOpen || advisorMode !== 'plate54' || !hasPlateRun) {
+      abortRef.current?.abort();
+      return;
+    }
     run54WellOptimization();
-  }, [isOpen, advisorMode, hasPlateRun, plateIdx, numSystems, poolMode, includeSpeculative]);
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, [isOpen, advisorMode, hasPlateRun, run54WellOptimization]);
 
   const activeSystemPlan: RecommendedPlateSolvent | null = useMemo(() => {
     if (!platePlan) return null;

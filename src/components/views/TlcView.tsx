@@ -2164,9 +2164,9 @@ export const TlcView: React.FC = () => {
                     gap: '6px',
                     padding: '5px 12px',
                     borderRadius: '6px',
-                    border: isActive ? '2px solid var(--pri)' : '1px solid var(--line)',
-                    background: isActive ? 'var(--pri)' : 'var(--panel)',
-                    color: isActive ? '#ffffff' : 'var(--fg)',
+                    border: isActive ? '2px solid var(--acc)' : '1px solid var(--line)',
+                    background: isActive ? 'var(--acc)' : 'var(--panel)',
+                    color: isActive ? 'var(--acc-fg)' : 'var(--fg)',
                     fontWeight: isActive ? 700 : 600,
                     fontSize: '12px',
                     cursor: 'pointer',
@@ -2180,12 +2180,12 @@ export const TlcView: React.FC = () => {
                       padding: '1px 5px',
                       borderRadius: '4px',
                       background: isActive
-                        ? 'rgba(255,255,255,0.22)'
+                        ? 'color-mix(in srgb, var(--acc-fg) 18%, transparent)'
                         : imgCount > 0
                         ? 'rgba(16, 185, 129, 0.14)'
                         : 'rgba(148, 163, 184, 0.14)',
                       color: isActive
-                        ? '#ffffff'
+                        ? 'var(--acc-fg)'
                         : imgCount > 0
                         ? '#059669'
                         : 'var(--mut)',

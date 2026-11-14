@@ -1019,7 +1019,7 @@ export const SetupView: React.FC = () => {
                           flexWrap: 'wrap',
                         }}
                       >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1, minWidth: '260px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1, minWidth: 0 }}>
                           <input
                             type="text"
                             className="code code-in"
@@ -1048,7 +1048,7 @@ export const SetupView: React.FC = () => {
                             title="Click to rename reagent code"
                           />
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, minWidth: 0 }}>
-                            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                            <div style={{ display: 'flex', gap: '6px', alignItems: 'center', minWidth: 0 }}>
                               <input
                                 type="text"
                                 className="f"
@@ -1068,13 +1068,14 @@ export const SetupView: React.FC = () => {
                                   fontWeight: 600,
                                   height: '36px',
                                   flex: 1,
+                                  minWidth: 0,
                                 }}
                               />
                               {r.name && (
                                 <button
                                   type="button"
                                   className="btn sm"
-                                  style={{ height: '36px', padding: '0 10px', fontSize: '11px', whiteSpace: 'nowrap' }}
+                                  style={{ height: '36px', padding: '0 10px', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}
                                   onClick={() => handleNameSelect(i, r.name)}
                                   title="Look up SMILES, 2D structure, molar mass, and density for this name via PubChem"
                                 >
@@ -1083,8 +1084,8 @@ export const SetupView: React.FC = () => {
                               )}
                             </div>
                             {r.smiles ? (
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
-                                <span style={{ fontWeight: 600, color: 'var(--fg)', letterSpacing: '0.02em' }}>SMILES:</span>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--mut)', minWidth: 0, flexWrap: 'wrap' }}>
+                                <span style={{ fontWeight: 600, color: 'var(--fg)', letterSpacing: '0.02em', flexShrink: 0 }}>SMILES:</span>
                                 <span
                                   className="mono"
                                   style={{
@@ -1092,7 +1093,8 @@ export const SetupView: React.FC = () => {
                                     padding: '2px 8px',
                                     borderRadius: '4px',
                                     border: '1px solid var(--line)',
-                                    maxWidth: '360px',
+                                    maxWidth: 'min(360px, 100%)',
+                                    minWidth: 0,
                                     overflow: 'hidden',
                                     textOverflow: 'ellipsis',
                                     whiteSpace: 'nowrap',
@@ -1207,20 +1209,21 @@ export const SetupView: React.FC = () => {
 
                         return (
                           <div
+                            className="reagent-card-grid"
                             style={{
                               display: 'grid',
                               gridTemplateColumns: showStructures
                                 ? hasInlineRange
-                                  ? '190px minmax(300px, 1.1fr) minmax(310px, 1.2fr)'
-                                  : '220px 1fr'
+                                  ? '210px minmax(0, 1.1fr) minmax(0, 1.2fr)'
+                                  : '232px minmax(0, 1fr)'
                                 : hasInlineRange
-                                ? 'minmax(300px, 1fr) minmax(310px, 1.2fr)'
+                                ? 'minmax(0, 1fr) minmax(0, 1.2fr)'
                                 : '1fr',
                               gap: '16px',
                               alignItems: 'stretch',
                             }}
                           >
-                            {/* Col 1: Chemical Structure Canvas (enlarged for high visual clarity) */}
+                            {/* Col 1: Chemical Structure Canvas (sized to fit inside card box cleanly) */}
                             {showStructures && (
                               <div
                                 style={{
@@ -1233,7 +1236,10 @@ export const SetupView: React.FC = () => {
                                   alignItems: 'center',
                                   justifyContent: 'center',
                                   cursor: 'pointer',
-                                  minHeight: hasInlineRange ? '156px' : '180px',
+                                  minWidth: 0,
+                                  overflow: 'hidden',
+                                  boxSizing: 'border-box',
+                                  minHeight: hasInlineRange ? '156px' : '175px',
                                   transition: 'border-color 0.15s ease, background 0.15s ease',
                                 }}
                                 title="Click to zoom, inspect, or edit 2D chemical structure"
@@ -1242,8 +1248,8 @@ export const SetupView: React.FC = () => {
                                   smiles={r.smiles}
                                   iupac={r.iupac || r.name}
                                   name={r.name}
-                                  width={hasInlineRange ? 210 : 250}
-                                  height={hasInlineRange ? 140 : 165}
+                                  width={hasInlineRange ? 186 : 208}
+                                  height={hasInlineRange ? 128 : 145}
                                   allowZoom={true}
                                   onResolvedSmiles={(smiles, mw, density, iupac) => {
                                     setState((prev) => {
@@ -1257,7 +1263,7 @@ export const SetupView: React.FC = () => {
                                     });
                                   }}
                                 />
-                                <span style={{ fontSize: '9px', color: 'var(--mut)', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                                <span style={{ fontSize: '9px', color: 'var(--mut)', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '0.05em', flexShrink: 0 }}>
                                   Inspect / Edit
                                 </span>
                               </div>
@@ -1856,6 +1862,46 @@ export const SetupView: React.FC = () => {
                 );
               });
             })()}
+
+            {state.reagents.length < 12 && (
+              <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'center' }}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={addReagent}
+                  style={{
+                    width: '100%',
+                    height: '42px',
+                    border: '1.5px dashed var(--line)',
+                    background: 'var(--soft)',
+                    color: 'var(--acc)',
+                    fontWeight: 600,
+                    fontSize: '13px',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    borderRadius: '10px',
+                    cursor: 'pointer',
+                  }}
+                  title="Add another reagent below"
+                >
+                  <svg
+                    width="15"
+                    height="15"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M7 2v10M2 7h10" />
+                  </svg>
+                  <span>Add reagent ({state.reagents.length} of 12)</span>
+                </button>
+              </div>
+            )}
 
             <div className="note" style={{ marginTop: '14px' }}>
               {state.mode === 'triplet'

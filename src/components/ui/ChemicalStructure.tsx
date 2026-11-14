@@ -336,7 +336,10 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
           className={`chem-struct-empty ${className}`}
           style={{
             width,
+            maxWidth: '100%',
             height,
+            maxHeight: '100%',
+            boxSizing: 'border-box',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -344,6 +347,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
             borderRadius: '6px',
             border: '1px solid var(--line)',
             position: 'relative',
+            overflow: 'hidden',
             cursor: 'pointer',
             transition: 'background 0.15s ease, border-color 0.15s ease',
           }}
@@ -429,7 +433,10 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
         className={`chem-struct-wrapper ${className}`}
         style={{
           width,
+          maxWidth: '100%',
           height,
+          maxHeight: '100%',
+          boxSizing: 'border-box',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',

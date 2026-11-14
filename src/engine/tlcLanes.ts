@@ -11,6 +11,7 @@ import {
 } from '../types';
 import { parseDelimited } from './importers/tableReader';
 import { csvText } from './exporters/csv';
+import { getTlcPlateSlice } from './tlcPlateSlice';
 
 export const LANE_FRAME_WIDTH = 3280;
 export const TLC_ROWS = 6;
@@ -1376,7 +1377,9 @@ export function exportTlcAnalysisCsv(options: TlcAnalysisExportOptions): string 
     scope = 'current',
   } = options;
 
-  const targetSets = scope === 'all' ? sets : [set];
+  const targetSets = (scope === 'all' ? sets : [set]).map((s) =>
+    s.plateData ? getTlcPlateSlice(s, plateIndex) : s
+  );
   const codes = run?.reagents?.map((r) => r.code) || [];
 
   const rowsData: Array<{
@@ -1532,7 +1535,9 @@ export function exportTlcAnalysisJson(options: TlcAnalysisExportOptions): string
     scope = 'current',
   } = options;
 
-  const targetSets = scope === 'all' ? sets : [set];
+  const targetSets = (scope === 'all' ? sets : [set]).map((s) =>
+    s.plateData ? getTlcPlateSlice(s, plateIndex) : s
+  );
 
   const exportPayload = {
     format: 'Robowski-TLC-Analysis-Export',
@@ -1687,7 +1692,8 @@ export function tlcRfCsv(
   for (let n = 1; n <= 5; n++) head.push(`rf_raw_${n}`);
   const rows = [head];
 
-  for (const set of sets) {
+  for (const rawSet of sets) {
+    const set = rawSet.plateData ? getTlcPlateSlice(rawSet, plateIndex) : rawSet;
     if (!set.cfg) continue;
     const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
     if (!ch) continue;

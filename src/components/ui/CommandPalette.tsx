@@ -182,11 +182,23 @@ export const CommandPalette: React.FC = () => {
       },
     },
     {
+      id: 'nav-predict',
+      category: 'Navigation',
+      title: 'Go to 3. Predict',
+      subtitle: 'Mechanistic reaction cascade, salt balance and LC-MS mass prediction',
+      badge: 'Step 3',
+      icon: '⚗️',
+      action: () => {
+        setVisited((v) => ({ ...v, predict: true }));
+        setView('predict');
+      },
+    },
+    {
       id: 'nav-deck',
       category: 'Navigation',
-      title: 'Go to 3. Deck Layout',
+      title: 'Go to 4. Deck Layout',
       subtitle: 'Breadboard vial coordinates, fill levels and tip racks',
-      badge: 'Step 3',
+      badge: 'Step 4',
       icon: '🧪',
       action: () => {
         setVisited((v) => ({ ...v, deck: true }));
@@ -196,9 +208,9 @@ export const CommandPalette: React.FC = () => {
     {
       id: 'nav-tlc',
       category: 'Navigation',
-      title: 'Go to 4. TLC Map',
+      title: 'Go to 5. TLC Map',
       subtitle: 'Physical TLC plate alignment, spot detection and Rf values',
-      badge: 'Step 4',
+      badge: 'Step 5',
       icon: '📷',
       action: () => {
         setVisited((v) => ({ ...v, tlc: true }));
@@ -208,9 +220,9 @@ export const CommandPalette: React.FC = () => {
     {
       id: 'nav-eln',
       category: 'Navigation',
-      title: 'Go to 5. HTE Notebook',
+      title: 'Go to 6. HTE Notebook',
       subtitle: '54-well physical observations, hit matrix, polymer/gas tags, and scale-up',
-      badge: 'Step 5',
+      badge: 'Step 6',
       icon: '📓',
       action: () => {
         setVisited((v) => ({ ...v, eln: true }));
@@ -220,9 +232,9 @@ export const CommandPalette: React.FC = () => {
     {
       id: 'nav-export',
       category: 'Navigation',
-      title: 'Go to 6. Export Package',
+      title: 'Go to 7. Export Package',
       subtitle: 'Robot input workbook (.xlsx), HTML bench sheet and archive',
-      badge: 'Step 6',
+      badge: 'Step 7',
       icon: '📦',
       action: () => {
         setVisited((v) => ({ ...v, export: true }));

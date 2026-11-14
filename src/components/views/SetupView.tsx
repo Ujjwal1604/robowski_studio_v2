@@ -1233,7 +1233,7 @@ export const SetupView: React.FC = () => {
                                   alignItems: 'center',
                                   justifyContent: 'center',
                                   cursor: 'pointer',
-                                  minHeight: hasInlineRange ? '138px' : '148px',
+                                  minHeight: hasInlineRange ? '156px' : '180px',
                                   transition: 'border-color 0.15s ease, background 0.15s ease',
                                 }}
                                 title="Click to zoom, inspect, or edit 2D chemical structure"
@@ -1242,8 +1242,8 @@ export const SetupView: React.FC = () => {
                                   smiles={r.smiles}
                                   iupac={r.iupac || r.name}
                                   name={r.name}
-                                  width={hasInlineRange ? 170 : 200}
-                                  height={hasInlineRange ? 116 : 130}
+                                  width={hasInlineRange ? 210 : 250}
+                                  height={hasInlineRange ? 140 : 165}
                                   allowZoom={true}
                                   onResolvedSmiles={(smiles, mw, density, iupac) => {
                                     setState((prev) => {
@@ -1570,8 +1570,8 @@ export const SetupView: React.FC = () => {
                             smiles={r.smiles}
                             iupac={r.iupac || r.name}
                             name={r.name}
-                            width={54}
-                            height={38}
+                            width={84}
+                            height={56}
                             allowZoom={true}
                             onResolvedSmiles={(smiles, mw, density, iupac) => {
                               setState((prev) => {

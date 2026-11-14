@@ -9,7 +9,7 @@ import {
   TlcImageEntry,
 } from '../types';
 import * as Core from '../engine';
-import { putTlcImage, getTlcImage, getImagesForSets } from './tlcStorage';
+import { putTlcImage, getAllSetImages, getImagesForSets } from './tlcStorage';
 import {
   exampleState,
   normalize,
@@ -192,7 +192,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [tlcSets, setTlcSets] = useState<TlcSet[]>([defaultTlcSet()]);
 
   const activeTlcStatus: 'ready' | 'pending' = useMemo(() => {
-    const hasImgs = tlcSets.some((s) => Object.keys(s.imgs || {}).length > 0);
+    const hasImgs = tlcSets.some((s) => Core.tlcSetHasAnyImages(s));
     return hasImgs ? 'ready' : 'pending';
   }, [tlcSets]);
 
@@ -653,23 +653,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         updated: Date.now(),
         state: JSON.parse(JSON.stringify(state)),
         tlc_status: activeTlcStatus,
-        tlc_sets: tlcSets.map((s) => ({
-          uid: s.uid,
-          name: s.name,
-          cfg: s.cfg,
-          cfgName: s.cfgName,
-          cfgText: s.cfgText,
-          frameW: s.frameW || Core.LANE_FRAME_WIDTH,
-          frontPx: s.frontPx ?? null,
-          frontAuto: s.frontAuto || {},
-          edgePicks: s.edgePicks || [],
-          edgeSettings: s.edgeSettings || {},
-          spotProminence: s.spotProminence ?? spotProminence,
-          imgMeta: Object.entries(s.imgs || {}).map(([k, im]) => ({
-            key: k,
-            name: im.name,
-          })),
-        })),
+        tlc_sets: tlcSets.map((s) => Core.serializeTlcSet(s, spotProminence)),
       };
 
       try {
@@ -712,23 +696,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         st.id = r.id;
         setState(st);
         if (r.tlc_sets && r.tlc_sets.length > 0) {
-          setTlcSets(
-            r.tlc_sets.map((s: any) => ({
-              uid: s.uid,
-              name: s.name,
-              cfg: s.cfg,
-              cfgName: s.cfgName,
-              cfgText: s.cfgText,
-              frameW: s.frameW || Core.LANE_FRAME_WIDTH,
-              frontPx: s.frontPx ?? null,
-              frontAuto: s.frontAuto || {},
-              edgePicks: s.edgePicks || [],
-              edgeSettings: s.edgeSettings || {},
-              spotProminence: s.spotProminence,
-              imgs: {},
-              prof: {},
-            }))
-          );
+          setTlcSets(r.tlc_sets.map((s: any) => Core.deserializeTlcSetMeta(s)));
           if (r.tlc_sets[0]?.spotProminence != null) {
             setSpotProminence(r.tlc_sets[0].spotProminence);
           }
@@ -755,27 +723,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const duplicatedSets: TlcSet[] = [];
           for (const s of r.tlc_sets) {
             const newUid = 'set_' + Math.random().toString(36).slice(2, 10);
-            duplicatedSets.push({
-              uid: newUid,
-              name: s.name,
-              cfg: s.cfg,
-              cfgName: s.cfgName,
-              cfgText: s.cfgText,
-              frameW: s.frameW || Core.LANE_FRAME_WIDTH,
-              frontPx: s.frontPx ?? null,
-              frontAuto: s.frontAuto || {},
-              edgePicks: s.edgePicks ? JSON.parse(JSON.stringify(s.edgePicks)) : [],
-              edgeSettings: s.edgeSettings ? JSON.parse(JSON.stringify(s.edgeSettings)) : {},
-              spotProminence: s.spotProminence,
-              imgs: {},
-              prof: {},
-            });
-            // Copy image blobs in IndexedDB to the new set namespace
-            for (const k of ['UV254', 'White', 'UV366']) {
-              const oldImg = await getTlcImage(s.uid, k);
-              if (oldImg) {
-                await putTlcImage(newUid, k, oldImg.name, oldImg.blob);
+            const clonedMeta = Core.deserializeTlcSetMeta(JSON.parse(JSON.stringify(s)));
+            clonedMeta.uid = newUid;
+            duplicatedSets.push(clonedMeta);
+            // Copy all image blobs across all plates in IndexedDB to the new set namespace
+            const knownImgKeys: string[] = [];
+            if (Array.isArray(s.imgMeta)) {
+              for (const m of s.imgMeta) knownImgKeys.push(m.key);
+            }
+            if (s.plateData && typeof s.plateData === 'object') {
+              for (const [pStr, pd] of Object.entries(s.plateData as Record<string, any>)) {
+                if (Array.isArray(pd?.imgMeta)) {
+                  for (const m of pd.imgMeta) knownImgKeys.push(Core.tlcStorageKey(m.key, Number(pStr)));
+                }
               }
+            }
+            const oldImages = await getAllSetImages(s.uid, knownImgKeys);
+            for (const oldImg of oldImages) {
+              await putTlcImage(newUid, oldImg.key, oldImg.name, oldImg.blob);
             }
           }
           setTlcSets(duplicatedSets);
@@ -954,33 +919,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           await putTlcImage(img.uid, img.key, img.name, img.blob);
         }
 
-        // Reconstruct TLC sets
+        // Reconstruct TLC sets (including per-plate images & metadata)
         const reconstructedSets: TlcSet[] = [];
         for (const s of parsed.tlcSets) {
-          const imgs: Record<string, TlcImageEntry> = {};
-          if (Array.isArray(s.imgMeta)) {
-            for (const m of s.imgMeta) {
-              const matched = parsed.tlcImages.find((im) => im.uid === s.uid && im.key === m.key);
-              if (matched) {
-                try {
-                  const bmp = await createImageBitmap(matched.blob);
-                  imgs[m.key] = { name: m.name, bmp };
-                } catch {}
-              }
-            }
+          let reconstructed = Core.deserializeTlcSetMeta(s);
+          const matchingImages = parsed.tlcImages.filter((im) => im.uid === s.uid);
+          for (const matched of matchingImages) {
+            const { plateIndex: pIdx, channel } = Core.parseTlcStorageKey(matched.key);
+            try {
+              const bmp = await createImageBitmap(matched.blob);
+              const metaList =
+                pIdx === 0 ? s.imgMeta : s.plateData?.[pIdx]?.imgMeta;
+              const matchedMeta = Array.isArray(metaList)
+                ? metaList.find((m: any) => m.key === channel)
+                : null;
+              const entryName = matchedMeta?.name || matched.name;
+              reconstructed = Core.updateTlcPlateSlice(reconstructed, pIdx, (slice) => ({
+                imgs: { ...slice.imgs, [channel]: { name: entryName, bmp } },
+              }));
+            } catch {}
           }
-          reconstructedSets.push({
-            uid: s.uid,
-            name: s.name,
-            cfg: s.cfg,
-            cfgName: s.cfgName,
-            cfgText: s.cfgText,
-            frameW: s.frameW || Core.LANE_FRAME_WIDTH,
-            frontPx: s.frontPx ?? null,
-            frontAuto: s.frontAuto || {},
-            imgs,
-            prof: {},
-          });
+          reconstructedSets.push(reconstructed);
         }
 
         if (reconstructedSets.length > 0) {

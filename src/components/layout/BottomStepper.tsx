@@ -10,10 +10,11 @@ interface StepDef {
 const STEPS: StepDef[] = [
   { id: 'setup', label: '1. Setup', shortDesc: 'Reagents & Ranges' },
   { id: 'combos', label: '2. Combinations', shortDesc: '54-Well Recipe Matrix' },
-  { id: 'deck', label: '3. Deck Layout', shortDesc: 'Hood Positions & Tip Racks' },
-  { id: 'tlc', label: '4. TLC Map', shortDesc: 'Plate Photos & Spot Densitometry' },
-  { id: 'eln', label: '5. HTE Notebook', shortDesc: 'Hit Matrix & Observations' },
-  { id: 'export', label: '6. Export Package', shortDesc: 'Robot XLSX & Bench Sheets' },
+  { id: 'predict', label: '3. Predict', shortDesc: 'Reaction & LC-MS Mass Prediction' },
+  { id: 'deck', label: '4. Deck Layout', shortDesc: 'Hood Positions & Tip Racks' },
+  { id: 'tlc', label: '5. TLC Map', shortDesc: 'Plate Photos & Spot Densitometry' },
+  { id: 'eln', label: '6. HTE Notebook', shortDesc: 'Hit Matrix & Observations' },
+  { id: 'export', label: '7. Export Package', shortDesc: 'Robot XLSX & Bench Sheets' },
 ];
 
 export const BottomStepper: React.FC = () => {

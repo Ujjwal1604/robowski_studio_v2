@@ -205,7 +205,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
             width,
             height,
             isDark,
-            bondLineWidth: 1.8,
+            bondLineWidth: width >= 200 ? 2.1 : 1.8,
           });
           if (svg) {
             const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
@@ -568,7 +568,7 @@ const StructureModal: React.FC<StructureModalProps> = ({
           borderRadius: '14px',
           border: '1px solid var(--line)',
           boxShadow: 'var(--shadow-lg)',
-          maxWidth: '460px',
+          maxWidth: '580px',
           width: '100%',
           padding: '24px',
           position: 'relative',
@@ -602,7 +602,7 @@ const StructureModal: React.FC<StructureModalProps> = ({
         <div
           style={{
             width: '100%',
-            height: '240px',
+            height: '300px',
             background: 'var(--bg)',
             borderRadius: '10px',
             border: '1px solid var(--line)',
@@ -614,7 +614,7 @@ const StructureModal: React.FC<StructureModalProps> = ({
           }}
         >
           {displaySmiles ? (
-            <ModalEnlargedStructure smiles={displaySmiles} width={390} height={216} />
+            <ModalEnlargedStructure smiles={displaySmiles} width={500} height={276} />
           ) : (
             <div style={{ textAlign: 'center', color: 'var(--mut)', fontSize: '13px' }}>
               No SMILES structure specified.

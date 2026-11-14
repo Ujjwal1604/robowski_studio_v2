@@ -17,6 +17,7 @@ import {
   wellLabel,
   containerOfLane,
   tlcLane,
+  resolveTlcSetForPlate,
 } from '../../engine';
 import { extractLaneProfile } from './TlcView';
 import { useApp } from '../../context/AppContext';
@@ -70,7 +71,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
   const activeHoverCol = activeFocusVial !== null ? (activeFocusVial % PLATE_SIZE) % COLS : null;
 
   // Derive TLC spot data for each lane on this plate
-  const activeTlcSet = (tlcSets && (tlcSets[plateIndex] || tlcSets[0])) || null;
+  const activeTlcSet = resolveTlcSetForPlate(tlcSets, plateIndex);
   const tlcLanes = activeTlcSet?.cfg?.lanes || [];
   const hasTlcImages = Boolean(
     activeTlcSet?.imgs.UV254?.bmp ||

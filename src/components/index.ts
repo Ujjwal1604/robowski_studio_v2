@@ -8,6 +8,7 @@ export { SummaryStrip } from './layout/SummaryStrip';
 // Page Views
 export { SetupView } from './views/SetupView';
 export { CombinationsView } from './views/CombinationsView';
+export { PredictionView } from './views/PredictionView';
 export { DeckView } from './views/DeckView';
 export { ExportView } from './views/ExportView';
 export { TlcView } from './views/TlcView';

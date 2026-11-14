@@ -20,11 +20,13 @@ export * from './importers/robotParser';
 export * from './presets';
 export * from './dilutionTier';
 export * from './tlcLanes';
+export * from './tlcPlateSlice';
 export * from './tlcLaneDetect';
 export * from './tlcEdge';
 export * from './barcode';
 export * from './demoTlc';
 export * from './elnSpreadsheet';
+export * from './predictor';
 
 import * as constants from './constants';
 import * as combinations from './combinations';

@@ -88,12 +88,44 @@ export async function deleteTlcSetImages(uid: string, keys: string[]): Promise<v
   });
 }
 
+export async function deleteAllSetImages(uid: string): Promise<void> {
+  const prefix = `${uid}/`;
+  const allKeys = await runTlcDbTx<IDBValidKey[]>('readonly', (store) => store.getAllKeys());
+  const keysToDelete: string[] = [];
+  if (Array.isArray(allKeys)) {
+    for (const k of allKeys) {
+      const str = String(k);
+      if (str.startsWith(prefix)) keysToDelete.push(str.slice(prefix.length));
+    }
+  }
+  const fallback = ['UV254', 'White', 'UV366', 'p1_UV254', 'p1_White', 'p1_UV366', 'p2_UV254', 'p2_White', 'p2_UV366'];
+  const unique = Array.from(new Set([...keysToDelete, ...fallback]));
+  await deleteTlcSetImages(uid, unique);
+}
+
 export async function getAllSetImages(
   uid: string,
-  keys: string[] = ['UV254', 'White', 'UV366']
+  extraKeys: string[] = []
 ): Promise<Array<{ uid: string; key: string; name: string; blob: Blob }>> {
+  const prefix = `${uid}/`;
+  const discovered = await runTlcDbTx<IDBValidKey[]>('readonly', (store) => store.getAllKeys());
+  const keysSet = new Set<string>(extraKeys);
+
+  if (Array.isArray(discovered) && discovered.length > 0) {
+    for (const fullKey of discovered) {
+      const str = String(fullKey);
+      if (str.startsWith(prefix)) {
+        keysSet.add(str.slice(prefix.length));
+      }
+    }
+  } else {
+    for (const k of ['UV254', 'White', 'UV366', 'p1_UV254', 'p1_White', 'p1_UV366', 'p2_UV254', 'p2_White', 'p2_UV366']) {
+      keysSet.add(k);
+    }
+  }
+
   const list: Array<{ uid: string; key: string; name: string; blob: Blob }> = [];
-  for (const k of keys) {
+  for (const k of keysSet) {
     const im = await getTlcImage(uid, k);
     if (im) {
       list.push({ uid, key: k, name: im.name, blob: im.blob });
@@ -103,11 +135,21 @@ export async function getAllSetImages(
 }
 
 export async function getImagesForSets(
-  sets: Array<{ uid: string }>
+  sets: Array<{ uid: string; plateData?: Record<number, { imgs?: Record<string, any> }>; imgs?: Record<string, any> }>
 ): Promise<Array<{ uid: string; key: string; name: string; blob: Blob }>> {
   const all: Array<{ uid: string; key: string; name: string; blob: Blob }> = [];
   for (const s of sets) {
-    const imgs = await getAllSetImages(s.uid);
+    const knownKeys: string[] = [];
+    for (const ch of Object.keys(s.imgs || {})) knownKeys.push(ch);
+    if (s.plateData) {
+      for (const [pStr, pd] of Object.entries(s.plateData)) {
+        const p = Number(pStr);
+        if (Number.isFinite(p) && p > 0 && pd?.imgs) {
+          for (const ch of Object.keys(pd.imgs)) knownKeys.push(`p${p}_${ch}`);
+        }
+      }
+    }
+    const imgs = await getAllSetImages(s.uid, knownKeys);
     all.push(...imgs);
   }
   return all;

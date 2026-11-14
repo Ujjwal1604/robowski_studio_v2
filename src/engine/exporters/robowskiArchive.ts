@@ -7,6 +7,7 @@ import { workbookBytes } from './xlsx';
 import { benchSheetHtml, deckSteps, stockSteps } from './benchSheet';
 import { stockCsv, loadCsv } from './csv';
 import { tlcLaneCsv } from '../tlcLanes';
+import { serializeTlcSet } from '../tlcPlateSlice';
 import { localDate } from '../constants';
 
 export interface RobowskiArchiveManifest {
@@ -89,21 +90,8 @@ export async function buildRobowskiArchive(
     },
   };
 
-  // Strip non-serializable ImageBitmap instances from TLC sets
-  const serializableSets = tlcSets.map((s) => ({
-    uid: s.uid,
-    name: s.name,
-    cfg: s.cfg,
-    cfgName: s.cfgName,
-    cfgText: s.cfgText,
-    frameW: s.frameW,
-    frontPx: s.frontPx,
-    frontAuto: s.frontAuto,
-    imgMeta: Object.entries(s.imgs || {}).map(([k, im]) => ({
-      key: k,
-      name: im.name,
-    })),
-  }));
+  // Strip non-serializable ImageBitmap instances from TLC sets (preserving all per-plate plateData)
+  const serializableSets = tlcSets.map((s) => serializeTlcSet(s));
 
   const wbBytes = workbookBytes({}, run);
   const benchHtml = benchSheetHtml(run, localDate());

@@ -33,6 +33,12 @@ import {
   exportLaneConfigCsv,
   getEffectiveLaneSpots,
   renderFalseColorLane,
+  getTlcPlateSlice,
+  updateTlcPlateSlice,
+  tlcStorageKey,
+  parseTlcStorageKey,
+  tlcSetPlateImageCount,
+  tlcSetPlateHasImages,
 } from '../../engine';
 import {
   fitEdgeCurve,
@@ -40,12 +46,12 @@ import {
   edgeGain,
   edgeOffset,
   edgeActive,
-  correctSpots,
   DEFAULT_EDGE_SETTING,
   EdgeFit,
   EdgeSetting,
   EdgePoint,
   EdgePick,
+  correctSpots,
 } from '../../engine/tlcEdge';
 import {
   TlcSet,
@@ -55,12 +61,13 @@ import {
   TlcSpot,
   TlcDensitogramData,
 } from '../../types';
-import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
+import { putTlcImage, deleteTlcSetImages, deleteAllSetImages, getAllSetImages } from '../../context/tlcStorage';
 import { detectLaneRows, laneConfigFromDetection } from '../../engine/tlcLaneDetect';
 import { TlcFullPlateView } from './TlcFullPlateView';
 import { parseWellQuery } from '../ui/CommandPalette';
 import { AiTlcInterpreter } from '../ui/AiTlcInterpreter';
 import { AiSolventAdvisorModal } from '../ui/AiSolventAdvisorModal';
+import { WellPredictedProductsPanel } from '../ui/WellPredictedProductsPanel';
 
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
@@ -429,6 +436,8 @@ export const TlcView: React.FC = () => {
     targetWell,
     setTargetWell,
     view,
+    setView,
+    setVisited,
     spotProminence,
     setSpotProminence,
     setState,
@@ -514,46 +523,95 @@ export const TlcView: React.FC = () => {
 
   const currentSet = sets[cur] || sets[0];
   const platesCount = run?.plates || 1;
+  const selectablePlatesCount = useMemo(() => {
+    let maxStored = 0;
+    for (const s of sets) {
+      if (s.plateData) {
+        for (const k of Object.keys(s.plateData)) {
+          const p = Number(k);
+          if (Number.isFinite(p) && p > maxStored) maxStored = p;
+        }
+      }
+    }
+    return Math.max(platesCount, maxStored + 1);
+  }, [platesCount, sets]);
   const isMultiSet = sets.length > 1;
 
-  // Restore saved images from IndexedDB on initial mount
+  useEffect(() => {
+    if (plate >= selectablePlatesCount) {
+      setPlate(0);
+    }
+  }, [plate, selectablePlatesCount]);
+
+  const activePlateSet = useMemo(
+    () => getTlcPlateSlice(currentSet, plate),
+    [currentSet, plate]
+  );
+
+  const plateSets = useMemo(
+    () => sets.map((s) => getTlcPlateSlice(s, plate)),
+    [sets, plate]
+  );
+
+  useEffect(() => {
+    if (fullPlateChannel === 'composite') {
+      if (!activePlateSet.imgs?.UV254 || !activePlateSet.imgs?.UV366) {
+        const firstAvail = TLC_KEYS.find((k) => Boolean(activePlateSet.imgs?.[k]));
+        if (firstAvail) setFullPlateChannel(firstAvail);
+      }
+    } else if (!activePlateSet.imgs?.[fullPlateChannel]) {
+      const firstAvail = TLC_KEYS.find((k) => Boolean(activePlateSet.imgs?.[k]));
+      if (firstAvail) setFullPlateChannel(firstAvail);
+    }
+  }, [activePlateSet, fullPlateChannel]);
+
+  const setUidsKey = sets.map((s) => s.uid).join('|');
+
+  // Restore saved images from IndexedDB (all plates) on mount or when run/set UIDs change
   useEffect(() => {
     let cancelled = false;
     const restoreCachedImages = async () => {
       let anyLoaded = false;
-      const loadedBySet: Record<number, Partial<Record<TlcChannelKey, TlcImageEntry>>> = {};
+      const loadedBySetPlate: Array<{ sIdx: number; pIdx: number; channel: string; entry: TlcImageEntry }> = [];
 
       for (let sIdx = 0; sIdx < sets.length; sIdx++) {
         const s = sets[sIdx];
-        for (const k of TLC_KEYS) {
-          if (!s.imgs[k]) {
-            try {
-              const cached = await getTlcImage(s.uid, k);
-              if (cached && !cancelled) {
+        try {
+          const cachedAll = await getAllSetImages(s.uid);
+          for (const cached of cachedAll) {
+            if (cancelled) return;
+            const { plateIndex: pIdx, channel } = parseTlcStorageKey(cached.key);
+            const slice = getTlcPlateSlice(s, pIdx);
+            if (!slice.imgs?.[channel]) {
+              try {
                 const bmp = await createImageBitmap(cached.blob);
                 if (!cancelled) {
-                  if (!loadedBySet[sIdx]) loadedBySet[sIdx] = {};
-                  loadedBySet[sIdx][k] = { name: cached.name, bmp };
+                  loadedBySetPlate.push({
+                    sIdx,
+                    pIdx,
+                    channel,
+                    entry: { name: cached.name, bmp },
+                  });
                   anyLoaded = true;
                 }
+              } catch {
+                // soft fail
               }
-            } catch {
-              // soft fail
             }
           }
+        } catch {
+          // soft fail
         }
       }
 
       if (anyLoaded && !cancelled) {
         setSets((prev) => {
           const next = [...prev];
-          for (const [idxStr, imgs] of Object.entries(loadedBySet)) {
-            const idx = Number(idxStr);
-            if (next[idx]) {
-              next[idx] = {
-                ...next[idx],
-                imgs: { ...next[idx].imgs, ...imgs },
-              };
+          for (const item of loadedBySetPlate) {
+            if (next[item.sIdx]) {
+              next[item.sIdx] = updateTlcPlateSlice(next[item.sIdx], item.pIdx, (slice) => ({
+                imgs: { ...(slice.imgs || {}), [item.channel]: item.entry },
+              }));
             }
           }
           return next;
@@ -564,9 +622,9 @@ export const TlcView: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [sets.length, setSets]);
+  }, [setUidsKey, setSets]);
 
-  // Load Lane Config CSV
+  // Load Lane Config CSV (scoped to active plate)
   const handleLoadCsv = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -575,8 +633,7 @@ export const TlcView: React.FC = () => {
       const cfg = parseLaneConfig(text);
       setSets((prev) => {
         const next = [...prev];
-        next[cur] = {
-          ...next[cur],
+        next[cur] = updateTlcPlateSlice(next[cur], plate, {
           cfg,
           cfgName: file.name,
           cfgText: text,
@@ -584,11 +641,11 @@ export const TlcView: React.FC = () => {
           frontAuto: {},
           originAuto: {},
           originAutoByLane: {},
-        };
+        });
         return next;
       });
       toast(
-        `Read ${cfg.lanes.length} lanes from ${file.name}.${
+        `Read ${cfg.lanes.length} lanes for Plate ${plate + 1} from ${file.name}.${
           cfg.warnings.length ? ' ' + cfg.warnings[0] : ''
         }`
       );
@@ -598,19 +655,19 @@ export const TlcView: React.FC = () => {
     e.target.value = '';
   };
 
-  // Load Plate Images (UV254, White, UV366)
+  // Load Plate Images (UV254, White, UV366) scoped to active plate
   const handleLoadImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
     if (!files.length) return;
-    toast('Reading plate images…');
+    toast(`Reading Plate ${plate + 1} images…`);
 
     let loadedCount = 0;
-    const newImgs: Record<string, TlcImageEntry> = { ...currentSet.imgs };
+    const newImgs: Record<string, TlcImageEntry> = { ...activePlateSet.imgs };
 
     for (const f of files) {
       const key = tlcKeyOf(f.name, newImgs);
       if (!key) {
-        toast(`Could not allocate channel for ${f.name}. All 3 channels (UV254, UV366, White) are already filled.`);
+        toast(`Could not allocate channel for ${f.name}. All 3 channels (UV254, UV366, White) are already filled on Plate ${plate + 1}.`);
         continue;
       }
       try {
@@ -620,8 +677,8 @@ export const TlcView: React.FC = () => {
         }
         newImgs[key] = { name: f.name, bmp };
         loadedCount++;
-        // Persist to IndexedDB
-        putTlcImage(currentSet.uid, key, f.name, f);
+        // Persist to IndexedDB under plate-scoped key
+        putTlcImage(currentSet.uid, tlcStorageKey(key, plate), f.name, f);
       } catch (err: any) {
         toast(`Could not open ${f.name}: ${err.message || err}`);
       }
@@ -630,37 +687,36 @@ export const TlcView: React.FC = () => {
     if (loadedCount > 0) {
       setSets((prev) => {
         const next = [...prev];
-        next[cur] = {
-          ...next[cur],
+        next[cur] = updateTlcPlateSlice(next[cur], plate, {
           imgs: newImgs,
           prof: {},
           frontAuto: {},
           originAuto: {},
           originAutoByLane: {},
-        };
+        });
         return next;
       });
       setShow((prev) => ({ ...prev, UV254: true, UV366: true, White: true }));
       toast(
-        currentSet.cfg
-          ? `Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}.`
-          : `Loaded ${loadedCount} plate image${loadedCount === 1 ? '' : 's'}. Choose a Lane CSV to view sliced lanes and calculate Rf.`
+        activePlateSet.cfg
+          ? `Loaded ${loadedCount} image${loadedCount === 1 ? '' : 's'} into Plate ${plate + 1}.`
+          : `Loaded ${loadedCount} image${loadedCount === 1 ? '' : 's'} into Plate ${plate + 1}. Run Auto-detect lanes, Copy Lanes from Plate 1, or load a Lane CSV.`
       );
     }
     e.target.value = '';
   };
 
-  // Find the lanes automatically from the two rows of origin dots (tries every loaded image, keeps the best).
+  // Find the lanes automatically from the two rows of origin dots (scoped to active plate).
   const handleAutoDetectLanes = () => {
-    const keys = TLC_KEYS.filter((k) => currentSet.imgs[k]?.bmp);
+    const keys = TLC_KEYS.filter((k) => activePlateSet.imgs[k]?.bmp);
     if (!keys.length) {
-      toast('Load a plate image first.');
+      toast(`Load a Plate ${plate + 1} image first.`);
       return;
     }
     try {
       let best: { det: ReturnType<typeof detectLaneRows>; key: TlcChannelKey } | null = null;
       for (const k of keys) {
-        const bmp = currentSet.imgs[k]!.bmp;
+        const bmp = activePlateSet.imgs[k]!.bmp;
         const w = Math.min(bmp.width, 1300);
         const h = Math.max(1, Math.round((bmp.height * w) / bmp.width));
         const cv = document.createElement('canvas');
@@ -676,15 +732,20 @@ export const TlcView: React.FC = () => {
         toast('Could not find the origin dots. Try a plate image where they show clearly (UV 254 works best).');
         return;
       }
-      const frameW = currentSet.frameW || LANE_FRAME_WIDTH;
+      const frameW = activePlateSet.frameW || LANE_FRAME_WIDTH;
       const cfg = laneConfigFromDetection(best.det, frameW);
-      const prev = currentSet.cfg;
-      if (prev) setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(prev))]);
-      originalCfgRef.current[currentSet.uid] = JSON.parse(JSON.stringify(cfg));
+      const prev = activePlateSet.cfg;
+      const pKey = `${currentSet.uid}:p${plate}`;
+      if (prev) {
+        setCfgHistoryByPlate((m) => ({
+          ...m,
+          [pKey]: [...(m[pKey] || []).slice(-39), JSON.parse(JSON.stringify(prev))],
+        }));
+      }
+      originalCfgRef.current[pKey] = JSON.parse(JSON.stringify(cfg));
       setSets((all) => {
         const next = [...all];
-        next[cur] = {
-          ...next[cur],
+        next[cur] = updateTlcPlateSlice(next[cur], plate, {
           cfg,
           cfgName: 'Auto-detected lanes',
           cfgText: undefined,
@@ -697,39 +758,62 @@ export const TlcView: React.FC = () => {
           frontAuto: {},
           originAuto: {},
           originAutoByLane: {},
-        };
+        });
         return next;
       });
       const pct = Math.round(best.det.confidence * 100);
       const note = best.det.warnings[0] ? ' ' + best.det.warnings[0] : '';
       toast(
         best.det.ok
-          ? `Lanes detected from ${TLC_LABEL[best.key]} (confidence ${pct}%).${note}`
-          : `Lanes placed from ${TLC_LABEL[best.key]}, but confidence is low (${pct}%). Check them by eye.${note}`
+          ? `Plate ${plate + 1} lanes detected from ${TLC_LABEL[best.key]} (confidence ${pct}%).${note}`
+          : `Plate ${plate + 1} lanes placed from ${TLC_LABEL[best.key]}, but confidence is low (${pct}%). Check them by eye.${note}`
       );
     } catch (err: any) {
       toast('Lane detection failed: ' + (err?.message || err));
     }
   };
 
-  // Apply Default Standard 54-Lane 6x9 Grid
+  // Apply Default Standard 54-Lane 6x9 Grid (scoped to active plate)
   const handleApplyDefaultGrid = () => {
-    const frameW = currentSet.frameW || LANE_FRAME_WIDTH;
+    const frameW = activePlateSet.frameW || LANE_FRAME_WIDTH;
     const cfg = createDefaultLaneConfig(frameW, 'two-tier');
     setSets((prev) => {
       const next = [...prev];
-      next[cur] = {
-        ...next[cur],
+      next[cur] = updateTlcPlateSlice(next[cur], plate, {
         cfg,
         cfgName: 'Standard 6×9 Grid (54 Lanes)',
         prof: {},
         frontAuto: {},
         originAuto: {},
         originAutoByLane: {},
-      };
+      });
       return next;
     });
-    toast('Applied standard 54-lane TLC grid (27 + 27 two-tier layout).');
+    toast(`Applied standard 54-lane TLC grid to Plate ${plate + 1}.`);
+  };
+
+  // Copy calibrated lane geometry from Plate 1 to current plate
+  const handleCopyLanesFromPlate1 = () => {
+    const p1 = getTlcPlateSlice(currentSet, 0);
+    if (!p1.cfg || plate === 0) return;
+    const clonedCfg: TlcLaneConfig = JSON.parse(JSON.stringify(p1.cfg));
+    const pKey = `${currentSet.uid}:p${plate}`;
+    originalCfgRef.current[pKey] = JSON.parse(JSON.stringify(clonedCfg));
+    setSets((prev) => {
+      const next = [...prev];
+      next[cur] = updateTlcPlateSlice(next[cur], plate, {
+        cfg: clonedCfg,
+        cfgName: `${p1.cfgName || 'Lanes'} (from Plate 1)`,
+        cfgText: p1.cfgText,
+        frameW: p1.frameW || LANE_FRAME_WIDTH,
+        prof: {},
+        frontAuto: {},
+        originAuto: {},
+        originAutoByLane: {},
+      });
+      return next;
+    });
+    toast(`Copied Plate 1 lane geometry to Plate ${plate + 1}.`);
   };
 
   // Load Synthetic Demo TLC Plate as a new, separate set
@@ -780,8 +864,13 @@ export const TlcView: React.FC = () => {
   const handleRemoveSetIndex = (indexToRemove: number) => {
     const setToRemove = sets[indexToRemove];
     if (!setToRemove) return;
-    Object.values(setToRemove.imgs).forEach((im) => im.bmp?.close && im.bmp.close());
-    deleteTlcSetImages(setToRemove.uid, Object.keys(setToRemove.imgs));
+    Object.values(setToRemove.imgs || {}).forEach((im) => im.bmp?.close && im.bmp.close());
+    if (setToRemove.plateData) {
+      Object.values(setToRemove.plateData).forEach((pd) => {
+        Object.values(pd?.imgs || {}).forEach((im) => im.bmp?.close && im.bmp.close());
+      });
+    }
+    deleteAllSetImages(setToRemove.uid);
 
     if (sets.length > 1) {
       setSets((prev) => prev.filter((_, i) => i !== indexToRemove));
@@ -802,50 +891,33 @@ export const TlcView: React.FC = () => {
     }
   };
 
-  // Remove individual channel image from current set
+  // Remove individual channel image from active plate of current set
   const handleRemoveImage = (key: TlcChannelKey) => {
-    const im = currentSet.imgs[key];
+    const im = activePlateSet.imgs[key];
     if (im?.bmp?.close) im.bmp.close();
-    deleteTlcSetImages(currentSet.uid, [key]);
+    deleteTlcSetImages(currentSet.uid, [tlcStorageKey(key, plate)]);
     setSets((prev) => {
       const next = [...prev];
-      const newImgs = { ...next[cur].imgs };
-      delete newImgs[key];
-      next[cur] = {
-        ...next[cur],
-        imgs: newImgs,
-        prof: {},
-        frontAuto: {},
-        originAuto: {},
-        originAutoByLane: {},
-      };
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        const newImgs = { ...slice.imgs };
+        delete newImgs[key];
+        return {
+          imgs: newImgs,
+          prof: {},
+          frontAuto: {},
+          originAuto: {},
+          originAutoByLane: {},
+        };
+      });
       return next;
     });
-    toast(`Removed ${TLC_LABEL[key]} image.`);
+    toast(`Removed ${TLC_LABEL[key]} image from Plate ${plate + 1}.`);
   };
 
-  // ---- Edge-effect correction (fitted per half of every set) ----
-  const [edgeSettings, setEdgeSettings] = useState<Record<string, EdgeSetting>>(() => {
-    const init: Record<string, EdgeSetting> = {};
-    for (const s of sets) {
-      if (s.edgeSettings) {
-        if (s.edgeSettings[0]) init[`${s.uid}:0`] = s.edgeSettings[0];
-        if (s.edgeSettings[1]) init[`${s.uid}:1`] = s.edgeSettings[1];
-      }
-    }
-    return init;
-  });
-  // Spots picked as 'same compound' per set; group = which compound
-  const [edgePicks, setEdgePicks] = useState<Record<string, EdgePick[]>>(() => {
-    const init: Record<string, EdgePick[]> = {};
-    for (const s of sets) {
-      if (s.edgePicks) init[s.uid] = s.edgePicks;
-    }
-    return init;
-  });
+  // ---- Edge-effect correction (fitted per half of each plate inside every set) ----
   const [pickMode, setPickMode] = useState(false);
   const [pickGroup, setPickGroup] = useState(0);
-  const edgeCache = useRef(new WeakMap<TlcSet, { key: string; fits: (EdgeFit | null)[] }>());
+  const edgeCache = useRef(new Map<string, { key: string; fits: (EdgeFit | null)[] }>());
 
   const detectOptsFor = useCallback(
     (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => {
@@ -871,9 +943,10 @@ export const TlcView: React.FC = () => {
 
   const getEdgeFits = useCallback(
     (set: TlcSet): (EdgeFit | null)[] => {
-      const picks = edgePicks[set.uid] || [];
-      const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs).join()}`;
-      const hit = edgeCache.current.get(set);
+      const picks = set.edgePicks || [];
+      const cacheMapKey = `${set.uid}:p${plate}`;
+      const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
+      const hit = edgeCache.current.get(cacheMapKey);
       if (hit && hit.key === key) return hit.fits;
       const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
       let fits: (EdgeFit | null)[] = [null, null];
@@ -911,60 +984,62 @@ export const TlcView: React.FC = () => {
           return auto[h].length ? fitEdgeCurve(auto[h]) : null;
         });
       }
-      edgeCache.current.set(set, { key, fits });
+      if (edgeCache.current.size > 40) edgeCache.current.clear();
+      edgeCache.current.set(cacheMapKey, { key, fits });
       return fits;
     },
-    [spotProminence, coreFraction, edgePicks, detectOptsFor]
+    [plate, spotProminence, coreFraction, detectOptsFor]
   );
 
   const handlePickSpot = useCallback(
     (laneId: number, pos: number) => {
       const uid = currentSet.uid;
-      const cur = edgePicks[uid] || [];
-      const same = cur.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
+      const curPicks = activePlateSet.edgePicks || [];
+      const same = curPicks.findIndex((q) => q.lane === laneId && Math.abs(q.pos - pos) < 6);
       let updated: EdgePick[];
       // clicking a picked spot again removes it
       if (same >= 0) {
-        updated = cur.filter((_, i) => i !== same);
+        updated = curPicks.filter((_, i) => i !== same);
       } else {
         // one pick per lane and compound
-        const rest = cur.filter((q) => !(q.lane === laneId && q.group === pickGroup));
+        const rest = curPicks.filter((q) => !(q.lane === laneId && q.group === pickGroup));
         updated = [...rest, { lane: laneId, pos, group: pickGroup }];
       }
-      setEdgePicks((prev) => ({ ...prev, [uid]: updated }));
       setSets((allSets) =>
-        allSets.map((s) => (s.uid === uid ? { ...s, edgePicks: updated } : s))
+        allSets.map((s) =>
+          s.uid === uid ? updateTlcPlateSlice(s, plate, { edgePicks: updated }) : s
+        )
       );
     },
-    [currentSet.uid, edgePicks, pickGroup, setSets]
+    [currentSet.uid, activePlateSet.edgePicks, pickGroup, plate, setSets]
   );
 
   const handleEdgeSetting = useCallback(
     (h: number, st: EdgeSetting) => {
       const uid = currentSet.uid;
-      setEdgeSettings((prev) => ({ ...prev, [`${uid}:${h}`]: st }));
       setSets((prev) =>
         prev.map((s) =>
           s.uid === uid
-            ? { ...s, edgeSettings: { ...(s.edgeSettings || {}), [h]: st } }
+            ? updateTlcPlateSlice(s, plate, (slice) => ({
+                edgeSettings: { ...(slice.edgeSettings || {}), [h]: st },
+              }))
             : s
         )
       );
     },
-    [currentSet.uid, setSets]
+    [currentSet.uid, plate, setSets]
   );
 
   const handleClearPicks = useCallback(() => {
     const uid = currentSet.uid;
-    setEdgePicks((prev) => ({ ...prev, [uid]: [] }));
     setSets((prev) =>
-      prev.map((s) => (s.uid === uid ? { ...s, edgePicks: [] } : s))
+      prev.map((s) => (s.uid === uid ? updateTlcPlateSlice(s, plate, { edgePicks: [] }) : s))
     );
-  }, [currentSet.uid, setSets]);
+  }, [currentSet.uid, plate, setSets]);
 
   const edgeSettingFor = useCallback(
-    (set: TlcSet, half: number): EdgeSetting => edgeSettings[`${set.uid}:${half}`] || DEFAULT_EDGE_SETTING,
-    [edgeSettings]
+    (set: TlcSet, half: number): EdgeSetting => set.edgeSettings?.[half] || DEFAULT_EDGE_SETTING,
+    []
   );
 
   // Get Spots helper for a set, channel, and lane with center-weighted core sampling.
@@ -992,7 +1067,7 @@ export const TlcView: React.FC = () => {
   const getPanelsForLane = useCallback(
     (t: number): LanePanel[] => {
       if (compare && isMultiSet) {
-        return sets
+        return plateSets
           .map((s, idx): LanePanel | null => {
             const lane = s.cfg?.lanes.find((l) => l.id === t);
             if (!lane || !s.imgs[cmpKey]) return null;
@@ -1009,7 +1084,7 @@ export const TlcView: React.FC = () => {
           .filter((p): p is LanePanel => p !== null);
       }
 
-      const s = currentSet;
+      const s = activePlateSet;
       return TLC_KEYS.filter((k) => s.imgs[k] && show[k])
         .map((k): LanePanel | null => {
           const lane = s.cfg?.lanes.find((l) => l.id === t);
@@ -1026,48 +1101,48 @@ export const TlcView: React.FC = () => {
         })
         .filter((p): p is LanePanel => p !== null);
     },
-    [compare, isMultiSet, sets, cmpKey, currentSet, cur, show, markSpots, getSpotsForLane]
+    [compare, isMultiSet, plateSets, cmpKey, activePlateSet, cur, show, markSpots, getSpotsForLane]
   );
 
   // Big modal inspection drawing: UV 254, UV 365 Fluorescence, and Composite side by side
   const inspectPanels = useMemo(() => {
-    if (inspectWell === null || !currentSet.cfg) return [];
+    if (inspectWell === null || !activePlateSet.cfg) return [];
     const t = tlcLane(inspectWell, 'column');
-    const lane = currentSet.cfg.lanes.find((l) => l.id === t);
+    const lane = activePlateSet.cfg.lanes.find((l) => l.id === t);
     if (!lane) return [];
 
     // Individual channel view (if user explicitly chooses only one channel)
-    if (densViewMode === 'UV254' && currentSet.imgs.UV254) {
+    if (densViewMode === 'UV254' && activePlateSet.imgs.UV254) {
       return [{
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'UV254' as TlcChannelKey,
         lane,
         label: 'UV 254 nm',
         channelTitle: 'UV 254 (Absorbance)',
-        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
       }];
     }
-    if (densViewMode === 'UV366' && currentSet.imgs.UV366) {
+    if (densViewMode === 'UV366' && activePlateSet.imgs.UV366) {
       return [{
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'UV366' as TlcChannelKey,
         lane,
         label: 'UV 365 nm',
         channelTitle: 'UV 365 (Fluorescence)',
-        spots: markSpots ? getSpotsForLane(currentSet, 'UV366', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV366', lane) : null,
       }];
     }
-    if (densViewMode === 'White' && currentSet.imgs.White) {
+    if (densViewMode === 'White' && activePlateSet.imgs.White) {
       return [{
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'White' as TlcChannelKey,
         lane,
         label: 'Visible',
         channelTitle: 'Visible Stain',
-        spots: markSpots ? getSpotsForLane(currentSet, 'White', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'White', lane) : null,
       }];
     }
 
@@ -1075,60 +1150,60 @@ export const TlcView: React.FC = () => {
     const panels: Array<LanePanel & { isComposite?: boolean; channelTitle?: string }> = [];
 
     // 1. UV 254 nm Absorbance (Quenching)
-    if (currentSet.imgs.UV254) {
+    if (activePlateSet.imgs.UV254) {
       panels.push({
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'UV254',
         lane,
         label: 'UV 254 nm',
         channelTitle: 'UV 254 (Absorbance)',
-        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
       });
     }
 
     // 2. UV 365 nm Fluorescence
-    if (currentSet.imgs.UV366) {
+    if (activePlateSet.imgs.UV366) {
       panels.push({
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'UV366',
         lane,
         label: 'UV 365 nm',
         channelTitle: 'UV 365 (Fluorescence)',
-        spots: markSpots ? getSpotsForLane(currentSet, 'UV366', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV366', lane) : null,
       });
     }
 
     // 3. Dual-Channel False-Color Composite Overlay
-    if (currentSet.imgs.UV254 && currentSet.imgs.UV366) {
+    if (activePlateSet.imgs.UV254 && activePlateSet.imgs.UV366) {
       panels.push({
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'UV254',
         lane,
         label: '✨ Composite',
         channelTitle: '✨ Composite (Overlay)',
         isComposite: true,
-        spots: markSpots ? getSpotsForLane(currentSet, 'UV254', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
       });
     }
 
     // 4. Visible Light / Stain (if present)
-    if (currentSet.imgs.White) {
+    if (activePlateSet.imgs.White) {
       panels.push({
-        s: currentSet,
+        s: activePlateSet,
         i: cur,
         key: 'White',
         lane,
         label: 'Visible',
         channelTitle: 'Visible (Stain)',
-        spots: markSpots ? getSpotsForLane(currentSet, 'White', lane) : null,
+        spots: markSpots ? getSpotsForLane(activePlateSet, 'White', lane) : null,
       });
     }
 
     return panels.length > 0 ? panels : getPanelsForLane(t);
-  }, [inspectWell, currentSet, cur, densViewMode, markSpots, getSpotsForLane, getPanelsForLane]);
+  }, [inspectWell, activePlateSet, cur, densViewMode, markSpots, getSpotsForLane, getPanelsForLane]);
 
   // Memoized panels for all 54 wells in the plate grid (only computed when viewing 54-well grid)
   const allPanels = useMemo(() => {
@@ -1193,9 +1268,9 @@ export const TlcView: React.FC = () => {
 
   // Keyboard listener inside well inspection modal for instant nudging and tilt
   useEffect(() => {
-    if (inspectWell === null || !currentSet.cfg) return;
+    if (inspectWell === null || !activePlateSet.cfg) return;
     const laneId = tlcLane(inspectWell, 'column');
-    const targetLane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+    const targetLane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
     if (!targetLane) return;
 
     const handleModalKeyDown = (e: KeyboardEvent) => {
@@ -1255,7 +1330,7 @@ export const TlcView: React.FC = () => {
 
     window.addEventListener('keydown', handleModalKeyDown);
     return () => window.removeEventListener('keydown', handleModalKeyDown);
-  }, [inspectWell, currentSet.cfg]);
+  }, [inspectWell, activePlateSet.cfg]);
 
   // Handle Mouse Move on Enlarged Canvas or Densitometer with Intelligent Peak Snapping
   const handleCanvasMouseMove = (e: React.MouseEvent<any>) => {
@@ -1408,14 +1483,14 @@ export const TlcView: React.FC = () => {
 
   // Export current TLC plate analysis data as CSV or JSON
   const handleExportAnalysis = (format: 'csv' | 'json', scope: 'current' | 'all' = 'current') => {
-    if (!currentSet.cfg && !hasConfig) {
+    if (!activePlateSet.cfg && !hasConfig) {
       toast('Please configure or generate lane grid before exporting analysis.');
       return;
     }
     try {
       const opts: TlcAnalysisExportOptions = {
-        set: currentSet,
-        sets,
+        set: activePlateSet,
+        sets: plateSets,
         run,
         plateIndex: plate,
         getSpots: getSpotsForLane,
@@ -1436,13 +1511,13 @@ export const TlcView: React.FC = () => {
       const baseName = (run?.runName || currentSet.name || 'tlc_plate')
         .toLowerCase()
         .replace(/[^a-z0-9_-]/g, '_');
-      const scopeSuffix = scope === 'all' ? 'all_sets' : `plate_${plate + 1}`;
+      const scopeSuffix = scope === 'all' ? `plate_${plate + 1}_all_sets` : `plate_${plate + 1}`;
       a.download = `tlc_analysis_${baseName}_${scopeSuffix}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast(`Exported TLC plate analysis (${ext.toUpperCase()}).`);
+      toast(`Exported Plate ${plate + 1} TLC analysis (${ext.toUpperCase()}).`);
     } catch (err: any) {
       toast(`Export failed: ${err.message || err}`);
     }
@@ -1451,49 +1526,59 @@ export const TlcView: React.FC = () => {
   // Download Batch tlc_rf_table.csv
   const handleDownloadRfCsv = () => handleExportAnalysis('csv', 'current');
 
-  // Undo history stack for lane configurations
-  const [cfgHistory, setCfgHistory] = useState<TlcLaneConfig[]>([]);
+  // Undo history stack for lane configurations (per set + plate)
+  const [cfgHistoryByPlate, setCfgHistoryByPlate] = useState<Record<string, TlcLaneConfig[]>>({});
   const originalCfgRef = useRef<Record<string, TlcLaneConfig>>({});
+  const plateCfgKey = `${currentSet.uid}:p${plate}`;
+  const cfgHistory = cfgHistoryByPlate[plateCfgKey] || [];
 
   // Capture original configuration for resetting
   useEffect(() => {
-    if (currentSet?.cfg && !originalCfgRef.current[currentSet.uid]) {
-      originalCfgRef.current[currentSet.uid] = JSON.parse(JSON.stringify(currentSet.cfg));
+    if (activePlateSet?.cfg && !originalCfgRef.current[plateCfgKey]) {
+      originalCfgRef.current[plateCfgKey] = JSON.parse(JSON.stringify(activePlateSet.cfg));
     }
-  }, [currentSet?.uid, currentSet?.cfg]);
+  }, [plateCfgKey, activePlateSet?.cfg]);
 
   const lastHistorySnapshotRef = useRef<number>(0);
 
   // Take explicit undo history snapshot (e.g. on slider grab or key press)
   const handleSnapshotHistory = useCallback(() => {
-    if (!currentSet?.cfg) return;
-    setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg!))]);
+    if (!activePlateSet?.cfg) return;
+    const snapCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+    setCfgHistoryByPlate((m) => ({
+      ...m,
+      [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), snapCfg],
+    }));
     lastHistorySnapshotRef.current = Date.now();
-  }, [currentSet?.cfg]);
+  }, [activePlateSet?.cfg, plateCfgKey]);
 
   // Real-time micro-adjustment of lane coordinates with smart debounced Undo history
   const handleUpdateLane = (laneId: number, patch: Partial<TlcLane>, forceSnapshot: boolean = false) => {
-    if (!currentSet?.cfg) return;
+    if (!activePlateSet?.cfg) return;
     const now = Date.now();
     // Snapshot history once at the start of a slide or after 500ms pause, or if forced
     if (forceSnapshot || now - lastHistorySnapshotRef.current > 500) {
-      const currentCfg = currentSet.cfg;
-      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentCfg))]);
+      const currentCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+      setCfgHistoryByPlate((m) => ({
+        ...m,
+        [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), currentCfg],
+      }));
       lastHistorySnapshotRef.current = now;
     }
     setSets((prev) => {
       const next = [...prev];
-      const cfg = next[cur]?.cfg;
-      if (!cfg) return next;
-      const newLanes = cfg.lanes.map((l) => (l.id === laneId ? { ...l, ...patch } : l));
-      next[cur] = {
-        ...next[cur],
-        cfg: { ...cfg, lanes: newLanes },
-        prof: {}, // invalidate cached sampled profile so it re-slices at new coordinates
-        frontAuto: {},
-        originAuto: {},
-        originAutoByLane: {},
-      };
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        if (!slice.cfg) return {};
+        const newLanes = slice.cfg.lanes.map((l) => (l.id === laneId ? { ...l, ...patch } : l));
+        return {
+          cfg: { ...slice.cfg, lanes: newLanes },
+          prof: {},
+          frontAuto: {},
+          originAuto: {},
+          originAutoByLane: {},
+        };
+      });
       return next;
     });
   };
@@ -1502,17 +1587,20 @@ export const TlcView: React.FC = () => {
   const handleUndo = () => {
     if (cfgHistory.length === 0) return;
     const prevCfg = cfgHistory[cfgHistory.length - 1];
-    setCfgHistory((h) => h.slice(0, -1));
+    setCfgHistoryByPlate((m) => ({
+      ...m,
+      [plateCfgKey]: (m[plateCfgKey] || []).slice(0, -1),
+    }));
     setSets((prev) => {
       const next = [...prev];
-      next[cur] = {
-        ...next[cur],
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, {
         cfg: prevCfg,
         prof: {},
         frontAuto: {},
         originAuto: {},
         originAutoByLane: {},
-      };
+      });
       return next;
     });
     toast('Reverted last adjustment (Undo).');
@@ -1520,7 +1608,7 @@ export const TlcView: React.FC = () => {
 
   // Reset single lane to its original template configuration
   const handleResetLane = (laneId: number) => {
-    const origSetCfg = originalCfgRef.current[currentSet.uid];
+    const origSetCfg = originalCfgRef.current[plateCfgKey];
     if (!origSetCfg) {
       toast('No original lane template recorded.');
       return;
@@ -1531,58 +1619,60 @@ export const TlcView: React.FC = () => {
     toast(`Reset Lane ${laneId} to original template.`);
   };
 
-  // Reset all lanes in the set to their original template configuration
+  // Reset all lanes in the current plate to their original template configuration
   const handleResetAllLanes = () => {
-    const origSetCfg = originalCfgRef.current[currentSet.uid];
+    const origSetCfg = originalCfgRef.current[plateCfgKey];
     if (!origSetCfg) {
       toast('No original lane template recorded.');
       return;
     }
-    if (currentSet.cfg) {
-      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg))]);
+    if (activePlateSet.cfg) {
+      const snapCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+      setCfgHistoryByPlate((m) => ({
+        ...m,
+        [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), snapCfg],
+      }));
     }
     setSets((prev) => {
       const next = [...prev];
-      next[cur] = {
-        ...next[cur],
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, {
         cfg: JSON.parse(JSON.stringify(origSetCfg)),
         prof: {},
         frontAuto: {},
         originAuto: {},
         originAutoByLane: {},
-      };
+      });
       return next;
     });
-    toast('Reset all lanes to original configuration.');
+    toast(`Reset all Plate ${plate + 1} lanes to original configuration.`);
   };
 
   // Solvent front update (moves meniscus baseline across the plate or for a specific side)
   const handleUpdateSetFront = (frontPx: number | null, side?: number) => {
     setSets((prev) => {
       const next = [...prev];
-      const target = next[cur];
-      if (!target) return next;
-      if (side !== undefined) {
-        const nextHalfFront = { ...(target.frontHalfPx || {}) };
-        if (frontPx != null && frontPx > 0) {
-          nextHalfFront[side] = frontPx;
-        } else {
-          delete nextHalfFront[side];
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        if (side !== undefined) {
+          const nextHalfFront = { ...(slice.frontHalfPx || {}) };
+          if (frontPx != null && frontPx > 0) {
+            nextHalfFront[side] = frontPx;
+          } else {
+            delete nextHalfFront[side];
+          }
+          return {
+            frontHalfPx: nextHalfFront,
+            prof: {},
+            frontAuto: {},
+          };
         }
-        next[cur] = {
-          ...target,
-          frontHalfPx: nextHalfFront,
-          prof: {},
-          frontAuto: {},
-        };
-      } else {
-        next[cur] = {
-          ...target,
+        return {
           frontPx: frontPx != null && frontPx > 0 ? frontPx : null,
           prof: {},
           frontAuto: {},
         };
-      }
+      });
       return next;
     });
   };
@@ -1593,34 +1683,38 @@ export const TlcView: React.FC = () => {
       toast('Load a plate photo first.');
       return;
     }
-    if (currentSet.cfg) {
-      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg!))]);
+    if (activePlateSet.cfg) {
+      const snapCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+      setCfgHistoryByPlate((m) => ({
+        ...m,
+        [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), snapCfg],
+      }));
     }
     setSets((prev) => {
       const next = [...prev];
-      const curSet = next[cur];
-      if (!curSet) return next;
-      const nextCfg = curSet.cfg
-        ? {
-            ...curSet.cfg,
-            hasZeroRf: false,
-            lanes: curSet.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
-          }
-        : curSet.cfg;
-      next[cur] = {
-        ...curSet,
-        cfg: nextCfg,
-        originPx: null,
-        frontPx: null,
-        frontHalfPx: undefined,
-        prof: {},
-        frontAuto: {},
-        originAuto: {},
-        originAutoByLane: {},
-      };
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        const nextCfg = slice.cfg
+          ? {
+              ...slice.cfg,
+              hasZeroRf: false,
+              lanes: slice.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+            }
+          : slice.cfg;
+        return {
+          cfg: nextCfg,
+          originPx: null,
+          frontPx: null,
+          frontHalfPx: undefined,
+          prof: {},
+          frontAuto: {},
+          originAuto: {},
+          originAutoByLane: {},
+        };
+      });
       return next;
     });
-    toast('Re-detected origin baseline and solvent front from plate photos.');
+    toast(`Re-detected Plate ${plate + 1} origin baseline and solvent front from plate photos.`);
   };
 
   // Global Ctrl+Z / Cmd+Z shortcut for Undo
@@ -1641,29 +1735,30 @@ export const TlcView: React.FC = () => {
 
   // Export current (or corrected) Lane CSV
   const handleExportLaneCsv = () => {
-    if (!currentSet.cfg) {
+    if (!activePlateSet.cfg) {
       toast('No lane configuration to export.');
       return;
     }
     try {
-      const csvContent = exportLaneConfigCsv(currentSet.cfg);
+      const csvContent = exportLaneConfigCsv(activePlateSet.cfg);
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `lane_config_${currentSet.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_corrected.csv`;
+      const plateTag = selectablePlatesCount > 1 ? `_plate_${plate + 1}` : '';
+      a.download = `lane_config_${currentSet.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}${plateTag}_corrected.csv`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast('Exported corrected lane CSV.');
+      toast(`Exported Plate ${plate + 1} corrected lane CSV.`);
     } catch (err: any) {
       toast('Error exporting lane CSV: ' + err.message);
     }
   };
 
-  const hasConfig = Boolean(currentSet.cfg);
-  const hasImages = TLC_KEYS.some((k) => Boolean(currentSet.imgs[k]));
+  const hasConfig = Boolean(activePlateSet.cfg);
+  const hasImages = TLC_KEYS.some((k) => Boolean(activePlateSet.imgs[k]));
 
   // Active Densitogram(s) for the modal
   const activeDens = useMemo(() => {
@@ -1691,9 +1786,9 @@ export const TlcView: React.FC = () => {
   // Spot management callbacks for the zoomed-in lane modal
   const handleAddSpotInModal = useCallback(
     (targetRf: number = 0.5) => {
-      if (inspectWell === null || !currentSet.cfg) return;
+      if (inspectWell === null || !activePlateSet.cfg) return;
       const laneId = tlcLane(inspectWell, 'column');
-      const lane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+      const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
       if (!lane) return;
       handleSnapshotHistory();
       const primary = inspectPanels[0];
@@ -1719,12 +1814,12 @@ export const TlcView: React.FC = () => {
       handleUpdateLane(laneId, { customSpots: nextSpots }, true);
       toast(`Added manual spot at Rf ${clampedRf.toFixed(2)}.`);
     },
-    [inspectWell, currentSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
   );
 
   const handleDeleteSpotInModal = useCallback(
     (spotIndex: number) => {
-      if (inspectWell === null || !currentSet.cfg) return;
+      if (inspectWell === null || !activePlateSet.cfg) return;
       const laneId = tlcLane(inspectWell, 'column');
       const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
       if (!currentSpots[spotIndex]) return;
@@ -1733,14 +1828,14 @@ export const TlcView: React.FC = () => {
       handleUpdateLane(laneId, { customSpots: remaining }, true);
       toast(`Removed spot #${spotIndex + 1}.`);
     },
-    [inspectWell, currentSet.cfg, inspectPanels, activeDens, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, handleSnapshotHistory]
   );
 
   const handleNudgeSpotInModal = useCallback(
     (spotIndex: number, deltaRf: number) => {
-      if (inspectWell === null || !currentSet.cfg) return;
+      if (inspectWell === null || !activePlateSet.cfg) return;
       const laneId = tlcLane(inspectWell, 'column');
-      const lane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+      const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
       if (!lane) return;
       const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
       if (!currentSpots[spotIndex]) return;
@@ -1769,16 +1864,16 @@ export const TlcView: React.FC = () => {
       });
       handleUpdateLane(laneId, { customSpots: updated }, true);
     },
-    [inspectWell, currentSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
   );
 
   const handleResetLaneSpotsInModal = useCallback(() => {
-    if (inspectWell === null || !currentSet.cfg) return;
+    if (inspectWell === null || !activePlateSet.cfg) return;
     const laneId = tlcLane(inspectWell, 'column');
     handleSnapshotHistory();
     handleUpdateLane(laneId, { customSpots: undefined }, true);
     toast('Reset lane spots back to automated detection.');
-  }, [inspectWell, currentSet.cfg, handleSnapshotHistory]);
+  }, [inspectWell, activePlateSet.cfg, handleSnapshotHistory]);
 
   // Window mousemove and mouseup listeners for continuous dragging across canvas & densitometer
   useEffect(() => {
@@ -1814,8 +1909,8 @@ export const TlcView: React.FC = () => {
 
     const handleWindowMouseUp = () => {
       const drag = dragModalSpotRef.current;
-      if (drag && currentSet?.cfg) {
-        const lane = currentSet.cfg.lanes.find((l) => l.id === drag.laneId);
+      if (drag && activePlateSet?.cfg) {
+        const lane = activePlateSet.cfg.lanes.find((l) => l.id === drag.laneId);
         if (lane && lane.customSpots) {
           handleUpdateLane(drag.laneId, { customSpots: lane.customSpots }, true);
         }
@@ -1830,7 +1925,7 @@ export const TlcView: React.FC = () => {
       window.removeEventListener('mousemove', handleWindowMouseMove);
       window.removeEventListener('mouseup', handleWindowMouseUp);
     };
-  }, [isDraggingModalSpot, currentSet?.cfg]);
+  }, [isDraggingModalSpot, activePlateSet?.cfg]);
 
   return (
     <div className="tab-pane" style={{ padding: '16px' }}>
@@ -2022,11 +2117,91 @@ export const TlcView: React.FC = () => {
               gap: '6px',
               fontWeight: 600,
             }}
-            title="AI recommends 2-3 solvent systems and designates the best one based on substrates and expected product"
+            title="Suggest a finite set of TLC solvent systems for all 54 wells (prioritizing High & Medium predicted products) or run a single-reaction query"
           >
-            ✦ AI Solvent Advisor
+            ✦ 54-Well / AI Solvent Advisor
           </button>
         </div>
+
+        {/* Prominent Plate Selector Bar (when experiment uses 2 or 3 plates) */}
+        {selectablePlatesCount > 1 && (
+          <div
+            role="group"
+            aria-label="Experiment Plates"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              flexWrap: 'wrap',
+              padding: '8px 10px',
+              marginBottom: '10px',
+              background: 'var(--soft)',
+              borderRadius: '8px',
+              border: '1px solid var(--line)',
+            }}
+          >
+            <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--fg)', marginRight: '2px' }}>
+              Active Plate:
+            </span>
+            {Array.from({ length: selectablePlatesCount }, (_, pIdx) => {
+              const imgCount = tlcSetPlateImageCount(currentSet, pIdx);
+              const slice = getTlcPlateSlice(currentSet, pIdx);
+              const hasLanes = Boolean(slice.cfg?.lanes?.length);
+              const isActive = pIdx === plate;
+              return (
+                <button
+                  key={pIdx}
+                  type="button"
+                  onClick={() => {
+                    setPlate(pIdx);
+                    setHoverRf(null);
+                    setHoverY(null);
+                    setHoverSpot(null);
+                  }}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '5px 12px',
+                    borderRadius: '6px',
+                    border: isActive ? '2px solid var(--pri)' : '1px solid var(--line)',
+                    background: isActive ? 'var(--pri)' : 'var(--panel)',
+                    color: isActive ? '#ffffff' : 'var(--fg)',
+                    fontWeight: isActive ? 700 : 600,
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                  }}
+                  title={`Switch to Plate ${pIdx + 1} (${imgCount} photo${imgCount === 1 ? '' : 's'}, ${hasLanes ? `${slice.cfg?.lanes.length} lanes` : 'no lanes'})`}
+                >
+                  <span>Plate {pIdx + 1}</span>
+                  <span
+                    style={{
+                      fontSize: '10px',
+                      padding: '1px 5px',
+                      borderRadius: '4px',
+                      background: isActive
+                        ? 'rgba(255,255,255,0.22)'
+                        : imgCount > 0
+                        ? 'rgba(16, 185, 129, 0.14)'
+                        : 'rgba(148, 163, 184, 0.14)',
+                      color: isActive
+                        ? '#ffffff'
+                        : imgCount > 0
+                        ? '#059669'
+                        : 'var(--mut)',
+                      fontWeight: 700,
+                    }}
+                  >
+                    {imgCount > 0 ? `${imgCount} img${imgCount === 1 ? '' : 's'}${hasLanes ? ' ✓' : ''}` : hasLanes ? 'lanes ✓' : 'empty'}
+                  </span>
+                </button>
+              );
+            })}
+            <span style={{ fontSize: '11px', color: 'var(--mut)', marginLeft: 'auto' }}>
+              Each plate stores its own photos, lane grid &amp; Rf data independently.
+            </span>
+          </div>
+        )}
 
         {/* Current Set Configuration & Action Buttons */}
         <div className="tlcbtns" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '10px' }}>
@@ -2071,6 +2246,17 @@ export const TlcView: React.FC = () => {
             Auto-detect lanes
           </button>
 
+          {plate > 0 && !hasConfig && Boolean(currentSet.cfg) && (
+            <button
+              type="button"
+              className="btn"
+              onClick={handleCopyLanesFromPlate1}
+              title="Copy the calibrated 54-lane geometry from Plate 1 to this plate"
+            >
+              Copy Lanes from Plate 1
+            </button>
+          )}
+
           <button
             type="button"
             className="btn"
@@ -2103,7 +2289,13 @@ export const TlcView: React.FC = () => {
           )}
 
           <button type="button" className="btn pri" onClick={() => fileImgRef.current?.click()}>
-            {hasImages ? 'Add / Replace Plate Photos' : 'Upload Plate Photos'}
+            {hasImages
+              ? selectablePlatesCount > 1
+                ? `Add / Replace Plate ${plate + 1} Photos`
+                : 'Add / Replace Plate Photos'
+              : selectablePlatesCount > 1
+              ? `Upload Plate ${plate + 1} Photos`
+              : 'Upload Plate Photos'}
           </button>
           <input
             ref={fileImgRef}
@@ -2289,7 +2481,7 @@ export const TlcView: React.FC = () => {
             </div>
           )}
 
-          {platesCount > 1 && (
+          {selectablePlatesCount > 1 && (
             <label className="tlcz" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
               <span>Plate:</span>
               <select
@@ -2297,8 +2489,10 @@ export const TlcView: React.FC = () => {
                 value={plate}
                 onChange={(e) => setPlate(parseInt(e.target.value, 10))}
               >
-                {Array.from({ length: platesCount }, (_, idx) => (
-                  <option key={idx} value={idx}>Plate {idx + 1}</option>
+                {Array.from({ length: selectablePlatesCount }, (_, idx) => (
+                  <option key={idx} value={idx}>
+                    Plate {idx + 1}{tlcSetPlateHasImages(currentSet, idx) ? ' ✓' : ''}
+                  </option>
                 ))}
               </select>
             </label>
@@ -2325,7 +2519,7 @@ export const TlcView: React.FC = () => {
               onChange={(e) => {
                 const val = e.target.value;
                 setTlcQuickJump(val);
-                const parsed = parseWellQuery(val, platesCount);
+                const parsed = parseWellQuery(val, selectablePlatesCount);
                 if (parsed) {
                   setPlate(parsed.plateIndex);
                   setInspectWell(parsed.wellIndex);
@@ -2365,23 +2559,28 @@ export const TlcView: React.FC = () => {
 
         {/* Status Chips */}
         <div className="tlcstat" style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+          {selectablePlatesCount > 1 && (
+            <span className="chip" style={{ fontSize: '11px', fontWeight: 700, background: 'var(--soft)' }}>
+              Plate {plate + 1} of {selectablePlatesCount}
+            </span>
+          )}
           {hasConfig ? (
             <span className="chip ok" style={{ fontSize: '11px' }}>
-              ✓ {currentSet.cfg?.lanes.length} lanes · {currentSet.cfgName}
-              {currentSet.cfg?.hasZeroRf
+              ✓ {activePlateSet.cfg?.lanes.length} lanes · {activePlateSet.cfgName}
+              {activePlateSet.cfg?.hasZeroRf
                 ? ' · microadjusted origins'
-                : currentSet.originPx
-                ? ` · manual origin (${currentSet.originPx} px)`
+                : activePlateSet.originPx
+                ? ` · manual origin (${activePlateSet.originPx} px)`
                 : ' · auto-detected baseline'}
             </span>
           ) : (
             <span className="chip warn" style={{ fontSize: '11px' }}>
-              ⚠️ No lane CSV loaded yet
+              ⚠️ No lane CSV loaded for Plate {plate + 1} yet
             </span>
           )}
 
           {TLC_KEYS.map((k) => {
-            const hasImg = Boolean(currentSet.imgs[k]);
+            const hasImg = Boolean(activePlateSet.imgs[k]);
             return hasImg ? (
               <label
                 key={k}
@@ -2402,13 +2601,13 @@ export const TlcView: React.FC = () => {
                 />
                 <b>{TLC_LABEL[k]}</b>
                 <span className="mono" style={{ color: 'var(--mut)', fontSize: '10px' }}>
-                  {currentSet.imgs[k].name.length > 20
-                    ? '…' + currentSet.imgs[k].name.slice(-18)
-                    : currentSet.imgs[k].name}
+                  {activePlateSet.imgs[k].name.length > 20
+                    ? '…' + activePlateSet.imgs[k].name.slice(-18)
+                    : activePlateSet.imgs[k].name}
                 </span>
                 <button
                   type="button"
-                  title={`Remove ${TLC_LABEL[k]} photo`}
+                  title={`Remove ${TLC_LABEL[k]} photo from Plate ${plate + 1}`}
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -2435,7 +2634,7 @@ export const TlcView: React.FC = () => {
 
           {!hasImages && (
             <span className="chip warn" style={{ fontSize: '11px' }}>
-              ⚠️ No plate images loaded yet
+              ⚠️ No Plate {plate + 1} images loaded yet
             </span>
           )}
         </div>
@@ -2513,15 +2712,26 @@ export const TlcView: React.FC = () => {
               onChange={(e) => {
                 const cf = parseFloat(e.target.value);
                 setCoreFraction(cf);
-                // Clear cached profiles and auto-detected fronts to recompute with new core corridor
+                // Clear cached profiles and auto-detected fronts across all plates to recompute with new core corridor
                 setSets((prev) =>
-                  prev.map((s) => ({
-                    ...s,
-                    prof: {},
-                    frontAuto: {},
-                    originAuto: {},
-                    originAutoByLane: {},
-                  }))
+                  prev.map((s) => {
+                    const nextPlateData = s.plateData
+                      ? Object.fromEntries(
+                          Object.entries(s.plateData).map(([pK, pd]) => [
+                            pK,
+                            { ...pd, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} },
+                          ])
+                        )
+                      : undefined;
+                    return {
+                      ...s,
+                      prof: {},
+                      frontAuto: {},
+                      originAuto: {},
+                      originAutoByLane: {},
+                      ...(nextPlateData ? { plateData: nextPlateData } : {}),
+                    };
+                  })
                 );
               }}
             />
@@ -2537,13 +2747,24 @@ export const TlcView: React.FC = () => {
               setFilters({ brightness: 100, contrast: 100, invert: false });
               setCoreFraction(0.35);
               setSets((prev) =>
-                prev.map((s) => ({
-                  ...s,
-                  prof: {},
-                  frontAuto: {},
-                  originAuto: {},
-                  originAutoByLane: {},
-                }))
+                prev.map((s) => {
+                  const nextPlateData = s.plateData
+                    ? Object.fromEntries(
+                        Object.entries(s.plateData).map(([pK, pd]) => [
+                          pK,
+                          { ...pd, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} },
+                        ])
+                      )
+                    : undefined;
+                  return {
+                    ...s,
+                    prof: {},
+                    frontAuto: {},
+                    originAuto: {},
+                    originAutoByLane: {},
+                    ...(nextPlateData ? { plateData: nextPlateData } : {}),
+                  };
+                })
               );
             }}
             style={{ marginLeft: 'auto', fontSize: '11px' }}
@@ -2555,7 +2776,7 @@ export const TlcView: React.FC = () => {
         {/* Collapsible Image & Meniscus Front Settings */}
         <details className="det" style={{ marginTop: '10px', fontSize: '12px' }}>
           <summary style={{ cursor: 'pointer', fontWeight: 600, color: 'var(--fg)' }}>
-            ⚙️ Advanced Image &amp; Solvent Front Calibration ({currentSet.name})
+            ⚙️ Advanced Image &amp; Solvent Front Calibration ({currentSet.name}{selectablePlatesCount > 1 ? ` · Plate ${plate + 1}` : ''})
           </summary>
           <div style={{ padding: '8px 12px', background: 'var(--soft)', borderRadius: '6px', marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
@@ -2565,13 +2786,20 @@ export const TlcView: React.FC = () => {
                   type="number"
                   className="f mono"
                   style={{ width: '90px' }}
-                  value={currentSet.frameW || LANE_FRAME_WIDTH}
+                  value={activePlateSet.frameW || LANE_FRAME_WIDTH}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
                     if (v >= 100) {
                       setSets((prev) => {
                         const next = [...prev];
-                        next[cur] = { ...next[cur], frameW: v, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} };
+                        if (!next[cur]) return next;
+                        next[cur] = updateTlcPlateSlice(next[cur], plate, {
+                          frameW: v,
+                          prof: {},
+                          frontAuto: {},
+                          originAuto: {},
+                          originAutoByLane: {},
+                        });
                         return next;
                       });
                     }
@@ -2586,27 +2814,28 @@ export const TlcView: React.FC = () => {
                   className="f mono"
                   style={{ width: '90px' }}
                   placeholder="auto"
-                  value={currentSet.originPx || ''}
+                  value={activePlateSet.originPx || ''}
                   onChange={(e) => {
                     const v = e.target.value ? parseInt(e.target.value, 10) : null;
                     setSets((prev) => {
                       const next = [...prev];
-                      const curSet = next[cur];
-                      const nextCfg = curSet.cfg
-                        ? {
-                            ...curSet.cfg,
-                            hasZeroRf: false,
-                            lanes: curSet.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
-                          }
-                        : curSet.cfg;
-                      next[cur] = {
-                        ...curSet,
-                        cfg: nextCfg,
-                        originPx: v && v > 0 ? v : null,
-                        prof: {},
-                        originAuto: {},
-                        originAutoByLane: {},
-                      };
+                      if (!next[cur]) return next;
+                      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+                        const nextCfg = slice.cfg
+                          ? {
+                              ...slice.cfg,
+                              hasZeroRf: false,
+                              lanes: slice.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+                            }
+                          : slice.cfg;
+                        return {
+                          cfg: nextCfg,
+                          originPx: v && v > 0 ? v : null,
+                          prof: {},
+                          originAuto: {},
+                          originAutoByLane: {},
+                        };
+                      });
                       return next;
                     });
                   }}
@@ -2620,12 +2849,17 @@ export const TlcView: React.FC = () => {
                   className="f mono"
                   style={{ width: '90px' }}
                   placeholder="auto"
-                  value={currentSet.frontPx || ''}
+                  value={activePlateSet.frontPx || ''}
                   onChange={(e) => {
                     const v = e.target.value ? parseInt(e.target.value, 10) : null;
                     setSets((prev) => {
                       const next = [...prev];
-                      next[cur] = { ...next[cur], frontPx: v > 0 ? v : null, prof: {}, frontAuto: {} };
+                      if (!next[cur]) return next;
+                      next[cur] = updateTlcPlateSlice(next[cur], plate, {
+                        frontPx: v && v > 0 ? v : null,
+                        prof: {},
+                        frontAuto: {},
+                      });
                       return next;
                     });
                   }}
@@ -2644,9 +2878,9 @@ export const TlcView: React.FC = () => {
             </div>
             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
               Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
-              {currentSet.cfg && (
+              {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && (
                 <span style={{ color: 'var(--pri)', marginLeft: '6px' }}>
-                  (Current baseline: {Math.round(tlcOrigin(currentSet, currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(currentSet, currentSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)
+                  (Current baseline: {Math.round(tlcOrigin(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)
                 </span>
               )}
             </div>
@@ -2667,20 +2901,20 @@ export const TlcView: React.FC = () => {
               alignItems: 'center',
             }}
           >
-            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--mut)' }}>Plate Channel:</span>
+            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--mut)' }}>Plate {plate + 1} Channel:</span>
             {TLC_KEYS.map((k) => (
               <button
                 key={k}
                 type="button"
                 className={`btn sm ${fullPlateChannel === k ? 'pri' : ''}`}
                 onClick={() => setFullPlateChannel(k)}
-                disabled={!currentSet.imgs[k]}
+                disabled={!activePlateSet.imgs[k]}
                 style={{ fontSize: '11px', padding: '4px 10px' }}
               >
-                {TLC_LABEL[k]} {currentSet.imgs[k] ? '✓' : '(empty)'}
+                {TLC_LABEL[k]} {activePlateSet.imgs[k] ? '✓' : '(empty)'}
               </button>
             ))}
-            {currentSet.imgs.UV254 && currentSet.imgs.UV366 && (
+            {activePlateSet.imgs.UV254 && activePlateSet.imgs.UV366 && (
               <button
                 type="button"
                 className={`btn sm ${fullPlateChannel === 'composite' ? 'pri' : ''}`}
@@ -2701,7 +2935,7 @@ export const TlcView: React.FC = () => {
           </div>
 
           <TlcFullPlateView
-            currentSet={currentSet}
+            currentSet={activePlateSet}
             activeChannel={fullPlateChannel}
             onSelectChannel={setFullPlateChannel}
             filters={filters}
@@ -2726,10 +2960,10 @@ export const TlcView: React.FC = () => {
             onExportLaneCsv={handleExportLaneCsv}
             spotProminence={spotProminence}
             pickMode={pickMode}
-            picks={edgePicks[currentSet.uid] || []}
+            picks={activePlateSet.edgePicks || []}
             onPickSpot={handlePickSpot}
-            edgeFits={getEdgeFits(currentSet)}
-            edgeSettings={[edgeSettingFor(currentSet, 0), edgeSettingFor(currentSet, 1)]}
+            edgeFits={getEdgeFits(activePlateSet)}
+            edgeSettings={[edgeSettingFor(activePlateSet, 0), edgeSettingFor(activePlateSet, 1)]}
             onEdgeSetting={handleEdgeSetting}
             onPickMode={setPickMode}
             pickGroup={pickGroup}
@@ -2753,18 +2987,29 @@ export const TlcView: React.FC = () => {
             >
               <div style={{ fontSize: '28px', marginBottom: '8px' }}>📷</div>
               <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>
-                No Plate Photographs Loaded
+                No Plate {selectablePlatesCount > 1 ? `${plate + 1} ` : ''}Photographs Loaded
               </div>
               <div style={{ fontSize: '12px', color: 'var(--mut)', maxWidth: '520px', margin: '0 auto 12px' }}>
-                Upload your laboratory TLC plate photographs using the <b>Upload Plate Photos</b> button, or test the live densitometer with realistic synthetic data below.
+                Upload your laboratory Plate {plate + 1} TLC photographs using <b>{selectablePlatesCount > 1 ? `Upload Plate ${plate + 1} Photos` : 'Upload Plate Photos'}</b>{plate === 0 ? ', or test the live densitometer with realistic synthetic data below.' : '.'}
               </div>
-              <button
-                type="button"
-                className="btn pri sm"
-                onClick={handleLoadDemoTlc}
-              >
-                🧪 Try Demo TLC Plate
-              </button>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn pri sm"
+                  onClick={() => fileImgRef.current?.click()}
+                >
+                  📷 Upload Plate {plate + 1} Photos
+                </button>
+                {plate === 0 && (
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={handleLoadDemoTlc}
+                  >
+                    🧪 Try Demo TLC Plate
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -3282,7 +3527,7 @@ export const TlcView: React.FC = () => {
                       </div>
 
                       {/* Dual-Channel False-Color Legend */}
-                      {densViewMode === 'overlay' && currentSet.imgs?.UV254?.bmp && currentSet.imgs?.UV366?.bmp && (
+                      {densViewMode === 'overlay' && activePlateSet.imgs?.UV254?.bmp && activePlateSet.imgs?.UV366?.bmp && (
                         <div
                           style={{
                             marginTop: '8px',
@@ -3674,9 +3919,9 @@ export const TlcView: React.FC = () => {
                   }}
                 >
                   {/* Real-Time Micro-Adjustment of This Lane (Prominently displayed right next to canvas!) */}
-                  {currentSet.cfg && (() => {
+                  {activePlateSet.cfg && (() => {
                     const laneId = tlcLane(inspectWell, 'column');
-                    const targetLane = currentSet.cfg.lanes.find((l) => l.id === laneId);
+                    const targetLane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
                     if (!targetLane) return null;
 
                     return (
@@ -3779,7 +4024,7 @@ export const TlcView: React.FC = () => {
                               <input
                                 type="range"
                                 min={Math.max(0, Math.round(targetLane.x0 - 120))}
-                                max={Math.min(currentSet.frameW || 3280, Math.round(targetLane.x0 + 120))}
+                                max={Math.min(activePlateSet.frameW || 3280, Math.round(targetLane.x0 + 120))}
                                 step={1}
                                 value={Math.round(targetLane.x0)}
                                 onChange={(e) => handleUpdateLane(laneId, { x0: +e.target.value })}
@@ -3923,7 +4168,7 @@ export const TlcView: React.FC = () => {
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                               <span style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24' }}>Origin (Rf=0):</span>
                               <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#fbbf24', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #78350f' }}>
-                                {Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
+                                {Math.round(tlcOrigin(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
                               </span>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -3931,7 +4176,7 @@ export const TlcView: React.FC = () => {
                                 type="button"
                                 style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
                                 onClick={() => {
-                                  const curr = Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  const curr = Math.round(tlcOrigin(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
                                   handleUpdateLane(laneId, { zeroRf: Math.max(5, curr - 1) });
                                 }}
                               >
@@ -3942,7 +4187,7 @@ export const TlcView: React.FC = () => {
                                 min={5}
                                 max={Math.round(targetLane.length * 0.45)}
                                 step={1}
-                                value={Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
+                                value={Math.round(tlcOrigin(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
                                 onChange={(e) => handleUpdateLane(laneId, { zeroRf: +e.target.value })}
                                 style={{ flex: 1, accentColor: '#fbbf24', height: '5px', cursor: 'ew-resize' }}
                               />
@@ -3950,7 +4195,7 @@ export const TlcView: React.FC = () => {
                                 type="button"
                                 style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
                                 onClick={() => {
-                                  const curr = Math.round(tlcOrigin(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  const curr = Math.round(tlcOrigin(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
                                   handleUpdateLane(laneId, { zeroRf: curr + 1 });
                                 }}
                               >
@@ -3964,7 +4209,7 @@ export const TlcView: React.FC = () => {
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                               <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front (Rf=1):</span>
                               <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
-                                {Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
+                                {Math.round(tlcFront(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px
                               </span>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -3972,7 +4217,7 @@ export const TlcView: React.FC = () => {
                                 type="button"
                                 style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
                                 onClick={() => {
-                                  const curr = Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  const curr = Math.round(tlcFront(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
                                   handleUpdateSetFront(Math.max(50, curr - 1));
                                 }}
                               >
@@ -3983,7 +4228,7 @@ export const TlcView: React.FC = () => {
                                 min={50}
                                 max={Math.round(targetLane.length * 1.05)}
                                 step={1}
-                                value={Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
+                                value={Math.round(tlcFront(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))}
                                 onChange={(e) => handleUpdateSetFront(+e.target.value)}
                                 style={{ flex: 1, accentColor: '#38bdf8', height: '5px', cursor: 'ew-resize' }}
                               />
@@ -3991,7 +4236,7 @@ export const TlcView: React.FC = () => {
                                 type="button"
                                 style={{ background: '#1e293b', color: '#fff', border: '1px solid #475569', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' }}
                                 onClick={() => {
-                                  const curr = Math.round(tlcFront(currentSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
+                                  const curr = Math.round(tlcFront(activePlateSet, targetLane, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)));
                                   handleUpdateSetFront(curr + 1);
                                 }}
                               >
@@ -4080,9 +4325,9 @@ export const TlcView: React.FC = () => {
                         >
                           + Add Spot (Rf 0.50)
                         </button>
-                        {currentSet.cfg && (() => {
+                        {activePlateSet.cfg && (() => {
                           const lId = tlcLane(inspectWell, 'column');
-                          const lObj = currentSet.cfg.lanes.find((l) => l.id === lId);
+                          const lObj = activePlateSet.cfg.lanes.find((l) => l.id === lId);
                           if (lObj?.customSpots !== undefined) {
                             return (
                               <button
@@ -4384,6 +4629,20 @@ export const TlcView: React.FC = () => {
                         return next;
                       });
                       toast(`Saved TLC AI interpretation to Well ${wellLabel(inspectWell)} in ELN.`);
+                    }}
+                  />
+
+                  <WellPredictedProductsPanel
+                    state={state}
+                    run={run}
+                    plate={plate}
+                    wellIndex={inspectWell}
+                    onOpenFullPredictor={() => {
+                      const wIdx = inspectWell;
+                      setInspectWell(null);
+                      setTargetWell({ wellIndex: wIdx, plateIndex: plate, source: 'palette' });
+                      setVisited((v) => ({ ...v, predict: true }));
+                      setView('predict');
                     }}
                   />
 

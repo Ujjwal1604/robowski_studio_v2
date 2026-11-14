@@ -6,6 +6,7 @@ import {
   SummaryStrip,
   SetupView,
   CombinationsView,
+  PredictionView,
   DeckView,
   ExportView,
   TlcView,
@@ -50,6 +51,7 @@ export const App: React.FC = () => {
       <main id="main">
         {view === 'setup' && <SetupView />}
         {view === 'combos' && <CombinationsView />}
+        {view === 'predict' && <PredictionView />}
         {view === 'deck' && <DeckView />}
         <div style={{ display: view === 'tlc' ? 'block' : 'none' }}>
           <TlcView />

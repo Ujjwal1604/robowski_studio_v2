@@ -617,6 +617,26 @@ export const CombinationsView: React.FC = () => {
                           source: 'combinations',
                         });
                       }
+                      setVisited((v) => ({ ...v, predict: true }));
+                      setView('predict');
+                    }}
+                    title="Predict reaction products & LC-MS masses for this well"
+                  >
+                    ⚗ Predict Products
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    style={{ height: '22px', padding: '0 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                    onClick={() => {
+                      const rowData = run.rows[activeDetailRow];
+                      if (rowData) {
+                        setTargetWell({
+                          wellIndex: rowData.container_id,
+                          plateIndex: rowData.plate_number,
+                          source: 'combinations',
+                        });
+                      }
                       setVisited((v) => ({ ...v, tlc: true }));
                       setView('tlc');
                     }}

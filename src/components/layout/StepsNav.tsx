@@ -4,6 +4,7 @@ import { useApp } from '../../context/AppContext';
 const TABS: [string, string][] = [
   ['setup', 'Setup'],
   ['combos', 'Combinations'],
+  ['predict', 'Predict'],
   ['deck', 'Deck'],
   ['tlc', 'TLC Map'],
   ['eln', 'HTE Notebook'],
@@ -22,6 +23,9 @@ export const StepsNav: React.FC = () => {
     }
     if (id === 'combos') {
       return !run ? '' : run.blockingIssues > 0 ? 'warn' : visited.combos ? 'done' : '';
+    }
+    if (id === 'predict') {
+      return visited.predict ? 'done' : '';
     }
     if (id === 'deck') {
       return !run ? '' : !run.deck.positions_fit ? 'warn' : visited.deck ? (platesOk() ? 'done' : 'warn') : '';

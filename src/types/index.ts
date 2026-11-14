@@ -391,9 +391,7 @@ export interface EdgeSetting {
   strength: number; // 0..1
 }
 
-export interface TlcSet {
-  uid: string;
-  name: string;
+export interface TlcPlateData {
   cfg: TlcLaneConfig | null;
   cfgName: string;
   cfgText?: string;
@@ -410,6 +408,13 @@ export interface TlcSet {
   edgePicks?: EdgePick[];
   edgeSettings?: Record<number, EdgeSetting>;
   spotProminence?: number;
+}
+
+export interface TlcSet extends TlcPlateData {
+  uid: string;
+  name: string;
+  /** Per-plate overrides for Plates 2+ (0-based plateIndex > 0). Plate 1 (0) lives on top-level fields. */
+  plateData?: Record<number, TlcPlateData>;
 }
 
 export type WellOutcomeStatus =

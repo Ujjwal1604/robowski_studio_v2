@@ -32,6 +32,7 @@ import {
   readTableFile,
   tlcLane,
   wellLabel,
+  resolveTlcSetForPlate,
 } from '../../engine';
 import { AiSynthesisReport } from '../ui/AiSynthesisReport';
 import { WellTlcPreview } from '../ui/WellTlcPreview';
@@ -309,7 +310,7 @@ export const ElnView: React.FC = () => {
         }
       : null);
 
-  const activeTlcSet = tlcSets && (tlcSets[activePlate] || tlcSets[0]);
+  const activeTlcSet = resolveTlcSetForPlate(tlcSets, activePlate);
 
   const assignOutcomeAndMaybeAdvance = useCallback(
     (status: WellOutcomeStatus, allowAutoAdvance: boolean) => {
@@ -509,7 +510,7 @@ export const ElnView: React.FC = () => {
     const q = sheetSearch.trim().toLowerCase();
 
     for (let p = startPlate; p <= endPlate; p++) {
-      const tlcSetForPlate = tlcSets?.[p] || tlcSets?.[0];
+      const tlcSetForPlate = resolveTlcSetForPlate(tlcSets, p);
       for (let w = 0; w < PLATE_SIZE; w++) {
         const gIdx = p * PLATE_SIZE + w;
         if (gIdx >= totalWellsCount && p > 0) continue;
@@ -1587,6 +1588,20 @@ export const ElnView: React.FC = () => {
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      setTargetWell({ wellIndex: selectedWellIdx, plateIndex: activePlate, source: 'palette' });
+                      setVisited((v) => ({ ...v, predict: true }));
+                      setView('predict');
+                    }}
+                    title="Predict reaction products & LC-MS masses for this well"
+                    style={{ height: '26px', padding: '0 8px', fontSize: '11.5px', display: 'inline-flex', alignItems: 'center', gap: '4px', marginRight: '4px' }}
+                  >
+                    <ExternalLink size={12} />
+                    <span>Predict</span>
+                  </button>
                   <label
                     style={{
                       display: 'inline-flex',

@@ -10,6 +10,7 @@ import { csvText } from './exporters/csv';
 import { worksheetXml } from './exporters/xlsx';
 import { zipStore } from './exporters/zipStore';
 import { tlcLane, wellLabel } from './tlcLanes';
+import { resolveTlcSetForPlate } from './tlcPlateSlice';
 
 const PLATE_SIZE = 54;
 const ROWS = 6;
@@ -104,7 +105,7 @@ export function elnObservationsRows(
           .join('; ')
       : '';
 
-    const activeTlcSet = tlcSets?.[pIdx] || tlcSets?.[0];
+    const activeTlcSet = resolveTlcSetForPlate(tlcSets, pIdx);
     const activeLane = activeTlcSet?.cfg?.lanes?.find((l) => l.id === laneIdx);
     const spotsRf = activeLane?.customSpots?.length
       ? activeLane.customSpots.map((s) => s.rf.toFixed(2)).join(', ')

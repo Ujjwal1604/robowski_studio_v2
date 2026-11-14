@@ -688,8 +688,8 @@ export const RunsView: React.FC = () => {
                       smiles={x.smiles}
                       iupac={x.iupac || x.name}
                       name={x.name}
-                      width={56}
-                      height={40}
+                      width={96}
+                      height={64}
                       allowZoom={true}
                       onResolvedSmiles={(smiles, mw) => {
                         putLib({

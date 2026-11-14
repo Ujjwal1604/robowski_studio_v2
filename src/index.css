@@ -1567,7 +1567,7 @@
     }
 
     .rw.has-struct {
-      grid-template-columns: 44px 62px minmax(150px, 1.6fr) 96px 94px 106px 126px 136px;
+      grid-template-columns: 44px 92px minmax(150px, 1.6fr) 96px 94px 106px 126px 136px;
       gap: 10px;
     }
 
@@ -2361,3 +2361,101 @@
         scroll-behavior: auto !important
       }
     }
+
+    /* Reaction Predictor Compact 6x9 Well Picker Grid */
+    .pred-plate-grid {
+      display: grid;
+      grid-template-columns: 24px repeat(9, minmax(0, 1fr));
+      gap: 4px;
+      align-items: center;
+    }
+
+    .pred-col-hdr,
+    .pred-row-hdr {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--mut);
+      text-align: center;
+      user-select: none;
+    }
+
+    .pred-well {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1px;
+      height: 38px;
+      padding: 2px 3px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--soft);
+      color: var(--fg);
+      transition: border-color .14s var(--ease), background .14s var(--ease), box-shadow .14s var(--ease);
+    }
+
+    .pred-well:hover:not(:disabled) {
+      border-color: var(--acc);
+    }
+
+    .pred-well.high {
+      background: color-mix(in srgb, var(--okbg) 72%, var(--panel));
+      border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+      color: var(--ok);
+    }
+
+    .pred-well.med {
+      background: color-mix(in srgb, var(--blue) 12%, var(--panel));
+      border-color: color-mix(in srgb, var(--blue) 40%, var(--line));
+    }
+
+    .pred-well.low {
+      background: color-mix(in srgb, var(--warnbg) 65%, var(--panel));
+      border-color: color-mix(in srgb, var(--warn) 38%, var(--line));
+    }
+
+    .pred-well.blank {
+      background: var(--off);
+      border-color: var(--offbd);
+      color: var(--mut);
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .pred-well.sel {
+      border: 2px solid var(--acc);
+      box-shadow: var(--ring);
+    }
+
+    .chem-struct-wrapper svg {
+      max-width: 100%;
+      max-height: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .pred-scheme {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      background: var(--soft);
+      border: 1px solid var(--line2);
+      border-radius: 10px;
+    }
+
+    .pred-sub-tile {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 10px;
+      background: var(--panel);
+      border: 1px solid var(--line2);
+      border-radius: 10px;
+      min-width: 185px;
+      max-width: 225px;
+      flex: 0 1 205px;
+    }
+

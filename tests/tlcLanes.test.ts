@@ -11,7 +11,9 @@ import {
   movingAvg,
   pctile,
   detectFront,
+  detectFrontDetailed,
   detectOrigin,
+  detectOriginDetailed,
   tlcFront,
   tlcOrigin,
   findSpots,
@@ -151,6 +153,160 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     expect(front).toBe(175);
   });
 
+  it('detects faint thin front over bright broad high-Rf spot and handles early-pulled plates (50%-97%)', () => {
+    const n = 1000;
+    // UV366-like dark background with a very bright broad fast spot at 760 and a fainter thin front at 890
+    const profBrightSpot = Array.from({ length: n }, (_, i) => {
+      const spot = 140 * Math.exp(-((i - 760) ** 2) / (2 * 22 * 22));
+      const thinFront = 32 * Math.exp(-((i - 890) ** 2) / (2 * 2.2 * 2.2));
+      return 20 + spot + thinFront;
+    });
+    expect(Math.abs(detectFront(profBrightSpot, 1) - 890)).toBeLessThanOrEqual(2);
+
+    // Early-pulled plate (front at 56% = 560 px, well below the old 65% floor) with dark quenching front + wet/dry step
+    const profEarly = Array.from({ length: n }, (_, i) => {
+      const bg = i < 560 ? 175 : 200;
+      const meniscus = 28 * Math.exp(-((i - 560) ** 2) / (2 * 2.5 * 2.5));
+      const slowSpot = 90 * Math.exp(-((i - 420) ** 2) / (2 * 18 * 18));
+      return bg - meniscus - slowSpot;
+    });
+    expect(Math.abs(detectFront(profEarly, -1) - 560)).toBeLessThanOrEqual(3);
+  });
+
+  it('detects persistent background step without false-triggering on an isolated broad spot and falls back when flat/noisy', () => {
+    const n = 1000;
+    // Pure step (wet vs dry silica) at 840 plus a huge broad dark spot at 700
+    const stepProf = Array.from({ length: n }, (_, i) => {
+      const base = i < 840 ? 160 : 195;
+      const bigSpot = 110 * Math.exp(-((i - 700) ** 2) / (2 * 20 * 20));
+      return base - bigSpot;
+    });
+    expect(Math.abs(detectFront(stepProf, -1) - 840)).toBeLessThanOrEqual(4);
+
+    // Flat and mild random-noise frontless profiles return 0 (triggering 93% fallback in tlcFront)
+    expect(detectFront(new Array(500).fill(180), -1)).toBe(0);
+    const noisyNoFront = Array.from({ length: 800 }, (_, i) => 180 + Math.sin(i * 1.7) * 1.2 + Math.cos(i * 2.9) * 1.2);
+    expect(detectFrontDetailed(noisyNoFront, -1).pos).toBe(0);
+  });
+
+  it('tlcFront picks the clearest channel across UV254/UV366 and tracks bowed fronts across 27 lanes', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    const L = cfg.lanes[0].length;
+    const set: TlcSet = {
+      uid: 'front-multi',
+      name: 'Multi Channel Plate',
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        UV366: { name: 'uv366.png', bmp: {} as any },
+      },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+
+    const getProf = (_s: TlcSet, key: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const idx = l.id % 27;
+      if (key === 'UV366') {
+        // Scattered bright fluorescent spots across wells and NO solvent front
+        const spotPos = 550 + ((idx * 37) % 350);
+        return Array.from({ length: L }, (_, i) => 18 + 110 * Math.exp(-((i - spotPos) ** 2) / (2 * 18 * 18)));
+      }
+      // UV254 has a gently bowed (±6 px) 3-px dark meniscus front centered around 860
+      const frontY = Math.round(860 - Math.cos(((idx - 13) / 13) * Math.PI) * 6);
+      return Array.from({ length: L }, (_, i) => {
+        const bg = i < frontY ? 185 : 202;
+        const line = 35 * Math.exp(-((i - frontY) ** 2) / (2 * 2.0 * 2.0));
+        return bg - line;
+      });
+    };
+
+    const frontH0 = tlcFront(set, cfg.lanes[0], getProf);
+    expect(Math.abs(frontH0 - 860)).toBeLessThanOrEqual(7);
+  });
+
+  it('rejects dark top borders, UV366 edge glare, handwritten ink, and high-Rf spot bands while detecting true or diffuse fronts', () => {
+    const n = 1073;
+    // 1. Dark top plate bezel (>1020) + bright high-Rf spot (810) does not beat real meniscus at 980
+    const bezelProf = Array.from({ length: n }, (_, i) =>
+      Math.max(15, 200 - (i > 1020 ? 150 : 0) - 25 * Math.exp(-((i - 980) ** 2) / (2 * 3 * 3)) - 110 * Math.exp(-((i - 810) ** 2) / (2 * 10 * 10)))
+    );
+    expect(Math.abs(detectFront(bezelProf, -1) - 980)).toBeLessThanOrEqual(2);
+
+    // 2. Spot-only lane with no front returns 0
+    const spotOnly = Array.from({ length: n }, (_, i) => 200 - 120 * Math.exp(-((i - 780) ** 2) / (2 * 11 * 11)));
+    expect(detectFront(spotOnly, -1)).toBe(0);
+
+    // 3. Dual-channel UV254 + UV366: UV366 has bright top edge glare (>1028) + spot row (40% of wells) and NO front;
+    //    UV254 has handwritten marker strokes near 1025 in half the lanes and a fainter real front at 975.
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    const L = cfg.lanes[0].length;
+    const setDual: TlcSet = {
+      uid: 'front-false-guard',
+      name: 'Dual Channel False Front Guard',
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        UV366: { name: 'uv366.png', bmp: {} as any },
+      },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const frontDual = tlcFront(setDual, cfg.lanes[0], (_s, key, l) => {
+      const idx = l.id % 27;
+      if (key === 'UV366') {
+        const glare = (i: number) => (i > Math.round(L * 0.95) ? 95 : 0);
+        const spot = idx < 11 ? (i: number) => 125 * Math.exp(-((i - Math.round(L * 0.72)) ** 2) / (2 * 10 * 10)) : () => 0;
+        return Array.from({ length: L }, (_, i) => 18 + glare(i) + spot(i));
+      }
+      const ink = idx % 2 === 0 && idx < 14 ? (i: number) => 150 * Math.exp(-((i - Math.round(L * 0.95)) ** 2) / (2 * 6 * 6)) : () => 0;
+      const spot = idx < 11 ? (i: number) => 120 * Math.exp(-((i - Math.round(L * 0.72)) ** 2) / (2 * 9 * 9)) : () => 0;
+      const targetFront = Math.round(L * 0.91);
+      return Array.from({ length: L }, (_, i) => 205 - ink(i) - spot(i) - 26 * Math.exp(-((i - targetFront) ** 2) / (2 * 2.3 * 2.3)));
+    });
+    expect(Math.abs(frontDual - Math.round(L * 0.91))).toBeLessThanOrEqual(4);
+
+    // 4. Multi-lane plate where 40% of lanes share a high-Rf spot at 72% and NO front exists falls back cleanly to 93%
+    const setSpotsNoFront: TlcSet = {
+      uid: 'front-spots-only',
+      name: 'Spots Without Front',
+      imgs: { UV254: { name: 'uv254_nf.png', bmp: {} as any } },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const frontFallback = tlcFront(setSpotsNoFront, cfg.lanes[0], (_s, _k, l) => {
+      const idx = l.id % 27;
+      return Array.from({ length: L }, (_, i) =>
+        idx < 11 ? 200 - 120 * Math.exp(-((i - Math.round(L * 0.72)) ** 2) / (2 * 9 * 9)) : 200
+      );
+    });
+    expect(frontFallback).toBe(Math.round(L * 0.93));
+
+    // 5. Plate-wide diffuse dark solvent front band across >=70% of lanes at 92% is still found accurately
+    const setDiffuse: TlcSet = {
+      uid: 'front-diffuse',
+      name: 'Diffuse Meniscus Plate',
+      imgs: { UV254: { name: 'uv254_diff.png', bmp: {} as any } },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const diffuseTarget = Math.round(L * 0.92);
+    const frontDiff = tlcFront(setDiffuse, cfg.lanes[0], (_s, _k, l) => {
+      const idx = l.id % 27;
+      return Array.from({ length: L }, (_, i) => {
+        const spot = idx < 10 ? 110 * Math.exp(-((i - Math.round(L * 0.70)) ** 2) / (2 * 10 * 10)) : 0;
+        const band = 115 * Math.exp(-((i - diffuseTarget) ** 2) / (2 * 14 * 14));
+        return 225 - spot - band;
+      });
+    });
+    expect(Math.abs(frontDiff - diffuseTarget)).toBeLessThanOrEqual(4);
+  });
+
   it('finds TLC spots and computes exact Rf and strength', () => {
     // 300 pixel lane, origin at 30, front at 270 (span = 240)
     // Dark spot at pixel 150 -> Rf = (150 - 30) / 240 = 0.50
@@ -231,6 +387,45 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     // 4. Normal lane with manual set.originPx override
     const setManual: any = { uid: 's2', name: 'Set B', imgs: {}, frameW: 3280, originPx: 115 };
     expect(tlcOrigin(setManual, normalLane)).toBe(115);
+
+    // 5. Rejects dark bottom plate border gradient and locks onto true origin dot center
+    const n = 1000;
+    const borderAndDot = Array.from({ length: n }, (_, i) => {
+      const border = i < 55 ? 25 : i < 70 ? 25 + ((i - 55) / 15) * 155 : 180;
+      const dot = 115 * Math.exp(-((i - 128) ** 2) / (2 * 7 * 7));
+      return border - dot;
+    });
+    expect(Math.abs(detectOrigin(borderAndDot, -1) - 128)).toBeLessThanOrEqual(2);
+
+    // 6. Blank/border-only profile without an origin dot returns 0 (falling back cleanly to ~10%)
+    const borderOnly = Array.from({ length: n }, (_, i) => (i < 65 ? 20 + (i / 65) * 160 : 180));
+    expect(detectOriginDetailed(borderOnly, -1).pos).toBe(0);
+
+    // 7. Multi-channel tlcOrigin picks clearest channel across 27 lanes (e.g. UV366 origin dots when UV254 has no dots)
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.lanes.forEach((l) => { l.zeroRf = null; });
+    const setMultiOrigin: TlcSet = {
+      uid: 'origin-multi',
+      name: 'Origin Multi',
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        UV366: { name: 'uv366.png', bmp: {} as any },
+      },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const originPos = tlcOrigin(setMultiOrigin, cfgNoZero.lanes[0], (_s, key, l) => {
+      const len = l.length;
+      if (key === 'UV254') {
+        // Pure bottom dark shadow gradient with no origin dot deposit
+        return Array.from({ length: len }, (_, i) => (i < 60 ? 25 + (i / 60) * 155 : 180));
+      }
+      // Crisp bright UV366 origin deposits centered around 132 px
+      return Array.from({ length: len }, (_, i) => 18 + 95 * Math.exp(-((i - 132) ** 2) / (2 * 6 * 6)));
+    });
+    expect(Math.abs(originPos - 132)).toBeLessThanOrEqual(2);
   });
 
   it('correctly maps inverted/opposing 180-degree upper tier lanes without coordinate distortion', () => {
@@ -345,6 +540,125 @@ describe('TLC Lanes & Coordinate Transforms', () => {
 
     expect(highRfSpot).toBeDefined();
     expect(highRfSpot!.rf).toBeCloseTo(0.95, 2);
+  });
+
+  it('tracks a bowed 27-lane baseline curve in tlcOrigin when lane.zeroRf is cleared', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const setCurved: TlcSet = {
+      uid: 'origin-curved',
+      name: 'Curved Origin Plate',
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const expectedOrigin = (laneId: number) => {
+      const u = ((laneId % 27) - 13) / 13;
+      return Math.round(115 + 16 * u * u);
+    };
+    const getProf = (_s: TlcSet, _key: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const c = expectedOrigin(l.id);
+      return Array.from({ length: l.length }, (_, i) => {
+        const border = i < 52 ? 25 + (i / 52) * 155 : 180;
+        const dot = 110 * Math.exp(-((i - c) ** 2) / (2 * 7 * 7));
+        return border - dot;
+      });
+    };
+
+    expect(Math.abs(tlcOrigin(setCurved, cfgNoZero.lanes[0], getProf) - expectedOrigin(0))).toBeLessThanOrEqual(3);
+    expect(Math.abs(tlcOrigin(setCurved, cfgNoZero.lanes[13], getProf) - expectedOrigin(13))).toBeLessThanOrEqual(3);
+    expect(Math.abs(tlcOrigin(setCurved, cfgNoZero.lanes[26], getProf) - expectedOrigin(26))).toBeLessThanOrEqual(3);
+
+    // Uneven well-to-well experimental error (+14 px, -11 px, stepped sections, and blank lane 8)
+    const jitter = [10, 0, -9, 7, -5, 14, 2, -11, 0, 9, -6, 13, 8, -10, 12, 0, -7, 5, 11, -9, 8, -4, 13, -8, 6, 10, -3];
+    const setJitter: TlcSet = {
+      uid: 'origin-jitter',
+      name: 'Jitter Origin Plate',
+      imgs: { UV254: { name: 'uv254_jitter.png', bmp: {} as any } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const getJitterProf = (_s: TlcSet, _key: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const idx = l.id % 27;
+      if (idx === 8) {
+        // Blank well: only dark plate bottom border, no origin dot
+        return Array.from({ length: l.length }, (_, i) => (i < 52 ? 25 + (i / 52) * 155 : 180));
+      }
+      const c = 115 + jitter[idx];
+      return Array.from({ length: l.length }, (_, i) => {
+        const border = i < 52 ? 25 + (i / 52) * 155 : 180;
+        const dot = 110 * Math.exp(-((i - c) ** 2) / (2 * 7 * 7));
+        return border - dot;
+      });
+    };
+    for (const idx of [0, 5, 7, 11, 13, 14, 22]) {
+      expect(Math.abs(tlcOrigin(setJitter, cfgNoZero.lanes[idx], getJitterProf) - (115 + jitter[idx]))).toBeLessThanOrEqual(3);
+    }
+    // Blank well 8 stays within the neighborhood of lanes 7 and 9 rather than jumping away
+    const blank8 = tlcOrigin(setJitter, cfgNoZero.lanes[8], getJitterProf);
+    expect(blank8).toBeGreaterThanOrEqual(100);
+    expect(blank8).toBeLessThanOrEqual(130);
+
+    // Saturated flat-core and upward-tailing dots still stay centered within 2 px
+    const setTailing: TlcSet = {
+      uid: 'origin-tailing',
+      name: 'Tailing Origin Plate',
+      imgs: { UV254: { name: 'uv254_tail.png', bmp: {} as any } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const tailOrig = (id: number) => 115 + (id % 3 === 0 ? 10 : id % 3 === 1 ? -8 : 0);
+    const getTailProf = (_s: TlcSet, _key: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const c = tailOrig(l.id % 27);
+      return Array.from({ length: l.length }, (_, y) => {
+        const core = 210 * Math.exp(-(((y - c) / 10) * ((y - c) / 10)) / 2);
+        const tail = l.id % 2 === 0 && y > c ? 115 * Math.exp(-(y - c) / 25) : 0;
+        return Math.max(18, 180 - Math.max(core, tail));
+      });
+    };
+    for (let i = 0; i < 12; i++) {
+      expect(Math.abs(tlcOrigin(setTailing, cfgNoZero.lanes[i], getTailProf) - tailOrig(i))).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it('does not mislabel an uneluted/tailing origin dot as Rf 0.01-0.03 while preserving resolved low-Rf spots', () => {
+    // 1. Heavy slightly upward-tailing origin deposit centered at o.origin = 110
+    const len = 1000;
+    const originOnly = Array.from({ length: len }, (_, i) => {
+      const core = 120 * Math.exp(-((i - 110) ** 2) / (2 * 9 * 9));
+      const tail = i > 110 ? 35 * Math.exp(-((i - 110) / 14)) : 0;
+      return 200 - Math.max(core, tail);
+    });
+    const noFakeSpot = findSpots(originOnly, {
+      sign: -1,
+      origin: 110,
+      front: 910,
+      radius: 24,
+    });
+    expect(noFakeSpot).toEqual([]);
+
+    // 2. Origin dot at 30 PLUS a genuine resolved polar spot at Rf = 0.075 (pos = 48)
+    const originPlusLowRf = Array.from({ length: 300 }, (_, i) => {
+      const originDot = 130 * Math.exp(-((i - 30) ** 2) / (2 * 4 * 4));
+      const lowRfDot = 140 * Math.exp(-((i - 48) ** 2) / (2 * 3 * 3));
+      return 200 - originDot - lowRfDot;
+    });
+    const spots = findSpots(originPlusLowRf, {
+      sign: -1,
+      origin: 30,
+      front: 270,
+      radius: 20,
+    });
+    expect(spots.length).toBe(1);
+    expect(spots[0].rf).toBeCloseTo(0.075, 2);
   });
 
   it('resolves closely spaced doublet peaks without peak suppression', () => {

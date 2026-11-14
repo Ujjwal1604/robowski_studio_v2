@@ -403,6 +403,7 @@ export interface TlcSet {
   frontAuto?: Record<number, number>;
   originPx?: number | null;
   originAuto?: Record<number, number>;
+  originAutoByLane?: Record<number, number>;
   prof?: Record<string, number[]>;
   imgs: Record<string, TlcImageEntry>;
   missing?: string[];

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="2" y1="2" x2="34" y2="34" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1A2B27" />
+      <stop offset="100%" stop-color="#0F1917" />
+    </linearGradient>
+    <linearGradient id="frontGrad" x1="8" y1="8" x2="28" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#7FD1C2" />
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="34" height="34" rx="9" fill="url(#bgGrad)" stroke="#2F4640" stroke-width="1.2" />
+  <!-- Solvent front & origin baseline tracks -->
+  <line x1="7.5" y1="9" x2="28.5" y2="9" stroke="url(#frontGrad)" stroke-width="1.6" stroke-linecap="round" opacity="0.9" />
+  <line x1="7.5" y1="27" x2="28.5" y2="27" stroke="#FFC857" stroke-width="1.6" stroke-linecap="round" opacity="0.95" />
+  <!-- Subtle vertical lane guides -->
+  <line x1="11.5" y1="10.5" x2="11.5" y2="25.5" stroke="#2D4A43" stroke-width="1.2" stroke-linecap="round" />
+  <line x1="18" y1="10.5" x2="18" y2="25.5" stroke="#2D4A43" stroke-width="1.2" stroke-linecap="round" />
+  <line x1="24.5" y1="10.5" x2="24.5" y2="25.5" stroke="#2D4A43" stroke-width="1.2" stroke-linecap="round" />
+  <!-- Origin dots -->
+  <circle cx="11.5" cy="27" r="2.1" fill="#FFC857" />
+  <circle cx="18" cy="27" r="2.1" fill="#FFC857" />
+  <circle cx="24.5" cy="27" r="2.1" fill="#FFC857" />
+  <!-- Eluted compound spots -->
+  <circle cx="11.5" cy="19.5" r="2.4" fill="#7FD1C2" />
+  <circle cx="18" cy="14.5" r="2.8" fill="#3FB8A5" />
+  <circle cx="18" cy="21.5" r="1.9" fill="#7FD1C2" opacity="0.7" />
+  <circle cx="24.5" cy="16.5" r="2.5" fill="#FFC857" />
+</svg>

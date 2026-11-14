@@ -32,6 +32,8 @@ export interface DetectedRow {
   residual: number;
   /** Spread of the dots' strength (0 = all alike). */
   uniformity: number;
+  /** Smooth per-lane vertical offset from the straight comb (working px, length 27) for bowed plates. */
+  yOffsets?: number[];
 }
 
 export interface LaneDetection {
@@ -176,7 +178,26 @@ function boxBlur(src: Float32Array, w: number, h: number, r: number) {
 function blobResponse(ch: Float32Array[], w: number, h: number) {
   const out = new Float32Array(w * h);
   const sigma = Math.max(1.2, (w / 3280) * 7.5);
+  const ya = Math.floor(h * 0.15);
+  const yb = Math.max(ya + 1, Math.ceil(h * 0.85));
+  const xa = Math.floor(w * 0.15);
+  const xb = Math.max(xa + 1, Math.ceil(w * 0.85));
+  const stepY = Math.max(1, Math.floor((yb - ya) / 25));
+  const stepX = Math.max(1, Math.floor((xb - xa) / 25));
+  const samp: number[] = [];
+
   for (const c of ch) {
+    // Clamp local brightness denominator to a fraction of interior silica intensity so dark
+    // plate borders right below the origin row cannot tilt blob peaks toward the border.
+    samp.length = 0;
+    for (let y = ya; y < yb; y += stepY) {
+      const row = y * w;
+      for (let x = xa; x < xb; x += stepX) samp.push(c[row + x]);
+    }
+    samp.sort((a, b) => a - b);
+    const chanMed = samp.length ? samp[samp.length >> 1] : 0;
+    const mFloor = 0.55 * chanMed;
+
     const g = gaussBlur(c, w, h, sigma);
     const m = boxBlur(c, w, h, Math.max(4, Math.round(sigma * 6)));
     for (let y = 1; y < h - 1; y++) {
@@ -190,7 +211,7 @@ function blobResponse(ch: Float32Array[], w: number, h: number) {
         const l1 = tr + d; // larger eigenvalue
         const l2 = tr - d;
         const v = Math.max(l1 < 0 ? -l1 : 0, l2 > 0 ? l2 : 0); // both negative or both positive
-        const s = ((v * sigma * sigma) / (m[i] + 15)) * 100;
+        const s = ((v * sigma * sigma) / (Math.max(m[i], mFloor) + 15)) * 100;
         if (s > out[i]) out[i] = s;
       }
     }
@@ -412,9 +433,9 @@ function pickSingleWindow(line: CombLine, w: number): { s0: number; score: numbe
     }
     const centreX = line.bx + line.ax * (s0 + (LANES_PER_HALF - 1) / 2);
     const off = Math.min(2, Math.abs(centreX - w / 2) / line.pitch);
-    // Keep the centering tie-breaker strictly smaller than 1 dot (0.4 < 1.0) so real dots decide
-    // placement first and symmetric missing outer edges still center cleanly.
-    const score = seen + 0.25 * strength + 1 - 0.4 * off;
+    // Keep centering penalty below a real single-dot score (~1.25) so symmetric blanks center
+    // without dropping genuine shifted outer lanes.
+    const score = seen + 0.25 * strength + 1 - 1.0 * off;
     if (score > best.score) best = { s0, score };
   }
   const built = buildRowFromLine(line, best.s0);
@@ -470,7 +491,9 @@ function pickSharedWindow(
     const centreU = upLine.bx + upLine.ax * (s0 + shift + (LANES_PER_HALF - 1) / 2);
     const centreX = (centreL + centreU) / 2;
     const off = Math.min(2, Math.abs(centreX - w / 2) / p);
-    const score = seen + 0.25 * strength + 2 - 0.4 * off;
+    // 1.25 < 1.8 < 2.5: rejects a 1-dot spurious border artifact on one half without dropping
+    // a genuine 2-half shifted outer column.
+    const score = seen + 0.25 * strength + 2 - 1.8 * off;
     if (score > best.score) best = { s0, score };
   }
 
@@ -483,6 +506,7 @@ function pickSharedWindow(
 interface RowOption {
   line: CombLine;
   row: DetectedRow;
+  priorFactor: number;
   adj: number;
 }
 
@@ -504,24 +528,256 @@ function findRows(resp: Float32Array, w: number, h: number, half: 'lower' | 'upp
     if (picked.row.seen < 6) continue;
     const miss = Math.min(1, Math.abs(picked.row.y0 / h - prior) / 0.08);
     const dev = Math.abs(picked.row.pitch / w - PITCH_FRAC) / PITCH_FRAC;
-    const adj = picked.score * (1 - 0.4 * miss) * (1 - 0.5 * Math.min(1, dev / 0.03));
-    out.push({ line, row: picked.row, adj });
+    const priorFactor = (1 - 0.4 * miss) * (1 - 0.5 * Math.min(1, dev / 0.03));
+    const adj = picked.score * priorFactor;
+    out.push({ line, row: picked.row, priorFactor, adj });
   }
   out.sort((a, b) => b.adj - a.adj);
   return out;
 }
 
 /**
- * The comb gives reliable column positions, but several rows of similar dots (origin dots, streak
- * heads) can look alike. In each lane the origin is the outermost round dot, so look for it there
- * and refit the row's height and tilt from those dots with a robust (median) line.
+ * Fit a 3-parameter quadratic `dy(u) = c0 + c1*u + c2*u^2` via Huber/Tukey IRLS so smooth plate
+ * or lens bow across the 27 lanes is followed without letting stray/tailing lanes pull the curve.
  */
-function refineRowHeight(resp: Float32Array, w: number, h: number, row: DetectedRow): DetectedRow {
+function fitSmoothQuadOffsets(
+  hits: Array<{ i: number; res: number }>,
+  p: number
+): { coeffs: [number, number, number]; medRes: number; agree: number } | null {
+  if (hits.length < 10) return null;
+  const uOf = (i: number) => (i - (LANES_PER_HALF - 1) / 2) / ((LANES_PER_HALF - 1) / 2);
+  let c0 = 0,
+    c1 = 0,
+    c2 = 0;
+
+  for (let iter = 0; iter < 6; iter++) {
+    const absRes = hits.map((h) => Math.abs(h.res - (c0 + c1 * uOf(h.i) + c2 * uOf(h.i) ** 2))).sort((a, b) => a - b);
+    const scale = Math.max(0.03 * p, 1.4826 * absRes[absRes.length >> 1]);
+    const cutoff = Math.max(0.12 * p, 2.5 * scale);
+
+    let s00 = 0, s01 = 0, s02 = 0, s11 = 0, s12 = 0, s22 = 0;
+    let r0 = 0, r1 = 0, r2 = 0;
+    for (const h of hits) {
+      const u = uOf(h.i);
+      const u2 = u * u;
+      const err = Math.abs(h.res - (c0 + c1 * u + c2 * u2));
+      let w = 1;
+      if (iter > 0) {
+        if (err >= cutoff) w = 0;
+        else {
+          const t = err / cutoff;
+          w = (1 - t * t) ** 2; // Tukey biweight
+        }
+      }
+      if (w <= 0) continue;
+      s00 += w;
+      s01 += w * u;
+      s02 += w * u2;
+      s11 += w * u2;
+      s12 += w * u * u2;
+      s22 += w * u2 * u2;
+      r0 += w * h.res;
+      r1 += w * u * h.res;
+      r2 += w * u2 * h.res;
+    }
+
+    // Tiny ridge on quadratic term keeps sparse edge extrapolation stable
+    s22 += 0.05;
+    // Solve 3x3 symmetric system via Gaussian elimination
+    const M = [
+      [s00, s01, s02, r0],
+      [s01, s11, s12, r1],
+      [s02, s12, s22, r2],
+    ];
+    for (let col = 0; col < 3; col++) {
+      let piv = col;
+      for (let row = col + 1; row < 3; row++) {
+        if (Math.abs(M[row][col]) > Math.abs(M[piv][col])) piv = row;
+      }
+      if (Math.abs(M[piv][col]) < 1e-9) return null;
+      if (piv !== col) [M[col], M[piv]] = [M[piv], M[col]];
+      const div = M[col][col];
+      for (let j = col; j < 4; j++) M[col][j] /= div;
+      for (let row = 0; row < 3; row++) {
+        if (row === col) continue;
+        const fac = M[row][col];
+        for (let j = col; j < 4; j++) M[row][j] -= fac * M[col][j];
+      }
+    }
+    c0 = M[0][3];
+    c1 = M[1][3];
+    c2 = M[2][3];
+  }
+
+  const inliers = hits.filter((h) => {
+    const u = uOf(h.i);
+    return Math.abs(h.res - (c0 + c1 * u + c2 * u * u)) < 0.18 * p;
+  });
+  if (inliers.length < 10) return null;
+  const minI = Math.min(...inliers.map((h) => h.i));
+  const maxI = Math.max(...inliers.map((h) => h.i));
+  if (maxI - minI < 12) return null;
+
+  const resSorted = hits
+    .map((h) => {
+      const u = uOf(h.i);
+      return Math.abs(h.res - (c0 + c1 * u + c2 * u * u));
+    })
+    .sort((a, b) => a - b);
+  return {
+    coeffs: [c0, c1, c2],
+    medRes: resSorted[resSorted.length >> 1],
+    agree: inliers.length,
+  };
+}
+
+/**
+ * Refine a coarse blob peak `yHit` on the raw intensity strip along `(cx, y)` by finding the
+ * symmetric 60%-peak connected dot core, removing Hessian curvature drift on flat-topped or
+ * slightly tailing origin deposits.
+ */
+function refineDotCoreY(
+  ch: Float32Array[],
+  w: number,
+  h: number,
+  cx: number,
+  yHit: number,
+  p: number
+): number {
+  const halfH = Math.max(6, Math.round(0.55 * p));
+  const yMin = Math.max(0, Math.round(yHit - halfH));
+  const yMax = Math.min(h - 1, Math.round(yHit + halfH));
+  const len = yMax - yMin + 1;
+  if (len < 7) return yHit;
+
+  const xA = Math.max(0, Math.round(cx - 0.14 * p));
+  const xB = Math.min(w - 1, Math.round(cx + 0.14 * p));
+  const xCount = Math.max(1, xB - xA + 1);
+  const hitIdx = Math.max(1, Math.min(len - 2, Math.round(yHit) - yMin));
+  const flankLo = Math.max(0, hitIdx - Math.max(3, Math.round(0.24 * p)));
+  const flankHi = Math.min(len - 1, hitIdx + Math.max(3, Math.round(0.24 * p)));
+
+  let bestChanProf: number[] | null = null;
+  let bestSign = -1;
+  let bestBg = 0;
+  let bestContrast = 0;
+
+  for (const c of ch) {
+    const raw = new Array<number>(len);
+    for (let k = 0; k < len; k++) {
+      const row = (yMin + k) * w;
+      let sum = 0;
+      for (let x = xA; x <= xB; x++) sum += c[row + x];
+      raw[k] = sum / xCount;
+    }
+    // Gentle [0.25, 0.5, 0.25] smoothing to suppress single-pixel camera grain
+    const sm = new Array<number>(len);
+    for (let k = 0; k < len; k++) {
+      const vm = raw[Math.max(0, k - 1)];
+      const v0 = raw[k];
+      const vp = raw[Math.min(len - 1, k + 1)];
+      sm[k] = 0.25 * vm + 0.5 * v0 + 0.25 * vp;
+    }
+
+    const coreVal = (sm[hitIdx - 1] + sm[hitIdx] + sm[hitIdx + 1]) / 3;
+    const upperFlank = sm.slice(0, flankLo + 1).sort((a, b) => a - b);
+    const lowerFlank = sm.slice(flankHi).sort((a, b) => a - b);
+    const medUp = upperFlank.length ? upperFlank[upperFlank.length >> 1] : coreVal;
+    const medLo = lowerFlank.length ? lowerFlank[lowerFlank.length >> 1] : coreVal;
+
+    const bgDark = Math.max(medUp, medLo);
+    const bgBright = Math.min(medUp, medLo);
+    const cDark = bgDark - coreVal;
+    const cBright = coreVal - bgBright;
+
+    if (cDark > bestContrast) {
+      bestContrast = cDark;
+      bestSign = -1;
+      bestBg = bgDark;
+      bestChanProf = sm;
+    }
+    if (cBright > bestContrast) {
+      bestContrast = cBright;
+      bestSign = 1;
+      bestBg = bgBright;
+      bestChanProf = sm;
+    }
+  }
+
+  if (!bestChanProf || bestContrast < 8) return yHit;
+
+  const sm = bestChanProf;
+  const sigAt = (k: number) => Math.max(0, bestSign * (sm[k] - bestBg));
+  const hitSig = sigAt(hitIdx);
+  const searchR = Math.max(3, Math.round(0.24 * p));
+
+  let loConn = hitIdx;
+  while (loConn > Math.max(1, hitIdx - searchR) && sigAt(loConn - 1) >= 0.45 * hitSig) loConn--;
+  let hiConn = hitIdx;
+  while (hiConn < Math.min(len - 2, hitIdx + searchR) && sigAt(hiConn + 1) >= 0.45 * hitSig) hiConn++;
+
+  let coreMax = hitSig;
+  for (let k = loConn; k <= hiConn; k++) {
+    const v = sigAt(k);
+    if (v > coreMax) coreMax = v;
+  }
+  if (coreMax < 8) return yHit;
+
+  let pLo = -1;
+  let pHi = -1;
+  for (let k = loConn; k <= hiConn; k++) {
+    if (sigAt(k) >= 0.88 * coreMax) {
+      if (pLo === -1) pLo = k;
+      pHi = k;
+    }
+  }
+  const seed = pLo !== -1 ? Math.round(0.5 * (pLo + pHi)) : hitIdx;
+  const thr = 0.60 * coreMax;
+  const maxHalf = Math.max(4, Math.round(0.32 * p));
+
+  let l = seed;
+  while (l > Math.max(0, seed - maxHalf) && sigAt(l - 1) >= thr) l--;
+  let leftY = l;
+  if (l > 0 && sigAt(l - 1) < thr && sigAt(l) >= thr) {
+    const v0 = sigAt(l - 1);
+    const v1 = sigAt(l);
+    leftY = l - (v1 - thr) / Math.max(1e-6, v1 - v0);
+  }
+
+  let r = seed;
+  while (r < Math.min(len - 1, seed + maxHalf) && sigAt(r + 1) >= thr) r++;
+  let rightY = r;
+  if (r < len - 1 && sigAt(r + 1) < thr && sigAt(r) >= thr) {
+    const v0 = sigAt(r);
+    const v1 = sigAt(r + 1);
+    rightY = r + (v0 - thr) / Math.max(1e-6, v0 - v1);
+  }
+
+  const mid = 0.5 * (leftY + rightY);
+  let sumW = 0;
+  let sumPos = 0;
+  for (let k = l; k <= r; k++) {
+    const wt = Math.max(0, sigAt(k) - thr);
+    sumW += wt;
+    sumPos += k * wt;
+  }
+  const centroid = sumW > 0 ? sumPos / sumW : mid;
+  const refined = yMin + 0.65 * mid + 0.35 * centroid;
+  if (Math.abs(refined - yHit) > 0.28 * p) return yHit;
+  return refined;
+}
+
+/**
+ * The comb gives reliable column positions, but several rows of similar dots (origin dots, streak
+ * heads) can look alike. In each lane the origin is the outermost round dot, so look for it there,
+ * refit the row's overall height, tilt, and gentle plate bow, and then lock each individual lane
+ * onto its actual origin dot center to follow experimental spotting variation.
+ */
+function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: number, row: DetectedRow): DetectedRow {
   const a0 = (row.angleDeg * Math.PI) / 180;
   const p = row.pitch;
   const outer = row.half === 'lower' ? 1 : -1; // direction towards the plate edge
-  const xs: number[] = [];
-  const ys: number[] = [];
+  const hits: Array<{ i: number; x: number; y: number }> = [];
   // Strength of dots already on the comb, as a yardstick for "a real origin dot".
   const ref: number[] = [];
   for (let i = 0; i < LANES_PER_HALF; i++) {
@@ -531,15 +787,17 @@ function refineRowHeight(resp: Float32Array, w: number, h: number, row: Detected
     if (cx > 0 && cx < w && cy > 0 && cy < h) ref.push(resp[cy * w + cx]);
   }
   ref.sort((a, b) => a - b);
-  const thr = 0.45 * (ref.length ? ref[Math.floor(ref.length / 2)] : 1);
+  const medianRef = ref.length ? ref[Math.floor(ref.length / 2)] : 1;
+  const thr = 0.45 * medianRef;
   const rad = Math.max(2, Math.round((w / 3280) * 9));
   for (let i = 0; i < LANES_PER_HALF; i++) {
     const px = row.x0 + Math.cos(a0) * p * i;
     const py = row.y0 + Math.sin(a0) * p * i;
+    let bestX = -1;
     let bestY = NaN;
     let bestV = 0;
-    const ya = Math.max(rad, Math.round(py - 0.85 * p));
-    const yb = Math.min(h - rad - 1, Math.round(py + 0.85 * p));
+    const ya = Math.max(rad, Math.round(py - 0.7 * p));
+    const yb = Math.min(h - rad - 1, Math.round(py + 0.7 * p));
     for (let y = ya; y <= yb; y++) {
       for (let x = Math.max(rad, Math.round(px - 0.2 * p)); x <= Math.min(w - rad - 1, Math.round(px + 0.2 * p)); x++) {
         const v = resp[y * w + x];
@@ -552,37 +810,160 @@ function refineRowHeight(resp: Float32Array, w: number, h: number, row: Detected
               break;
             }
         if (!isMax) continue;
-        // Prefer a strong dot, with a gentle pull towards the plate edge and the comb row.
-        const score = v / (thr / 0.45) + 0.25 * ((y - py) * outer) / p - 0.5 * Math.abs(y - py) / p;
+        // Prefer a strong dot, with a mild tie-breaker towards the outermost dot when the comb
+        // initially landed on a developed row instead of the origin.
+        const score = v / medianRef + 0.15 * ((y - py) * outer) / p - 0.5 * Math.abs(y - py) / p;
         if (Number.isNaN(bestY) || score > bestV) {
+          bestX = x;
           bestY = y;
           bestV = score;
         }
       }
     }
     if (!Number.isNaN(bestY)) {
-      xs.push(px);
-      ys.push(bestY);
+      if (bestY > 1 && bestY < h - 2 && bestX >= 0) {
+        const vm = resp[(bestY - 1) * w + bestX];
+        const v0 = resp[bestY * w + bestX];
+        const vp = resp[(bestY + 1) * w + bestX];
+        const denom = vm - 2 * v0 + vp;
+        if (denom < -1e-9) {
+          bestY += Math.max(-0.5, Math.min(0.5, (0.5 * (vm - vp)) / denom));
+        }
+      }
+      hits.push({ i, x: px, y: bestY });
     }
   }
-  if (xs.length < 8) return row;
+  if (hits.length < 8) return row;
   // Theil-Sen line through (x, y): median of pairwise slopes, then median intercept.
   const slopes: number[] = [];
-  for (let i = 0; i < xs.length; i++)
-    for (let j = i + 1; j < xs.length; j++) if (Math.abs(xs[j] - xs[i]) > 5 * p) slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
+  for (let i = 0; i < hits.length; i++)
+    for (let j = i + 1; j < hits.length; j++)
+      if (Math.abs(hits[j].x - hits[i].x) > 5 * p) slopes.push((hits[j].y - hits[i].y) / (hits[j].x - hits[i].x));
   slopes.sort((a, b) => a - b);
   const slope = slopes.length ? slopes[Math.floor(slopes.length / 2)] : Math.tan(a0);
-  const icpt = ys.map((y, i) => y - slope * xs[i]).sort((a, b) => a - b);
+  const icpt = hits.map((q) => q.y - slope * q.x).sort((a, b) => a - b);
   const b = icpt[Math.floor(icpt.length / 2)];
-  const res = ys.map((y, i) => Math.abs(y - (b + slope * xs[i]))).sort((a, b) => a - b);
+  const res = hits.map((q) => Math.abs(q.y - (b + slope * q.x))).sort((a, b) => a - b);
   const medRes = res[Math.floor(res.length / 2)];
-  // Only trust the refit when most lanes agree on one straight line.
-  const agree = ys.filter((y, i) => Math.abs(y - (b + slope * xs[i])) < 0.12 * p).length;
-  if (agree < 11 || medRes > 0.1 * p) return row;
+  const agree = hits.filter((q) => Math.abs(q.y - (b + slope * q.x)) < 0.18 * p).length;
+
+  // Also check if a gentle smooth quadratic bow explains the residuals even more tightly.
+  const quad = fitSmoothQuadOffsets(
+    hits.map((q) => ({ i: q.i, res: q.y - (b + slope * q.x) })),
+    p
+  );
+  const useQuad = quad !== null && quad.agree >= 10 && quad.medRes <= 0.16 * p;
+  if (!useQuad && (agree < 10 || medRes > 0.16 * p)) return row;
+
   const ang = Math.atan(slope);
   const x0 = row.x0;
   const y0 = b + slope * x0;
-  return { ...row, x0, y0, angleDeg: (ang * 180) / Math.PI, residual: Math.max(row.residual, medRes / p) };
+  const cosA = Math.max(0.5, Math.cos(ang));
+  const backboneOf = (i: number) => {
+    if (!useQuad || !quad) return 0;
+    const u = (i - (LANES_PER_HALF - 1) / 2) / ((LANES_PER_HALF - 1) / 2);
+    return (quad.coeffs[0] + quad.coeffs[1] * u + quad.coeffs[2] * u * u) / cosA;
+  };
+
+  // Second pass: lock each individual lane onto its own origin dot center within +/-0.30*p of
+  // the row backbone so non-straight experimental spotting variation across lanes is preserved.
+  const localThr = 0.35 * medianRef;
+  const perLaneOff: number[] = new Array(LANES_PER_HALF).fill(NaN);
+  const backboneOff: number[] = Array.from({ length: LANES_PER_HALF }, (_, i) => backboneOf(i));
+
+  for (let i = 0; i < LANES_PER_HALF; i++) {
+    const px = x0 + Math.cos(ang) * p * i;
+    const pyLine = y0 + Math.sin(ang) * p * i;
+    const pyBackbone = pyLine + backboneOff[i] * cosA;
+    const ya = Math.max(rad, Math.round(pyBackbone - 0.30 * p));
+    const yb = Math.min(h - rad - 1, Math.round(pyBackbone + 0.30 * p));
+    const xa = Math.max(rad, Math.round(px - 0.22 * p));
+    const xb = Math.min(w - rad - 1, Math.round(px + 0.22 * p));
+
+    let bestX = -1;
+    let bestY = NaN;
+    let bestS = -Infinity;
+    for (let y = ya; y <= yb; y++) {
+      for (let x = xa; x <= xb; x++) {
+        const v = resp[y * w + x];
+        if (v < localThr) continue;
+        let isMax = true;
+        for (let dy = -rad; dy <= rad && isMax; dy++)
+          for (let dx = -rad; dx <= rad; dx++)
+            if (resp[(y + dy) * w + x + dx] > v) {
+              isMax = false;
+              break;
+            }
+        if (!isMax) continue;
+        const sc = v / medianRef + 0.18 * ((y - pyBackbone) * outer) / p - 0.30 * Math.abs(y - pyBackbone) / p;
+        if (sc > bestS) {
+          bestX = x;
+          bestY = y;
+          bestS = sc;
+        }
+      }
+    }
+    if (!Number.isNaN(bestY)) {
+      if (bestY > 1 && bestY < h - 2 && bestX >= 0) {
+        const vm = resp[(bestY - 1) * w + bestX];
+        const v0 = resp[bestY * w + bestX];
+        const vp = resp[(bestY + 1) * w + bestX];
+        const denom = vm - 2 * v0 + vp;
+        if (denom < -1e-9) {
+          bestY += Math.max(-0.5, Math.min(0.5, (0.5 * (vm - vp)) / denom));
+        }
+        bestY = refineDotCoreY(ch, w, h, bestX, bestY, p);
+      }
+      perLaneOff[i] = (bestY - pyLine) / cosA;
+    }
+  }
+
+  // Interpolate deviations across blank/unspotted wells cleanly relative to the backbone.
+  const validIndices: number[] = [];
+  for (let i = 0; i < LANES_PER_HALF; i++) {
+    if (!Number.isNaN(perLaneOff[i])) validIndices.push(i);
+  }
+
+  const rawOffsets = Array.from({ length: LANES_PER_HALF }, (_, i) => {
+    let off = perLaneOff[i];
+    if (Number.isNaN(off)) {
+      if (validIndices.length === 0) {
+        off = backboneOff[i];
+      } else {
+        let left = -1;
+        let right = -1;
+        for (const k of validIndices) {
+          if (k < i) left = k;
+          else if (k > i && right === -1) right = k;
+        }
+        if (left !== -1 && right !== -1) {
+          const dL = perLaneOff[left] - backboneOff[left];
+          const dR = perLaneOff[right] - backboneOff[right];
+          const f = (i - left) / (right - left);
+          off = backboneOff[i] + dL + (dR - dL) * f;
+        } else {
+          const near = left !== -1 ? left : right;
+          const dist = Math.abs(i - near);
+          const dN = perLaneOff[near] - backboneOff[near];
+          off = backboneOff[i] + dN * Math.exp(-dist / 2);
+        }
+      }
+    }
+    return Math.max(-0.45 * p, Math.min(0.45 * p, off));
+  });
+
+  const finalRes = useQuad && quad ? Math.min(medRes, quad.medRes) : medRes;
+  const maxAbs = Math.max(...rawOffsets.map(Math.abs));
+  const yOffsets = maxAbs >= 0.015 * p ? rawOffsets : undefined;
+
+  return {
+    ...row,
+    x0,
+    y0,
+    angleDeg: (ang * 180) / Math.PI,
+    residual: Math.max(row.residual, finalRes / p),
+    yOffsets,
+  };
 }
 
 export function detectLaneRows(img: RasterImage, workWidth: number = WORK_WIDTH): LaneDetection {
@@ -590,13 +971,13 @@ export function detectLaneRows(img: RasterImage, workWidth: number = WORK_WIDTH)
   const resp = blobResponse(ch, w, h);
   // The robot's dot spacing is fixed, so look close to the usual spacing first and only widen the search
   // if that finds nothing convincing (cropped plate or shifted camera scale).
-  const first = detectWith(resp, w, h, 0.04);
+  const first = detectWith(resp, ch, w, h, 0.04);
   if (first.confidence >= 0.4) return first;
-  const wide = detectWith(resp, w, h, 0.14);
+  const wide = detectWith(resp, ch, w, h, 0.14);
   return wide.confidence > first.confidence ? wide : first;
 }
 
-function detectWith(resp: Float32Array, w: number, h: number, range: number): LaneDetection {
+function detectWith(resp: Float32Array, ch: Float32Array[], w: number, h: number, range: number): LaneDetection {
   const lowOpts = findRows(resp, w, h, 'lower', range).slice(0, 4);
   const upOpts = findRows(resp, w, h, 'upper', range).slice(0, 4);
   let lower: DetectedRow | null = lowOpts[0]?.row ?? null;
@@ -608,7 +989,8 @@ function detectWith(resp: Float32Array, w: number, h: number, range: number): La
     for (const up of upOpts) {
       const shared = pickSharedWindow(lo.line, up.line, w);
       if (!shared) continue;
-      const sc = shared.jointScore + 0.15 * (lo.adj + up.adj);
+      // Each row's height/pitch prior must count in pairing, or a dense spot row can beat the origin row on dot count alone.
+      const sc = shared.jointScore * (0.5 + 0.5 * Math.min(lo.priorFactor, up.priorFactor)) + 0.15 * (lo.adj + up.adj);
       if (sc > bestPairScore) {
         bestPairScore = sc;
         lower = shared.lower;
@@ -618,8 +1000,8 @@ function detectWith(resp: Float32Array, w: number, h: number, range: number): La
     }
   }
 
-  if (lower) lower = refineRowHeight(resp, w, h, lower);
-  if (upper) upper = refineRowHeight(resp, w, h, upper);
+  if (lower) lower = refineRowHeight(resp, ch, w, h, lower);
+  if (upper) upper = refineRowHeight(resp, ch, w, h, upper);
 
   const warnings: string[] = [];
   const det: LaneDetection = { ok: false, confidence: 0, lower, upper, workWidth: w, workHeight: h, warnings };
@@ -716,20 +1098,25 @@ export function laneConfigFromDetection(
     // Lane axis: up for the lower half, down for the upper half.
     const dx = half === 'lower' ? Math.sin(a) : -Math.sin(a);
     const dy = half === 'lower' ? -Math.cos(a) : Math.cos(a);
-    const zero = REF_ZERO_RF * s;
+    const baseZero = REF_ZERO_RF * s;
     const y0Row = approx ? (half === 'lower' ? det.workHeight * 0.9 : det.workHeight * 0.145) : r.y0;
     for (let i = 0; i < LANES_PER_HALF; i++) {
       const dotX = (r.x0 + ux * r.pitch * i) * k;
       const dotY = (y0Row + uy * r.pitch * i) * k;
+      const dyOff = !approx && r.yOffsets ? (r.yOffsets[i] ?? 0) * k : 0;
+      const laneZero = Math.max(
+        10,
+        baseZero + ((half === 'lower' ? -1 : 1) * dyOff) / Math.max(0.5, Math.cos(a))
+      );
       lanes.push({
         id: (half === 'lower' ? 0 : LANES_PER_HALF) + i,
-        x0: Math.round((dotX - dx * zero) * 10) / 10,
-        y0: Math.round((dotY - dy * zero) * 10) / 10,
+        x0: Math.round((dotX - dx * baseZero) * 10) / 10,
+        y0: Math.round((dotY - dy * baseZero) * 10) / 10,
         length: Math.round(REF_LENGTH * s),
         width: Math.round(REF_WIDTH * s),
         angle: Math.round(theta * 100) / 100,
         spotRadius: Math.round(REF_SPOT_RADIUS * s),
-        zeroRf: Math.round(zero * 10) / 10,
+        zeroRf: Math.round(laneZero * 10) / 10,
       });
     }
   }

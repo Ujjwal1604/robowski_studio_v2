@@ -13,20 +13,14 @@ export const Header: React.FC = () => {
             onClick={() => setView('setup')}
             title="Back to the run"
           >
-            <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
-              <rect width="34" height="34" rx="9" fill="#15211E" />
-              <g fill="#7FD1C2">
-                <circle cx="10" cy="10" r="2.6" />
-                <circle cx="17" cy="10" r="2.6" />
-                <circle cx="24" cy="10" r="2.6" />
-                <circle cx="10" cy="17" r="2.6" />
-                <circle cx="24" cy="17" r="2.6" />
-                <circle cx="10" cy="24" r="2.6" />
-                <circle cx="17" cy="24" r="2.6" />
-                <circle cx="24" cy="24" r="2.6" />
-              </g>
-              <circle cx="17" cy="17" r="3.4" fill="#FFC857" />
-            </svg>
+            <img
+              src="./favicon.svg"
+              alt=""
+              width={34}
+              height={34}
+              aria-hidden="true"
+              className="logo-mark"
+            />
             Robowski Studio
           </button>
         </h1>

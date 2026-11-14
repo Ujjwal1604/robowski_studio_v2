@@ -1266,6 +1266,12 @@
       opacity: .8
     }
 
+    .logo-mark {
+      display: block;
+      border-radius: 9px;
+      flex-shrink: 0
+    }
+
     .hdot {
       width: 8px;
       height: 8px;

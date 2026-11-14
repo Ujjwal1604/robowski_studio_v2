@@ -28,6 +28,7 @@ interface TlcFullPlateViewProps {
   getProfile?: (set: TlcSet, key: any, lane: any) => number[];
   onUpdateLane?: (laneId: number, patch: Partial<TlcLane>) => void;
   onUpdateSetFront?: (frontPx: number | null, side?: number) => void;
+  onAutoDetectBaselines?: () => void;
   onSnapshotHistory?: () => void;
   onUndo?: () => void;
   canUndo?: boolean;
@@ -93,6 +94,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   getProfile,
   onUpdateLane,
   onUpdateSetFront,
+  onAutoDetectBaselines,
   onSnapshotHistory,
   onUndo,
   canUndo = false,
@@ -2304,6 +2306,19 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                   </button>
                 </div>
               </div>
+
+              {onAutoDetectBaselines && (
+                <div style={{ gridColumn: '1 / -1', display: 'flex', justifyContent: 'flex-end', paddingTop: '2px' }}>
+                  <button
+                    type="button"
+                    style={{ ...hudBtn, background: '#0f172a', borderColor: '#facc15', color: '#facc15', padding: '4px 10px' }}
+                    onClick={onAutoDetectBaselines}
+                    title="Re-detect the origin baseline and solvent front directly from your plate photos without moving lane boxes"
+                  >
+                    Auto-detect Origin &amp; Front
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

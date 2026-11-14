@@ -248,7 +248,7 @@ function drawLanePanels(
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Yellow ticks where spot origin was applied (Rf = 0)
-    const origPx = tlcOrigin(p.s, l);
+    const origPx = tlcOrigin(p.s, l, (s, k, ln) => extractLaneProfile(s, k, ln, 0.35));
     ctx.strokeStyle = '#FFC857';
     ctx.lineWidth = 1.5;
     const y = top + k * (l.length - origPx);
@@ -582,6 +582,8 @@ export const TlcView: React.FC = () => {
           cfgText: text,
           prof: {},
           frontAuto: {},
+          originAuto: {},
+          originAutoByLane: {},
         };
         return next;
       });
@@ -633,6 +635,8 @@ export const TlcView: React.FC = () => {
           imgs: newImgs,
           prof: {},
           frontAuto: {},
+          originAuto: {},
+          originAutoByLane: {},
         };
         return next;
       });
@@ -692,6 +696,7 @@ export const TlcView: React.FC = () => {
           prof: {},
           frontAuto: {},
           originAuto: {},
+          originAutoByLane: {},
         };
         return next;
       });
@@ -719,6 +724,8 @@ export const TlcView: React.FC = () => {
         cfgName: 'Standard 6×9 Grid (54 Lanes)',
         prof: {},
         frontAuto: {},
+        originAuto: {},
+        originAutoByLane: {},
       };
       return next;
     });
@@ -810,6 +817,7 @@ export const TlcView: React.FC = () => {
         prof: {},
         frontAuto: {},
         originAuto: {},
+        originAutoByLane: {},
       };
       return next;
     });
@@ -1484,6 +1492,7 @@ export const TlcView: React.FC = () => {
         prof: {}, // invalidate cached sampled profile so it re-slices at new coordinates
         frontAuto: {},
         originAuto: {},
+        originAutoByLane: {},
       };
       return next;
     });
@@ -1502,6 +1511,7 @@ export const TlcView: React.FC = () => {
         prof: {},
         frontAuto: {},
         originAuto: {},
+        originAutoByLane: {},
       };
       return next;
     });
@@ -1539,6 +1549,7 @@ export const TlcView: React.FC = () => {
         prof: {},
         frontAuto: {},
         originAuto: {},
+        originAutoByLane: {},
       };
       return next;
     });
@@ -1574,6 +1585,42 @@ export const TlcView: React.FC = () => {
       }
       return next;
     });
+  };
+
+  // Re-detect both origin baseline and solvent front across all lanes from the plate photos
+  const handleAutoDetectBaselines = () => {
+    if (!hasImages) {
+      toast('Load a plate photo first.');
+      return;
+    }
+    if (currentSet.cfg) {
+      setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(currentSet.cfg!))]);
+    }
+    setSets((prev) => {
+      const next = [...prev];
+      const curSet = next[cur];
+      if (!curSet) return next;
+      const nextCfg = curSet.cfg
+        ? {
+            ...curSet.cfg,
+            hasZeroRf: false,
+            lanes: curSet.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+          }
+        : curSet.cfg;
+      next[cur] = {
+        ...curSet,
+        cfg: nextCfg,
+        originPx: null,
+        frontPx: null,
+        frontHalfPx: undefined,
+        prof: {},
+        frontAuto: {},
+        originAuto: {},
+        originAutoByLane: {},
+      };
+      return next;
+    });
+    toast('Re-detected origin baseline and solvent front from plate photos.');
   };
 
   // Global Ctrl+Z / Cmd+Z shortcut for Undo
@@ -2472,6 +2519,8 @@ export const TlcView: React.FC = () => {
                     ...s,
                     prof: {},
                     frontAuto: {},
+                    originAuto: {},
+                    originAutoByLane: {},
                   }))
                 );
               }}
@@ -2487,7 +2536,15 @@ export const TlcView: React.FC = () => {
             onClick={() => {
               setFilters({ brightness: 100, contrast: 100, invert: false });
               setCoreFraction(0.35);
-              setSets((prev) => prev.map((s) => ({ ...s, prof: {}, frontAuto: {} })));
+              setSets((prev) =>
+                prev.map((s) => ({
+                  ...s,
+                  prof: {},
+                  frontAuto: {},
+                  originAuto: {},
+                  originAutoByLane: {},
+                }))
+              );
             }}
             style={{ marginLeft: 'auto', fontSize: '11px' }}
           >
@@ -2514,7 +2571,7 @@ export const TlcView: React.FC = () => {
                     if (v >= 100) {
                       setSets((prev) => {
                         const next = [...prev];
-                        next[cur] = { ...next[cur], frameW: v, prof: {}, frontAuto: {}, originAuto: {} };
+                        next[cur] = { ...next[cur], frameW: v, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} };
                         return next;
                       });
                     }
@@ -2534,7 +2591,22 @@ export const TlcView: React.FC = () => {
                     const v = e.target.value ? parseInt(e.target.value, 10) : null;
                     setSets((prev) => {
                       const next = [...prev];
-                      next[cur] = { ...next[cur], originPx: v > 0 ? v : null, prof: {}, originAuto: {} };
+                      const curSet = next[cur];
+                      const nextCfg = curSet.cfg
+                        ? {
+                            ...curSet.cfg,
+                            hasZeroRf: false,
+                            lanes: curSet.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+                          }
+                        : curSet.cfg;
+                      next[cur] = {
+                        ...curSet,
+                        cfg: nextCfg,
+                        originPx: v && v > 0 ? v : null,
+                        prof: {},
+                        originAuto: {},
+                        originAutoByLane: {},
+                      };
                       return next;
                     });
                   }}
@@ -2559,6 +2631,16 @@ export const TlcView: React.FC = () => {
                   }}
                 />
               </label>
+
+              <button
+                type="button"
+                className="btn sm"
+                onClick={handleAutoDetectBaselines}
+                disabled={!hasImages || !hasConfig}
+                title="Re-detect the origin baseline and solvent front directly from your plate photos without moving lane boxes"
+              >
+                Auto-detect Origin &amp; Front
+              </button>
             </div>
             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
               Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
@@ -2635,6 +2717,7 @@ export const TlcView: React.FC = () => {
             getProfile={(s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)}
             onUpdateLane={handleUpdateLane}
             onUpdateSetFront={handleUpdateSetFront}
+            onAutoDetectBaselines={handleAutoDetectBaselines}
             onSnapshotHistory={handleSnapshotHistory}
             onUndo={handleUndo}
             canUndo={cfgHistory.length > 0}

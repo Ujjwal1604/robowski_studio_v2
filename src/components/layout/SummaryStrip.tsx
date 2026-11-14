@@ -1,4 +1,5 @@
 import React from 'react';
+import { BookOpen } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { PAL } from '../../engine';
 
@@ -97,13 +98,25 @@ export const SummaryStrip: React.FC = () => {
           ))}
         </span>
         {state.eln && Object.values(state.eln.wells || {}).some((w) => (w.tags && w.tags.length > 0) || Boolean(w.notes) || (w.status && w.status !== 'none')) && (
-          <span
-            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+          <button
+            type="button"
+            style={{
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '5px',
+              background: 'none',
+              border: 0,
+              padding: 0,
+              color: 'inherit',
+              font: 'inherit',
+            }}
             onClick={() => setView('eln')}
             title="View HTE Notebook observations and hit matrix"
           >
-            📓 <b>{Object.values(state.eln.wells || {}).filter((w) => (w.tags && w.tags.length > 0) || Boolean(w.notes)).length}</b> obs
-          </span>
+            <BookOpen size={13} strokeWidth={1.8} />
+            <b>{Object.values(state.eln.wells || {}).filter((w) => (w.tags && w.tags.length > 0) || Boolean(w.notes)).length}</b> obs
+          </button>
         )}
         {renderChip()}
       </div>

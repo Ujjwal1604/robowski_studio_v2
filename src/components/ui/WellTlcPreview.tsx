@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowUpRight, Layers } from 'lucide-react';
 import { TlcLane, TlcSet, TlcSpot } from '../../types';
 import {
   LANE_FRAME_WIDTH,
@@ -125,7 +126,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     });
     const effectiveSpots = getEffectiveLaneSpots(lane, dens.spots);
 
-    // Also compute secondary UV366 curve if composite is selected
     let uv366Dens = null;
     if (activeMode === 'composite' && availableChannels.includes('UV366')) {
       const p366 = extractLaneProfileLocal(tlcSet, 'UV366', lane);
@@ -156,7 +156,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
 
     const targetH = 148;
     const k = targetH / Math.max(1, lane.length);
-    const targetW = Math.max(28, Math.round(lane.width * k * 1.4));
+    const targetW = Math.max(32, Math.round(lane.width * k * 1.45));
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     canvas.width = targetW * dpr;
@@ -176,7 +176,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       const im = tlcSet.imgs?.[activeMode];
       if (im?.bmp) {
         const m = laneMatrix(lane, im.bmp.width / (tlcSet.frameW || LANE_FRAME_WIDTH), k);
-        // Stretch width slightly to targetW for clear visibility
         const scaleX = targetW / Math.max(1, lane.width * k);
         ctx.save();
         ctx.setTransform(
@@ -192,7 +191,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       }
     }
 
-    // Draw origin, solvent front, and spot ticks
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     if (densitogramInfo) {
       const origY = k * (lane.length - densitogramInfo.origin);
@@ -235,39 +233,58 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     return (
       <div
         style={{
-          padding: '10px 12px',
-          borderRadius: '8px',
+          padding: '12px 14px',
+          borderRadius: '11px',
           background: 'var(--soft)',
           border: '1px solid var(--line)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          gap: '10px',
+          gap: '12px',
         }}
       >
-        <div>
-          <div style={{ fontWeight: 600, fontSize: '12px', color: 'var(--fg)' }}>
-            TLC Lane #{laneIdx + 1} (Plate {plateIndex + 1})
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+          <div
+            style={{
+              width: '32px',
+              height: '32px',
+              borderRadius: '8px',
+              background: 'var(--panel)',
+              border: '1px solid var(--line)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--mut)',
+              flexShrink: 0,
+            }}
+          >
+            <Layers size={15} />
           </div>
-          <div style={{ fontSize: '11px', color: 'var(--mut)', marginTop: '2px' }}>
-            {customSpotsOnly.length > 0
-              ? `${customSpotsOnly.length} custom spot(s) · Main Rf: ${customSpotsOnly[0]?.rf?.toFixed(2)}`
-              : 'No TLC plate images uploaded for this plate yet'}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: '12.5px', color: 'var(--fg)' }}>
+              TLC Lane #{laneIdx + 1} · Plate {plateIndex + 1}
+            </div>
+            <div style={{ fontSize: '11.5px', color: 'var(--mut)', marginTop: '1px' }}>
+              {customSpotsOnly.length > 0
+                ? `${customSpotsOnly.length} custom spot(s) · Main Rf ${customSpotsOnly[0]?.rf?.toFixed(2)}`
+                : 'No TLC images uploaded for this plate yet'}
+            </div>
           </div>
         </div>
         <button
           type="button"
           className="btn sm"
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}
           onClick={onOpenTlcMap}
           title="Jump directly to this well's lane in TLC Map"
         >
-          Open in TLC Map ➔
+          <span>Open TLC Map</span>
+          <ArrowUpRight size={13} />
         </button>
       </div>
     );
   }
 
-  // Build SVG densitogram path (Rf from 0.0 to 1.0 mapped horizontally, intensity vertically)
   const svgW = 240;
   const svgH = 92;
   const padL = 8;
@@ -287,7 +304,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     const sampled = filtered.filter((_, i) => i % step === 0 || i === filtered.length - 1);
     const coords = sampled.map((p) => {
       const x = padL + ((p.rf + 0.05) / 1.1) * plotW;
-      const y = padT + plotH - (Math.min(1, p.signal / maxSig) * plotH);
+      const y = padT + plotH - Math.min(1, p.signal / maxSig) * plotH;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     });
     const firstX = (padL + ((sampled[0].rf + 0.05) / 1.1) * plotW).toFixed(1);
@@ -312,70 +329,66 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
   return (
     <div
       style={{
-        padding: '10px 12px',
-        borderRadius: '8px',
+        padding: '12px 14px',
+        borderRadius: '11px',
         background: 'var(--soft)',
         border: '1px solid var(--line)',
       }}
     >
-      {/* Top Row: Title + Channel Switch + Open in TLC Map */}
+      {/* Top Bar */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
           gap: '8px',
-          marginBottom: '8px',
+          marginBottom: '10px',
           flexWrap: 'wrap',
         }}
       >
-        <div style={{ fontWeight: 600, fontSize: '12px', color: 'var(--fg)' }}>
-          TLC Lane #{laneIdx + 1} Preview
+        <div style={{ fontWeight: 600, fontSize: '12.5px', color: 'var(--fg)' }}>
+          TLC Lane #{laneIdx + 1}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-          {hasComposite && (
-            <button
-              type="button"
-              className="btn sm"
-              style={{
-                padding: '2px 7px',
-                height: '22px',
-                fontSize: '10px',
-                background: activeMode === 'composite' ? 'var(--acc)' : 'var(--panel)',
-                color: activeMode === 'composite' ? 'var(--acc-fg)' : 'var(--fg2)',
-                borderColor: activeMode === 'composite' ? 'var(--acc)' : 'var(--line)',
-              }}
-              onClick={() => setSelectedMode('composite')}
-            >
-              Composite
-            </button>
-          )}
-          {availableChannels.map((ch) => (
-            <button
-              key={ch}
-              type="button"
-              className="btn sm"
-              style={{
-                padding: '2px 7px',
-                height: '22px',
-                fontSize: '10px',
-                background: activeMode === ch ? 'var(--acc)' : 'var(--panel)',
-                color: activeMode === ch ? 'var(--acc-fg)' : 'var(--fg2)',
-                borderColor: activeMode === ch ? 'var(--acc)' : 'var(--line)',
-              }}
-              onClick={() => setSelectedMode(ch)}
-            >
-              {ch === 'White' ? 'Vis' : ch}
-            </button>
-          ))}
+          <div className="seg" style={{ padding: '2px', borderRadius: '8px' }}>
+            {hasComposite && (
+              <button
+                type="button"
+                className={activeMode === 'composite' ? 'on' : ''}
+                style={{ height: '24px', padding: '0 8px', fontSize: '11px', borderRadius: '6px' }}
+                onClick={() => setSelectedMode('composite')}
+              >
+                Composite
+              </button>
+            )}
+            {availableChannels.map((ch) => (
+              <button
+                key={ch}
+                type="button"
+                className={activeMode === ch ? 'on' : ''}
+                style={{ height: '24px', padding: '0 8px', fontSize: '11px', borderRadius: '6px' }}
+                onClick={() => setSelectedMode(ch)}
+              >
+                {ch === 'White' ? 'Vis' : ch}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
             className="btn sm"
-            style={{ padding: '2px 8px', height: '22px', fontSize: '10px' }}
+            style={{
+              height: '26px',
+              padding: '0 9px',
+              fontSize: '11px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '3px',
+            }}
             onClick={onOpenTlcMap}
-            title="Inspect full TLC plate & adjust spot markers"
+            title="Inspect full TLC plate and adjust spot markers"
           >
-            Full TLC ➔
+            <span>TLC Map</span>
+            <ArrowUpRight size={12} />
           </button>
         </div>
       </div>
@@ -387,7 +400,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           title="Click to inspect lane in TLC Map"
           style={{
             cursor: 'pointer',
-            borderRadius: '6px',
+            borderRadius: '8px',
             overflow: 'hidden',
             border: '1px solid var(--line)',
             background: '#090d16',
@@ -401,13 +414,12 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
         </div>
 
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
-          {/* 1D Densitogram Trace */}
           <div
             style={{
               background: 'var(--panel)',
               border: '1px solid var(--line)',
-              borderRadius: '6px',
-              padding: '4px 6px',
+              borderRadius: '8px',
+              padding: '6px 8px',
             }}
           >
             <svg
@@ -415,7 +427,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
               style={{ width: '100%', height: 'auto', display: 'block' }}
               aria-label={`1D TLC densitogram for lane ${laneIdx + 1}`}
             >
-              {/* Baseline & Origin/Front lines */}
               <line
                 x1={padL + (0.05 / 1.1) * plotW}
                 y1={padT}
@@ -443,20 +454,17 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                 strokeWidth="1"
               />
 
-              {/* Primary trace */}
               {primaryTrace.area && (
-                <path d={primaryTrace.area} fill={traceColor} fillOpacity="0.18" />
+                <path d={primaryTrace.area} fill={traceColor} fillOpacity="0.16" />
               )}
               {primaryTrace.line && (
                 <path d={primaryTrace.line} fill="none" stroke={traceColor} strokeWidth="1.6" />
               )}
 
-              {/* Secondary UV366 trace if composite */}
               {uv366Trace.line && (
                 <path d={uv366Trace.line} fill="none" stroke="#a855f7" strokeWidth="1.4" strokeDasharray="3,2" />
               )}
 
-              {/* Detected spot markers */}
               {spotsToShow.slice(0, 6).map((sp, idx) => {
                 const sx = padL + ((Math.max(-0.05, Math.min(1.05, sp.rf)) + 0.05) / 1.1) * plotW;
                 return (
@@ -474,8 +482,8 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                       x={sx}
                       y={padT + 8}
                       fontSize="7"
-                      fontFamily="monospace"
-                      fontWeight="700"
+                      fontFamily="IBM Plex Mono, monospace"
+                      fontWeight="600"
                       fill="#FF4D8D"
                       textAnchor="middle"
                     >
@@ -485,7 +493,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                 );
               })}
 
-              {/* X-axis Rf labels */}
               <text x={padL + (0.05 / 1.1) * plotW} y={svgH - 4} fontSize="8" fill="var(--mut)" textAnchor="middle">
                 Rf 0
               </text>
@@ -498,28 +505,30 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
             </svg>
           </div>
 
-          {/* Detected Spot Summary */}
-          <div style={{ marginTop: '6px', display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <div
+            className="mono"
+            style={{
+              marginTop: '7px',
+              fontSize: '11px',
+              color: 'var(--fg2)',
+              display: 'flex',
+              gap: '6px',
+              flexWrap: 'wrap',
+              alignItems: 'center',
+            }}
+          >
             {spotsToShow.length > 0 ? (
               spotsToShow.slice(0, 5).map((sp, idx) => (
-                <span
-                  key={idx}
-                  className="mono"
-                  style={{
-                    fontSize: '10px',
-                    padding: '2px 6px',
-                    borderRadius: '4px',
-                    background: 'var(--panel)',
-                    border: '1px solid var(--line)',
-                    color: 'var(--fg)',
-                  }}
-                >
-                  Rf {sp.rf.toFixed(2)}
-                  {sp.areaPct != null ? ` (${sp.areaPct}%)` : ''}
-                </span>
+                <React.Fragment key={idx}>
+                  {idx > 0 && <span style={{ color: 'var(--mut)' }}>·</span>}
+                  <span>
+                    Rf {sp.rf.toFixed(2)}
+                    {sp.areaPct != null ? ` (${sp.areaPct}%)` : ''}
+                  </span>
+                </React.Fragment>
               ))
             ) : (
-              <span style={{ fontSize: '11px', color: 'var(--mut)' }}>
+              <span style={{ fontFamily: 'inherit', color: 'var(--mut)' }}>
                 No resolved peaks above baseline
               </span>
             )}

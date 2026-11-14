@@ -56,6 +56,7 @@ import {
   TlcDensitogramData,
 } from '../../types';
 import { putTlcImage, getTlcImage, deleteTlcSetImages } from '../../context/tlcStorage';
+import { detectLaneRows, laneConfigFromDetection } from '../../engine/tlcLaneDetect';
 import { TlcFullPlateView } from './TlcFullPlateView';
 import { parseWellQuery } from '../ui/CommandPalette';
 import { AiTlcInterpreter } from '../ui/AiTlcInterpreter';
@@ -643,6 +644,67 @@ export const TlcView: React.FC = () => {
       );
     }
     e.target.value = '';
+  };
+
+  // Find the lanes automatically from the two rows of origin dots (tries every loaded image, keeps the best).
+  const handleAutoDetectLanes = () => {
+    const keys = TLC_KEYS.filter((k) => currentSet.imgs[k]?.bmp);
+    if (!keys.length) {
+      toast('Load a plate image first.');
+      return;
+    }
+    try {
+      let best: { det: ReturnType<typeof detectLaneRows>; key: TlcChannelKey } | null = null;
+      for (const k of keys) {
+        const bmp = currentSet.imgs[k]!.bmp;
+        const w = Math.min(bmp.width, 1300);
+        const h = Math.max(1, Math.round((bmp.height * w) / bmp.width));
+        const cv = document.createElement('canvas');
+        cv.width = w;
+        cv.height = h;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        if (!ctx) continue;
+        ctx.drawImage(bmp, 0, 0, w, h);
+        const det = detectLaneRows(ctx.getImageData(0, 0, w, h), w);
+        if (!best || det.confidence > best.det.confidence) best = { det, key: k };
+      }
+      if (!best || (!best.det.lower && !best.det.upper)) {
+        toast('Could not find the origin dots. Try a plate image where they show clearly (UV 254 works best).');
+        return;
+      }
+      const frameW = currentSet.frameW || LANE_FRAME_WIDTH;
+      const cfg = laneConfigFromDetection(best.det, frameW);
+      const prev = currentSet.cfg;
+      if (prev) setCfgHistory((h) => [...h.slice(-39), JSON.parse(JSON.stringify(prev))]);
+      originalCfgRef.current[currentSet.uid] = JSON.parse(JSON.stringify(cfg));
+      setSets((all) => {
+        const next = [...all];
+        next[cur] = {
+          ...next[cur],
+          cfg,
+          cfgName: 'Auto-detected lanes',
+          cfgText: undefined,
+          frontPx: null,
+          frontHalfPx: undefined,
+          originPx: null,
+          edgePicks: undefined,
+          edgeSettings: undefined,
+          prof: {},
+          frontAuto: {},
+          originAuto: {},
+        };
+        return next;
+      });
+      const pct = Math.round(best.det.confidence * 100);
+      const note = best.det.warnings[0] ? ' ' + best.det.warnings[0] : '';
+      toast(
+        best.det.ok
+          ? `Lanes detected from ${TLC_LABEL[best.key]} (confidence ${pct}%).${note}`
+          : `Lanes placed from ${TLC_LABEL[best.key]}, but confidence is low (${pct}%). Check them by eye.${note}`
+      );
+    } catch (err: any) {
+      toast('Lane detection failed: ' + (err?.message || err));
+    }
   };
 
   // Apply Default Standard 54-Lane 6x9 Grid
@@ -1951,6 +2013,16 @@ export const TlcView: React.FC = () => {
           </button>
 
           <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
+
+          <button
+            type="button"
+            className="btn pri"
+            onClick={handleAutoDetectLanes}
+            disabled={!hasImages}
+            title="Find the two rows of origin dots in the plate photo and place all 54 lanes from them."
+          >
+            Auto-detect lanes
+          </button>
 
           <button
             type="button"

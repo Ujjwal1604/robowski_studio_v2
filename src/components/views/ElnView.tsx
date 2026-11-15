@@ -19,6 +19,11 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import {
+  applyRunConditionsPatch,
+  getCanonicalRunConditions,
+  summarizeRunHydrates,
+} from '../../engine';
+import {
   WellOutcomeStatus,
   WellObservation,
   HteElnRecord,
@@ -165,12 +170,27 @@ export const ElnView: React.FC = () => {
   const numPlates = run?.plates || Math.max(1, Math.ceil(rowsCache.length / PLATE_SIZE));
   const totalWellsCount = Math.max(run?.rows?.length || 0, numPlates * PLATE_SIZE);
 
-  // Update top-level ELN fields
+  const canonicalCond = useMemo(() => getCanonicalRunConditions(state), [state]);
+  const hydrateSummary = useMemo(() => summarizeRunHydrates(state, run), [state, run]);
+
+  // Update top-level ELN fields (syncing shared reaction conditions back to Setup/Predictor)
   const updateEln = useCallback(
     (patch: Partial<HteElnRecord>) => {
       setState((prev) => {
-        const next = JSON.parse(JSON.stringify(prev));
+        let next = JSON.parse(JSON.stringify(prev));
         next.eln = { ...(next.eln || {}), ...patch };
+        if (patch.temperatureC !== undefined) {
+          const t = Number(patch.temperatureC);
+          if (patch.temperatureC !== '' && Number.isFinite(t)) {
+            next = applyRunConditionsPatch(next, { temperatureC: t });
+          }
+        }
+        if (patch.waterPct !== undefined) {
+          const w = Number(patch.waterPct);
+          if (patch.waterPct !== '' && Number.isFinite(w)) {
+            next = applyRunConditionsPatch(next, { baseWaterPct: Math.max(0, w) });
+          }
+        }
         return next;
       });
     },
@@ -676,10 +696,10 @@ export const ElnView: React.FC = () => {
     if (!scaleUpCalculations || !scaleUpCalculations.length) return '';
     const solids = scaleUpCalculations.filter((c) => c.massG != null && (!c.volMl || c.volMl < 0.2));
     const liquids = scaleUpCalculations.filter((c) => c.volMl != null && c.volMl >= 0.2);
-    const solv = state.reactionSolvent || 'solvent';
-    const temp = eln.temperatureC ? `${eln.temperatureC} °C` : 'room temperature';
-    const time = eln.reactionTimeHours ? `${eln.reactionTimeHours} h` : '16 h';
-    const atm = eln.atmosphere || 'inert atmosphere';
+    const solv = canonicalCond.solvent || 'solvent';
+    const temp = `${canonicalCond.temperatureC} °C`;
+    const time = canonicalCond.reactionTimeHours !== '' ? `${canonicalCond.reactionTimeHours} h` : '16 h';
+    const atm = canonicalCond.atmosphere || 'inert atmosphere';
 
     let txt = `Bench Scale Procedure (${scaleUpScaleMmol} mmol scale):\n\n`;
     txt += `An oven-dried reaction vial equipped with a magnetic stir bar was charged with `;
@@ -690,8 +710,15 @@ export const ElnView: React.FC = () => {
         .join(', ')}`;
     }
     const estSolvVolume = Math.round((scaleUpScaleMmol / 0.1) * 10) / 10;
-    txt += ` and anhydrous ${solv} (~${estSolvVolume} mL) under ${atm}. `;
+    const moistureDesc =
+      canonicalCond.baseWaterPct <= 0.3
+        ? `anhydrous ${solv}`
+        : `${solv} (~${canonicalCond.baseWaterPct.toFixed(1)}% H₂O)`;
+    txt += ` and ${moistureDesc} (~${estSolvVolume} mL) under ${atm}. `;
     txt += `The vial was sealed with a ${eln.plateSealType || 'septum cap'} and stirred at ${temp} for ${time}.`;
+    if (hydrateSummary.hasHydrates) {
+      txt += `\n[Hydrate Water Note]: Hydrate reagent(s) (${hydrateSummary.items.map((i) => `${i.code}: ${i.label}`).join(', ')}) introduce +${hydrateSummary.minTotalHydrateWaterPct.toFixed(2)}–${hydrateSummary.maxTotalHydrateWaterPct.toFixed(2)}% v/v H₂O.`;
+    }
 
     const hitObs =
       eln.wells[`${Math.floor(scaleUpHitWellIdx / PLATE_SIZE)}-${scaleUpHitWellIdx % PLATE_SIZE}`];
@@ -952,10 +979,33 @@ export const ElnView: React.FC = () => {
                   type="number"
                   className="f mono"
                   style={{ height: '34px', fontSize: '12.5px' }}
-                  value={eln.temperatureC ?? ''}
-                  placeholder="60"
-                  onChange={(e) => updateEln({ temperatureC: e.target.value })}
+                  value={canonicalCond.temperatureC}
+                  placeholder="25"
+                  onChange={(e) => {
+                    const num = Number(e.target.value);
+                    if (e.target.value !== '' && Number.isFinite(num)) {
+                      updateEln({ temperatureC: num });
+                    }
+                  }}
                 />
+              </div>
+              <div>
+                <label className="lbl">Base Water (% v/v)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="100"
+                  className="f mono"
+                  style={{ height: '34px', fontSize: '12.5px' }}
+                  value={canonicalCond.baseWaterPct}
+                  onChange={(e) => updateEln({ waterPct: Math.max(0, Number(e.target.value) || 0) })}
+                />
+                {hydrateSummary.hasHydrates && (
+                  <div className="mono" style={{ fontSize: '10.5px', color: 'var(--acc)', marginTop: '3px' }}>
+                    +{hydrateSummary.minTotalHydrateWaterPct.toFixed(2)}%–{hydrateSummary.maxTotalHydrateWaterPct.toFixed(2)}% hydrate H₂O
+                  </div>
+                )}
               </div>
               <div>
                 <label className="lbl">Heating Apparatus</label>

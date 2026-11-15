@@ -6,6 +6,7 @@ import {
   PredictorSubstrateInput,
   WellConditionConfig,
 } from './types';
+import { detectHydrateStoichiometry } from '../conditions';
 
 interface CounterionDef {
   smilesSet: string[];
@@ -393,14 +394,16 @@ export function parseSubstrateAndSalts(
   input: PredictorSubstrateInput
 ): ParsedSubstrate {
   const raw = (input.smiles || '').trim();
+  const eqInit = Math.max(0, Number(input.equivalents) || 1);
+  const concInit = Number(input.concentrationMm) > 0 ? Number(input.concentrationMm) : 50 * eqInit;
   const baseFail = (error: string): ParsedSubstrate => ({
     id: input.id,
     code: input.code,
     name: input.name,
     rawSmiles: raw,
     neutralSmiles: '',
-    equivalents: Math.max(0, Number(input.equivalents) || 1),
-    concentrationMm: Number(input.concentrationMm) || 50,
+    equivalents: eqInit,
+    concentrationMm: concInit,
     saltDetected: null,
     saltAcidEquiv: 0,
     hydrateWaterEquiv: 0,
@@ -542,15 +545,28 @@ export function parseSubstrateAndSalts(
 
     parentMol.delete();
 
+    const nameHydrateDet = detectHydrateStoichiometry(undefined, input.name, input.iupac);
+    const resolvedWaterPerMol = Math.max(waterPerMol, nameHydrateDet.waterEquivPerMol);
+    const nonWaterLabels = saltLabels.filter((lbl) => lbl !== 'Hydrate');
+
     let saltDesc: string | null = null;
-    if (saltLabels.length > 0) {
+    const descParts: string[] = [];
+    if (nonWaterLabels.length > 0) {
       const counts = new Map<string, number>();
-      for (const lbl of saltLabels) counts.set(lbl, (counts.get(lbl) || 0) + 1);
-      saltDesc = Array.from(counts.entries())
-        .map(([lbl, n]) => (n > 1 ? `${n} eq ${lbl}` : lbl))
-        .join(' + ');
+      for (const lbl of nonWaterLabels) counts.set(lbl, (counts.get(lbl) || 0) + 1);
+      descParts.push(
+        ...Array.from(counts.entries()).map(([lbl, n]) => (n > 1 ? `${n} eq ${lbl}` : lbl))
+      );
     } else if (protonAdjust > 0) {
-      saltDesc = `Protonated cation (+${protonAdjust} H⁺)`;
+      descParts.push(`Protonated cation (+${protonAdjust} H⁺)`);
+    }
+    if (resolvedWaterPerMol > 0) {
+      descParts.push(
+        resolvedWaterPerMol === 1 ? 'Hydrate (1 H₂O)' : `Hydrate (${resolvedWaterPerMol} H₂O)`
+      );
+    }
+    if (descParts.length > 0) {
+      saltDesc = descParts.join(' + ');
     }
 
     return {
@@ -560,10 +576,10 @@ export function parseSubstrateAndSalts(
       rawSmiles: raw,
       neutralSmiles: cleanSmiles,
       equivalents: eq,
-      concentrationMm: Number(input.concentrationMm) || 50,
+      concentrationMm: Number(input.concentrationMm) > 0 ? Number(input.concentrationMm) : 50 * eq,
       saltDetected: saltDesc,
       saltAcidEquiv: saltHPerMol * eq,
-      hydrateWaterEquiv: waterPerMol * eq,
+      hydrateWaterEquiv: resolvedWaterPerMol * eq,
       sites: Array.from(siteByRule.values()),
       exactMass,
       formula,

@@ -69,7 +69,7 @@ const CARBON_ACID_DUAL =
 const CARBON_ACID_DUAL_OR_KETONE =
   '[CX4;H2,H1;!$(C-C-[OX2H]);$(C(C=O)C=O),$(C(C#N)C#N),$(C(C=O)C#N),$(C(S(=O)=O)C=O),$(C([#6;X3](=O)[#6])):3]';
 const CARBON_ACID_SINGLE =
-  '[CX4;H3,H2,H1;!$(C-C-[OX2H]);!$(C(C=O)C=O);!$(C(C#N)C#N);$(C([#6;X3](=O)[#6])),$(C([CX3](=O)[OX2,NX3])[a]),$(C(C#N)[#6]),$(C[NX3+](=O)[O-]),$(C-c1:[n,c]:[n,c]:[c]:[c]:[c]:1),$(C-c1[n,o,s][c,n][c,n][c,n]1):3]';
+  '[CX4;H3,H2,H1;!$(C-C-[OX2H]);!$(C-[OX2H,NX3]);!$(C(C=O)C=O);!$(C(C#N)C#N);$(C([#6;X3](=O)[#6])),$(C([CX3](=O)[OX2,NX3])[a]),$(C(C#N)[#6]),$(C[NX3+](=O)[O-]),$(C-c1:[n,c]:[n,c]:[c]:[c]:[c]:1),$(C-c1[n,o,s][c,n][c,n][c,n]1):3]';
 // Heteroaromatic azole NH (imidazole, benzimidazole, pyrazole, triazole, indole)
 const AZOLE_NH = '[nX3H1;r5:3]';
 // Activated Michael acceptor C=C-EWG
@@ -853,9 +853,9 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     acidFactor: 0.35,
     baseFactor: 0.85,
     neutralFactor: 0.5,
-    t50: 85,
+    t50: 105,
     width: 20,
-    prior: 0.68,
+    prior: 0.32, // uncatalyzed aminolysis of an unactivated ester is slow
     reversible: false,
     kClass: 'favorable',
     thermoBonus: 0.14,

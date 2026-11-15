@@ -86,6 +86,8 @@ export interface RunState {
   threshold: number | string;
   dilutionFactor: number | string;
   reactionSolvent: string;
+  temperatureC?: number | string;
+  waterPct?: number | string;
   leftoverMl: number | string;
   flasksText: string;
   randomize: boolean;
@@ -231,6 +233,8 @@ export interface RunResult {
   mode: string;
   hood: 'left' | 'right';
   reactionSolvent: string;
+  temperatureC?: number;
+  waterPct?: number;
   vialVolume: number;
   threshold: number;
   dilutionFactor: number;
@@ -399,6 +403,8 @@ export interface TlcPlateData {
   frontPx?: number | null;
   frontHalfPx?: Record<number, number>; // side 0 (Lanes 0-26) and side 1 (Lanes 27-53)
   frontAuto?: Record<number, number>;
+  /** per half: whether auto front/origin was genuinely detected (vs default guess) and signal strength */
+  autoConf?: Record<string, { detected: boolean; score: number }>;
   originPx?: number | null;
   originAuto?: Record<number, number>;
   originAutoByLane?: Record<number, number>;
@@ -460,6 +466,7 @@ export interface HteElnRecord {
   targetProduct?: string;
   // Physical & Reaction Execution Conditions
   temperatureC?: number | string;
+  waterPct?: number | string;
   heatingApparatus?: string;  // e.g. "Aluminum heating block", "Oil bath", "Ambient 23°C", "Chilled 0°C"
   reactionTimeHours?: number | string;
   atmosphere?: string;        // "N2 Glovebox", "Argon Schlenk", "Ambient air", "Sealed septum cap"

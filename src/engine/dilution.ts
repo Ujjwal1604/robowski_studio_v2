@@ -592,6 +592,18 @@ export function buildRun(data: any): RunResult {
     mode,
     hood,
     reactionSolvent,
+    temperatureC:
+      data.temperatureC !== '' && data.temperatureC != null && Number.isFinite(Number(data.temperatureC))
+        ? Number(data.temperatureC)
+        : data.eln?.temperatureC !== '' && data.eln?.temperatureC != null && Number.isFinite(Number(data.eln.temperatureC))
+        ? Number(data.eln.temperatureC)
+        : undefined,
+    waterPct:
+      data.waterPct !== '' && data.waterPct != null && Number.isFinite(Number(data.waterPct))
+        ? Math.max(0, Number(data.waterPct))
+        : data.eln?.waterPct !== '' && data.eln?.waterPct != null && Number.isFinite(Number(data.eln.waterPct))
+        ? Math.max(0, Number(data.eln.waterPct))
+        : undefined,
     vialVolume: vial,
     threshold,
     dilutionFactor: factor,

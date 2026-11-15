@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { chooseSaveFolder, clearSaveFolder, folderSaveSupported, getSaveFolderName } from '../../utils/folderSave';
 import { useApp } from '../../context/AppContext';
 import { notebookCardSvg, localDate } from '../../engine';
 import * as Core from '../../engine';
@@ -20,6 +21,10 @@ export const ExportView: React.FC = () => {
   } = useApp();
 
   const [descOpen, setDescOpen] = useState(false);
+  const [saveFolder, setSaveFolder] = useState<string | null>(null);
+  useEffect(() => {
+    getSaveFolderName().then(setSaveFolder).catch(() => {});
+  }, []);
 
   const blocked = !run || run.blockingIssues > 0;
 
@@ -429,6 +434,43 @@ export const ExportView: React.FC = () => {
               >
                 Save as new
               </button>
+            </div>
+            <div style={{ marginTop: '10px', fontSize: '12px', color: 'var(--mut)' }}>
+              {folderSaveSupported() ? (
+                <>
+                  Save folder (for example inside Dropbox):{' '}
+                  <b>{saveFolder ?? 'not set'}</b>{' '}
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={async () => {
+                      const res = await chooseSaveFolder();
+                      if (res.name) {
+                        setSaveFolder(res.name);
+                        toast('Runs will also be written to "' + res.name + '" when you press Save.');
+                      } else if (res.blockedReason === 'iframe-blocked') {
+                        toast('Folder picker is blocked inside an embedded preview frame. Open in a standalone tab or export the .robowski archive.');
+                      }
+                    }}
+                  >
+                    {saveFolder ? 'Change folder' : 'Choose folder'}
+                  </button>{' '}
+                  {saveFolder && (
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={async () => {
+                        await clearSaveFolder();
+                        setSaveFolder(null);
+                      }}
+                    >
+                      Stop
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>This browser cannot write to a folder directly. Use Chrome/Brave/Edge for folder auto-save, or export the .robowski archive and move it into Dropbox.</>
+              )}
             </div>
           </div>
         </div>

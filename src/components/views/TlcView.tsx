@@ -18,6 +18,7 @@ import {
   movingAvg,
   pctile,
   detectFront,
+  tlcDetectionNotes,
   findSpots,
   extractDensitogram,
   computeLaneRowIntensity,
@@ -2878,6 +2879,17 @@ export const TlcView: React.FC = () => {
             </div>
             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
               Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
+              {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && hasImages && (
+                <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                  {tlcDetectionNotes(activePlateSet, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)).map((n) => (
+                    <div key={n.label} style={{ color: n.warning ? 'var(--warn)' : 'var(--mut)' }}>
+                      {n.label}: {n.source}
+                      {n.source === 'detected' ? ` (strength ${n.score.toFixed(1)})` : ''}
+                      {n.warning ? ` — ${n.warning}` : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
               {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && (
                 <span style={{ color: 'var(--pri)', marginLeft: '6px' }}>
                   (Current baseline: {Math.round(tlcOrigin(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)

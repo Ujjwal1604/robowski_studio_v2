@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { RunResult, RunRow, RunState } from '../../types';
 import {
   WellPredictionResult,
+  computeSpeciesHighlightBonds,
   extractWellForPrediction,
+  getCanonicalRunConditions,
   predictWellReactions,
   wellLabel,
 } from '../../engine';
@@ -27,21 +29,38 @@ export const WellPredictedProductsPanel: React.FC<WellPredictedProductsPanelProp
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<WellPredictionResult | null>(null);
+  const [rdkitInst, setRdkitInst] = useState<any>(null);
   const [missingCodes, setMissingCodes] = useState<string[]>([]);
+
+  const activeRow: RunRow | undefined = useMemo(
+    () =>
+      run?.rows.find((r) => r.plate_number === plate && r.container_id === wellIndex) ||
+      run?.rows[plate * 54 + wellIndex],
+    [run, plate, wellIndex]
+  );
+
+  const wellChemSig = useMemo(() => {
+    if (!activeRow) return '';
+    const canon = getCanonicalRunConditions(state);
+    const rSig = (state.reagents || [])
+      .map((r) => `${r.code}:${r.name || ''}:${r.iupac || ''}:${r.smiles || ''}`)
+      .join('|');
+    const recSig = (activeRow.recipe || [])
+      .filter((it) => Number(it.target_concentration) > 0)
+      .map((it) => `${it.code}=${Number(it.target_concentration)}:${it.equivalence ?? ''}`)
+      .join(';');
+    return `${plate}-${wellIndex}::${canon.solvent}:${canon.temperatureC}:${canon.baseWaterPct}::${rSig}::${recSig}`;
+  }, [activeRow, plate, wellIndex, state.reagents, state.reactionSolvent, state.temperatureC, state.waterPct, state.eln?.temperatureC, state.eln?.waterPct]);
 
   useEffect(() => {
     setResult(null);
     setMissingCodes([]);
-  }, [plate, wellIndex, state]);
+  }, [wellChemSig]);
 
   useEffect(() => {
-    if (!open || !run) return;
-    const row: RunRow | undefined =
-      run.rows.find((r) => r.plate_number === plate && r.container_id === wellIndex) ||
-      run.rows[plate * 54 + wellIndex];
-    if (!row) return;
+    if (!open || !activeRow || !wellChemSig) return;
 
-    const ext = extractWellForPrediction(state, row);
+    const ext = extractWellForPrediction(state, activeRow);
     setMissingCodes(ext.missingSmilesCodes);
     const validSubs = ext.substrates.filter((s) => s.smiles.trim().length > 0);
     if (validSubs.length === 0) {
@@ -54,6 +73,7 @@ export const WellPredictedProductsPanel: React.FC<WellPredictedProductsPanelProp
     getRDKitInstance()
       .then((rdkit) => {
         if (cancelled || !rdkit) return;
+        setRdkitInst(rdkit);
         const pred = predictWellReactions(rdkit, validSubs, ext.condition);
         if (!cancelled) setResult(pred);
       })
@@ -64,7 +84,18 @@ export const WellPredictedProductsPanel: React.FC<WellPredictedProductsPanelProp
     return () => {
       cancelled = true;
     };
-  }, [open, run, state, plate, wellIndex]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, wellChemSig]);
+
+  const highlightByKey = useMemo(() => {
+    const map = new Map<string, number[]>();
+    if (!rdkitInst || !result) return map;
+    for (const sp of result.species.slice(0, 6)) {
+      const hl = computeSpeciesHighlightBonds(rdkitInst, sp);
+      if (hl.allNewBonds.length > 0) map.set(sp.key, hl.allNewBonds);
+    }
+    return map;
+  }, [rdkitInst, result]);
 
   return (
     <div
@@ -114,7 +145,12 @@ export const WellPredictedProductsPanel: React.FC<WellPredictedProductsPanelProp
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
               <div className="mono" style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
                 {result.acidBase.effectiveMedium} · pH {result.acidBase.effectivePhDmso.toFixed(1)} ·{' '}
-                {result.condition.temperatureC} °C · Top {Math.min(6, result.species.length)} of {result.species.length}
+                {result.condition.solvent} · {result.condition.temperatureC} °C ·{' '}
+                {result.condition.waterPct.toFixed(2)}% H₂O
+                {(result.condition.hydrateWaterPct || 0) > 0
+                  ? ` (+${(result.condition.hydrateWaterPct || 0).toFixed(2)}% hydrate)`
+                  : ''}{' '}
+                · Top {Math.min(6, result.species.length)} of {result.species.length}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(225px, 1fr))', gap: '10px' }}>
                 {result.species.slice(0, 6).map((sp, idx) => (
@@ -139,7 +175,13 @@ export const WellPredictedProductsPanel: React.FC<WellPredictedProductsPanelProp
                       </span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'center' }}>
-                      <ChemicalStructure smiles={sp.smiles} name={sp.formula} width={205} height={138} />
+                      <ChemicalStructure
+                        smiles={sp.smiles}
+                        name={sp.formula}
+                        width={205}
+                        height={138}
+                        highlightBonds={highlightByKey.get(sp.key)}
+                      />
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '6px', flexWrap: 'wrap' }}>
                       <span className="mono" style={{ fontSize: '12px', color: 'var(--acc)', fontWeight: 700 }}>

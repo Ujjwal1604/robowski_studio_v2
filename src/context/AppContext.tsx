@@ -9,6 +9,7 @@ import {
   TlcImageEntry,
 } from '../types';
 import * as Core from '../engine';
+import { writeToSaveFolder } from '../utils/folderSave';
 import { putTlcImage, getAllSetImages, getImagesForSets } from './tlcStorage';
 import {
   exampleState,
@@ -680,7 +681,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       try {
         await putRun(sm);
-        toast(`Saved "${state.name}".`);
+        let note = '';
+        const safeName = String(state.name || 'run').replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40);
+        const fr = await writeToSaveFolder(`${safeName}_${newId}.json`, JSON.stringify(sm, null, 2));
+        if (fr === 'saved') note = ' Copy written to your save folder.';
+        else if (fr === 'needs-permission') note = ' Save folder needs permission again (re-pick it in Export).';
+        toast(`Saved "${state.name}".${note}`);
       } catch (e: any) {
         toast('Could not save: ' + (e?.message || e));
       }

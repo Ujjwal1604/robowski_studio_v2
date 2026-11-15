@@ -5,6 +5,7 @@ import {
   predictNormalPhaseRf,
   optimizePlateTlcSolvents,
   predictWellReactions,
+  extractWellForPrediction,
   WellPredictionResult,
 } from '../src/engine/predictor';
 import { exampleState } from '../src/context/runPayload';
@@ -245,5 +246,220 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     expect(predictNormalPhaseRf(lipophilicKetone, c18_85).rf).toBeGreaterThan(
       predictNormalPhaseRf(lipophilicKetone, c18_60).rf
     );
+  });
+
+  it('offers polarity-matched solvent systems with AcOH/Et3N modifiers and avoids suggesting standalone additives or unnecessary modifiers on neutral plates', async () => {
+    // Low/medium-polarity carboxylic acid (benzoic acid) should have a readable EtOAc/Hex + 1% AcOH system rather than blowing to the front in 8% MeOH/DCM + AcOH
+    const benzoicProf = profileMoleculeForTlc(rdkit, 'O=C(O)c1ccccc1');
+    const etoac30AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_30_acoh')!;
+    const meoh8AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_acoh')!;
+    expect(etoac30AcOH.name).toContain('EtOAc / Hexanes + 1% AcOH');
+    expect(etoac30AcOH.chamberPrep20mL).toContain('EtOAc');
+    expect(etoac30AcOH.chamberPrep20mL).toContain('AcOH');
+
+    const benzoicInEtoac = predictNormalPhaseRf(benzoicProf, etoac30AcOH);
+    const benzoicInMeoh = predictNormalPhaseRf(benzoicProf, meoh8AcOH);
+    expect(benzoicInEtoac.tailing).toBe(false);
+    expect(benzoicInEtoac.rf).toBeGreaterThanOrEqual(0.22);
+    expect(benzoicInEtoac.rf).toBeLessThanOrEqual(0.68);
+    expect(benzoicInMeoh.rf).toBeGreaterThan(0.80);
+
+    // Acidic well (TsOH) protonating a pyridine-containing substrate tails without base modifier and is rescued by Et3N in EtOAc/Hexanes
+    const pyrKetone = profileMoleculeForTlc(rdkit, 'CC(=O)c1ccncc1');
+    const neutral50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const basic60 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_60_et3n')!;
+    const inAcidWellNeutralEluent = predictNormalPhaseRf(pyrKetone, neutral50, {
+      hasAcidAdditive: true,
+      additiveLabel: 'TsOH',
+    });
+    const inAcidWellBasicEluent = predictNormalPhaseRf(pyrKetone, basic60, {
+      hasAcidAdditive: true,
+      additiveLabel: 'TsOH',
+    });
+    expect(inAcidWellNeutralEluent.tailing).toBe(true);
+    expect(inAcidWellBasicEluent.tailing).toBe(false);
+    expect(inAcidWellBasicEluent.rf).toBeGreaterThan(inAcidWellNeutralEluent.rf);
+
+    // Neutral plate (Benzaldehyde + Malononitrile, no amines/acids/additives) should NOT pull in Et3N/AcOH modifiers
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      {
+        code: 'A',
+        name: 'Benzaldehyde',
+        smiles: 'O=Cc1ccccc1',
+        molarMass: 106.12,
+        density: 1.04,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+      {
+        code: 'B',
+        name: 'Malononitrile',
+        smiles: 'N#CCC#N',
+        molarMass: 66.06,
+        density: 1.05,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+      {
+        code: 'C',
+        name: 'Pyridine',
+        smiles: '',
+        molarMass: 79.1,
+        density: 0.98,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+    const neutralRow = {
+      local_index: 0,
+      global_index: 0,
+      combo_index: 0,
+      plate_number: 0,
+      container_id: 0,
+      recipe: [
+        { code: 'A', name: 'Benzaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: 'Malononitrile', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: 'Pyridine', target_concentration: 10, equivalence: 0.2 },
+      ],
+      'vol#solvent': 400,
+    };
+
+    const ext = extractWellForPrediction(state, neutralRow as any);
+    expect(ext.substrates.map((s) => s.code)).toEqual(['A', 'B']);
+    expect(ext.condition.medium).toBe('base');
+
+    const neutralRun = {
+      plates: 1,
+      reactions: 1,
+      rows: [neutralRow],
+    } as unknown as RunResult;
+
+    const neutralPlan = await optimizePlateTlcSolvents(rdkit, state, neutralRun, [], {
+      plateIndex: 0,
+      maxSystems: 3,
+    });
+    expect(neutralPlan.recommendedSystems.length).toBeGreaterThanOrEqual(1);
+    for (const rec of neutralPlan.recommendedSystems) {
+      expect(rec.system.baseModifier).toBeUndefined();
+      expect(rec.system.acidModifier).toBeUndefined();
+      expect(rec.system.chamberPrep20mL).toMatch(/EtOAc|Hexanes|DCM|MeOH|Acetone|Toluene|MeCN/i);
+    }
+  });
+
+  it('respects explicit stationaryPhase preference (SiO2, C18, Neutral Al2O3, Basic Al2O3)', async () => {
+    const amineProf = profileMoleculeForTlc(rdkit, 'NCc1ccccc1');
+    const acidProf = profileMoleculeForTlc(rdkit, 'O=C(O)c1ccccc1');
+    const meoh7 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_7')!;
+
+    // On Basic Al2O3, basic amine elutes cleanly without Et3N even with TsOH well additive; carboxylic acid pins strongly
+    const amineOnBasicAl = predictNormalPhaseRf(
+      amineProf,
+      meoh7,
+      { hasAcidAdditive: true, additiveLabel: 'TsOH' },
+      'Al2O3_basic'
+    );
+    const acidOnBasicAl = predictNormalPhaseRf(acidProf, meoh7, undefined, 'Al2O3_basic');
+    expect(amineOnBasicAl.tailing).toBe(false);
+    expect(amineOnBasicAl.rf).toBeGreaterThan(0.30);
+    expect(acidOnBasicAl.tailing).toBe(true);
+    expect(acidOnBasicAl.tailingReason).toMatch(/Al₂O₃/);
+
+    // Build a 6-well plate with imidazole-2-carboxaldehyde + benzylamine
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      {
+        code: 'A',
+        name: '2-Imidazolecarboxaldehyde',
+        smiles: 'O=Cc1ncc[nH]1',
+        molarMass: 96.09,
+        density: 1.2,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+      {
+        code: 'B',
+        name: 'Benzylamine',
+        smiles: 'NCc1ccccc1',
+        molarMass: 107.15,
+        density: 0.98,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 60 };
+    const rows = Array.from({ length: 6 }, (_, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: [
+        { code: 'A', name: '2-Imidazolecarboxaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: 'Benzylamine', target_concentration: 50, equivalence: 1 },
+      ],
+      'vol#solvent': 400,
+    }));
+    const fakeRun = { plates: 1, reactions: 6, rows } as unknown as RunResult;
+
+    // 1. SiO2-only mode excludes C18 systems even in balanced mode
+    const sio2Plan = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      maxSystems: 3,
+      poolMode: 'balanced',
+      stationaryPhase: 'SiO2',
+    });
+    expect(sio2Plan.stationaryPhase).toBe('SiO2');
+    expect(sio2Plan.recommendedSystems.every((r) => r.system.stationaryPhase === 'SiO2')).toBe(true);
+    expect(sio2Plan.otherSystems.every((r) => r.system.stationaryPhase === 'SiO2')).toBe(true);
+
+    // 2. C18 mode recommends only C18 reverse-phase systems even when poolMode is 'primary_only'
+    const c18Plan = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      maxSystems: 3,
+      poolMode: 'primary_only',
+      stationaryPhase: 'C18',
+    });
+    expect(c18Plan.stationaryPhase).toBe('C18');
+    expect(c18Plan.recommendedSystems.length).toBeGreaterThanOrEqual(1);
+    expect(c18Plan.recommendedSystems.every((r) => r.system.stationaryPhase === 'C18')).toBe(true);
+    expect(c18Plan.otherSystems.every((r) => r.system.stationaryPhase === 'C18')).toBe(true);
+
+    // 3. Basic Al2O3 mode excludes both AcOH and NH3/Et3N systems as well as C18
+    const alBasicPlan = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      maxSystems: 3,
+      poolMode: 'prefer_primary',
+      stationaryPhase: 'Al2O3_basic',
+    });
+    expect(alBasicPlan.stationaryPhase).toBe('Al2O3_basic');
+    expect(
+      alBasicPlan.recommendedSystems.every(
+        (r) => r.system.stationaryPhase === 'SiO2' && !r.system.acidModifier && !r.system.baseModifier
+      )
+    ).toBe(true);
+    expect(
+      alBasicPlan.otherSystems.every(
+        (r) => r.system.stationaryPhase === 'SiO2' && !r.system.acidModifier && !r.system.baseModifier
+      )
+    ).toBe(true);
+
+    // 4. Neutral Al2O3 mode excludes both AcOH and NH3/Et3N systems as well as C18 (even with TsOH salt additive in plate)
+    const alNeutralPlan = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      maxSystems: 3,
+      poolMode: 'prefer_primary',
+      stationaryPhase: 'Al2O3_neutral',
+    });
+    expect(alNeutralPlan.stationaryPhase).toBe('Al2O3_neutral');
+    expect(
+      alNeutralPlan.recommendedSystems.every(
+        (r) => r.system.stationaryPhase === 'SiO2' && !r.system.acidModifier && !r.system.baseModifier
+      )
+    ).toBe(true);
+    expect(
+      alNeutralPlan.otherSystems.every(
+        (r) => r.system.stationaryPhase === 'SiO2' && !r.system.acidModifier && !r.system.baseModifier
+      )
+    ).toBe(true);
   });
 });

@@ -1,0 +1,1394 @@
+From 5ffccff3c75400685cfe19e50c76838b9e6b5dca Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 18:58:36 +0900
+Subject: [PATCH] Predictor safety net, scoring rework, pathway tree, LCMS
+ targets; TLC confidence notes; folder auto-save
+
+- atom-balance gate, RDKit steric checks, tautomer grouping, in-source loss ions
+- scoring: likelihood x persistence, reversible tag, concentration/water effects, stronger depth penalty
+- pathway tree ordered by own score; carbon-acid rule fix
+- LCMS target list with ambiguity flags; CSV gains likelihood/persistence/ions
+- TLC front/origin shown as detected vs default guess with warnings
+- optional Dropbox/any-folder auto-save of run records (File System Access API)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/components/views/ExportView.tsx     |  42 +++++-
+ src/components/views/PredictionView.tsx |   3 +-
+ src/components/views/TlcView.tsx        |  12 ++
+ src/context/AppContext.tsx              |   7 +-
+ src/engine/predictor/engine.ts          |  81 +++++++++-
+ src/engine/predictor/lcmsTargets.ts     |  64 ++++++++
+ src/engine/predictor/molQueries.ts      |  88 +++++++++++
+ src/engine/predictor/pathwayGrouping.ts |  12 +-
+ src/engine/predictor/plateBridge.ts     |  20 +++
+ src/engine/predictor/rules.ts           |   6 +-
+ src/engine/predictor/scoring.ts         | 140 +++++++++++++-----
+ src/engine/predictor/types.ts           |  14 +-
+ src/engine/tlcLanes.ts                  |  51 +++++++
+ src/types/index.ts                      |   2 +
+ src/utils/folderSave.ts                 |  95 ++++++++++++
+ tests/lcmsTargets.test.ts               |  23 +++
+ tests/pathwayGrouping.test.ts           |  68 ++++++++-
+ tests/predictorRework.test.ts           | 188 ++++++++++++++++++++++++
+ 18 files changed, 864 insertions(+), 52 deletions(-)
+ create mode 100644 src/engine/predictor/lcmsTargets.ts
+ create mode 100644 src/engine/predictor/molQueries.ts
+ create mode 100644 src/utils/folderSave.ts
+ create mode 100644 tests/lcmsTargets.test.ts
+ create mode 100644 tests/predictorRework.test.ts
+
+diff --git a/src/components/views/ExportView.tsx b/src/components/views/ExportView.tsx
+index 32243ea..4f82609 100644
+--- a/src/components/views/ExportView.tsx
++++ b/src/components/views/ExportView.tsx
+@@ -1,4 +1,5 @@
+-import React, { useState } from 'react';
++import React, { useEffect, useState } from 'react';
++import { chooseSaveFolder, clearSaveFolder, folderSaveSupported, getSaveFolderName } from '../../utils/folderSave';
+ import { useApp } from '../../context/AppContext';
+ import { notebookCardSvg, localDate } from '../../engine';
+ import * as Core from '../../engine';
+@@ -18,6 +19,10 @@ export const ExportView: React.FC = () => {
+     activeTlcStatus,
+     exportRobowskiArchive,
+   } = useApp();
++  const [saveFolder, setSaveFolder] = useState<string | null>(null);
++  useEffect(() => {
++    getSaveFolderName().then(setSaveFolder).catch(() => {});
++  }, []);
+ 
+   const [descOpen, setDescOpen] = useState(false);
+ 
+@@ -430,6 +435,41 @@ export const ExportView: React.FC = () => {
+                 Save as new
+               </button>
+             </div>
++            <div style={{ marginTop: '10px', fontSize: '12px', color: 'var(--mut)' }}>
++              {folderSaveSupported() ? (
++                <>
++                  Save folder (for example inside Dropbox):{' '}
++                  <b>{saveFolder ?? 'not set'}</b>{' '}
++                  <button
++                    type="button"
++                    className="btn sm"
++                    onClick={async () => {
++                      const n = await chooseSaveFolder();
++                      if (n) {
++                        setSaveFolder(n);
++                        toast('Runs will also be written to "' + n + '" when you press Save.');
++                      }
++                    }}
++                  >
++                    {saveFolder ? 'Change folder' : 'Choose folder'}
++                  </button>{' '}
++                  {saveFolder && (
++                    <button
++                      type="button"
++                      className="btn sm"
++                      onClick={async () => {
++                        await clearSaveFolder();
++                        setSaveFolder(null);
++                      }}
++                    >
++                      Stop
++                    </button>
++                  )}
++                </>
++              ) : (
++                <>This browser cannot write to a folder directly (Firefox). Use Brave or Chrome for folder auto-save; otherwise export the .robowski archive and move it into Dropbox.</>
++              )}
++            </div>
+           </div>
+         </div>
+       </div>
+diff --git a/src/components/views/PredictionView.tsx b/src/components/views/PredictionView.tsx
+index 1039aca..c72372a 100644
+--- a/src/components/views/PredictionView.tsx
++++ b/src/components/views/PredictionView.tsx
+@@ -1558,7 +1558,7 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
+                           </span>
+                         )}
+                         <span style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+-                          {sp.status === 'sink' ? 'Stable' : 'Equil.'}
++                          {sp.status === 'sink' ? 'Stable' : 'Equil.'} · {`L ${sp.likelihood.toFixed(2)} · P ${sp.persistence.toFixed(2)}`}{sp.reversibleEnd ? ' · reversible' : ''}{sp.tautomerForms > 1 ? ` · ${sp.tautomerForms} tautomer forms` : ''}
+                         </span>
+                       </div>
+ 
+@@ -1801,6 +1801,7 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
+                           </span>
+                           <span style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                             {sp.status === 'sink' ? 'Stable Product' : 'Equilibrium'}
++                            <span className="mono" style={{ fontSize: '11.5px', color: 'var(--mut)', fontWeight: 400 }}>{`L ${sp.likelihood.toFixed(2)} · P ${sp.persistence.toFixed(2)}`}{sp.reversibleEnd ? ' · reversible' : ''}{sp.tautomerForms > 1 ? ` · ${sp.tautomerForms} tautomer forms` : ''}</span>
+                           </span>
+                           {stoichLabel && (
+                             <span className="mono" style={{ fontSize: '12px', color: 'var(--mut)' }}>
+diff --git a/src/components/views/TlcView.tsx b/src/components/views/TlcView.tsx
+index bdfde49..d557749 100644
+--- a/src/components/views/TlcView.tsx
++++ b/src/components/views/TlcView.tsx
+@@ -18,6 +18,7 @@ import {
+   movingAvg,
+   pctile,
+   detectFront,
++  tlcDetectionNotes,
+   findSpots,
+   extractDensitogram,
+   computeLaneRowIntensity,
+@@ -2878,6 +2879,17 @@ export const TlcView: React.FC = () => {
+             </div>
+             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
+               Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
++              {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && hasImages && (
++                <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
++                  {tlcDetectionNotes(activePlateSet, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)).map((n) => (
++                    <div key={n.label} style={{ color: n.warning ? '#f59e0b' : 'var(--mut)' }}>
++                      {n.label}: {n.source}
++                      {n.source === 'detected' ? ` (strength ${n.score.toFixed(1)})` : ''}
++                      {n.warning ? ` - ${n.warning}` : ''}
++                    </div>
++                  ))}
++                </div>
++              )}
+               {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && (
+                 <span style={{ color: 'var(--pri)', marginLeft: '6px' }}>
+                   (Current baseline: {Math.round(tlcOrigin(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)
+diff --git a/src/context/AppContext.tsx b/src/context/AppContext.tsx
+index 0829571..8e3c2ae 100644
+--- a/src/context/AppContext.tsx
++++ b/src/context/AppContext.tsx
+@@ -9,6 +9,7 @@ import {
+   TlcImageEntry,
+ } from '../types';
+ import * as Core from '../engine';
++import { writeToSaveFolder } from '../utils/folderSave';
+ import { putTlcImage, getAllSetImages, getImagesForSets } from './tlcStorage';
+ import {
+   exampleState,
+@@ -680,7 +681,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children
+ 
+       try {
+         await putRun(sm);
+-        toast(`Saved "${state.name}".`);
++        let note = '';
++        const fr = await writeToSaveFolder(`${String(state.name || 'run').replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40)}_${newId}.json`, JSON.stringify(sm, null, 2));
++        if (fr === 'saved') note = ' Copy written to your save folder.';
++        else if (fr === 'needs-permission') note = ' Save folder needs permission again (re-pick it in Export).';
++        toast(`Saved "${state.name}".${note}`);
+       } catch (e: any) {
+         toast('Could not save: ' + (e?.message || e));
+       }
+diff --git a/src/engine/predictor/engine.ts b/src/engine/predictor/engine.ts
+index 183176e..92512c0 100644
+--- a/src/engine/predictor/engine.ts
++++ b/src/engine/predictor/engine.ts
+@@ -1,6 +1,7 @@
+ // Robowski Studio - General N-Component Priority-Search Reaction Prediction Engine
+ import {
+   ChemicalAlert,
++  LossIon,
+   PredictedSpecies,
+   PredictionOptions,
+   PredictorSubstrateInput,
+@@ -24,6 +25,7 @@ import {
+   scoreChain,
+   temperatureGate,
+ } from './scoring';
++import { stepIsAtomBalanced, countSubstruct } from './molQueries';
+ 
+ const PROTON_MASS = 1.00727647;
+ const NA_MASS = 22.989218;
+@@ -178,6 +180,7 @@ interface MolMeta {
+   numAromaticRings: number;
+   numHeavyAtoms: number;
+   ringSizes: number[];
++  tautomerKey: string;
+ }
+ 
+ interface InternalSpecies {
+@@ -228,6 +231,16 @@ function computeSpeciesTemplateMatches(
+   return result;
+ }
+ 
++/**
++ * InChI without its stereo layers: mobile-H groups are already folded together, so tautomers of one
++ * structure (guanidines, amidines, amides) share the same key.
++ */
++function tautomerKeyFromInchi(inchi: string): string {
++  if (!inchi) return '';
++  const layers = inchi.split('/');
++  return layers.filter((l, i) => i === 0 || !/^[btmsi]/.test(l) || /^h/.test(l)).join('/');
++}
++
+ function inspectMol(rdkit: any, smi: string, cache: Map<string, MolMeta | null>): MolMeta | null {
+   if (cache.has(smi)) return cache.get(smi) || null;
+   let mol: any = null;
+@@ -268,6 +281,7 @@ function inspectMol(rdkit: any, smi: string, cache: Map<string, MolMeta | null>)
+       numAromaticRings: Number(desc.NumAromaticRings) || 0,
+       numHeavyAtoms: Number(desc.NumHeavyAtoms) || 0,
+       ringSizes,
++      tautomerKey: tautomerKeyFromInchi(inchi),
+     };
+     cache.set(smi, meta);
+     cache.set(cleanSmi, meta);
+@@ -394,6 +408,45 @@ function runRxnSingle(
+   return results;
+ }
+ 
++// Step families in which a leaving group (halide, isobutene, CO2, tosylate ...) may leave without being listed.
++const LEAVING_GROUP_STEPS = new Set(['SN(N)', 'SN(S)', 'SN(O)', 'AR', 'AS(N)', 'AS(O)', 'EL', 'DC', 'OX', 'PC', 'AO', 'EA']);
++
++const H2O_MASS = 18.010565;
++const C4H8_MASS = 56.0626;
++const BOC_MASS = 100.052429; // C5H8O2 lost as [M+H-Boc+H]+ from a Boc amine
++
++/** Fragments that commonly appear instead of (or next to) the molecular ion in ESI-LCMS. */
++function inSourceLossIons(rdkit: any, smiles: string, exactMass: number): LossIon[] {
++  const out: LossIon[] = [];
++  const mh = exactMass + PROTON_MASS;
++  const hasCarbinolamine = countSubstruct(rdkit, smiles, '[CX4]([OX2H])[NX3]') > 0;
++  const hasAlcohol = countSubstruct(rdkit, smiles, '[CX4][OX2H]') > 0;
++  if (hasAlcohol) {
++    out.push({
++      label: '[M+H-H2O]+',
++      mz: Math.round((mh - H2O_MASS) * 10000) / 10000,
++      note: hasCarbinolamine
++        ? 'Carbinolamines dehydrate in the source and show up at the imine mass'
++        : 'Aliphatic alcohols often lose water in the source',
++    });
++  }
++  if (countSubstruct(rdkit, smiles, '[CX4;H0]([CH3])([CH3])([CH3])[OX2]C(=O)') > 0) {
++    out.push({
++      label: '[M+H-C4H8]+',
++      mz: Math.round((mh - C4H8_MASS) * 10000) / 10000,
++      note: 'tert-Butyl ester loses isobutene in the source (shows the free acid mass)',
++    });
++  }
++  if (countSubstruct(rdkit, smiles, '[CX4;H0]([CH3])([CH3])([CH3])[OX2]C(=O)[NX3]') > 0) {
++    out.push({
++      label: '[M+H-Boc]+',
++      mz: Math.round((mh - BOC_MASS) * 10000) / 10000,
++      note: 'Boc carbamate loses Boc in the source (shows the free amine mass)',
++    });
++  }
++  return out;
++}
++
+ function classifyFragmentName(smi: string): string {
+   const map: Record<string, string> = {
+     N: 'NH₃',
+@@ -666,6 +719,16 @@ export function predictWellReactions(
+           if (!mainMeta) continue;
+           if (mainMeta.amw > maxMw || mainMeta.numHeavyAtoms < 2) continue;
+ 
++          // Atom bookkeeping: a template must not create or delete atoms (other than H and O in water).
++          {
++            const prodFormulas = [mainMeta.formula];
++            for (const extra of prodSmis.slice(1)) {
++              const em = inspectMol(rdkit, extra, molCache);
++              if (em) prodFormulas.push(em.formula);
++            }
++            if (!stepIsAtomBalanced(pair.map((p) => p.meta.formula), prodFormulas, LEAVING_GROUP_STEPS.has(rule.stepLabel))) continue;
++          }
++
+           // Skip no-op where product equals one of its parents
+           if (pair.some((p) => p.key === mainMeta.smiles)) continue;
+ 
+@@ -839,6 +902,10 @@ export function predictWellReactions(
+     }
+   }
+ 
++  const limitingConcMm = Math.max(
++    1,
++    Math.min(...activeSubs.map((s) => (Number(s.concentrationMm) > 0 ? Number(s.concentrationMm) : 50)), 50 * 4)
++  );
+   const finalSpecies: PredictedSpecies[] = [];
+   const finalFragments: PredictedSpecies[] = [];
+ 
+@@ -863,7 +930,8 @@ export function predictWellReactions(
+       sp.cumulativeThermo,
+       status === 'transient',
+       lowestCls,
+-      competitionFactor
++      competitionFactor,
++      { concMm: limitingConcMm, waterPct: effectiveCondition.waterPct }
+     );
+ 
+     const molAlerts = sp.isSmallFragment ? [] : detectMolAlerts(rdkit, sp.meta.smiles);
+@@ -897,6 +965,12 @@ export function predictWellReactions(
+       inventory: sp.inventory,
+       fragmentUses: sp.fragmentUses,
+       score: sp.isSmallFragment ? Math.min(0.6, scored.score) : scored.score,
++      likelihood: scored.likelihood,
++      persistence: scored.persistence,
++      reversibleEnd: status === 'transient',
++      tautomerKey: sp.meta.tautomerKey,
++      tautomerForms: 1,
++      lossIons: sp.isSmallFragment ? [] : inSourceLossIons(rdkit, sp.meta.smiles, sp.meta.exactMass),
+       bottleneckScore: scored.bottleneckScore,
+       thermoBonus: scored.thermoBoost,
+       tier: scored.tier,
+@@ -920,6 +994,11 @@ export function predictWellReactions(
+     return a.stepsCount - b.stepsCount;
+   });
+ 
++  // Tautomers / mobile-H forms of one structure: count them so the UI can show one entry per structure.
++  const formsByKey = new Map<string, number>();
++  for (const sp of finalSpecies) if (sp.tautomerKey) formsByKey.set(sp.tautomerKey, (formsByKey.get(sp.tautomerKey) || 0) + 1);
++  for (const sp of finalSpecies) sp.tautomerForms = formsByKey.get(sp.tautomerKey) || 1;
++
+   // Aggregate well-level alerts
+   const wellAlerts: ChemicalAlert[] = [];
+   if (acidBase.effectiveMedium === 'buffered' && acidBase.totalAddedAcidEq > 0) {
+diff --git a/src/engine/predictor/lcmsTargets.ts b/src/engine/predictor/lcmsTargets.ts
+new file mode 100644
+index 0000000..7fe26da
+--- /dev/null
++++ b/src/engine/predictor/lcmsTargets.ts
+@@ -0,0 +1,64 @@
++import type { PredictedSpecies } from './types';
++
++export interface LcmsTarget {
++  mz: number;
++  ion: string; // [M+H]+, [M+Na]+, [M-H]-, [M+H-H2O]+ ...
++  kind: 'parent' | 'adduct' | 'in-source';
++  speciesKey: string;
++  formula: string;
++  smiles: string;
++  score: number;
++  likelihood: number;
++  persistence: number;
++  /** other species (formula) that could give a peak within tolerance */
++  sharedWith: string[];
++}
++
++export const MZ_TOLERANCE = 0.005; // Da, for "same peak" grouping
++
++/** Build every m/z worth looking for and flag peaks explainable by more than one species. */
++export function buildLcmsTargets(species: PredictedSpecies[], tol = MZ_TOLERANCE): LcmsTarget[] {
++  const rows: LcmsTarget[] = [];
++  for (const sp of species) {
++    const base = {
++      speciesKey: sp.key,
++      formula: sp.formula,
++      smiles: sp.smiles,
++      score: sp.score,
++      likelihood: sp.likelihood,
++      persistence: sp.persistence,
++      sharedWith: [] as string[],
++    };
++    rows.push({ ...base, mz: sp.mhPlus, ion: '[M+H]+', kind: 'parent' });
++    rows.push({ ...base, mz: sp.mNaPlus, ion: '[M+Na]+', kind: 'adduct' });
++    rows.push({ ...base, mz: sp.mHMinus, ion: '[M-H]-', kind: 'adduct' });
++    for (const l of sp.lossIons ?? []) rows.push({ ...base, mz: l.mz, ion: l.label, kind: 'in-source' });
++  }
++  rows.sort((a, b) => a.mz - b.mz);
++  for (let i = 0; i < rows.length; i++) {
++    for (let j = i + 1; j < rows.length && rows[j].mz - rows[i].mz <= tol; j++) {
++      if (rows[i].speciesKey === rows[j].speciesKey) continue;
++      const a = `${rows[j].formula} ${rows[j].ion}`;
++      const b = `${rows[i].formula} ${rows[i].ion}`;
++      if (!rows[i].sharedWith.includes(a)) rows[i].sharedWith.push(a);
++      if (!rows[j].sharedWith.includes(b)) rows[j].sharedWith.push(b);
++    }
++  }
++  return rows;
++}
++
++export function lcmsTargetsToCsv(targets: LcmsTarget[]): string {
++  const esc = (v: unknown) => {
++    const s = String(v ?? '');
++    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
++  };
++  const head = ['m/z', 'Ion', 'Kind', 'Formula', 'Score', 'Likelihood', 'Persistence', 'Ambiguous with', 'SMILES'];
++  const lines = [head.join(',')];
++  for (const t of targets)
++    lines.push(
++      [t.mz.toFixed(4), t.ion, t.kind, t.formula, t.score.toFixed(3), t.likelihood.toFixed(3), t.persistence.toFixed(3), t.sharedWith.join('; '), t.smiles]
++        .map(esc)
++        .join(',')
++    );
++  return lines.join('\n');
++}
+diff --git a/src/engine/predictor/molQueries.ts b/src/engine/predictor/molQueries.ts
+new file mode 100644
+index 0000000..99ec855
+--- /dev/null
++++ b/src/engine/predictor/molQueries.ts
+@@ -0,0 +1,88 @@
++// Robowski Studio - small RDKit helpers shared by the predictor: substructure counting and atom bookkeeping.
++
++const qmolCache = new WeakMap<object, Map<string, any>>();
++
++function getQmol(rdkit: any, smarts: string): any | null {
++  let m = qmolCache.get(rdkit);
++  if (!m) {
++    m = new Map();
++    qmolCache.set(rdkit, m);
++  }
++  if (m.has(smarts)) return m.get(smarts);
++  let q: any = null;
++  try {
++    q = rdkit.get_qmol(smarts) || null;
++  } catch {
++    q = null;
++  }
++  m.set(smarts, q);
++  return q;
++}
++
++/** Number of distinct substructure matches of a SMARTS pattern in a molecule (0 on any failure). */
++export function countSubstruct(rdkit: any, smiles: string, smarts: string): number {
++  const q = getQmol(rdkit, smarts);
++  if (!q) return 0;
++  let mol: any = null;
++  try {
++    mol = rdkit.get_mol(smiles);
++    if (!mol || !mol.is_valid()) return 0;
++    const raw = mol.get_substruct_matches(q);
++    const arr = JSON.parse(raw || '[]');
++    return Array.isArray(arr) ? arr.length : 0;
++  } catch {
++    return 0;
++  } finally {
++    try {
++      mol?.delete?.();
++    } catch {}
++  }
++}
++
++/** Element counts from a Hill-style formula such as C13H11N or C27H22N6O. */
++export function parseFormula(formula: string): Record<string, number> {
++  const out: Record<string, number> = {};
++  const re = /([A-Z][a-z]?)(\d*)/g;
++  let m: RegExpExecArray | null;
++  while ((m = re.exec(formula)) !== null) {
++    if (!m[1]) continue;
++    out[m[1]] = (out[m[1]] || 0) + (m[2] ? parseInt(m[2], 10) : 1);
++  }
++  return out;
++}
++
++/**
++ * Atom bookkeeping for one reaction step. Hydrogen and oxygen may move (water, hydroxide), but every other
++ * element must be conserved exactly (or, for steps that shed a leaving group, never increase), and oxygen
++ * may never be created. A template that silently deletes
++ * unmapped atoms fails this check, which stops invented fragments from entering the species pool.
++ */
++export function stepIsAtomBalanced(
++  reactantFormulas: string[],
++  productFormulas: string[],
++  allowLeavingGroup = false
++): boolean {
++  const sum = (fs: string[]) => {
++    const t: Record<string, number> = {};
++    for (const f of fs) {
++      const p = parseFormula(f);
++      for (const k of Object.keys(p)) t[k] = (t[k] || 0) + p[k];
++    }
++    return t;
++  };
++  const r = sum(reactantFormulas);
++  const p = sum(productFormulas);
++  const elements = new Set([...Object.keys(r), ...Object.keys(p)]);
++  for (const el of elements) {
++    if (el === 'H') continue;
++    const a = r[el] || 0;
++    const b = p[el] || 0;
++    if (el === 'O') {
++      if (b > a) return false;
++      continue;
++    }
++    // Substitution / elimination / decarboxylation steps may shed a leaving group the template does not list.
++    if (allowLeavingGroup ? b > a : a !== b) return false;
++  }
++  return true;
++}
+diff --git a/src/engine/predictor/pathwayGrouping.ts b/src/engine/predictor/pathwayGrouping.ts
+index 1664461..0b1c42b 100644
+--- a/src/engine/predictor/pathwayGrouping.ts
++++ b/src/engine/predictor/pathwayGrouping.ts
+@@ -28,8 +28,8 @@ export interface PathwayFamily {
+   leadSpecies: PredictedSpecies;
+   leadGlobalRank: number;
+   nodes: PathwaySpeciesNode[]; // all nodes in progression order
+-  primaryNodes: PathwaySpeciesNode[]; // High / Medium / Lead + all their mechanistic ancestors
+-  minorNodes: PathwaySpeciesNode[]; // Low / Speculative side-branches
++  primaryNodes: PathwaySpeciesNode[]; // every non-Speculative species + lead + all their mechanistic ancestors, in tree order
++  minorNodes: PathwaySpeciesNode[]; // Speculative side-branches only
+ }
+ 
+ export function isTautomerStep(step: StepEvent): boolean {
+@@ -246,10 +246,12 @@ export function groupSpeciesByPathway(
+ 
+       orderedEntries.push({ sp, depth, role });
+ 
++      // Siblings are ordered by their own score, so a 0.17 imine is never listed below a 0.15 branch just
++      // because that branch leads on to something bigger. The subtree peak only breaks ties.
+       const children = [...(childrenMap.get(sp.key) || [])].sort((a, b) => {
++        if (Math.abs(b.score - a.score) > 1e-6) return b.score - a.score;
+         const subDiff = getSubtreePeak(b.key) - getSubtreePeak(a.key);
+         if (Math.abs(subDiff) > 1e-6) return subDiff;
+-        if (b.score !== a.score) return b.score - a.score;
+         return a.stepsCount - b.stepsCount;
+       });
+ 
+@@ -286,8 +288,10 @@ export function groupSpeciesByPathway(
+ 
+     // Separate primaryNodes (High/Medium/Lead + all their ancestors) vs minorNodes (Low/Speculative leaves)
+     const primaryKeySet = new Set<string>();
++    // Everything except Speculative species is shown (a Low-tier imine at 0.17 is exactly the peak you would
++    // look for in LCMS); Speculative side-branches are collapsed.
+     for (const n of nodes) {
+-      if (n.isLead || n.species.tier === 'High' || n.species.tier === 'Medium') {
++      if (n.isLead || n.species.tier !== 'Speculative') {
+         let cur: string | null = n.species.key;
+         const guard = new Set<string>();
+         while (cur && !guard.has(cur)) {
+diff --git a/src/engine/predictor/plateBridge.ts b/src/engine/predictor/plateBridge.ts
+index 15e750c..1b7c7f7 100644
+--- a/src/engine/predictor/plateBridge.ts
++++ b/src/engine/predictor/plateBridge.ts
+@@ -136,6 +136,8 @@ export function extractWellForPrediction(
+   };
+ }
+ 
++import { buildLcmsTargets } from './lcmsTargets';
++
+ export function exportLcmsTargetListCsv(
+   results: Array<{ wellLabel: string; groupLabel: string; result: WellPredictionResult }>
+ ): string {
+@@ -153,6 +155,10 @@ export function exportLcmsTargetListCsv(
+     'Rank',
+     'Tier',
+     'Score',
++    'Likelihood',
++    'Persistence',
++    'Reversible',
++    'Tautomer forms',
+     'Role / State',
+     'Formula',
+     'Exact Mass',
+@@ -161,6 +167,8 @@ export function exportLcmsTargetListCsv(
+     '[M-H]-',
+     'cLogP',
+     'TPSA',
++    'In-source ions',
++    'Ambiguous m/z',
+     'Steps',
+     'Mechanism Chain',
+     'Predicted SMILES',
+@@ -171,6 +179,12 @@ export function exportLcmsTargetListCsv(
+ 
+   for (const entry of results) {
+     const { wellLabel, groupLabel, result } = entry;
++    const amb = new Map<string, Set<string>>();
++    for (const t of buildLcmsTargets(result.species)) {
++      if (!t.sharedWith.length) continue;
++      if (!amb.has(t.speciesKey)) amb.set(t.speciesKey, new Set());
++      amb.get(t.speciesKey)!.add(`${t.ion} ${t.mz.toFixed(3)} also ${t.sharedWith.join('/')}`);
++    }
+     result.species.forEach((sp, idx) => {
+       lines.push(
+         [
+@@ -182,6 +196,10 @@ export function exportLcmsTargetListCsv(
+           idx + 1,
+           sp.tier,
+           sp.score.toFixed(3),
++          sp.likelihood.toFixed(3),
++          sp.persistence.toFixed(3),
++          sp.reversibleEnd ? 'yes' : 'no',
++          sp.tautomerForms,
+           sp.status === 'sink' ? 'Stable Product' : sp.status === 'transient' ? 'Reversible Intermediate' : 'Byproduct',
+           sp.formula,
+           sp.exactMass.toFixed(4),
+@@ -190,6 +208,8 @@ export function exportLcmsTargetListCsv(
+           sp.mHMinus.toFixed(4),
+           sp.clogP.toFixed(2),
+           sp.tpsa.toFixed(1),
++          (sp.lossIons ?? []).map((l) => `${l.label} ${l.mz.toFixed(4)}`).join('; '),
++          [...(amb.get(sp.key) ?? [])].join('; '),
+           sp.stepsCount,
+           sp.mechanismSummary,
+           sp.smiles,
+diff --git a/src/engine/predictor/rules.ts b/src/engine/predictor/rules.ts
+index 3b41de5..15bd9af 100644
+--- a/src/engine/predictor/rules.ts
++++ b/src/engine/predictor/rules.ts
+@@ -69,7 +69,7 @@ const CARBON_ACID_DUAL =
+ const CARBON_ACID_DUAL_OR_KETONE =
+   '[CX4;H2,H1;!$(C-C-[OX2H]);$(C(C=O)C=O),$(C(C#N)C#N),$(C(C=O)C#N),$(C(S(=O)=O)C=O),$(C([#6;X3](=O)[#6])):3]';
+ const CARBON_ACID_SINGLE =
+-  '[CX4;H3,H2,H1;!$(C-C-[OX2H]);!$(C(C=O)C=O);!$(C(C#N)C#N);$(C([#6;X3](=O)[#6])),$(C([CX3](=O)[OX2,NX3])[a]),$(C(C#N)[#6]),$(C[NX3+](=O)[O-]),$(C-c1:[n,c]:[n,c]:[c]:[c]:[c]:1),$(C-c1[n,o,s][c,n][c,n][c,n]1):3]';
++  '[CX4;H3,H2,H1;!$(C-C-[OX2H]);!$(C-[OX2H,NX3]);!$(C(C=O)C=O);!$(C(C#N)C#N);$(C([#6;X3](=O)[#6])),$(C([CX3](=O)[OX2,NX3])[a]),$(C(C#N)[#6]),$(C[NX3+](=O)[O-]),$(C-c1:[n,c]:[n,c]:[c]:[c]:[c]:1),$(C-c1[n,o,s][c,n][c,n][c,n]1):3]';
+ // Heteroaromatic azole NH (imidazole, benzimidazole, pyrazole, triazole, indole)
+ const AZOLE_NH = '[nX3H1;r5:3]';
+ // Activated Michael acceptor C=C-EWG
+@@ -853,9 +853,9 @@ export const REACTION_RULES: ReactionRuleDef[] = [
+     acidFactor: 0.35,
+     baseFactor: 0.85,
+     neutralFactor: 0.5,
+-    t50: 85,
++    t50: 105,
+     width: 20,
+-    prior: 0.68,
++    prior: 0.32, // uncatalysed aminolysis of an unactivated ester is slow
+     reversible: false,
+     kClass: 'favorable',
+     thermoBonus: 0.14,
+diff --git a/src/engine/predictor/scoring.ts b/src/engine/predictor/scoring.ts
+index 0022f04..32eeb4a 100644
+--- a/src/engine/predictor/scoring.ts
++++ b/src/engine/predictor/scoring.ts
+@@ -1,6 +1,7 @@
+ // Robowski Studio - Thermodynamic + Bottleneck Kinetic Scoring & Ring-Size Analysis
+ import { AcidBaseSummary, ConfidenceClass, PredictionTier, StepEvent, WellConditionConfig } from './types';
+ import { ReactionRuleDef } from './rules';
++import { countSubstruct } from './molQueries';
+ 
+ export function computeRingSizesFromMol(mol: any): number[] {
+   try {
+@@ -101,32 +102,34 @@ export function estimateStericFactor(
+ ): number {
+   if (!rule.stericRule || rule.stericRule === 'none') return 1.0;
+ 
++  // Structural patterns (RDKit substructure, so the result does not depend on how a SMILES string is written).
++  const TERT_BUTYL = '[CX4;H0]([CH3])([CH3])[CH3]';
++  const KETONE = '[CX3;H0](=O)([#6])[#6]';
++  const ALDEHYDE = '[CX3;H1](=O)[#6]';
++  const AMINE_N = '[NX3;H2,H1;!$(N-C=[O,N,S])]';
++  const ARYL_AMINE_N = '[NX3;H2,H1;$(N-c);!$(N-C=[O,N,S])]';
++
+   let factor = 1.0;
+   for (const smi of reactantSmiles) {
+-    // Check tert-butyl or heavily branched quaternary centers near carbonyl/ester/amine
+     if (rule.stericRule === 'alpha_branching') {
+-      const tBuMatches = (smi.match(/C\(C\)\(C\)C/g) || []).length;
+-      if (tBuMatches > 0) {
+-        factor *= Math.pow(0.74, Math.min(2, tBuMatches));
+-      }
+-      // Di-substituted / bulky ketones react slower than aldehydes
+-      if (/CC\(=O\)C/.test(smi) && !/C=O/.test(smi.replace(/CC\(=O\)C/g, ''))) {
++      const tBu = countSubstruct(rdkit, smi, TERT_BUTYL);
++      if (tBu > 0) factor *= Math.pow(0.74, Math.min(2, tBu));
++      // Ketones react slower than aldehydes
++      if (countSubstruct(rdkit, smi, KETONE) > 0 && countSubstruct(rdkit, smi, ALDEHYDE) === 0) {
+         factor *= 0.85;
+       }
+     } else if (rule.stericRule === 'nucleophile_crowding') {
+-      const tBuMatches = (smi.match(/C\(C\)\(C\)C/g) || []).length;
+-      if (tBuMatches > 0 && /N/.test(smi)) {
+-        factor *= Math.pow(0.82, Math.min(2, tBuMatches));
++      const tBu = countSubstruct(rdkit, smi, TERT_BUTYL);
++      if (tBu > 0 && countSubstruct(rdkit, smi, AMINE_N) > 0) {
++        factor *= Math.pow(0.82, Math.min(2, tBu));
+       }
+-      // Check aromaticity/resonance attenuation for anilines vs aliphatic amines
+-      if (/Nc1/.test(smi) && !/N[CH2,CH3]/.test(smi)) {
++      // Anilines are weaker, more hindered nucleophiles than alkylamines
++      if (countSubstruct(rdkit, smi, ARYL_AMINE_N) > 0 && countSubstruct(rdkit, smi, AMINE_N) === countSubstruct(rdkit, smi, ARYL_AMINE_N)) {
+         factor *= 0.86;
+       }
+     }
+   }
+ 
+-  // Also check heavy-atom crowding via RDKit molecular weight/branching subtly
+-  void rdkit;
+   return Math.max(0.25, Math.min(1.0, factor));
+ }
+ 
+@@ -160,20 +163,84 @@ export function estimateElectronicFactor(rule: ReactionRuleDef, reactantSmiles:
+   return Math.max(0.4, Math.min(1.15, factor));
+ }
+ 
++// Equilibrium constants of reversible step types. Bimolecular steps: M^-1 (used as K * concentration).
++// Unimolecular steps: dimensionless (intramolecular steps get an effective-molarity boost). These are
++// deliberately simple defaults; they say how much of a reversible species is expected to persist.
++const K_EQ: Record<string, number> = {
++  'NA(N)': 3, // hemiaminal from amine + carbonyl (weakly favoured; aryl amines even less)
++  'NA(C)': 3, // aldol-type adduct
++  'NA(O)': 2,
++  'NA(S)': 5,
++  'MI(N)': 10, // aza-Michael
++  'MI(C)': 40, // C-Michael
++  'MI(S)': 8,
++  'MI(O)': 3,
++  DH: 8, // imine / enamine / enone formation (water-sensitive)
++  IS: 10,
++  Tautomer: 0.6,
++};
++const DEFAULT_K_EQ = 5;
++const EFFECTIVE_MOLARITY = 5;
++const REF_CONC_MM = 50;
++const HALF_SAT_MM = 8;
++
++export interface ScoreContext {
++  /** Limiting substrate concentration in the well (mM). */
++  concMm?: number;
++  /** Water, vol % of the well. */
++  waterPct?: number;
++}
++
++/**
++ * Share of a reversible end-species expected to persist at equilibrium. Sequential reversible steps at the
++ * end of a chain multiply (A <-> B <-> C gives K1*K2); an irreversible step downstream drains equilibria
++ * upstream of it, so only the trailing reversible run counts.
++ */
++export function equilibriumPersistence(chain: StepEvent[], ctx: ScoreContext = {}): number {
++  const cM = Math.max(1, ctx.concMm ?? REF_CONC_MM) / 1000;
++  const water = Math.max(0, ctx.waterPct ?? 0);
++  let x = 1;
++  let n = 0;
++  for (let i = chain.length - 1; i >= 0; i--) {
++    const st = chain[i];
++    if (!st.reversible) break;
++    const k = K_EQ[st.stepLabel] ?? DEFAULT_K_EQ;
++    let xi: number;
++    if (st.stepLabel === 'DH') xi = k / (1 + 0.35 * water);
++    else if (st.stepLabel === 'Tautomer') xi = k;
++    else if (st.reactantSmiles.length >= 2) xi = k * cM;
++    else xi = k * EFFECTIVE_MOLARITY;
++    x *= xi;
++    n++;
++  }
++  if (n === 0) return 1;
++  return Math.max(0.02, Math.min(0.97, x / (1 + x)));
++}
++
+ /**
+- * Computes non-collapsing pathway plausibility score from step events.
+- * Uses bottleneck kinetic rate + geometric path quality + thermodynamic sink driving force,
+- * and partitions reversible transients cleanly.
++ * Pathway plausibility, in two parts that are reported separately:
++ *  - likelihood: can it form (kinetic bottleneck, path length, concentration, driving force)
++ *  - persistence: how much of it is still there at the end (equilibrium share for reversible species; 1 for sinks)
++ * The ranking score is likelihood * (0.4 + 0.6 * persistence), so a fast reversible species ranks below an
++ * equally fast irreversible one but is never zeroed.
+  */
+ export function scoreChain(
+   chain: StepEvent[],
+   cumulativeThermoBonus: number,
+   isTransient: boolean,
+   lowestClass: ConfidenceClass,
+-  competitionPenalty = 1.0
+-): { score: number; bottleneckScore: number; thermoBoost: number; tier: PredictionTier } {
++  competitionPenalty = 1.0,
++  ctx: ScoreContext = {}
++): {
++  score: number;
++  likelihood: number;
++  persistence: number;
++  bottleneckScore: number;
++  thermoBoost: number;
++  tier: PredictionTier;
++} {
+   if (chain.length === 0) {
+-    return { score: 1.0, bottleneckScore: 1.0, thermoBoost: 0, tier: 'High' };
++    return { score: 1.0, likelihood: 1.0, persistence: 1.0, bottleneckScore: 1.0, thermoBoost: 0, tier: 'High' };
+   }
+ 
+   const weights = chain.map((s) => Math.max(0.01, Math.min(1.15, s.stepWeight)));
+@@ -184,27 +251,24 @@ export function scoreChain(
+   // Bottleneck-weighted kinetic plausibility
+   const bottleneckScore = Math.pow(minW, 0.48) * Math.pow(geomMean, 0.52);
+ 
+-  // Very gentle complexity penalty so clean 1-step & 5-step cyclizations both shine,
+-  // while endless oligomerization is discouraged
+-  const depthPenalty = Math.pow(0.955, Math.max(0, chain.length - 1));
++  // Each extra step costs 12%: long speculative cascades must earn their rank
++  const depthPenalty = Math.pow(0.88, Math.max(0, chain.length - 1));
++
++  // Concentration: bimolecular steps slow down when the well is dilute (reference: 50 mM)
++  const c = Math.max(1, ctx.concMm ?? REF_CONC_MM);
++  const perBimolecular = c / (c + HALF_SAT_MM) / (REF_CONC_MM / (REF_CONC_MM + HALF_SAT_MM));
++  const bimolecularSteps = chain.filter((s) => s.reactantSmiles.length >= 2).length;
++  const concFactor = Math.pow(Math.min(1.15, perBimolecular), bimolecularSteps);
+ 
+   // Thermodynamic driving force for ring closure / aromatization / amide / gas release
+   const thermoBoost = Math.min(0.32, Math.max(-0.08, cumulativeThermoBonus * 0.42));
+ 
+-  let rawScore = bottleneckScore * depthPenalty * competitionPenalty * (0.82 + thermoBoost);
+-
+-  // Reversible transient penalty (equilibrium K/(1+K))
+-  if (isTransient) {
+-    const last = chain[chain.length - 1];
+-    // Hemiaminals / uncyclized reversible adducts stay lower in steady-state solution
+-    const eqScale =
+-      last.stepLabel === 'Tautomer'
+-        ? 0.3
+-        : last.stepLabel === 'NA(N)' || last.stepLabel === 'NA(C)'
+-        ? 0.36
+-        : 0.48;
+-    rawScore *= eqScale;
+-  }
++  const likelihood = Math.max(
++    0,
++    Math.min(0.98, bottleneckScore * depthPenalty * competitionPenalty * concFactor * (0.82 + thermoBoost))
++  );
++  const persistence = isTransient ? equilibriumPersistence(chain, ctx) : 1.0;
++  const rawScore = likelihood * (0.4 + 0.6 * persistence);
+ 
+   const score = Math.max(0, Math.min(0.98, Math.round(rawScore * 1000) / 1000));
+ 
+@@ -219,6 +283,8 @@ export function scoreChain(
+ 
+   return {
+     score,
++    likelihood: Math.round(likelihood * 1000) / 1000,
++    persistence: Math.round(persistence * 1000) / 1000,
+     bottleneckScore: Math.round(bottleneckScore * 1000) / 1000,
+     thermoBoost: Math.round(thermoBoost * 1000) / 1000,
+     tier,
+diff --git a/src/engine/predictor/types.ts b/src/engine/predictor/types.ts
+index 1cb3cac..0f875ac 100644
+--- a/src/engine/predictor/types.ts
++++ b/src/engine/predictor/types.ts
+@@ -101,6 +101,12 @@ export interface ChemicalAlert {
+   message: string;
+ }
+ 
++export interface LossIon {
++  label: string; // e.g. [M+H-H2O]+
++  mz: number;
++  note: string;
++}
++
+ export interface PredictedSpecies {
+   key: string; // canonical SMILES (stereo stripped for v1)
+   smiles: string;
+@@ -115,7 +121,13 @@ export interface PredictedSpecies {
+   numAromaticRings: number;
+   inventory: number[]; // equivalents consumed from each input substrate
+   fragmentUses: number; // how many released small-fragment additions used
+-  score: number; // 0..1 plausibility
++  score: number; // 0..1 ranking score = likelihood * (0.4 + 0.6 * persistence)
++  likelihood: number; // 0..1 can it form (kinetics, path length, concentration, driving force)
++  persistence: number; // 0..1 share expected to remain at equilibrium (1 for irreversible sinks)
++  reversibleEnd: boolean; // ends in a reversible step (hemiaminal, imine, aldol ...)
++  tautomerKey: string; // same value for tautomers / mobile-H forms of one structure
++  tautomerForms: number; // how many species share this tautomerKey
++  lossIons: LossIon[]; // in-source fragments to look for in LCMS
+   bottleneckScore: number;
+   thermoBonus: number;
+   tier: PredictionTier;
+diff --git a/src/engine/tlcLanes.ts b/src/engine/tlcLanes.ts
+index 19d316f..00f8820 100644
+--- a/src/engine/tlcLanes.ts
++++ b/src/engine/tlcLanes.ts
+@@ -1053,6 +1053,7 @@ export function tlcFront(
+     set.frontAuto = {};
+     set.originAuto = {};
+     set.originAutoByLane = {};
++    set.autoConf = {};
+     (set as any)._autoCacheSig = sig;
+   }
+ 
+@@ -1069,6 +1070,8 @@ export function tlcFront(
+       }
+     }
+     set.frontAuto[h] = best.pos > 0 ? best.pos : Math.round(lane.length * 0.93);
++    set.autoConf = set.autoConf || {};
++    set.autoConf[`front${h}`] = { detected: best.pos > 0, score: best.pos > 0 ? best.score : 0 };
+   }
+   return set.frontAuto[h] ?? Math.round(lane.length * 0.93);
+ }
+@@ -1322,6 +1325,7 @@ export function tlcOrigin(
+     set.frontAuto = {};
+     set.originAuto = {};
+     set.originAutoByLane = {};
++    set.autoConf = {};
+     (set as any)._autoCacheSig = sig;
+   }
+ 
+@@ -1341,6 +1345,8 @@ export function tlcOrigin(
+         best = res;
+       }
+     }
++    set.autoConf = set.autoConf || {};
++    set.autoConf[`origin${h}`] = { detected: best.pos > 10, score: best.pos > 10 ? best.score : 0 };
+     if (best.pos > 10) {
+       set.originAuto[h] = best.pos;
+       if (best.byLane) {
+@@ -1352,6 +1358,51 @@ export function tlcOrigin(
+   return set.originAutoByLane?.[lane.id] ?? set.originAuto?.[h] ?? Math.max(20, Math.round(lane.length * 0.10));
+ }
+ 
++export interface DetectionNote {
++  label: string; // "Front, lower half"
++  source: 'detected' | 'default guess' | 'manual';
++  score: number;
++  warning?: string;
++}
++
++/** Plain-language confidence for the auto front/origin of every half (forces detection first). */
++export function tlcDetectionNotes(
++  set: TlcSet,
++  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
++): DetectionNote[] {
++  const lanes = set.cfg?.lanes ?? [];
++  const notes: DetectionNote[] = [];
++  const halves = Array.from(new Set(lanes.map((l) => tlcHalf(l)))).sort();
++  const name = (h: number) => (halves.length > 1 ? (h === 0 ? ', lower half' : ', upper half') : '');
++  const pos: Record<string, number> = {};
++  for (const h of halves) {
++    const lane = lanes.find((l) => tlcHalf(l) === h)!;
++    const frontManual = (set.frontHalfPx?.[h] ?? 0) > 0 || (set.frontPx ?? 0) > 0;
++    const originManual = (set.originPx ?? 0) > 0 || (lane.zeroRf ?? 0) > 0;
++    const f = tlcFront(set, lane, getProfile);
++    if (!originManual) tlcOrigin(set, lane, getProfile);
++    pos[`f${h}`] = f / lane.length;
++    const fc = set.autoConf?.[`front${h}`];
++    const oc = set.autoConf?.[`origin${h}`];
++    const fn: DetectionNote = frontManual
++      ? { label: `Front${name(h)}`, source: 'manual', score: 0 }
++      : { label: `Front${name(h)}`, source: fc?.detected ? 'detected' : 'default guess', score: fc?.score ?? 0 };
++    if (fn.source === 'default guess') fn.warning = 'No clear solvent front found; 93% of lane length is assumed. Rf values depend on it.';
++    else if (fn.source === 'detected' && fn.score < 6) fn.warning = 'Weak front signal; check the line position.';
++    if (fn.source !== 'manual' && f / lane.length > 0.97) fn.warning = 'Front is at the edge of the search window.';
++    const on: DetectionNote = originManual
++      ? { label: `Origin${name(h)}`, source: 'manual', score: 0 }
++      : { label: `Origin${name(h)}`, source: oc?.detected ? 'detected' : 'default guess', score: oc?.score ?? 0 };
++    if (on.source === 'default guess') on.warning = 'No clear origin spots found; 10% of lane length is assumed.';
++    notes.push(fn, on);
++  }
++  if (halves.length > 1 && Math.abs(pos[`f${halves[0]}`] - pos[`f${halves[1]}`]) > 0.06) {
++    const fr = notes.find((n) => n.label.startsWith('Front'));
++    if (fr) fr.warning = 'The two halves disagree on the front by more than 6% of lane length.';
++  }
++  return notes;
++}
++
+ export interface TlcAnalysisExportOptions {
+   set: TlcSet;
+   sets?: TlcSet[];
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 5dcc84d..645b366 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -399,6 +399,8 @@ export interface TlcPlateData {
+   frontPx?: number | null;
+   frontHalfPx?: Record<number, number>; // side 0 (Lanes 0-26) and side 1 (Lanes 27-53)
+   frontAuto?: Record<number, number>;
++  /** per half: was the auto front/origin really detected (vs default guess) and how strong */
++  autoConf?: Record<string, { detected: boolean; score: number }>;
+   originPx?: number | null;
+   originAuto?: Record<number, number>;
+   originAutoByLane?: Record<number, number>;
+diff --git a/src/utils/folderSave.ts b/src/utils/folderSave.ts
+new file mode 100644
+index 0000000..6ce30ab
+--- /dev/null
++++ b/src/utils/folderSave.ts
+@@ -0,0 +1,95 @@
++// Optional auto-save of run records into a folder the user picks (e.g. inside Dropbox).
++// Uses the File System Access API (Chromium browsers such as Brave/Chrome/Edge). Firefox has no
++// support, so callers must feature-detect and fall back to a normal download.
++
++const DB = 'robowski-folder';
++const STORE = 'handles';
++const KEY = 'autosave';
++
++export function folderSaveSupported(): boolean {
++  return typeof window !== 'undefined' && typeof (window as any).showDirectoryPicker === 'function';
++}
++
++function openDb(): Promise<IDBDatabase> {
++  return new Promise((resolve, reject) => {
++    const req = indexedDB.open(DB, 1);
++    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
++    req.onsuccess = () => resolve(req.result);
++    req.onerror = () => reject(req.error);
++  });
++}
++
++async function idbGet(): Promise<any | null> {
++  try {
++    const db = await openDb();
++    return await new Promise((resolve) => {
++      const r = db.transaction(STORE).objectStore(STORE).get(KEY);
++      r.onsuccess = () => resolve(r.result ?? null);
++      r.onerror = () => resolve(null);
++    });
++  } catch {
++    return null;
++  }
++}
++
++async function idbSet(value: any | null): Promise<void> {
++  const db = await openDb();
++  await new Promise<void>((resolve, reject) => {
++    const tx = db.transaction(STORE, 'readwrite');
++    if (value == null) tx.objectStore(STORE).delete(KEY);
++    else tx.objectStore(STORE).put(value, KEY);
++    tx.oncomplete = () => resolve();
++    tx.onerror = () => reject(tx.error);
++  });
++}
++
++/** Ask the user for a folder (must be called from a click). Returns its name, or null if cancelled. */
++export async function chooseSaveFolder(): Promise<string | null> {
++  if (!folderSaveSupported()) return null;
++  try {
++    const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite', id: 'robowski-runs' });
++    await idbSet(handle);
++    return handle.name as string;
++  } catch {
++    return null; // cancelled
++  }
++}
++
++export async function clearSaveFolder(): Promise<void> {
++  try {
++    await idbSet(null);
++  } catch {}
++}
++
++export async function getSaveFolderName(): Promise<string | null> {
++  const h = await idbGet();
++  return h?.name ?? null;
++}
++
++/**
++ * Write a file into the chosen folder. Returns 'saved', 'no-folder' (nothing configured / unsupported)
++ * or 'needs-permission' (browser asks again after a restart; works once the user re-picks or grants it).
++ */
++export async function writeToSaveFolder(
++  filename: string,
++  data: string | Blob | Uint8Array
++): Promise<'saved' | 'no-folder' | 'needs-permission'> {
++  if (!folderSaveSupported()) return 'no-folder';
++  const h = await idbGet();
++  if (!h) return 'no-folder';
++  try {
++    let perm = await h.queryPermission({ mode: 'readwrite' });
++    if (perm !== 'granted') {
++      // Only succeeds when called from a user gesture (e.g. the Save button click).
++      perm = await h.requestPermission({ mode: 'readwrite' }).catch(() => 'denied');
++    }
++    if (perm !== 'granted') return 'needs-permission';
++    const fh = await h.getFileHandle(filename, { create: true });
++    const w = await fh.createWritable();
++    await w.write(data as any);
++    await w.close();
++    return 'saved';
++  } catch {
++    return 'needs-permission';
++  }
++}
+diff --git a/tests/lcmsTargets.test.ts b/tests/lcmsTargets.test.ts
+new file mode 100644
+index 0000000..1665295
+--- /dev/null
++++ b/tests/lcmsTargets.test.ts
+@@ -0,0 +1,23 @@
++import { describe, it, expect } from 'vitest';
++import { buildLcmsTargets, lcmsTargetsToCsv } from '../src/engine/predictor/lcmsTargets';
++
++const sp = (key: string, formula: string, mh: number, loss: number[] = []): any => ({
++  key, smiles: key, formula, mhPlus: mh, mNaPlus: mh + 21.98, mHMinus: mh - 2.015,
++  score: 0.5, likelihood: 0.6, persistence: 0.8,
++  lossIons: loss.map((mz) => ({ label: '[M+H-H2O]+', mz, note: '' })),
++});
++
++describe('lcmsTargets', () => {
++  it('lists parent, adducts and in-source ions', () => {
++    const t = buildLcmsTargets([sp('a', 'C1', 200.1, [182.09])]);
++    expect(t.map((x) => x.ion)).toEqual(expect.arrayContaining(['[M+H]+', '[M+Na]+', '[M-H]-', '[M+H-H2O]+']));
++  });
++  it('flags a mass explainable by two species', () => {
++    const t = buildLcmsTargets([sp('a', 'C1', 200.1), sp('b', 'C2', 218.11, [200.101])]);
++    const hit = t.find((x) => x.speciesKey === 'a' && x.ion === '[M+H]+')!;
++    expect(hit.sharedWith.length).toBe(1);
++  });
++  it('writes CSV', () => {
++    expect(lcmsTargetsToCsv(buildLcmsTargets([sp('a', 'C1', 200.1)])).split('\n').length).toBe(4);
++  });
++});
+diff --git a/tests/pathwayGrouping.test.ts b/tests/pathwayGrouping.test.ts
+index 9da0bb1..20cf5b5 100644
+--- a/tests/pathwayGrouping.test.ts
++++ b/tests/pathwayGrouping.test.ts
+@@ -157,8 +157,8 @@ describe('Pathway Family Grouping', () => {
+ 
+     const sp4 = makeSyntheticSpecies({
+       key: 'MINOR_LEAF_A_E',
+-      score: 0.21,
+-      tier: 'Low',
++      score: 0.06,
++      tier: 'Speculative',
+       status: 'sink',
+       inventory: [1, 0, 2],
+       stepsCount: 2,
+@@ -187,7 +187,7 @@ describe('Pathway Family Grouping', () => {
+       fam1PrimaryKeys.indexOf('SINK_A_E_CYCLIZED')
+     );
+ 
+-    // Non-essential Low leaf sp4 goes to minorNodes
++    // A Speculative leaf is collapsed into minorNodes; Low and above stay visible
+     expect(families[0].minorNodes.map((n) => n.species.key)).toEqual(['MINOR_LEAF_A_E']);
+ 
+     // Global ranks match the flat score list (#1..#4)
+@@ -328,4 +328,66 @@ describe('Pathway Family Grouping', () => {
+       expect(families[i - 1].peakScore).toBeGreaterThanOrEqual(families[i].peakScore);
+     }
+   });
++
++  it('lists siblings by their own score, so a higher-scoring imine is not buried below a weaker branch', () => {
++    const step = (ruleId: string, label: string, reactantSmiles: string[]) => ({
++      ruleId,
++      stepLabel: label,
++      description: ruleId,
++      reactantSmiles,
++      stepWeight: 0.5,
++      bottleneckFactor: 0.5,
++      conditionFactor: 1,
++      tempFactor: 1,
++      stericFactor: 1,
++      ringFactor: 1,
++      electronicFactor: 1,
++      reversible: false,
++    });
++    const entry = makeSyntheticSpecies({
++      key: 'ENTRY',
++      score: 0.11,
++      tier: 'Low',
++      status: 'transient',
++      inventory: [1, 1, 0],
++      stepsCount: 1,
++      bestChain: [step('NA_N', 'NA(N)', ['A', 'D'])],
++    });
++    // the weaker branch leads on to something big; the imine is a dead end with the higher own score
++    const weakBranch = makeSyntheticSpecies({
++      key: 'WEAK_BRANCH',
++      score: 0.12,
++      tier: 'Low',
++      status: 'transient',
++      inventory: [1, 2, 0],
++      stepsCount: 2,
++      bestChain: [step('NA_N', 'NA(N)', ['A', 'D']), step('NA_C', 'NA(C)', ['ENTRY', 'D'])],
++    });
++    const big = makeSyntheticSpecies({
++      key: 'BIG',
++      score: 0.4,
++      tier: 'Medium',
++      status: 'sink',
++      inventory: [1, 2, 0],
++      stepsCount: 3,
++      bestChain: [
++        step('NA_N', 'NA(N)', ['A', 'D']),
++        step('NA_C', 'NA(C)', ['ENTRY', 'D']),
++        step('MI_N', 'MI(N)', ['WEAK_BRANCH']),
++      ],
++    });
++    const imine = makeSyntheticSpecies({
++      key: 'IMINE',
++      score: 0.17,
++      tier: 'Low',
++      status: 'transient',
++      inventory: [1, 1, 0],
++      stepsCount: 2,
++      bestChain: [step('NA_N', 'NA(N)', ['A', 'D']), step('DH_imine', 'DH', ['ENTRY'])],
++    });
++    const fams = groupSpeciesByPathway([big, imine, weakBranch, entry], dummySubstrates);
++    const order = fams[0].primaryNodes.map((n) => n.species.key);
++    expect(order.indexOf('IMINE')).toBeLessThan(order.indexOf('WEAK_BRANCH'));
++    expect(order).toContain('IMINE');
++  });
+ });
+diff --git a/tests/predictorRework.test.ts b/tests/predictorRework.test.ts
+new file mode 100644
+index 0000000..c3a6b2d
+--- /dev/null
++++ b/tests/predictorRework.test.ts
+@@ -0,0 +1,188 @@
++import { describe, it, expect, beforeAll } from 'vitest';
++import {
++  predictWellReactions,
++  PredictorSubstrateInput,
++  WellConditionConfig,
++} from '../src/engine/predictor';
++import { stepIsAtomBalanced, parseFormula, countSubstruct } from '../src/engine/predictor/molQueries';
++import { estimateStericFactor, equilibriumPersistence } from '../src/engine/predictor/scoring';
++import { REACTION_RULES } from '../src/engine/predictor';
++
++let rdkit: any;
++beforeAll(async () => {
++  const mod: any = await import('@rdkit/rdkit');
++  rdkit = await (mod.default || mod)();
++});
++
++const S = (code: string, smiles: string, eq = 1): PredictorSubstrateInput => ({
++  id: code,
++  code,
++  name: code,
++  smiles,
++  equivalents: eq,
++  concentrationMm: 50 * eq,
++});
++const COND = (o: Partial<WellConditionConfig> = {}): WellConditionConfig => ({
++  medium: 'auto',
++  additiveName: '',
++  additiveEquiv: 0,
++  additivePka: 0,
++  temperatureC: 25,
++  waterPct: 2,
++  solvent: 'DMSO',
++  equivBasis: 'limiting',
++  ...o,
++});
++const carbons = (f: string) => parseFormula(f).C || 0;
++const nitrogens = (f: string) => parseFormula(f).N || 0;
++
++describe('atom bookkeeping', () => {
++  it('parses formulas and checks balance', () => {
++    expect(parseFormula('C27H22N6O')).toEqual({ C: 27, H: 22, N: 6, O: 1 });
++    expect(stepIsAtomBalanced(['C7H6O', 'C6H7N'], ['C13H11N', 'H2O'])).toBe(true);
++    expect(stepIsAtomBalanced(['C7H6O', 'C6H7N'], ['C13H11N'])).toBe(true); // water not listed: only H and O move
++    expect(stepIsAtomBalanced(['C7H6O', 'C6H7N'], ['C12H11N'])).toBe(false); // carbon lost
++    expect(stepIsAtomBalanced(['C7H6O', 'C6H7N'], ['C13H12N2O'])).toBe(false); // nitrogen created
++    expect(stepIsAtomBalanced(['C11H20O4'], ['C7H12O4'])).toBe(false);
++    expect(stepIsAtomBalanced(['C11H20O4'], ['C7H12O4'], true)).toBe(true); // isobutene leaving group allowed
++  });
++
++  it('no predicted species loses or invents carbon/nitrogen in a 4-component well', () => {
++    const subs = [
++      S('A', 'O=Cc1ccccc1'),
++      S('B', 'N#CCC#N'),
++      S('C', 'Nc1ccccc1'),
++      S('D', 'O=C1CCCC1'),
++    ];
++    const res = predictWellReactions(
++      rdkit,
++      subs,
++      COND({ medium: 'base', additiveName: 'DBU', additiveEquiv: 0.5, additivePka: 13.9, temperatureC: 80 })
++    );
++    expect(res.species.length).toBeGreaterThan(20);
++    for (const sp of res.species) {
++      const sumC = res.substrates.reduce((a, sub, i) => a + carbons(sub.formula) * (sp.inventory[i] || 0), 0);
++      const sumN = res.substrates.reduce((a, sub, i) => a + nitrogens(sub.formula) * (sp.inventory[i] || 0), 0);
++      expect(carbons(sp.formula), `${sp.smiles} carbon`).toBe(sumC);
++      expect(nitrogens(sp.formula), `${sp.smiles} nitrogen`).toBe(sumN);
++    }
++  });
++});
++
++describe('structural steric checks', () => {
++  it('counts both tert-butyl groups however the SMILES is written', () => {
++    expect(countSubstruct(rdkit, 'CC(C)(C)OC(=O)CC(=O)OC(C)(C)C', '[CX4;H0]([CH3])([CH3])[CH3]')).toBe(2);
++    expect(countSubstruct(rdkit, 'O=C(CC(=O)OC(C)(C)C)OC(C)(C)C', '[CX4;H0]([CH3])([CH3])[CH3]')).toBe(2);
++  });
++
++  it('penalises a di-tert-butyl substrate twice, whatever the atom order', () => {
++    const rule = REACTION_RULES.find((r) => r.stericRule === 'alpha_branching')!;
++    const a = estimateStericFactor(rule, ['CC(C)(C)OC(=O)CC(=O)OC(C)(C)C'], rdkit);
++    const b = estimateStericFactor(rule, ['O=C(CC(=O)OC(C)(C)C)OC(C)(C)C'], rdkit);
++    expect(a).toBeCloseTo(b, 6);
++    expect(a).toBeCloseTo(0.74 * 0.74, 3);
++  });
++});
++
++describe('scoring rework', () => {
++  it('imine formation under acid at 80 C is Medium and outranks its carbinolamine', () => {
++    const res = predictWellReactions(
++      rdkit,
++      [S('A', 'O=Cc1ccccc1'), S('B', 'Nc1ccccc1')],
++      COND({ medium: 'acid', additiveName: 'TsOH', additiveEquiv: 0.2, additivePka: 0.9, temperatureC: 80 })
++    );
++    const imine = res.species.find((s) => s.formula === 'C13H11N')!;
++    const hemi = res.species.find((s) => s.formula === 'C13H13NO')!;
++    expect(imine.tier).toBe('Medium');
++    expect(imine.score).toBeGreaterThan(hemi.score);
++    expect(imine.reversibleEnd).toBe(true);
++    expect(imine.persistence).toBeGreaterThan(hemi.persistence);
++  });
++
++  it('uncatalysed ester aminolysis is not rated above an acid-catalysed imine', () => {
++    const amide = predictWellReactions(
++      rdkit,
++      [S('A', 'COC(=O)c1ccccc1'), S('B', 'NCc1ccccc1')],
++      COND({ temperatureC: 120 })
++    ).species.find((s) => s.formula === 'C14H13NO')!;
++    expect(amide.tier).not.toBe('Medium');
++    expect(amide.tier).not.toBe('High');
++    expect(amide.persistence).toBe(1);
++  });
++
++  it('long cascades are discounted relative to short ones', () => {
++    const res = predictWellReactions(
++      rdkit,
++      [S('A', 'O=Cc1ccccc1'), S('B', 'N#CCC#N'), S('C', 'Nc1ccccc1'), S('D', 'O=C1CCCC1')],
++      COND({ medium: 'base', additiveName: 'DBU', additiveEquiv: 0.5, additivePka: 13.9, temperatureC: 80 })
++    );
++    const long = res.species.filter((s) => s.stepsCount >= 5);
++    expect(long.every((s) => s.tier !== 'High')).toBe(true);
++    const short = res.species.filter((s) => s.stepsCount <= 2 && s.status === 'sink');
++    expect(Math.max(...short.map((s) => s.score))).toBeGreaterThan(Math.max(...long.map((s) => s.score)));
++  });
++
++  it('dilution lowers scores of bimolecular steps; water lowers dehydration persistence', () => {
++    const subsHi = [S('A', 'O=Cc1ccccc1', 1), S('B', 'Nc1ccccc1', 1)];
++    const subsLo = subsHi.map((s) => ({ ...s, concentrationMm: 5 }));
++    const hi = predictWellReactions(rdkit, subsHi, COND({ temperatureC: 80 })).species.find((s) => s.formula === 'C13H11N')!;
++    const lo = predictWellReactions(rdkit, subsLo, COND({ temperatureC: 80 })).species.find((s) => s.formula === 'C13H11N')!;
++    expect(lo.likelihood).toBeLessThan(hi.likelihood);
++    const chain = hi.bestChain;
++    expect(equilibriumPersistence(chain, { concMm: 50, waterPct: 0.2 })).toBeGreaterThan(
++      equilibriumPersistence(chain, { concMm: 50, waterPct: 10 })
++    );
++  });
++
++  it('reports likelihood and persistence, with irreversible sinks at persistence 1', () => {
++    const res = predictWellReactions(
++      rdkit,
++      [S('A', 'O=Cc1ccccc1'), S('B', 'N#CCC#N')],
++      COND({ medium: 'base', additiveName: 'DBU', additiveEquiv: 0.2, additivePka: 13.9 })
++    );
++    const sink = res.species.find((s) => s.formula === 'C10H6N2')!;
++    expect(sink.persistence).toBe(1);
++    expect(sink.likelihood).toBeCloseTo(sink.score, 2);
++    for (const s of res.species) {
++      expect(s.score).toBeLessThanOrEqual(s.likelihood + 1e-9);
++    }
++  });
++});
++
++describe('guanidine + quinoline aldehyde + malonate well', () => {
++  const subs = [
++    S('A', 'N=C(N)NCc1ccncc1'),
++    S('D', 'O=Cc1ccc2ccccc2n1', 2),
++    S('E', 'CC(C)(C)OC(=O)CC(=O)OC(C)(C)C'),
++  ];
++  let res: ReturnType<typeof predictWellReactions>;
++  beforeAll(() => {
++    res = predictWellReactions(rdkit, subs, COND());
++  });
++
++  it('does not couple a carbinolamine carbon to a second aldehyde (no benzoin-type chains)', () => {
++    const bad = res.species.filter((s) => {
++      const ids = s.bestChain.map((c) => c.ruleId);
++      const k = ids.indexOf('NA_N_carbonyl');
++      return k >= 0 && ids.slice(k + 1).includes('NA_C_carbonyl_single');
++    });
++    expect(bad).toHaveLength(0);
++    expect(res.species.find((s) => s.formula === 'C17H15N5')).toBeDefined(); // the imine is still predicted
++  });
++
++  it('flags carbinolamines and t-butyl esters with in-source loss ions', () => {
++    const hemi = res.species.find((s) => s.formula === 'C17H17N5O')!;
++    const loss = hemi.lossIons.find((l) => l.label === '[M+H-H2O]+')!;
++    expect(loss).toBeDefined();
++    const imine = res.species.find((s) => s.formula === 'C17H15N5')!;
++    expect(Math.abs(loss.mz - imine.mhPlus)).toBeLessThan(0.002); // the carbinolamine loss ion IS the imine mass
++    const ester = res.species.find((s) => s.lossIons.some((l) => l.label === '[M+H-C4H8]+'));
++    expect(ester).toBeDefined();
++  });
++
++  it('keys 1,3- and 1,1-substituted guanidine adducts separately but tautomers together', () => {
++    const forms = res.species.filter((s) => s.formula === 'C17H17N5O');
++    const keys = new Set(forms.map((f) => f.tautomerKey));
++    expect(keys.size).toBe(forms.length);
++  });
++});
+-- 
+2.43.0

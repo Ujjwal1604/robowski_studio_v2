@@ -25,14 +25,14 @@ const SIDE_INFO = [
     index: 0,
     title: 'Side 1 (Lanes 0–26)',
     tier: 'Lower Tier',
-    wells: 'Wells A1–C9',
+    wells: 'Wells A1–C5 (col-spotted)',
     laneRange: '0 to 26',
   },
   {
     index: 1,
     title: 'Side 2 (Lanes 27–53)',
     tier: 'Upper Tier',
-    wells: 'Wells D1–F9',
+    wells: 'Wells D5–F9 (col-spotted)',
     laneRange: '27 to 53',
   },
 ];

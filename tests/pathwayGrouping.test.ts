@@ -157,8 +157,8 @@ describe('Pathway Family Grouping', () => {
 
     const sp4 = makeSyntheticSpecies({
       key: 'MINOR_LEAF_A_E',
-      score: 0.21,
-      tier: 'Low',
+      score: 0.06,
+      tier: 'Speculative',
       status: 'sink',
       inventory: [1, 0, 2],
       stepsCount: 2,
@@ -187,7 +187,7 @@ describe('Pathway Family Grouping', () => {
       fam1PrimaryKeys.indexOf('SINK_A_E_CYCLIZED')
     );
 
-    // Non-essential Low leaf sp4 goes to minorNodes
+    // Only Speculative leaves collapse into minorNodes; Low and above remain visible
     expect(families[0].minorNodes.map((n) => n.species.key)).toEqual(['MINOR_LEAF_A_E']);
 
     // Global ranks match the flat score list (#1..#4)
@@ -328,4 +328,112 @@ describe('Pathway Family Grouping', () => {
       expect(families[i - 1].peakScore).toBeGreaterThanOrEqual(families[i].peakScore);
     }
   });
+
+  it('orders siblings by their own score so a higher-scoring imine is not buried below a weaker branch', () => {
+    const step = (ruleId: string, label: string, reactantSmiles: string[]) => ({
+      ruleId,
+      stepLabel: label,
+      description: ruleId,
+      reactantSmiles,
+      stepWeight: 0.5,
+      bottleneckFactor: 0.5,
+      conditionFactor: 1,
+      tempFactor: 1,
+      stericFactor: 1,
+      ringFactor: 1,
+      electronicFactor: 1,
+      reversible: false,
+    });
+    const entry = makeSyntheticSpecies({
+      key: 'ENTRY',
+      score: 0.11,
+      tier: 'Low',
+      status: 'transient',
+      inventory: [1, 1, 0],
+      stepsCount: 1,
+      bestChain: [step('NA_N', 'NA(N)', ['A', 'D'])],
+    });
+    const weakBranch = makeSyntheticSpecies({
+      key: 'WEAK_BRANCH',
+      score: 0.12,
+      tier: 'Low',
+      status: 'transient',
+      inventory: [1, 2, 0],
+      stepsCount: 2,
+      bestChain: [step('NA_N', 'NA(N)', ['A', 'D']), step('NA_C', 'NA(C)', ['ENTRY', 'D'])],
+    });
+    const big = makeSyntheticSpecies({
+      key: 'BIG',
+      score: 0.4,
+      tier: 'Medium',
+      status: 'sink',
+      inventory: [1, 2, 0],
+      stepsCount: 3,
+      bestChain: [
+        step('NA_N', 'NA(N)', ['A', 'D']),
+        step('NA_C', 'NA(C)', ['ENTRY', 'D']),
+        step('MI_N', 'MI(N)', ['WEAK_BRANCH']),
+      ],
+    });
+    const imine = makeSyntheticSpecies({
+      key: 'IMINE',
+      score: 0.17,
+      tier: 'Low',
+      status: 'transient',
+      inventory: [1, 1, 0],
+      stepsCount: 2,
+      bestChain: [step('NA_N', 'NA(N)', ['A', 'D']), step('DH_imine', 'DH', ['ENTRY'])],
+    });
+    const fams = groupSpeciesByPathway([big, imine, weakBranch, entry], dummySubstrates);
+    const order = fams[0].primaryNodes.map((n) => n.species.key);
+    expect(order.indexOf('IMINE')).toBeLessThan(order.indexOf('WEAK_BRANCH'));
+    expect(order).toContain('IMINE');
+
+    // Inside primaryRoutes, contiguous causal steps along a cascade stick together:
+    // Route 1 (lead route): ENTRY -> WEAK_BRANCH -> BIG
+    // Route 2 (fork at ENTRY): IMINE
+    expect(fams[0].primaryRoutes.length).toBe(2);
+    expect(fams[0].primaryRoutes[0].isLeadRoute).toBe(true);
+    expect(fams[0].primaryRoutes[0].nodes.map((n) => n.species.key)).toEqual([
+      'ENTRY',
+      'WEAK_BRANCH',
+      'BIG',
+    ]);
+    expect(fams[0].primaryRoutes[1].branchFromKey).toBe('ENTRY');
+    expect(fams[0].primaryRoutes[1].nodes.map((n) => n.species.key)).toEqual(['IMINE']);
+  });
+
+  it('keeps every cascade route causally linked with zero missing or duplicated primary nodes', () => {
+    const subs: PredictorSubstrateInput[] = [
+      { id: '1', code: 'A', name: 'Benzaldehyde', smiles: 'O=Cc1ccccc1', equivalents: 1 },
+      { id: '2', code: 'B', name: 'Malononitrile', smiles: 'N#CCC#N', equivalents: 1 },
+      { id: '3', code: 'C', name: 'Aniline', smiles: 'Nc1ccccc1', equivalents: 1 },
+    ];
+    const cond: WellConditionConfig = {
+      medium: 'base',
+      additiveName: 'DBU',
+      additiveEquiv: 0.5,
+      additivePka: 13.9,
+      temperatureC: 80,
+      waterPct: 2,
+      solvent: 'DMSO',
+      equivBasis: 'limiting',
+    };
+    const res = predictWellReactions(rdkit, subs, cond);
+    const fams = groupSpeciesByPathway(res.species, res.substrates);
+
+    for (const fam of fams) {
+      const routeNodeKeys = fam.primaryRoutes.flatMap((r) => r.nodes.map((n) => n.species.key));
+      expect(routeNodeKeys.length).toBe(fam.primaryNodes.length);
+      expect(new Set(routeNodeKeys).size).toBe(fam.primaryNodes.length);
+
+      for (const route of fam.primaryRoutes) {
+        expect(route.nodes.length).toBeGreaterThanOrEqual(1);
+        for (let i = 1; i < route.nodes.length; i++) {
+          expect(route.nodes[i].parentKey).toBe(route.nodes[i - 1].species.key);
+        }
+      }
+    }
+  });
 });
+

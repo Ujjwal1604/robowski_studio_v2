@@ -16,6 +16,21 @@ export interface PathwaySpeciesNode {
   alsoViaLabels: string[];
 }
 
+export interface CascadeRoute {
+  id: string;
+  routeNumber: number; // 1-indexed within family, sorted descending by route peakScore
+  isLeadRoute: boolean;
+  branchFromKey: string | null;
+  branchFromRank: number | null;
+  branchFromFormula: string | null;
+  branchFromStepLabel: string | null;
+  peakScore: number;
+  peakTier: PredictionTier;
+  leadGlobalRank: number;
+  substrateCodes: string[];
+  nodes: PathwaySpeciesNode[]; // contiguous parent -> child chain along this cascade route
+}
+
 export interface PathwayFamily {
   id: string;
   pathwayNumber: number; // 1-indexed after sorting descending by peakScore
@@ -28,8 +43,9 @@ export interface PathwayFamily {
   leadSpecies: PredictedSpecies;
   leadGlobalRank: number;
   nodes: PathwaySpeciesNode[]; // all nodes in progression order
-  primaryNodes: PathwaySpeciesNode[]; // High / Medium / Lead + all their mechanistic ancestors
-  minorNodes: PathwaySpeciesNode[]; // Low / Speculative side-branches
+  primaryNodes: PathwaySpeciesNode[]; // every non-Speculative species + lead + mechanistic ancestors
+  minorNodes: PathwaySpeciesNode[]; // Speculative side-branches only
+  primaryRoutes: CascadeRoute[]; // contiguous parent -> child routes inside primaryNodes
 }
 
 export function isTautomerStep(step: StepEvent): boolean {
@@ -246,10 +262,11 @@ export function groupSpeciesByPathway(
 
       orderedEntries.push({ sp, depth, role });
 
+      // Sort siblings by own score so a stronger intermediate (e.g. Low imine) is not buried below a weaker branch
       const children = [...(childrenMap.get(sp.key) || [])].sort((a, b) => {
+        if (Math.abs(b.score - a.score) > 1e-6) return b.score - a.score;
         const subDiff = getSubtreePeak(b.key) - getSubtreePeak(a.key);
         if (Math.abs(subDiff) > 1e-6) return subDiff;
-        if (b.score !== a.score) return b.score - a.score;
         return a.stepsCount - b.stepsCount;
       });
 
@@ -284,10 +301,10 @@ export function groupSpeciesByPathway(
       };
     });
 
-    // Separate primaryNodes (High/Medium/Lead + all their ancestors) vs minorNodes (Low/Speculative leaves)
+    // Keep Low-tier species visible (e.g. imines/intermediates); only collapse Speculative leaf branches
     const primaryKeySet = new Set<string>();
     for (const n of nodes) {
-      if (n.isLead || n.species.tier === 'High' || n.species.tier === 'Medium') {
+      if (n.isLead || n.species.tier !== 'Speculative') {
         let cur: string | null = n.species.key;
         const guard = new Set<string>();
         while (cur && !guard.has(cur)) {
@@ -300,6 +317,145 @@ export function groupSpeciesByPathway(
 
     const primaryNodes = nodes.filter((n) => primaryKeySet.has(n.species.key));
     const minorNodes = nodes.filter((n) => !primaryKeySet.has(n.species.key));
+
+    // Decompose primaryNodes into contiguous causal CascadeRoutes (heavy-path spine first,
+    // so every product along a single cascade sequence sticks together and forks get own rows).
+    const primaryNodeMap = new Map<string, PathwaySpeciesNode>();
+    const primaryChildren = new Map<string, PathwaySpeciesNode[]>();
+    for (const pn of primaryNodes) {
+      primaryNodeMap.set(pn.species.key, pn);
+      primaryChildren.set(pn.species.key, []);
+    }
+    for (const pn of primaryNodes) {
+      if (pn.parentKey && primaryNodeMap.has(pn.parentKey)) {
+        primaryChildren.get(pn.parentKey)!.push(pn);
+      }
+    }
+
+    const primarySubPeakMemo = new Map<string, number>();
+    const primarySubVisited = new Set<string>();
+    const getPrimarySubPeak = (k: string): number => {
+      if (primarySubPeakMemo.has(k)) return primarySubPeakMemo.get(k)!;
+      if (primarySubVisited.has(k)) return primaryNodeMap.get(k)?.species.score ?? 0;
+      primarySubVisited.add(k);
+      let mx = primaryNodeMap.get(k)?.species.score ?? 0;
+      for (const ch of primaryChildren.get(k) || []) {
+        mx = Math.max(mx, getPrimarySubPeak(ch.species.key));
+      }
+      primarySubVisited.delete(k);
+      primarySubPeakMemo.set(k, mx);
+      return mx;
+    };
+
+    const orderSubCodes = (set: Set<string>) =>
+      substrates.map((s) => s.code).filter((c) => set.has(c));
+
+    const primaryRoots = primaryNodes
+      .filter((pn) => !pn.parentKey || !primaryNodeMap.has(pn.parentKey))
+      .sort((a, b) => {
+        const subDiff = getPrimarySubPeak(b.species.key) - getPrimarySubPeak(a.species.key);
+        if (Math.abs(subDiff) > 1e-6) return subDiff;
+        if (b.species.score !== a.species.score) return b.species.score - a.species.score;
+        return a.globalRank - b.globalRank;
+      });
+
+    const routeQueue: Array<{ start: PathwaySpeciesNode; branchFrom: PathwaySpeciesNode | null }> =
+      primaryRoots.map((r) => ({ start: r, branchFrom: null }));
+    const routeVisited = new Set<string>();
+    const rawPrimaryRoutes: Array<Omit<CascadeRoute, 'routeNumber'>> = [];
+
+    while (routeQueue.length > 0) {
+      const { start, branchFrom } = routeQueue.shift()!;
+      if (routeVisited.has(start.species.key)) continue;
+
+      const chainNodes: PathwaySpeciesNode[] = [];
+      let cur: PathwaySpeciesNode | null = start;
+      while (cur && !routeVisited.has(cur.species.key)) {
+        routeVisited.add(cur.species.key);
+        chainNodes.push(cur);
+
+        const kids = (primaryChildren.get(cur.species.key) || [])
+          .filter((ch) => !routeVisited.has(ch.species.key))
+          .sort((a, b) => {
+            const subDiff = getPrimarySubPeak(b.species.key) - getPrimarySubPeak(a.species.key);
+            if (Math.abs(subDiff) > 1e-6) return subDiff;
+            if (Math.abs(b.species.score - a.species.score) > 1e-6) {
+              return b.species.score - a.species.score;
+            }
+            if (a.species.stepsCount !== b.species.stepsCount) {
+              return a.species.stepsCount - b.species.stepsCount;
+            }
+            return a.globalRank - b.globalRank;
+          });
+
+        if (kids.length === 0) break;
+        // Follow strongest downstream subtree along this cascade; queue sibling forks
+        for (let i = 1; i < kids.length; i++) {
+          routeQueue.push({ start: kids[i], branchFrom: cur });
+        }
+        cur = kids[0];
+      }
+
+      if (chainNodes.length === 0) continue;
+
+      const routeLead = [...chainNodes].sort((a, b) => {
+        if (b.species.score !== a.species.score) return b.species.score - a.species.score;
+        return a.globalRank - b.globalRank;
+      })[0];
+
+      const subSet = new Set<string>();
+      for (const cn of chainNodes) {
+        for (const code of codesFromInventory(cn.species.inventory, substrates)) {
+          subSet.add(code);
+        }
+      }
+
+      rawPrimaryRoutes.push({
+        id: `${bucketId}::route::${start.species.key}`,
+        isLeadRoute: chainNodes.some((cn) => cn.isLead),
+        branchFromKey: branchFrom ? branchFrom.species.key : null,
+        branchFromRank: branchFrom ? branchFrom.globalRank : null,
+        branchFromFormula: branchFrom ? branchFrom.species.formula : null,
+        branchFromStepLabel: branchFrom ? branchFrom.lastStepLabel : null,
+        peakScore: routeLead.species.score,
+        peakTier: routeLead.species.tier,
+        leadGlobalRank: routeLead.globalRank,
+        substrateCodes: orderSubCodes(subSet),
+        nodes: chainNodes,
+      });
+    }
+
+    // Defensive pass in case any cyclic primaryNode remained unvisited
+    for (const pn of primaryNodes) {
+      if (!routeVisited.has(pn.species.key)) {
+        routeVisited.add(pn.species.key);
+        const subSet = new Set(codesFromInventory(pn.species.inventory, substrates));
+        rawPrimaryRoutes.push({
+          id: `${bucketId}::route::${pn.species.key}`,
+          isLeadRoute: pn.isLead,
+          branchFromKey: pn.parentKey,
+          branchFromRank: pn.parentGlobalRank,
+          branchFromFormula: null,
+          branchFromStepLabel: pn.lastStepLabel || null,
+          peakScore: pn.species.score,
+          peakTier: pn.species.tier,
+          leadGlobalRank: pn.globalRank,
+          substrateCodes: orderSubCodes(subSet),
+          nodes: [pn],
+        });
+      }
+    }
+
+    rawPrimaryRoutes.sort((a, b) => {
+      if (a.isLeadRoute !== b.isLeadRoute) return a.isLeadRoute ? -1 : 1;
+      if (Math.abs(b.peakScore - a.peakScore) > 1e-6) return b.peakScore - a.peakScore;
+      return a.leadGlobalRank - b.leadGlobalRank;
+    });
+
+    const primaryRoutes: CascadeRoute[] = rawPrimaryRoutes.map((r, idx) => ({
+      ...r,
+      routeNumber: idx + 1,
+    }));
 
     // Collect substrate participation labels
     const nonTautMembers = members.filter((m) => !(anchorByKey.get(m.key)?.isPureTautomer));
@@ -317,8 +473,6 @@ export function groupSpeciesByPathway(
         allSubSet.add(code);
       }
     }
-    const orderSubCodes = (set: Set<string>) =>
-      substrates.map((s) => s.code).filter((c) => set.has(c));
 
     const rootStep = bucket.rootStep;
     const entryStepLabel = rootStep?.stepLabel || 'Step';
@@ -337,6 +491,7 @@ export function groupSpeciesByPathway(
       nodes,
       primaryNodes,
       minorNodes,
+      primaryRoutes,
     });
   }
 

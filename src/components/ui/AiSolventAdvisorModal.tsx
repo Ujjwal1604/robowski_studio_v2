@@ -7,13 +7,16 @@ import {
 } from '../../services/aiService';
 import { useApp } from '../../context/AppContext';
 import {
+  containerOfLane,
+  isKnownAdditiveReagent,
   LANE_FRAME_WIDTH,
   optimizePlateTlcSolvents,
   PlateSolventPlanResult,
   RecommendedPlateSolvent,
   SimulatedWellLane,
   SolventPoolMode,
-  wellLabel,
+  tlcLane,
+  TlcStationaryPhasePreference,
   WellConditionConfig,
   WellPredictionResult,
 } from '../../engine';
@@ -66,6 +69,32 @@ function laneScoreColor(score: number): string {
   return '#ef4444';
 }
 
+function stationaryPhaseBadge(
+  sysPhase: 'SiO2' | 'C18',
+  pref: TlcStationaryPhasePreference
+): { short: string; full: string; isC18: boolean; isAlumina: boolean } {
+  if (sysPhase === 'C18') {
+    return { short: 'C18 RP', full: 'Reverse-Phase C18', isC18: true, isAlumina: false };
+  }
+  if (pref === 'Al2O3_neutral') {
+    return { short: 'Neutral Al₂O₃', full: 'Neutral Alumina (Al₂O₃)', isC18: false, isAlumina: true };
+  }
+  if (pref === 'Al2O3_basic') {
+    return { short: 'Basic Al₂O₃', full: 'Basic Alumina (Al₂O₃)', isC18: false, isAlumina: true };
+  }
+  return { short: 'SiO₂', full: 'Normal-Phase SiO₂', isC18: false, isAlumina: false };
+}
+
+function formatTlcTabName(baseName: string, pref: TlcStationaryPhasePreference): string {
+  if (pref === 'Al2O3_neutral' && !baseName.includes('Al₂O₃')) {
+    return `${baseName} (Neutral Al₂O₃)`;
+  }
+  if (pref === 'Al2O3_basic' && !baseName.includes('Al₂O₃')) {
+    return `${baseName} (Basic Al₂O₃)`;
+  }
+  return baseName;
+}
+
 export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   isOpen,
   onClose,
@@ -91,6 +120,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [plateIdx, setPlateIdx] = useState<number>(initialPlateIndex);
   const [numSystems, setNumSystems] = useState<number>(3);
   const [poolMode, setPoolMode] = useState<SolventPoolMode>('prefer_primary');
+  const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
   const [plateLoading, setPlateLoading] = useState<boolean>(false);
   const [plateProgress, setPlateProgress] = useState<{ done: number; total: number }>({ done: 0, total: 54 });
@@ -122,13 +152,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
   const cacheSignature = useMemo(() => {
     const reagentSig = (state.reagents || [])
-      .map((r) => `${r.code}:${r.smiles || ''}:${r.molarMass || ''}`)
+      .map((r) => `${r.code}:${r.smiles || ''}:${r.molarMass || ''}:${r.name || ''}`)
       .join('|');
+    const condSig = `${state.reactionSolvent || ''}:${state.temperatureC ?? state.eln?.temperatureC ?? 25}:${state.waterPct ?? state.eln?.waterPct ?? 2}`;
     const ovSig = conditionOverrides
       ? `${conditionOverrides.medium || ''}:${conditionOverrides.temperatureC ?? ''}:${conditionOverrides.waterPct ?? ''}`
       : '';
-    return `${run?.rows?.length || 0}::${state.mode}::${reagentSig}::${ovSig}::spec=${includeSpeculative}`;
-  }, [run?.rows?.length, state.mode, state.reagents, conditionOverrides, includeSpeculative]);
+    return `${run?.rows?.length || 0}::${state.mode}::${condSig}::${reagentSig}::${ovSig}::spec=${includeSpeculative}`;
+  }, [run?.rows?.length, state.mode, state.reactionSolvent, state.temperatureC, state.waterPct, state.eln?.temperatureC, state.eln?.waterPct, state.reagents, conditionOverrides, includeSpeculative]);
 
   useEffect(() => {
     if (isOpen && hasPlateRun) {
@@ -152,9 +183,17 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
   useEffect(() => {
     if (initialSubstrates.length > 0) {
-      setSubstrates(initialSubstrates);
+      const reagentMap = new Map((state.reagents || []).map((r) => [r.code, r]));
+      const tagged = initialSubstrates.map((s) => {
+        const reg = s.code ? reagentMap.get(s.code) : undefined;
+        const isAdd = reg
+          ? Boolean(isKnownAdditiveReagent(reg, state))
+          : /\b(TsOH|TFA|HCl|AcOH|DBU|Et3N|DIPEA|K2CO3|Cs2CO3|DMAP|Pyridine|NaOH|KOtBu)\b/i.test(s.name);
+        return isAdd ? { ...s, role: 'Additive' } : s;
+      });
+      setSubstrates(tagged);
       if (!expectedProduct) {
-        const names = initialSubstrates.map((s) => s.name).filter(Boolean);
+        const names = tagged.filter((s) => s.role !== 'Additive').map((s) => s.name).filter(Boolean);
         if (names.length >= 2) {
           setExpectedProduct(`Coupling product of ${names[0]} and ${names[1]}`);
         } else if (names.length === 1) {
@@ -206,6 +245,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
         plateIndex: plateIdx,
         maxSystems: numSystems,
         poolMode,
+        stationaryPhase: stationaryPhasePref,
         conditionOverrides,
         cachedPredictions: mergedCached,
         includeSpeculative,
@@ -219,7 +259,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
       if (controller.signal.aborted || runSeqRef.current !== seq) return;
 
-      // Save computed well predictions into session cache so toggling 2/3/4 Systems or Preference is instant
+      // Save computed well predictions into session cache so toggling 2/3/4 Systems, Preference, or Stationary Phase is instant
       if (plan.wellPredictions) {
         for (const [wIdxStr, wp] of Object.entries(plan.wellPredictions)) {
           predCacheRef.current.preds[`${plateIdx}-${wIdxStr}`] = wp;
@@ -253,6 +293,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     plateIdx,
     numSystems,
     poolMode,
+    stationaryPhasePref,
     conditionOverrides,
     cachedPlatePredictions,
     includeSpeculative,
@@ -293,7 +334,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
   const handleApplyAllSystemsAsTlcTabs = () => {
     if (!platePlan || platePlan.recommendedSystems.length === 0) return;
-    const sysNames = platePlan.recommendedSystems.map((r) => r.system.name);
+    const planPhase = platePlan.stationaryPhase || stationaryPhasePref;
+    const sysNames = platePlan.recommendedSystems.map((r) => formatTlcTabName(r.system.name, planPhase));
     setTlcSets((prev) => {
       const existingNames = new Set(prev.map((s) => s.name.trim().toLowerCase()));
       const next = [...prev];
@@ -547,17 +589,44 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   </label>
 
                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
-                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>Preference</span>
+                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>Stationary Phase</span>
                     <select
                       className="f"
                       style={{ height: '28px', fontSize: '12px', padding: '0 8px' }}
+                      value={stationaryPhasePref}
+                      onChange={(e) => setStationaryPhasePref(e.target.value as TlcStationaryPhasePreference)}
+                      title="Choose the TLC plate stationary phase for retention modeling and solvent selection"
+                    >
+                      <option value="auto">Auto (SiO₂ Primary + C18 Fallback)</option>
+                      <option value="SiO2">Silica Gel (SiO₂ — Normal Phase)</option>
+                      <option value="C18">Reverse Phase (C18)</option>
+                      <option value="Al2O3_neutral">Neutral Alumina (Al₂O₃)</option>
+                      <option value="Al2O3_basic">Basic Alumina (Al₂O₃)</option>
+                    </select>
+                  </label>
+
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>Preference</span>
+                    <select
+                      className="f"
+                      disabled={stationaryPhasePref === 'C18'}
+                      style={{
+                        height: '28px',
+                        fontSize: '12px',
+                        padding: '0 8px',
+                        opacity: stationaryPhasePref === 'C18' ? 0.55 : 1,
+                      }}
                       value={poolMode}
                       onChange={(e) => setPoolMode(e.target.value as SolventPoolMode)}
-                      title="Prefer EtOAc/Hexanes & MeOH/DCM (±Et3N / 2M NH3-MeOH) while keeping Acetone/Hex, MeOH/EtOAc, MeOH/Toluene & C18 available"
+                      title={
+                        stationaryPhasePref === 'C18'
+                          ? 'Reverse-phase C18 evaluates all aqueous MeCN/MeOH mobile phases'
+                          : 'Prefer EtOAc/Hexanes & MeOH/DCM (±Et3N / 2M NH3-MeOH) while keeping Acetone/Hex, MeOH/EtOAc, MeOH/Toluene & C18 available'
+                      }
                     >
                       <option value="prefer_primary">Prefer EtOAc/Hex &amp; MeOH/DCM (±Et₃N/NH₃)</option>
                       <option value="primary_only">Workhorses Only (EtOAc/Hex &amp; MeOH/DCM)</option>
-                      <option value="balanced">All Systems Equal (incl. C18 / Acetone / Toluene)</option>
+                      <option value="balanced">All Systems Equal (incl. Acetone / Toluene)</option>
                     </select>
                   </label>
 
@@ -613,7 +682,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   }}
                 >
                   <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
-                    Predicting products &amp; simulating normal-phase silica retention across Plate {plateIdx + 1}…
+                    Predicting products &amp; simulating{' '}
+                    {stationaryPhasePref === 'C18'
+                      ? 'reverse-phase C18'
+                      : stationaryPhasePref === 'Al2O3_neutral'
+                      ? 'neutral alumina (Al₂O₃)'
+                      : stationaryPhasePref === 'Al2O3_basic'
+                      ? 'basic alumina (Al₂O₃)'
+                      : 'TLC stationary-phase'}{' '}
+                    retention across Plate {plateIdx + 1}…
                   </div>
                   <div className="mono" style={{ fontSize: '12px', color: 'var(--acc)' }}>
                     {plateProgress.done} / {plateProgress.total} active wells evaluated
@@ -633,7 +710,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   >
                     {platePlan.recommendedSystems.map((rec) => {
                       const isSel = activeSystemPlan?.system.id === rec.system.id;
-                      const isC18 = rec.system.stationaryPhase === 'C18';
+                      const badge = stationaryPhaseBadge(
+                        rec.system.stationaryPhase,
+                        platePlan.stationaryPhase || stationaryPhasePref
+                      );
+                      const tabName = formatTlcTabName(
+                        rec.system.name,
+                        platePlan.stationaryPhase || stationaryPhasePref
+                      );
                       return (
                         <div
                           key={rec.system.id}
@@ -677,12 +761,33 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   fontWeight: 700,
                                   padding: '2px 5px',
                                   borderRadius: '4px',
-                                  background: isC18 ? 'color-mix(in srgb, #38bdf8 16%, transparent)' : 'var(--soft)',
-                                  color: isC18 ? '#38bdf8' : 'var(--mut)',
+                                  background: badge.isC18
+                                    ? 'color-mix(in srgb, #38bdf8 16%, transparent)'
+                                    : badge.isAlumina
+                                    ? 'color-mix(in srgb, #a855f7 16%, transparent)'
+                                    : 'var(--soft)',
+                                  color: badge.isC18 ? '#38bdf8' : badge.isAlumina ? '#c084fc' : 'var(--mut)',
                                 }}
                               >
-                                {isC18 ? 'C18 RP' : 'SiO₂'}
+                                {badge.short}
                               </span>
+                              {(rec.system.baseModifier || rec.system.acidModifier) && (
+                                <span
+                                  className="mono"
+                                  style={{
+                                    fontSize: '10px',
+                                    fontWeight: 700,
+                                    padding: '2px 5px',
+                                    borderRadius: '4px',
+                                    background: rec.system.baseModifier
+                                      ? 'color-mix(in srgb, #38bdf8 14%, transparent)'
+                                      : 'color-mix(in srgb, #f59e0b 14%, transparent)',
+                                    color: rec.system.baseModifier ? '#38bdf8' : '#f59e0b',
+                                  }}
+                                >
+                                  + {rec.system.baseModifier || rec.system.acidModifier}
+                                </span>
+                              )}
                             </div>
                             <span className="mono" style={{ fontSize: '11.5px', fontWeight: 700, color: '#10b981' }}>
                               {rec.wellCoveragePct}% resolved
@@ -706,8 +811,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 className="btn sm"
                                 style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                                 onClick={() => {
-                                  onApplyToCurrentSet(rec.system.name);
-                                  toast(`Applied "${rec.system.name}" to active TLC tab.`);
+                                  onApplyToCurrentSet(tabName);
+                                  toast(`Applied "${tabName}" to active TLC tab.`);
                                 }}
                               >
                                 Apply to Tab
@@ -719,8 +824,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 className="btn sm"
                                 style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                                 onClick={() => {
-                                  onCreateNewSet(rec.system.name);
-                                  toast(`Created TLC tab "${rec.system.name}".`);
+                                  onCreateNewSet(tabName);
+                                  toast(`Created TLC tab "${tabName}".`);
                                 }}
                               >
                                 + Tab
@@ -757,8 +862,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         </span>
                       )}
                     </div>
-                    {platePlan.summaryNotes[1] && (
-                      <span style={{ color: 'var(--warn)', fontSize: '11.5px' }}>{platePlan.summaryNotes[1]}</span>
+                    {platePlan.summaryNotes.length > 1 && (
+                      <span style={{ color: 'var(--warn)', fontSize: '11.5px' }}>
+                        {platePlan.summaryNotes.slice(1).join(' · ')}
+                      </span>
                     )}
                   </div>
 
@@ -781,7 +888,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{activeSystemPlan.system.name}</span>
                           </div>
                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            {activeSystemPlan.system.stationaryPhase === 'C18' ? 'Reverse-Phase C18' : 'Normal-Phase SiO₂'} · 20 mL: {activeSystemPlan.system.chamberPrep20mL}
+                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 20 mL: {activeSystemPlan.system.chamberPrep20mL}
                           </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
@@ -794,7 +901,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             className="btn sm"
                             style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                             onClick={() => {
-                              const name = activeSystemPlan.system.name;
+                              const name = formatTlcTabName(
+                                activeSystemPlan.system.name,
+                                platePlan.stationaryPhase || stationaryPhasePref
+                              );
                               setTlcSets((prev) => {
                                 if (prev.some((s) => s.name.trim().toLowerCase() === name.trim().toLowerCase())) {
                                   return prev;
@@ -823,11 +933,26 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         </div>
                       </div>
 
-                      {/* Render Upper Plate (Lanes 1-27) & Lower Plate (Lanes 28-54) */}
+                      {/* Render Plate Half 1 (Spotter Lanes 1-27: A1, B1, C1, D1, E1, F1, A2..C5) & Half 2 (Lanes 28-54: D5..F9) */}
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(460px, 1fr))', gap: '12px' }}>
                         {[
-                          { title: 'Plate Half 1 (A1–C9 · Lanes 1–27)', slice: activeSystemPlan.lanes.slice(0, 27) },
-                          { title: 'Plate Half 2 (D1–F9 · Lanes 28–54)', slice: activeSystemPlan.lanes.slice(27, 54) },
+                          {
+                            title: 'Plate Half 1 (A1–C5 · Lanes 1–27 · Column-Spotted)',
+                            slice: Array.from({ length: 27 }, (_, spotIdx) => ({
+                              spotIdx,
+                              lane: activeSystemPlan.lanes[containerOfLane(spotIdx)],
+                            })).filter((x) => Boolean(x.lane)),
+                          },
+                          {
+                            title: 'Plate Half 2 (D5–F9 · Lanes 28–54 · Column-Spotted)',
+                            slice: Array.from({ length: 27 }, (_, i) => {
+                              const spotIdx = 27 + i;
+                              return {
+                                spotIdx,
+                                lane: activeSystemPlan.lanes[containerOfLane(spotIdx)],
+                              };
+                            }).filter((x) => Boolean(x.lane)),
+                          },
                         ].map((half, hIdx) => (
                           <div
                             key={hIdx}
@@ -870,7 +995,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 }}
                               />
 
-                              {half.slice.map((lane) => {
+                              {half.slice.map(({ spotIdx, lane }) => {
                                 const isSelLane = lane.wellIndex === selectedLaneIdx;
                                 return (
                                   <button
@@ -880,8 +1005,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     disabled={lane.isBlank}
                                     title={
                                       lane.isBlank
-                                        ? `${lane.wellCoord} (Blank)`
-                                        : `${lane.wellCoord}: Score ${Math.round(lane.resolutionScore * 100)}% · ΔRf ${lane.deltaRf.toFixed(2)}`
+                                        ? `Lane ${spotIdx + 1} · ${lane.wellCoord} (Blank)`
+                                        : `Lane ${spotIdx + 1} · ${lane.wellCoord}: Score ${Math.round(lane.resolutionScore * 100)}% · ΔRf ${lane.deltaRf.toFixed(2)}`
                                     }
                                     style={{
                                       position: 'relative',
@@ -953,7 +1078,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 marginTop: '3px',
                               }}
                             >
-                              {half.slice.map((lane) => (
+                              {half.slice.map(({ lane }) => (
                                 <div
                                   key={lane.wellIndex}
                                   className="mono"
@@ -991,7 +1116,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         >
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                             <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700 }}>
-                              Well {inspectedLane.wellCoord} in {activeSystemPlan.system.shortLabel} · ΔRf = {inspectedLane.deltaRf.toFixed(2)} · Separation{' '}
+                              Well {inspectedLane.wellCoord} (Spotter Lane {tlcLane(inspectedLane.wellIndex) + 1}) in {activeSystemPlan.system.shortLabel} · ΔRf = {inspectedLane.deltaRf.toFixed(2)} · Separation{' '}
                               <span style={{ color: laneScoreColor(inspectedLane.resolutionScore) }}>
                                 {Math.round(inspectedLane.resolutionScore * 100)}%
                               </span>
@@ -1103,7 +1228,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         >
                           {platePlan.otherSystems.map((rec) => {
                             const isSel = activeSystemPlan?.system.id === rec.system.id;
-                            const isC18 = rec.system.stationaryPhase === 'C18';
+                            const badge = stationaryPhaseBadge(
+                              rec.system.stationaryPhase,
+                              platePlan.stationaryPhase || stationaryPhasePref
+                            );
                             return (
                               <button
                                 key={rec.system.id}
@@ -1136,10 +1264,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     style={{
                                       fontSize: '10px',
                                       fontWeight: 700,
-                                      color: isC18 ? '#38bdf8' : '#10b981',
+                                      color: badge.isC18 ? '#38bdf8' : badge.isAlumina ? '#c084fc' : '#10b981',
                                     }}
                                   >
-                                    {isC18 ? 'C18 · ' : ''}{rec.wellCoveragePct}%
+                                    {badge.isC18 ? 'C18 · ' : badge.isAlumina ? `${badge.short} · ` : ''}{rec.wellCoveragePct}%
                                   </span>
                                 </div>
                                 <div style={{ fontSize: '10.5px', color: 'var(--mut)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -1502,41 +1630,69 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             </div>
                           </div>
 
-                          <div style={{ fontSize: '11px', padding: '6px 8px', background: 'rgba(0,0,0,0.2)', borderRadius: '4px', fontFamily: 'monospace', marginBottom: '8px' }}>
+                          <div style={{ fontSize: '11px', padding: '6px 8px', background: 'rgba(0,0,0,0.2)', borderRadius: '4px', fontFamily: 'monospace', marginBottom: '6px' }}>
                             {sys.chamberPrep}
                           </div>
+                          {sys.modifiers && !/^(none|none required|n\/a|-)$/i.test(sys.modifiers.trim()) && (
+                            <div
+                              className="mono"
+                              style={{
+                                fontSize: '11px',
+                                padding: '4px 8px',
+                                marginBottom: '6px',
+                                borderRadius: '4px',
+                                background: 'color-mix(in srgb, #38bdf8 10%, transparent)',
+                                border: '1px solid color-mix(in srgb, #38bdf8 25%, transparent)',
+                                color: '#38bdf8',
+                              }}
+                            >
+                              Modifier in system: {sys.modifiers}
+                            </div>
+                          )}
                           <p style={{ fontSize: '11px', color: 'var(--mut)', lineHeight: '1.45', margin: 0 }}>
                             {sys.rationale}
                           </p>
                         </div>
 
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', borderTop: '1px solid var(--line)', paddingTop: '10px' }}>
-                          {onApplyToCurrentSet && (
-                            <button
-                              type="button"
-                              className="btn sm pri"
-                              style={{ flex: 1, fontSize: '11px', height: '28px', background: sys.isBest ? '#10b981' : undefined }}
-                              onClick={() => {
-                                onApplyToCurrentSet(sys.name);
-                                toast(`Applied "${sys.name}" to current TLC Plate set.`);
-                              }}
-                            >
-                              Apply to Plate
-                            </button>
-                          )}
-                          {onCreateNewSet && (
-                            <button
-                              type="button"
-                              className="btn sm"
-                              style={{ fontSize: '11px', height: '28px' }}
-                              onClick={() => {
-                                onCreateNewSet(sys.name);
-                                toast(`Created new TLC plate set for "${sys.name}".`);
-                              }}
-                            >
-                              + New TLC Tab
-                            </button>
-                          )}
+                          {(() => {
+                            const mod = (sys.modifiers || '').trim();
+                            const hasRealMod = Boolean(mod) && !/^(none|none required|n\/a|-)$/i.test(mod);
+                            const fullSystemName =
+                              hasRealMod && !sys.name.toLowerCase().includes(mod.toLowerCase())
+                                ? `${sys.name} + ${mod}`
+                                : sys.name;
+                            return (
+                              <>
+                                {onApplyToCurrentSet && (
+                                  <button
+                                    type="button"
+                                    className="btn sm pri"
+                                    style={{ flex: 1, fontSize: '11px', height: '28px', background: sys.isBest ? '#10b981' : undefined }}
+                                    onClick={() => {
+                                      onApplyToCurrentSet(fullSystemName);
+                                      toast(`Applied "${fullSystemName}" to current TLC Plate set.`);
+                                    }}
+                                  >
+                                    Apply to Plate
+                                  </button>
+                                )}
+                                {onCreateNewSet && (
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '11px', height: '28px' }}
+                                    onClick={() => {
+                                      onCreateNewSet(fullSystemName);
+                                      toast(`Created new TLC plate set for "${fullSystemName}".`);
+                                    }}
+                                  >
+                                    + New TLC Tab
+                                  </button>
+                                )}
+                              </>
+                            );
+                          })()}
                           <button
                             type="button"
                             className="btn sm"

@@ -167,6 +167,8 @@ export function notebookSummary(run: RunResult, dateStr?: string) {
     modeName + ' mode',
     `${run.vialVolume} µL per vial`,
     run.reactionSolvent,
+    ...(run.temperatureC != null ? [`${run.temperatureC} °C`] : []),
+    ...(run.waterPct != null ? [`${run.waterPct}% base H₂O`] : []),
     `Robowski ${run.hood} hood`,
     `${wells} reactions${blanks ? ' + ' + blanks + ' blank' + (blanks > 1 ? 's' : '') : ''}`,
     `${run.plates} plate${run.plates > 1 ? 's' : ''}`,

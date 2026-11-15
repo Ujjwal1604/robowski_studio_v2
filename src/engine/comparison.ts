@@ -12,6 +12,7 @@ import {
   WellOutcomeStatus,
 } from '../types';
 import { PAL, canonicalSolvent } from './constants';
+import { getCanonicalRunConditions, summarizeRunHydrates } from './conditions';
 import { axisValues } from './combinations';
 import { buildRun } from './dilution';
 import { triBuildRows, triDefault, triSync } from './triplet';
@@ -603,6 +604,7 @@ export function extractWellSnapshot(
 
   const spots: TlcSpot[] = Array.isArray(lane?.customSpots) ? lane!.customSpots! : [];
 
+  const canon = getCanonicalRunConditions(state);
   return {
     slotUid,
     runId: compRun.id,
@@ -622,11 +624,11 @@ export function extractWellSnapshot(
     eln,
     elnCampaign: {
       reactionClass: state.eln?.reactionClass,
-      temperatureC: state.eln?.temperatureC,
-      reactionTimeHours: state.eln?.reactionTimeHours,
-      atmosphere: state.eln?.atmosphere,
-      illumination: state.eln?.illumination,
-      agitation: state.eln?.agitation,
+      temperatureC: canon.temperatureC,
+      reactionTimeHours: canon.reactionTimeHours,
+      atmosphere: canon.atmosphere,
+      illumination: canon.illumination,
+      agitation: canon.agitation,
     },
     tlc: {
       tlcSet: resolvedSet,
@@ -784,18 +786,33 @@ export function compareRunsSummary(runs: ComparableRun[]): MultiRunComparisonRes
     },
     {
       key: 'elnTemp',
-      label: 'ELN temperature (°C)',
-      get: (r) => (r.state.eln?.temperatureC != null && r.state.eln?.temperatureC !== '' ? `${r.state.eln.temperatureC} °C` : '—'),
+      label: 'Temperature (°C)',
+      get: (r) => `${getCanonicalRunConditions(r.state).temperatureC} °C`,
+    },
+    {
+      key: 'waterPct',
+      label: 'Effective water (% v/v)',
+      get: (r) => {
+        const hyd = summarizeRunHydrates(r.state, r.run);
+        const base = getCanonicalRunConditions(r.state).baseWaterPct;
+        if (!hyd.hasHydrates) return `${base.toFixed(1)}% H₂O`;
+        return hyd.minEffectiveWaterPct === hyd.maxEffectiveWaterPct
+          ? `${hyd.minEffectiveWaterPct.toFixed(2)}% H₂O (+${hyd.minTotalHydrateWaterPct.toFixed(2)}% hydrate)`
+          : `${hyd.minEffectiveWaterPct.toFixed(2)}–${hyd.maxEffectiveWaterPct.toFixed(2)}% H₂O (incl. hydrate)`;
+      },
     },
     {
       key: 'elnTime',
       label: 'Reaction time (h)',
-      get: (r) => (r.state.eln?.reactionTimeHours != null && r.state.eln?.reactionTimeHours !== '' ? `${r.state.eln.reactionTimeHours} h` : '—'),
+      get: (r) => {
+        const t = getCanonicalRunConditions(r.state).reactionTimeHours;
+        return t !== '' ? `${t} h` : '—';
+      },
     },
     {
       key: 'elnAtmosphere',
       label: 'Atmosphere',
-      get: (r) => r.state.eln?.atmosphere || '—',
+      get: (r) => getCanonicalRunConditions(r.state).atmosphere || '—',
     },
     {
       key: 'elnOutcomes',
@@ -982,6 +999,17 @@ export function buildWellComparisonMatrix(
       snapshots.map((s) => {
         const t = s.extraction?.condition.temperatureC ?? s.elnCampaign.temperatureC;
         return t != null && t !== '' ? `${t} °C` : '—';
+      })
+    ),
+    formatParamRow(
+      'water',
+      'Water (% v/v)',
+      snapshots.map((s) => {
+        const c = s.extraction?.condition;
+        if (!c) return '—';
+        return (c.hydrateWaterPct || 0) > 0
+          ? `${c.waterPct.toFixed(2)}% (+${Number(c.hydrateWaterPct).toFixed(2)}% hydrate)`
+          : `${c.waterPct.toFixed(1)}%`;
       })
     ),
     formatParamRow(

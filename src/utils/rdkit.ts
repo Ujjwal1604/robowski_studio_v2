@@ -78,6 +78,9 @@ export interface RdkitDrawOptions {
   height: number;
   isDark?: boolean;
   bondLineWidth?: number;
+  highlightBonds?: number[];
+  highlightAtoms?: number[];
+  highlightColor?: [number, number, number, number];
 }
 
 /**
@@ -98,9 +101,17 @@ export function drawSmilesWithRDKit(
       return null;
     }
 
-    const { width, height, isDark = false, bondLineWidth = 1.8 } = options;
+    const {
+      width,
+      height,
+      isDark = false,
+      bondLineWidth = 1.8,
+      highlightBonds,
+      highlightAtoms,
+      highlightColor,
+    } = options;
 
-    const details = {
+    const details: Record<string, any> = {
       width: Math.max(40, Math.round(width)),
       height: Math.max(30, Math.round(height)),
       bondLineWidth,
@@ -108,6 +119,14 @@ export function drawSmilesWithRDKit(
       backgroundColour: [1, 1, 1, 0], // transparent background
       legend: '',
     };
+
+    if (highlightBonds && highlightBonds.length > 0) {
+      details.bonds = highlightBonds;
+      details.atoms = highlightAtoms ?? [];
+      details.highlightColour =
+        highlightColor ?? (isDark ? [0.07, 0.45, 0.38, 1.0] : [0.55, 0.94, 0.80, 1.0]);
+      details.highlightBondWidthMultiplier = 18;
+    }
 
     let svg: string = mol.get_svg_with_highlights(JSON.stringify(details));
     mol.delete();

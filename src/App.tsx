@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from './context/AppContext';
 import {
   Header,
@@ -22,6 +22,13 @@ import {
 
 export const App: React.FC = () => {
   const { view, saveRun, closePreview, previewModal } = useApp();
+  const [mountedViews, setMountedViews] = useState<Record<string, boolean>>(() => ({
+    [view]: true,
+  }));
+
+  useEffect(() => {
+    setMountedViews((prev) => (prev[view] ? prev : { ...prev, [view]: true }));
+  }, [view]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -51,7 +58,11 @@ export const App: React.FC = () => {
       <main id="main">
         {view === 'setup' && <SetupView />}
         {view === 'combos' && <CombinationsView />}
-        {view === 'predict' && <PredictionView />}
+        {mountedViews.predict && (
+          <div style={{ display: view === 'predict' ? 'block' : 'none' }}>
+            <PredictionView />
+          </div>
+        )}
         {view === 'deck' && <DeckView />}
         <div style={{ display: view === 'tlc' ? 'block' : 'none' }}>
           <TlcView />

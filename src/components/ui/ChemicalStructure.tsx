@@ -18,6 +18,9 @@ interface ChemicalStructureProps {
   height?: number;
   className?: string;
   allowZoom?: boolean;
+  highlightBonds?: number[];
+  highlightAtoms?: number[];
+  highlightColor?: [number, number, number, number];
   onResolvedSmiles?: (smiles: string, mw?: number, density?: number, iupac?: string) => void;
 }
 
@@ -139,6 +142,9 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
   height = 38,
   className = '',
   allowZoom = true,
+  highlightBonds,
+  highlightAtoms,
+  highlightColor,
   onResolvedSmiles,
 }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -206,6 +212,9 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
             height,
             isDark,
             bondLineWidth: width >= 200 ? 2.1 : 1.8,
+            highlightBonds,
+            highlightAtoms,
+            highlightColor,
           });
           if (svg) {
             const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
@@ -292,7 +301,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [activeSmiles, width, height]);
+  }, [activeSmiles, width, height, highlightBonds, highlightAtoms, highlightColor]);
 
   const handleManualResolve = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -499,6 +508,9 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
           activeSmiles={activeSmiles}
           modalInputSmiles={modalInputSmiles}
           setModalInputSmiles={setModalInputSmiles}
+          highlightBonds={highlightBonds}
+          highlightAtoms={highlightAtoms}
+          highlightColor={highlightColor}
           onClose={() => setZoomOpen(false)}
           onSave={(newSmi) => {
             setActiveSmiles(newSmi);
@@ -534,6 +546,9 @@ interface StructureModalProps {
   activeSmiles: string;
   modalInputSmiles: string;
   setModalInputSmiles: (s: string) => void;
+  highlightBonds?: number[];
+  highlightAtoms?: number[];
+  highlightColor?: [number, number, number, number];
   onClose: () => void;
   onSave: (s: string) => void;
   onResolveCandidate: () => Promise<void>;
@@ -546,6 +561,9 @@ const StructureModal: React.FC<StructureModalProps> = ({
   activeSmiles,
   modalInputSmiles,
   setModalInputSmiles,
+  highlightBonds,
+  highlightAtoms,
+  highlightColor,
   onClose,
   onSave,
   onResolveCandidate,
@@ -621,7 +639,14 @@ const StructureModal: React.FC<StructureModalProps> = ({
           }}
         >
           {displaySmiles ? (
-            <ModalEnlargedStructure smiles={displaySmiles} width={500} height={276} />
+            <ModalEnlargedStructure
+              smiles={displaySmiles}
+              width={500}
+              height={276}
+              highlightBonds={highlightBonds}
+              highlightAtoms={highlightAtoms}
+              highlightColor={highlightColor}
+            />
           ) : (
             <div style={{ textAlign: 'center', color: 'var(--mut)', fontSize: '13px' }}>
               No SMILES structure specified.
@@ -689,10 +714,20 @@ const StructureModal: React.FC<StructureModalProps> = ({
 };
 
 // Enlarged high-res vector drawer for modal
-const ModalEnlargedStructure: React.FC<{ smiles: string; width: number; height: number }> = ({
+const ModalEnlargedStructure: React.FC<{
+  smiles: string;
+  width: number;
+  height: number;
+  highlightBonds?: number[];
+  highlightAtoms?: number[];
+  highlightColor?: [number, number, number, number];
+}> = ({
   smiles,
   width,
   height,
+  highlightBonds,
+  highlightAtoms,
+  highlightColor,
 }) => {
   const modalSvgRef = useRef<SVGSVGElement | null>(null);
   const [modalRdkitSvg, setModalRdkitSvg] = useState<string | null>(null);
@@ -720,6 +755,9 @@ const ModalEnlargedStructure: React.FC<{ smiles: string; width: number; height: 
             height,
             isDark,
             bondLineWidth: 2.0,
+            highlightBonds,
+            highlightAtoms,
+            highlightColor,
           });
           if (svg) {
             const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
@@ -800,7 +838,7 @@ const ModalEnlargedStructure: React.FC<{ smiles: string; width: number; height: 
     return () => {
       isCancelled = true;
     };
-  }, [smiles, width, height]);
+  }, [smiles, width, height, highlightBonds, highlightAtoms, highlightColor]);
 
   if (modalRdkitSvg) {
     return (

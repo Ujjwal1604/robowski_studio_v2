@@ -1,6 +1,7 @@
 // Robowski Studio - General N-Component Priority-Search Reaction Prediction Engine
 import {
   ChemicalAlert,
+  LossIon,
   PredictedSpecies,
   PredictionOptions,
   PredictorSubstrateInput,
@@ -15,6 +16,7 @@ import {
   stripStereoFromSmiles,
 } from './saltAndSites';
 import { REACTION_RULES, ReactionRuleDef } from './rules';
+import { WATER_PCT_PER_MM } from '../conditions';
 import {
   computeRingSizesFromMol,
   conditionGate,
@@ -24,12 +26,13 @@ import {
   scoreChain,
   temperatureGate,
 } from './scoring';
+import { stepIsAtomBalanced, countSubstruct } from './molQueries';
 
 const PROTON_MASS = 1.00727647;
 const NA_MASS = 22.989218;
 
 // Extra tautomer rule so pre-formed or imine intermediates can access enamine reactivity
-const TAUTOMER_RULES: ReactionRuleDef[] = [
+export const TAUTOMER_RULES: ReactionRuleDef[] = [
   {
     id: 'TAUT_imine_to_enamine',
     stepLabel: 'Tautomer',
@@ -178,6 +181,7 @@ interface MolMeta {
   numAromaticRings: number;
   numHeavyAtoms: number;
   ringSizes: number[];
+  tautomerKey: string;
 }
 
 interface InternalSpecies {
@@ -228,6 +232,16 @@ function computeSpeciesTemplateMatches(
   return result;
 }
 
+/**
+ * InChI without its stereo layers (/b, /t, /m, /s): mobile-H groups are folded together, so tautomers
+ * of one connectivity share the same key.
+ */
+function tautomerKeyFromInchi(inchi: string): string {
+  if (!inchi) return '';
+  const layers = inchi.split('/');
+  return layers.filter((l, i) => i === 0 || !/^[btms]/i.test(l)).join('/');
+}
+
 function inspectMol(rdkit: any, smi: string, cache: Map<string, MolMeta | null>): MolMeta | null {
   if (cache.has(smi)) return cache.get(smi) || null;
   let mol: any = null;
@@ -268,6 +282,7 @@ function inspectMol(rdkit: any, smi: string, cache: Map<string, MolMeta | null>)
       numAromaticRings: Number(desc.NumAromaticRings) || 0,
       numHeavyAtoms: Number(desc.NumHeavyAtoms) || 0,
       ringSizes,
+      tautomerKey: tautomerKeyFromInchi(inchi),
     };
     cache.set(smi, meta);
     cache.set(cleanSmi, meta);
@@ -394,6 +409,59 @@ function runRxnSingle(
   return results;
 }
 
+// Step families where a leaving group (halide, isobutene, CO2, tosylate ...) may shed without being mapped.
+const LEAVING_GROUP_STEPS = new Set([
+  'SN(N)',
+  'SN(S)',
+  'SN(O)',
+  'AR',
+  'AS(N)',
+  'AS(O)',
+  'EL',
+  'DC',
+  'OX',
+  'PC',
+  'AO',
+  'EA',
+]);
+
+const H2O_MASS = 18.010565;
+const C4H8_MASS = 56.0626;
+const BOC_MASS = 100.052429; // C5H8O2 lost as [M+H-Boc]+ from a Boc carbamate
+
+/** Fragments that commonly appear instead of (or next to) the molecular ion in ESI-LCMS. */
+function inSourceLossIons(rdkit: any, smiles: string, exactMass: number): LossIon[] {
+  const out: LossIon[] = [];
+  const mh = exactMass + PROTON_MASS;
+  const hasCarbinolamine = countSubstruct(rdkit, smiles, '[CX4]([OX2H])[NX3]') > 0;
+  const hasAlcohol = countSubstruct(rdkit, smiles, '[CX4][OX2H]') > 0;
+  if (hasAlcohol) {
+    out.push({
+      label: '[M+H-H2O]+',
+      mz: Math.round((mh - H2O_MASS) * 10000) / 10000,
+      note: hasCarbinolamine
+        ? 'Carbinolamines dehydrate in the source and show up at the imine mass'
+        : 'Aliphatic alcohols often lose water in the source',
+    });
+  }
+  // Require carbonyl attached to carbon ([#6]) so N-Boc carbamates do not trigger tert-butyl ester alerts
+  if (countSubstruct(rdkit, smiles, '[CX4;H0]([CH3])([CH3])([CH3])[OX2]C(=O)[#6]') > 0) {
+    out.push({
+      label: '[M+H-C4H8]+',
+      mz: Math.round((mh - C4H8_MASS) * 10000) / 10000,
+      note: 'tert-Butyl ester loses isobutene in the source (shows the free acid mass)',
+    });
+  }
+  if (countSubstruct(rdkit, smiles, '[CX4;H0]([CH3])([CH3])([CH3])[OX2]C(=O)[NX3]') > 0) {
+    out.push({
+      label: '[M+H-Boc]+',
+      mz: Math.round((mh - BOC_MASS) * 10000) / 10000,
+      note: 'Boc carbamate loses Boc in the source (shows the free amine mass)',
+    });
+  }
+  return out;
+}
+
 function classifyFragmentName(smi: string): string {
   const map: Record<string, string> = {
     N: 'NH₃',
@@ -468,11 +536,45 @@ export function predictWellReactions(
   const parsedSubs = substrateInputs.map((s) => parseSubstrateAndSalts(rdkit, s));
   const activeSubs = parsedSubs.filter((s) => s.valid && s.equivalents > 0);
 
-  // Add any hydrate water into effective waterPct
-  const hydrateEq = activeSubs.reduce((acc, s) => acc + s.hydrateWaterEquiv, 0);
+  // Add any hydrate water (organic substrates + catalytic additives) into effective waterPct without double counting
+  const baseWaterPct =
+    condition.baseWaterPct != null && Number.isFinite(Number(condition.baseWaterPct))
+      ? Math.max(0, Number(condition.baseWaterPct))
+      : Math.max(0, Number(condition.waterPct) || 0);
+
+  let subHydrateMm = 0;
+  let subHydrateEquiv = 0;
+  const subHydrateSources: string[] = [];
+  for (const sub of activeSubs) {
+    if (sub.hydrateWaterEquiv <= 0) continue;
+    const perMol = sub.equivalents > 0 ? sub.hydrateWaterEquiv / sub.equivalents : 0;
+    subHydrateMm += perMol * sub.concentrationMm;
+    subHydrateEquiv += sub.hydrateWaterEquiv;
+    subHydrateSources.push(
+      `${sub.code} (${Math.round(perMol * 100) / 100} H₂O, ${Math.round(sub.concentrationMm * 10) / 10} mM)`
+    );
+  }
+
+  const addHydrateMm = Math.max(0, Number(condition.additiveHydrateWaterMm) || 0);
+  const addHydrateEquiv = Math.max(0, Number(condition.additiveHydrateWaterEquiv) || 0);
+  const addHydrateSources = Array.isArray(condition.additiveHydrateSources)
+    ? condition.additiveHydrateSources
+    : [];
+
+  const totalHydrateMm = Math.round((subHydrateMm + addHydrateMm) * 100) / 100;
+  const totalHydrateEquiv = Math.round((subHydrateEquiv + addHydrateEquiv) * 1000) / 1000;
+  const hydrateWaterPct = Math.round(totalHydrateMm * WATER_PCT_PER_MM * 1000) / 1000;
+  const effectiveWaterPct = Math.round((baseWaterPct + hydrateWaterPct) * 1000) / 1000;
+  const combinedHydrateSources = [...subHydrateSources, ...addHydrateSources];
+
   const effectiveCondition: WellConditionConfig = {
     ...condition,
-    waterPct: (Number(condition.waterPct) || 0) + hydrateEq * 0.5,
+    baseWaterPct,
+    hydrateWaterPct,
+    hydrateWaterMm: totalHydrateMm,
+    hydrateWaterEquiv: totalHydrateEquiv,
+    hydrateSources: combinedHydrateSources,
+    waterPct: effectiveWaterPct,
   };
 
   // 2. Solve exact DMSO proton balance
@@ -666,6 +768,24 @@ export function predictWellReactions(
           if (!mainMeta) continue;
           if (mainMeta.amw > maxMw || mainMeta.numHeavyAtoms < 2) continue;
 
+          // Atom bookkeeping: prevent SMARTS rules from silently creating or deleting heavy atoms
+          {
+            const prodFormulas = [mainMeta.formula];
+            for (const extra of prodSmis.slice(1)) {
+              const em = inspectMol(rdkit, extra, molCache);
+              if (em) prodFormulas.push(em.formula);
+            }
+            if (
+              !stepIsAtomBalanced(
+                pair.map((p) => p.meta.formula),
+                prodFormulas,
+                LEAVING_GROUP_STEPS.has(rule.stepLabel)
+              )
+            ) {
+              continue;
+            }
+          }
+
           // Skip no-op where product equals one of its parents
           if (pair.some((p) => p.key === mainMeta.smiles)) continue;
 
@@ -704,6 +824,7 @@ export function predictWellReactions(
             reversible: rule.reversible,
             releasedFragment: releasedFragMeta ? classifyFragmentName(releasedFragMeta.smiles) : null,
             releasedGas: rule.releasesGas || null,
+            productSmiles: mainMeta.smiles,
           };
 
           // Merge both parents' upstream StepEvents (preserving order, deduplicating shared ancestors)
@@ -839,6 +960,10 @@ export function predictWellReactions(
     }
   }
 
+  const limitingConcMm = Math.max(
+    1,
+    Math.min(...activeSubs.map((s) => (Number(s.concentrationMm) > 0 ? Number(s.concentrationMm) : 50)), 200)
+  );
   const finalSpecies: PredictedSpecies[] = [];
   const finalFragments: PredictedSpecies[] = [];
 
@@ -863,7 +988,8 @@ export function predictWellReactions(
       sp.cumulativeThermo,
       status === 'transient',
       lowestCls,
-      competitionFactor
+      competitionFactor,
+      { concMm: limitingConcMm, waterPct: effectiveCondition.waterPct }
     );
 
     const molAlerts = sp.isSmallFragment ? [] : detectMolAlerts(rdkit, sp.meta.smiles);
@@ -897,6 +1023,12 @@ export function predictWellReactions(
       inventory: sp.inventory,
       fragmentUses: sp.fragmentUses,
       score: sp.isSmallFragment ? Math.min(0.6, scored.score) : scored.score,
+      likelihood: scored.likelihood,
+      persistence: scored.persistence,
+      reversibleEnd: status === 'transient',
+      tautomerKey: sp.meta.tautomerKey,
+      tautomerForms: 1,
+      lossIons: sp.isSmallFragment ? [] : inSourceLossIons(rdkit, sp.meta.smiles, sp.meta.exactMass),
       bottleneckScore: scored.bottleneckScore,
       thermoBonus: scored.thermoBoost,
       tier: scored.tier,
@@ -920,6 +1052,15 @@ export function predictWellReactions(
     return a.stepsCount - b.stepsCount;
   });
 
+  // Count mobile-H / tautomer forms sharing one connectivity key
+  const formsByKey = new Map<string, number>();
+  for (const sp of finalSpecies) {
+    if (sp.tautomerKey) formsByKey.set(sp.tautomerKey, (formsByKey.get(sp.tautomerKey) || 0) + 1);
+  }
+  for (const sp of finalSpecies) {
+    sp.tautomerForms = formsByKey.get(sp.tautomerKey) || 1;
+  }
+
   // Aggregate well-level alerts
   const wellAlerts: ChemicalAlert[] = [];
   if (acidBase.effectiveMedium === 'buffered' && acidBase.totalAddedAcidEq > 0) {
@@ -934,7 +1075,16 @@ export function predictWellReactions(
     wellAlerts.push({
       kind: 'salt_effect',
       severity: 'info',
-      message: `Salt detected in SMILES: ${salts.map((s) => `${s.code} (${s.saltDetected})`).join(', ')}`,
+      message: `Salt/form detected: ${salts.map((s) => `${s.code} (${s.saltDetected})`).join(', ')}`,
+    });
+  }
+  if ((effectiveCondition.hydrateWaterMm || 0) > 0) {
+    const pctStr = (effectiveCondition.hydrateWaterPct || 0).toFixed(2);
+    const eqStr = (effectiveCondition.hydrateWaterEquiv || 0).toFixed(2);
+    wellAlerts.push({
+      kind: 'hydrate_water',
+      severity: 'info',
+      message: `Hydrate reagents contribute +${pctStr}% v/v H₂O (${effectiveCondition.hydrateWaterMm} mM, ${eqStr} eq): ${(effectiveCondition.hydrateSources || []).join(', ')}`,
     });
   }
   if (releasedGases.size > 0) {

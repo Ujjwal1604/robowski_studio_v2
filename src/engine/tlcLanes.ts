@@ -1053,6 +1053,7 @@ export function tlcFront(
     set.frontAuto = {};
     set.originAuto = {};
     set.originAutoByLane = {};
+    set.autoConf = {};
     (set as any)._autoCacheSig = sig;
   }
 
@@ -1069,6 +1070,8 @@ export function tlcFront(
       }
     }
     set.frontAuto[h] = best.pos > 0 ? best.pos : Math.round(lane.length * 0.93);
+    set.autoConf = set.autoConf || {};
+    set.autoConf[`front${h}`] = { detected: best.pos > 0, score: best.pos > 0 ? best.score : 0 };
   }
   return set.frontAuto[h] ?? Math.round(lane.length * 0.93);
 }
@@ -1322,6 +1325,7 @@ export function tlcOrigin(
     set.frontAuto = {};
     set.originAuto = {};
     set.originAutoByLane = {};
+    set.autoConf = {};
     (set as any)._autoCacheSig = sig;
   }
 
@@ -1341,6 +1345,8 @@ export function tlcOrigin(
         best = res;
       }
     }
+    set.autoConf = set.autoConf || {};
+    set.autoConf[`origin${h}`] = { detected: best.pos > 10, score: best.pos > 10 ? best.score : 0 };
     if (best.pos > 10) {
       set.originAuto[h] = best.pos;
       if (best.byLane) {
@@ -1350,6 +1356,58 @@ export function tlcOrigin(
   }
 
   return set.originAutoByLane?.[lane.id] ?? set.originAuto?.[h] ?? Math.max(20, Math.round(lane.length * 0.10));
+}
+
+export interface DetectionNote {
+  label: string;
+  source: 'detected' | 'default guess' | 'manual';
+  score: number;
+  warning?: string;
+}
+
+/** Plain-language confidence for auto front/origin of every half. */
+export function tlcDetectionNotes(
+  set: TlcSet,
+  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): DetectionNote[] {
+  const lanes = set.cfg?.lanes ?? [];
+  const notes: DetectionNote[] = [];
+  const halves = Array.from(new Set(lanes.map((l) => tlcHalf(l)))).sort();
+  const name = (h: number) => (halves.length > 1 ? (h === 0 ? ', lower half' : ', upper half') : '');
+  const pos: Record<string, number> = {};
+  for (const h of halves) {
+    const lane = lanes.find((l) => tlcHalf(l) === h)!;
+    const frontManual = (set.frontHalfPx?.[h] ?? 0) > 0 || (set.frontPx ?? 0) > 0;
+    const originManual = (set.originPx ?? 0) > 0 || (lane.zeroRf ?? 0) > 0;
+    const f = tlcFront(set, lane, getProfile);
+    if (!originManual) tlcOrigin(set, lane, getProfile);
+    pos[`f${h}`] = f / lane.length;
+    const fc = set.autoConf?.[`front${h}`];
+    const oc = set.autoConf?.[`origin${h}`];
+    const fn: DetectionNote = frontManual
+      ? { label: `Front${name(h)}`, source: 'manual', score: 0 }
+      : { label: `Front${name(h)}`, source: fc?.detected ? 'detected' : 'default guess', score: fc?.score ?? 0 };
+    if (fn.source === 'default guess') {
+      fn.warning = 'No clear solvent front found; 93% of lane length is assumed. Rf values depend on it.';
+    } else if (fn.source === 'detected' && fn.score < 6) {
+      fn.warning = 'Weak front signal; check the line position.';
+    }
+    if (fn.source !== 'manual' && f / lane.length > 0.97) {
+      fn.warning = 'Front is at the edge of the search window.';
+    }
+    const on: DetectionNote = originManual
+      ? { label: `Origin${name(h)}`, source: 'manual', score: 0 }
+      : { label: `Origin${name(h)}`, source: oc?.detected ? 'detected' : 'default guess', score: oc?.score ?? 0 };
+    if (on.source === 'default guess') {
+      on.warning = 'No clear origin spots found; 10% of lane length is assumed.';
+    }
+    notes.push(fn, on);
+  }
+  if (halves.length > 1 && Math.abs(pos[`f${halves[0]}`] - pos[`f${halves[1]}`]) > 0.06) {
+    const fr = notes.find((n) => n.label.startsWith('Front'));
+    if (fr) fr.warning = 'The two halves disagree on the front by more than 6% of lane length.';
+  }
+  return notes;
 }
 
 export interface TlcAnalysisExportOptions {

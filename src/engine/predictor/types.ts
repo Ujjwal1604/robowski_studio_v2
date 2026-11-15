@@ -9,6 +9,7 @@ export interface PredictorSubstrateInput {
   id: string;
   code: string;
   name: string;
+  iupac?: string;
   smiles: string;
   equivalents: number;
   concentrationMm?: number;
@@ -21,10 +22,21 @@ export interface WellConditionConfig {
   additiveEquiv: number;
   additivePka: number; // conjugate-acid pKa in DMSO (TsOH ~0.9, DBU ~13.9, TEA ~9.0)
   temperatureC: number; // e.g. 25, 80, 120
-  waterPct: number; // vol % water in DMSO, e.g. 0.2 (dry), 2 (standard), 5 (wet)
+  waterPct: number; // effective vol % water (baseWaterPct + hydrateWaterPct)
+  baseWaterPct?: number; // nominal solvent / added moisture vol % excluding hydrate water
+  hydrateWaterPct?: number; // vol % water contributed by hydrate reagents/additives
+  hydrateWaterMm?: number; // mM H2O released by hydrate reagents/additives
+  hydrateWaterEquiv?: number; // total equivalents of H2O from hydrates relative to limiting substrate
+  hydrateSources?: string[]; // human-readable descriptions of hydrate contributors
+  additiveHydrateWaterMm?: number; // mM H2O from additives/catalysts excluded from organic substrates
+  additiveHydrateWaterEquiv?: number; // equiv H2O from additives/catalysts
+  additiveHydrateSources?: string[];
   solvent: string; // e.g. 'DMSO'
   equivBasis: EquivBasis;
   dilutionFactor?: number; // well total conc factor (default ~50 mM base)
+  reactionTimeHours?: number | string;
+  atmosphere?: string;
+  agitation?: string;
 }
 
 export interface IonizableSite {
@@ -85,6 +97,7 @@ export interface StepEvent {
   reversible: boolean;
   releasedFragment?: string | null;
   releasedGas?: string | null;
+  productSmiles?: string;
 }
 
 export type ChemicalAlertKind =
@@ -92,6 +105,7 @@ export type ChemicalAlertKind =
   | 'chelator_motif'
   | 'michael_acceptor'
   | 'salt_effect'
+  | 'hydrate_water'
   | 'buffered_well'
   | 'blank_likely';
 
@@ -99,6 +113,12 @@ export interface ChemicalAlert {
   kind: ChemicalAlertKind;
   severity: 'info' | 'warn';
   message: string;
+}
+
+export interface LossIon {
+  label: string; // e.g. [M+H-H2O]+
+  mz: number;
+  note: string;
 }
 
 export interface PredictedSpecies {
@@ -115,7 +135,13 @@ export interface PredictedSpecies {
   numAromaticRings: number;
   inventory: number[]; // equivalents consumed from each input substrate
   fragmentUses: number; // how many released small-fragment additions used
-  score: number; // 0..1 plausibility
+  score: number; // 0..1 ranking score = likelihood * (0.4 + 0.6 * persistence)
+  likelihood: number; // 0..1 kinetic / path plausibility
+  persistence: number; // 0..1 equilibrium share expected to persist (1 for irreversible sinks)
+  reversibleEnd: boolean; // ends in a reversible equilibrium step
+  tautomerKey: string; // shared across mobile-H / tautomer forms of one connectivity
+  tautomerForms: number; // count of predicted forms sharing tautomerKey
+  lossIons: LossIon[]; // expected ESI in-source loss ions
   bottleneckScore: number;
   thermoBonus: number;
   tier: PredictionTier;

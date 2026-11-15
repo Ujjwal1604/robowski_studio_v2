@@ -294,17 +294,31 @@ app.post('/api/ai/solvent-systems', async (req, res) => {
       stationaryPhase = 'Silica Gel (SiO2)',
     } = req.body;
 
+    const organicSubs = Array.isArray(substrates)
+      ? substrates.filter((s: any) => !/^additive/i.test(String(s?.role || '')))
+      : [];
+    const wellAdditives = Array.isArray(substrates)
+      ? substrates.filter((s: any) => /^additive/i.test(String(s?.role || '')))
+      : [];
+
     const prompt = `You are an expert synthetic organic and analytical process chemist specializing in reaction monitoring, thin-layer chromatography (TLC), and flash column purification.
 
 REACTION DATA:
 - Transformation / Reaction Class: ${reactionClass || 'Organic Synthesis Screen'}
-- Substrates / Starting Materials: ${JSON.stringify(substrates)}
+- Substrates / Starting Materials: ${JSON.stringify(organicSubs)}
+- Reaction Additives / Catalysts / Acid-Base Conditions: ${wellAdditives.length ? JSON.stringify(wellAdditives) : 'None specified'}
 - Target / Expected Product: ${expectedProduct || 'Target reaction product'}
 - Stationary Phase: ${stationaryPhase}
 
 TASK:
-Suggest exactly 2 or 3 distinct TLC solvent systems (mobile phases) to monitor this reaction and cleanly separate the target product from the starting materials and expected byproducts.
-Designate the single BEST system (with isBest: true) that provides an optimal product retention factor in the ideal analytical window (0.25 <= Rf <= 0.45, with Delta Rf >= 0.20 from substrates), plus 1 or 2 high-quality alternative systems (e.g., one with an additive like AcOH or Et3N if polar/tailing, and one orthogonal or greener solvent system like Heptane/Acetone or MTBE/Hexane).
+Suggest exactly 2 or 3 distinct, COMPLETE TLC mobile-phase solvent systems to monitor this reaction and cleanly separate the target product from starting materials, residual reaction additives/salts, and expected byproducts.
+CRITICAL RULES FOR STATIONARY PHASE & MODIFIERS:
+1. NEVER suggest a standalone additive or modifier by itself (for example, NEVER output "1% Et3N", "AcOH", "NH4OH", "TFA", or "DBU" alone as a solvent system "name" or "ratio"). Every entry in "systems" MUST be a complete carrier mobile phase + ratio (e.g., "30% EtOAc / 70% Hexanes + 1% Et3N" or "5% MeOH / 95% DCM + 1% AcOH" or "DCM / MeOH / (2M NH3 in MeOH) (95:3:2)").
+2. STATIONARY PHASE COMPATIBILITY (${stationaryPhase}):
+   - If Stationary Phase is "Neutral Alumina (Al2O3)" or "Basic Alumina (Al2O3)": DO NOT add NH3 (e.g., 2M NH3 in MeOH, NH4OH), Et3N, or AcOH modifiers to the mobile phase. Alumina lacks acidic silanols (Basic Alumina is already basic; Neutral Alumina is chosen specifically to keep separation neutral without base/acid additives), and AcOH reacts with/strips alumina. Recommend neat normal-phase organic solvent blends (e.g., EtOAc/Hexanes, MeOH/DCM, Acetone/Hexanes, MeOH/EtOAc).
+   - If Stationary Phase is "Silica Gel (SiO2 - Normal Phase)": if analytes contain basic amines/azoles/guanidines, carboxylic acids, or residual acid/base catalysts/salts (like TsOH, TFA, HCl, DBU), include an appropriate compensating modifier (1% Et3N, 2M NH3 in MeOH, or 1% AcOH) INSIDE a polarity-matched bulk solvent system (in "name", "ratio", "chamberPrep", and "modifiers").
+   - If Stationary Phase is "Reverse Phase (C18)": recommend aqueous MeCN/H2O or MeOH/H2O eluents (optionally with 0.1% TFA/formic acid for ionizable amines/acids).
+3. Designate the single BEST system (with isBest: true) providing optimal product retention (0.22 <= Rf <= 0.65, Delta Rf >= 0.18), plus 1 or 2 complementary or orthogonal complete solvent systems.
 
 Return ONLY valid JSON (no markdown text, no backticks) with this structure:
 {
@@ -342,6 +356,11 @@ Return ONLY valid JSON (no markdown text, no backticks) with this structure:
 
     const rawResponse = await generateAiContent(ai, prompt);
 
+    const hasCarrierSolvent = (text: string) =>
+      /\b(etoac|ethyl\s+acetate|hex|hexane|hexanes|heptane|dcm|ch2cl2|dichloromethane|meoh|methanol|etoh|mecn|acn|acetonitrile|acetone|toluene|et2o|ether|mtbe|pentane|chcl3|chloroform|h2o|water|ipa|thf)\b/i.test(
+        text || ''
+      );
+
     let parsed: any;
     try {
       let cleaned = rawResponse.trim();
@@ -351,6 +370,66 @@ Return ONLY valid JSON (no markdown text, no backticks) with this structure:
         cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
       }
       parsed = JSON.parse(cleaned);
+
+      if (parsed && Array.isArray(parsed.systems)) {
+        const anchorCarrier =
+          parsed.systems.find((s: any) => hasCarrierSolvent(s?.name))?.name ||
+          '5% MeOH / 95% DCM';
+        const anchorWithoutMod = anchorCarrier.replace(/\s*\+\s*.*$/, '').trim();
+        const isReversePhase = /c18|reverse/i.test(stationaryPhase);
+
+        parsed.systems = parsed.systems.map((sys: any) => {
+          const rawName = String(sys?.name || '').trim();
+          const rawMod = String(sys?.modifiers || '').trim();
+          if (!hasCarrierSolvent(rawName)) {
+            const combinedCue = `${rawName} ${rawMod}`;
+            const isAcidMod = /\b(acoh|acetic|tfa|hcooh|formic)\b/i.test(combinedCue);
+            const isNh3Mod = /\b(nh3|nh4oh|ammonia)\b/i.test(combinedCue);
+            const modText =
+              rawName && !/^(none|modifier|additive)$/i.test(rawName)
+                ? rawName.replace(/^add\s+/i, '').trim()
+                : isNh3Mod
+                ? '2% (2M NH3 in MeOH)'
+                : isAcidMod
+                ? '1% AcOH'
+                : '1% Et3N';
+            if (isReversePhase) {
+              return {
+                ...sys,
+                name: `50% MeCN / 50% H2O + ${modText}`,
+                ratio: `50:50 v/v MeCN / H2O + ${modText}`,
+                chamberPrep: `For 20 mL chamber: 10.0 mL MeCN + 10.0 mL H2O + ${modText}`,
+                modifiers: modText,
+              };
+            }
+            if (isNh3Mod) {
+              return {
+                ...sys,
+                name: 'DCM / MeOH / (2M NH3 in MeOH) (95:3:2)',
+                ratio: '95:3:2 v/v/v DCM / MeOH / (2M NH3 in MeOH)',
+                chamberPrep: 'For 20 mL chamber: 19.0 mL DCM + 0.6 mL MeOH + 0.4 mL (2M NH3 in MeOH)',
+                modifiers: '2% (2M NH3 in MeOH)',
+              };
+            }
+            const base = hasCarrierSolvent(anchorWithoutMod)
+              ? anchorWithoutMod
+              : isAcidMod
+              ? '30% EtOAc / 70% Hexanes'
+              : '5% MeOH / 95% DCM';
+            return {
+              ...sys,
+              name: `${base} + ${modText}`,
+              ratio: sys?.ratio && hasCarrierSolvent(sys.ratio) ? sys.ratio : `${base} + ${modText}`,
+              chamberPrep:
+                sys?.chamberPrep && hasCarrierSolvent(sys.chamberPrep)
+                  ? sys.chamberPrep
+                  : `For 20 mL chamber: prepare ${base} containing ${modText} (0.2 mL additive in 19.8 mL solvent)`,
+              modifiers: modText,
+            };
+          }
+          return sys;
+        });
+      }
     } catch {
       parsed = {
         reactionSummary: `Chromatographic separation for ${reactionClass || 'reaction'} on ${stationaryPhase}.`,

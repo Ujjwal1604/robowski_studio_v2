@@ -1,7 +1,7 @@
 import React from 'react';
 import { BookOpen } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { PAL } from '../../engine';
+import { PAL, getCanonicalRunConditions } from '../../engine';
 
 export const SummaryStrip: React.FC = () => {
   const { state, run, err, missing, allEmpty, triPending, triMeta, setView } = useApp();
@@ -84,6 +84,15 @@ export const SummaryStrip: React.FC = () => {
         </span>
         <span title={run ? run.runtime.calibrationNote : ''}>
           Est. time <b>{run ? run.runtime.label : '-'}</b>
+        </span>
+        <span>
+          Cond{' '}
+          <b className="mono">
+            {(() => {
+              const c = getCanonicalRunConditions(state);
+              return `${c.solvent} · ${c.temperatureC} °C`;
+            })()}
+          </b>
         </span>
         <span style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}>
           {state.reagents.map((r, i) => (

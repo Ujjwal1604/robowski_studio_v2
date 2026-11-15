@@ -9,6 +9,10 @@ import {
   applyPresetToState,
   computeDilutionTier,
   readTableFile,
+  getCanonicalRunConditions,
+  applyRunConditionsPatch,
+  summarizeRunHydrates,
+  detectHydrateStoichiometry,
 } from '../../engine';
 import * as Tri from '../../engine';
 import { exampleState } from '../../context/runPayload';
@@ -683,21 +687,6 @@ export const SetupView: React.FC = () => {
             </div>
 
             <div className="fld">
-              <label className="lbl">Solvent</label>
-              <select
-                className="f"
-                value={state.reactionSolvent}
-                onChange={(e) => setPath('reactionSolvent', e.target.value)}
-              >
-                {SUPPORTED_SOLVENTS.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="fld">
               <label className="lbl">Leftover per stock (mL)</label>
               <input
                 type="number"
@@ -774,6 +763,242 @@ export const SetupView: React.FC = () => {
               : 'Concentration mode: every reagent has its own range in mM.'}
           </div>
         </div>
+
+        {/* Canonical Reaction Conditions Card (Uniform across Setup, Predictor, TLC, ELN, Compare, Exports) */}
+        {(() => {
+          const cond = getCanonicalRunConditions(state);
+          const hyd = summarizeRunHydrates(state, run);
+          const tempPresets = [0, 25, 50, 80, 100, 120];
+          const waterPresets = [
+            { label: 'Dry (0.2%)', val: 0.2 },
+            { label: 'Ambient (2%)', val: 2.0 },
+            { label: 'Wet (10%)', val: 10.0 },
+          ];
+          const patchCond = (p: Parameters<typeof applyRunConditionsPatch>[1]) =>
+            setState((prev) => applyRunConditionsPatch(prev, p));
+
+          return (
+            <div className="card pad">
+              <div className="chead" style={{ flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                <div className="ct">
+                  Reaction Conditions{' '}
+                  <span className="cnt">
+                    Synced across Setup, Reaction Predictor, TLC, ELN &amp; Compare
+                  </span>
+                </div>
+                <div className="mono" style={{ fontSize: '12px', color: 'var(--acc)', fontWeight: 600 }}>
+                  {cond.solvent} · {cond.temperatureC} °C ·{' '}
+                  {hyd.hasHydrates
+                    ? hyd.minEffectiveWaterPct === hyd.maxEffectiveWaterPct
+                      ? `${hyd.minEffectiveWaterPct.toFixed(2)}% H₂O (${cond.baseWaterPct.toFixed(1)}% base + ${hyd.minTotalHydrateWaterPct.toFixed(2)}% hydrate)`
+                      : `${hyd.minEffectiveWaterPct.toFixed(2)}–${hyd.maxEffectiveWaterPct.toFixed(2)}% H₂O (incl. hydrates)`
+                    : `${cond.baseWaterPct.toFixed(1)}% H₂O`}
+                </div>
+              </div>
+
+              <div className="pgrid">
+                <div className="fld">
+                  <label className="lbl">Reaction solvent</label>
+                  <select
+                    className="f"
+                    value={cond.solvent}
+                    onChange={(e) => patchCond({ solvent: e.target.value })}
+                  >
+                    {SUPPORTED_SOLVENTS.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Temperature (°C)</label>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <input
+                      type="number"
+                      className="f mono"
+                      style={{ width: '92px', flexShrink: 0 }}
+                      value={cond.temperatureC}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === '' || val === '-') return;
+                        const num = Number(val);
+                        if (Number.isFinite(num)) patchCond({ temperatureC: num });
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                      {tempPresets.map((tp) => (
+                        <button
+                          key={tp}
+                          type="button"
+                          className={`btn sm ${cond.temperatureC === tp ? 'pri' : ''}`}
+                          style={{ height: '26px', padding: '0 7px', fontSize: '11px' }}
+                          onClick={() => patchCond({ temperatureC: tp })}
+                        >
+                          {tp}°
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Base solvent moisture / added H₂O (% v/v)</label>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0"
+                      max="100"
+                      className="f mono"
+                      style={{ width: '82px', flexShrink: 0 }}
+                      value={cond.baseWaterPct}
+                      onChange={(e) => {
+                        const num = Math.max(0, Number(e.target.value) || 0);
+                        patchCond({ baseWaterPct: num });
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                      {waterPresets.map((wp) => (
+                        <button
+                          key={wp.val}
+                          type="button"
+                          className={`btn sm ${Math.abs(cond.baseWaterPct - wp.val) < 0.01 ? 'pri' : ''}`}
+                          style={{ height: '26px', padding: '0 7px', fontSize: '11px' }}
+                          onClick={() => patchCond({ baseWaterPct: wp.val })}
+                        >
+                          {wp.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Reaction time (h)</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    min="0"
+                    className="f mono"
+                    value={cond.reactionTimeHours}
+                    placeholder="16"
+                    onChange={(e) =>
+                      patchCond({
+                        reactionTimeHours: e.target.value === '' ? '' : Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Atmosphere</label>
+                  <input
+                    type="text"
+                    className="f"
+                    value={cond.atmosphere}
+                    placeholder="N2 Glovebox"
+                    onChange={(e) => patchCond({ atmosphere: e.target.value })}
+                  />
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Agitation</label>
+                  <input
+                    type="text"
+                    className="f"
+                    value={cond.agitation}
+                    placeholder="Tumble stirrer 800 rpm"
+                    onChange={(e) => patchCond({ agitation: e.target.value })}
+                  />
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Heating / Cooling</label>
+                  <input
+                    type="text"
+                    className="f"
+                    value={cond.heatingApparatus}
+                    placeholder="Al heating block"
+                    onChange={(e) => patchCond({ heatingApparatus: e.target.value })}
+                  />
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Illumination</label>
+                  <input
+                    type="text"
+                    className="f"
+                    value={cond.illumination}
+                    placeholder="None / Blue LED 450 nm"
+                    onChange={(e) => patchCond({ illumination: e.target.value })}
+                  />
+                </div>
+
+                <div className="fld">
+                  <label className="lbl">Plate seal</label>
+                  <input
+                    type="text"
+                    className="f"
+                    value={cond.plateSealType}
+                    placeholder="Teflon silicone bonded mat"
+                    onChange={(e) => patchCond({ plateSealType: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              {hyd.hasHydrates && (
+                <div
+                  style={{
+                    marginTop: '12px',
+                    padding: '10px 14px',
+                    borderRadius: '8px',
+                    background: 'color-mix(in srgb, var(--acc) 7%, var(--soft))',
+                    border: '1px solid color-mix(in srgb, var(--acc) 30%, var(--line))',
+                    fontSize: '12.5px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                    <span style={{ fontWeight: 600, color: 'var(--fg)' }}>
+                      Hydrate Chemical Water Contribution Detected
+                    </span>
+                    <span className="mono" style={{ fontWeight: 700, color: 'var(--acc)' }}>
+                      Effective H₂O:{' '}
+                      {hyd.minEffectiveWaterPct === hyd.maxEffectiveWaterPct
+                        ? `${hyd.minEffectiveWaterPct.toFixed(2)}% v/v`
+                        : `${hyd.minEffectiveWaterPct.toFixed(2)}–${hyd.maxEffectiveWaterPct.toFixed(2)}% v/v`}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', color: 'var(--fg2)' }}>
+                    {hyd.items.map((it) => (
+                      <span
+                        key={it.code}
+                        className="mono"
+                        style={{
+                          fontSize: '11.5px',
+                          background: 'var(--panel)',
+                          border: '1px solid var(--line)',
+                          borderRadius: '6px',
+                          padding: '3px 8px',
+                        }}
+                      >
+                        <strong>{it.code}</strong> · {it.label} → +
+                        {it.minWaterPct === it.maxWaterPct
+                          ? `${it.minWaterPct.toFixed(2)}%`
+                          : `${it.minWaterPct.toFixed(2)}–${it.maxWaterPct.toFixed(2)}%`}{' '}
+                        v/v H₂O ({it.minWaterMm === it.maxWaterMm ? `${Math.round(it.minWaterMm)} mM` : `${Math.round(it.minWaterMm)}–${Math.round(it.maxWaterMm)} mM`})
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Reagents Table / Studio Card */}
         <div className="card pad" style={{ overflowX: 'auto' }}>
@@ -1115,10 +1340,53 @@ export const SetupView: React.FC = () => {
                                 >
                                   Copy
                                 </button>
+                                {(() => {
+                                  const hDet = detectHydrateStoichiometry(r.smiles, r.name, r.iupac);
+                                  if (hDet.waterEquivPerMol <= 0) return null;
+                                  return (
+                                    <span
+                                      className="mono"
+                                      style={{
+                                        fontSize: '10.5px',
+                                        fontWeight: 600,
+                                        color: 'var(--acc)',
+                                        background: 'color-mix(in srgb, var(--acc) 10%, var(--soft))',
+                                        border: '1px solid color-mix(in srgb, var(--acc) 35%, var(--line))',
+                                        borderRadius: '4px',
+                                        padding: '1px 6px',
+                                      }}
+                                      title="Water of crystallization counted automatically in reaction conditions"
+                                    >
+                                      {hDet.label}
+                                    </span>
+                                  );
+                                })()}
                               </div>
                             ) : (
-                              <div style={{ fontSize: '11px', color: 'var(--mut)', fontStyle: 'italic' }}>
-                                {r.name ? 'Press Enter or click "Fetch info" to auto-fetch structure & properties' : 'Type a name or IUPAC to auto-resolve structure, molar mass, and density'}
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: '11px', color: 'var(--mut)', fontStyle: 'italic' }}>
+                                  {r.name ? 'Press Enter or click "Fetch info" to auto-fetch structure & properties' : 'Type a name or IUPAC to auto-resolve structure, molar mass, and density'}
+                                </span>
+                                {(() => {
+                                  const hDet = detectHydrateStoichiometry(r.smiles, r.name, r.iupac);
+                                  if (hDet.waterEquivPerMol <= 0) return null;
+                                  return (
+                                    <span
+                                      className="mono"
+                                      style={{
+                                        fontSize: '10.5px',
+                                        fontWeight: 600,
+                                        color: 'var(--acc)',
+                                        background: 'color-mix(in srgb, var(--acc) 10%, var(--soft))',
+                                        border: '1px solid color-mix(in srgb, var(--acc) 35%, var(--line))',
+                                        borderRadius: '4px',
+                                        padding: '1px 6px',
+                                      }}
+                                    >
+                                      {hDet.label}
+                                    </span>
+                                  );
+                                })()}
                               </div>
                             )}
                           </div>
@@ -2617,15 +2885,37 @@ const TripletPatternEditor: React.FC = () => {
   const nf = (v: any, d = 2) =>
     Number.isFinite(+v) ? (+v).toLocaleString('en-US', { maximumFractionDigits: d }) : '-';
 
+  const reagentColor = (code: string) => {
+    if (!code) return 'var(--line)';
+    const idx = state.reagents.findIndex((r) => r.code === code);
+    return idx >= 0 ? PAL[idx % PAL.length] : 'var(--acc)';
+  };
+
+  const reagentLabel = (code: string) => {
+    if (!code) return '';
+    const r = state.reagents.find((x) => x.code === code);
+    return r ? (r.name ? `${r.code} · ${r.name}` : r.code) : code;
+  };
+
   const cells = [];
   for (let rr = 0; rr < g.r; rr++) {
     for (let cc = 0; cc < g.c; cc++) {
       const a = t.adds[rr];
+      const accentColor = a && a.code ? reagentColor(a.code) : 'var(--line)';
       cells.push(
-        <div key={`${rr}-${cc}`} className="tcell">
+        <div
+          key={`${rr}-${cc}`}
+          className="tcell"
+          style={{ borderLeftColor: accentColor }}
+          title={
+            a && a.code
+              ? `Ratio ${(t.ratios[cc] || []).join(':')} · ${reagentLabel(a.code)} (${nf(a.equiv, 3)} eq)`
+              : `Ratio ${(t.ratios[cc] || []).join(':')} · no additive`
+          }
+        >
           <b className="mono">{(t.ratios[cc] || []).join(':')}</b>
           <span>
-            {a && a.code ? `${a.code} ${nf(a.equiv, 3)} eq` : 'no additive'}
+            {a && a.code ? `${a.code} · ${nf(a.equiv, 3)} eq` : 'No additive'}
           </span>
         </div>
       );
@@ -2633,14 +2923,13 @@ const TripletPatternEditor: React.FC = () => {
   }
 
   return (
-    <div style={{ marginTop: '20px' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
       {state.imported && (
         <div
           className="card pad"
           style={{
-            marginBottom: '16px',
-            background: 'var(--soft, rgba(59,130,246,0.06))',
-            borderColor: 'var(--accent, #3b82f6)',
+            background: 'var(--soft)',
+            borderColor: 'var(--acc)',
           }}
         >
           <div
@@ -2652,12 +2941,28 @@ const TripletPatternEditor: React.FC = () => {
               gap: '10px',
             }}
           >
-            <div>
-              <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--fg, #0f172a)' }}>
-                📥 Imported Triplet Run: {state.imported.name}
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--mut, #64748b)', marginTop: '2px' }}>
-                {state.imported.rows.length} wells mapped from Excel with exact concentrations (including blank solvent wells).
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="var(--acc)"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ marginTop: '2px', flexShrink: 0 }}
+                aria-hidden="true"
+              >
+                <path d="M8 10V2M4.5 6.5 8 10l3.5-3.5M2.5 12.5h11" />
+              </svg>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '13.5px', color: 'var(--fg)' }}>
+                  Imported Triplet Run: {state.imported.name}
+                </div>
+                <div style={{ fontSize: '12px', color: 'var(--mut)', marginTop: '2px' }}>
+                  {state.imported.rows.length} wells mapped from Excel with exact concentrations (including blank solvent wells).
+                </div>
               </div>
             </div>
             <button
@@ -2666,7 +2971,7 @@ const TripletPatternEditor: React.FC = () => {
               onClick={unimport}
               title="Discard imported lock to edit pattern and regenerate combinations"
             >
-              Discard lock & edit pattern
+              Discard lock &amp; edit pattern
             </button>
           </div>
         </div>
@@ -2675,7 +2980,12 @@ const TripletPatternEditor: React.FC = () => {
       {/* Pattern Card */}
       <div className="card pad">
         <div className="chead">
-          <div className="ct">Plate pattern</div>
+          <div>
+            <div className="ct">Plate pattern</div>
+            <p className="sub" style={{ margin: '4px 0 0' }}>
+              Every section of the plate holds one {gn}. Columns set the reagent ratios; rows set the additives.
+            </p>
+          </div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <button
               type="button"
@@ -2684,7 +2994,20 @@ const TripletPatternEditor: React.FC = () => {
               onClick={() => triExcelInputRef.current?.click()}
               title="Import a Triplet run from Excel (.xlsx)"
             >
-              📥 Import from Excel
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M8 12V3M4 7l4-4 4 4M2 13h12" />
+              </svg>
+              Import from Excel
             </button>
             <input
               ref={triExcelInputRef}
@@ -2698,8 +3021,7 @@ const TripletPatternEditor: React.FC = () => {
               }}
             />
             <select
-              className="f"
-              style={{ width: 'auto' }}
+              className="f sm"
               value={pre}
               onChange={(e) => {
                 const val = e.target.value;
@@ -2721,10 +3043,6 @@ const TripletPatternEditor: React.FC = () => {
             </select>
           </div>
         </div>
-        <p className="sub" style={{ marginTop: '-8px' }}>
-          Every section of the plate holds one {gn}. Its columns are the ratios, its rows the
-          additives.
-        </p>
 
         <div className="pgrid">
           <div className="fld">
@@ -2771,187 +3089,268 @@ const TripletPatternEditor: React.FC = () => {
           </div>
         </div>
 
-        {/* Ratios Table */}
-        <div className="tbl" style={{ marginTop: '14px' }}>
-          <table className="tri-tbl">
-            <thead>
-              <tr>
-                <th>Ratio</th>
-                {Array.from({ length: size }, (_, j) => (
-                  <th key={j}>Reagent {j + 1}</th>
-                ))}
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {t.ratios.map((v, i) => (
-                <tr key={i}>
-                  <td className="mono">{i + 1}</td>
-                  {v.map((x, j) => (
-                    <td key={j}>
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
-                        className="f mono"
-                        value={x}
-                        onChange={(e) => setPath(`tri.ratios.${i}.${j}`, +e.target.value)}
-                        style={{ width: '76px', height: '32px' }}
-                      />
-                    </td>
+        {/* Ratios & Additives Subpanels */}
+        <div className="tri-panels">
+          {/* Ratios Subpanel */}
+          <div className="tri-subpanel">
+            <div className="tri-subhead">
+              <div className="tri-subhead-title">
+                <span>Ratios (columns)</span>
+                <span className="tri-subhead-meta mono">{t.ratios.length}/9</span>
+              </div>
+              {t.ratios.length < 9 && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                  onClick={() => {
+                    setState((prev) => {
+                      const next = JSON.parse(JSON.stringify(prev));
+                      const nv = Array(size).fill(1);
+                      nv[next.tri.ratios.length % size] = 2;
+                      next.tri.ratios.push(nv);
+                      Tri.triSync(next);
+                      return next;
+                    });
+                  }}
+                >
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M7 2v10M2 7h10" />
+                  </svg>
+                  Add ratio
+                </button>
+              )}
+            </div>
+
+            <div className="tri-tbl-wrap">
+              <table className="tri-tbl" style={{ minWidth: `${100 + size * 74}px` }}>
+                <colgroup>
+                  <col style={{ width: '52px' }} />
+                  {Array.from({ length: size }, (_, j) => (
+                    <col key={j} />
                   ))}
-                  <td>
-                    {t.ratios.length > 1 && (
-                      <button
-                        type="button"
-                        className="ib"
-                        onClick={() => {
-                          setState((prev) => {
-                            const next = JSON.parse(JSON.stringify(prev));
-                            next.tri.ratios.splice(i, 1);
-                            Tri.triSync(next);
-                            return next;
-                          });
-                        }}
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        {t.ratios.length < 9 && (
-          <button
-            type="button"
-            className="btn sm"
-            style={{ marginTop: '8px' }}
-            onClick={() => {
-              setState((prev) => {
-                const next = JSON.parse(JSON.stringify(prev));
-                const nv = Array(size).fill(1);
-                nv[next.tri.ratios.length % size] = 2;
-                next.tri.ratios.push(nv);
-                Tri.triSync(next);
-                return next;
-              });
-            }}
-          >
-            Add ratio
-          </button>
-        )}
-
-        {/* Additives Table */}
-        <div className="tbl" style={{ marginTop: '16px' }}>
-          <table className="tri-tbl">
-            <thead>
-              <tr>
-                <th>Additive (reagent)</th>
-                <th>Equivalents</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {t.adds.map((a, i) => (
-                <tr key={i}>
-                  <td>
-                    <select
-                      className="f"
-                      value={a.code}
-                      onChange={(e) => setPath(`tri.adds.${i}.code`, e.target.value)}
-                    >
-                      <option value="">No additive</option>
-                      {state.reagents.map((r) => (
-                        <option key={r.code} value={r.code}>
-                          {r.name ? `${r.code} · ${r.name}` : r.code}
-                        </option>
+                  <col style={{ width: '46px' }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th className="idx">#</th>
+                    {Array.from({ length: size }, (_, j) => (
+                      <th key={j}>Reagent {j + 1}</th>
+                    ))}
+                    <th className="act" aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {t.ratios.map((v, i) => (
+                    <tr key={i}>
+                      <td className="idx mono">{i + 1}</td>
+                      {v.map((x, j) => (
+                        <td key={j}>
+                          <input
+                            type="number"
+                            step="any"
+                            min="0"
+                            className="f mono"
+                            value={x}
+                            onChange={(e) => setPath(`tri.ratios.${i}.${j}`, +e.target.value)}
+                            aria-label={`Ratio ${i + 1} reagent ${j + 1}`}
+                          />
+                        </td>
                       ))}
-                    </select>
-                  </td>
-                  <td>
-                    <input
-                      type="number"
-                      step="any"
-                      min="0"
-                      className="f mono"
-                      value={a.equiv}
-                      onChange={(e) => setPath(`tri.adds.${i}.equiv`, +e.target.value)}
-                      style={{ width: '84px', height: '32px' }}
-                    />
-                  </td>
-                  <td>
-                    <button
-                      type="button"
-                      className="ib"
-                      onClick={() => {
-                        setState((prev) => {
-                          const next = JSON.parse(JSON.stringify(prev));
-                          next.tri.adds.splice(i, 1);
-                          Tri.triSync(next);
-                          return next;
-                        });
-                      }}
-                    >
-                      ✕
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      <td className="act">
+                        {t.ratios.length > 1 && (
+                          <button
+                            type="button"
+                            className="ib del"
+                            title="Remove ratio"
+                            aria-label={`Remove ratio ${i + 1}`}
+                            onClick={() => {
+                              setState((prev) => {
+                                const next = JSON.parse(JSON.stringify(prev));
+                                next.tri.ratios.splice(i, 1);
+                                Tri.triSync(next);
+                                return next;
+                              });
+                            }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
+                              <line x1="4" y1="4" x2="12" y2="12" />
+                              <line x1="12" y1="4" x2="4" y2="12" />
+                            </svg>
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Additives Subpanel */}
+          <div className="tri-subpanel">
+            <div className="tri-subhead">
+              <div className="tri-subhead-title">
+                <span>Additives (rows)</span>
+                <span className="tri-subhead-meta mono">{t.adds.length}/6</span>
+              </div>
+              {t.adds.length < 6 && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                  onClick={() => {
+                    setState((prev) => {
+                      const next = JSON.parse(JSON.stringify(prev));
+                      next.tri.adds.push({ code: '', equiv: 0.5 });
+                      Tri.triSync(next);
+                      return next;
+                    });
+                  }}
+                >
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M7 2v10M2 7h10" />
+                  </svg>
+                  Add additive
+                </button>
+              )}
+            </div>
+
+            <div className="tri-tbl-wrap">
+              <table className="tri-tbl" style={{ minWidth: '340px' }}>
+                <colgroup>
+                  <col />
+                  <col style={{ width: '96px' }} />
+                  <col style={{ width: '46px' }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>Additive reagent</th>
+                    <th>Equiv.</th>
+                    <th className="act" aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {t.adds.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} style={{ color: 'var(--mut)', fontSize: '12.5px', padding: '14px 12px', whiteSpace: 'normal' }}>
+                        No additive rows configured. Add a row to vary additives across rows of each section.
+                      </td>
+                    </tr>
+                  ) : (
+                    t.adds.map((a, i) => (
+                      <tr key={i}>
+                        <td>
+                          <select
+                            className="f"
+                            value={a.code}
+                            onChange={(e) => setPath(`tri.adds.${i}.code`, e.target.value)}
+                            title={a.code ? reagentLabel(a.code) : 'No additive'}
+                            aria-label={`Additive row ${i + 1}`}
+                          >
+                            <option value="">No additive</option>
+                            {state.reagents.map((r) => (
+                              <option key={r.code} value={r.code}>
+                                {r.name ? `${r.code} · ${r.name}` : r.code}
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                        <td>
+                          <input
+                            type="number"
+                            step="any"
+                            min="0"
+                            className="f mono"
+                            value={a.equiv}
+                            onChange={(e) => setPath(`tri.adds.${i}.equiv`, +e.target.value)}
+                            aria-label={`Additive row ${i + 1} equivalents`}
+                          />
+                        </td>
+                        <td className="act">
+                          <button
+                            type="button"
+                            className="ib del"
+                            title="Remove additive row"
+                            aria-label={`Remove additive row ${i + 1}`}
+                            onClick={() => {
+                              setState((prev) => {
+                                const next = JSON.parse(JSON.stringify(prev));
+                                next.tri.adds.splice(i, 1);
+                                Tri.triSync(next);
+                                return next;
+                              });
+                            }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
+                              <line x1="4" y1="4" x2="12" y2="12" />
+                              <line x1="12" y1="4" x2="4" y2="12" />
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
-        {t.adds.length < 6 && (
-          <button
-            type="button"
-            className="btn sm"
-            style={{ marginTop: '8px' }}
-            onClick={() => {
-              setState((prev) => {
-                const next = JSON.parse(JSON.stringify(prev));
-                next.tri.adds.push({ code: '', equiv: 0.5 });
-                Tri.triSync(next);
-                return next;
-              });
-            }}
-          >
-            Add additive row
-          </button>
-        )}
-
-        <div className="lbl" style={{ marginTop: '16px' }}>
-          ONE SECTION
-        </div>
-        <div
-          className="tri-prev"
-          style={{
-            gridTemplateColumns: `repeat(${g.c}, minmax(70px, 1fr))`,
-            maxWidth: `${g.c * 120}px`,
-          }}
-        >
-          {cells}
-        </div>
-        <div className="hint" style={{ margin: 0 }}>
-          {g.n
-            ? `${g.across} × ${g.down} = ${g.n} sections per plate, ${g.c} × ${g.r} wells each${
-                g.leftover ? `, ${g.leftover} wells left unused` : ''
-              }.`
-            : 'This pattern does not fit on a 6 × 9 plate.'}
+        {/* One Section Preview Tray */}
+        <div className="tri-prev-tray">
+          <div className="tri-subhead" style={{ marginBottom: '8px' }}>
+            <div className="tri-subhead-title">One section layout</div>
+            <div className="tri-subhead-meta mono">
+              {g.n
+                ? `${g.across} × ${g.down} = ${g.n} sections/plate · ${g.c} × ${g.r} wells each${
+                    g.leftover ? ` · ${g.leftover} unused` : ''
+                  }`
+                : 'Does not fit on a 6 × 9 plate'}
+            </div>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <div
+              className="tri-prev"
+              style={{
+                gridTemplateColumns: `repeat(${g.c}, minmax(92px, 1fr))`,
+                maxWidth: `${Math.max(280, g.c * 148)}px`,
+              }}
+            >
+              {cells}
+            </div>
+          </div>
         </div>
       </div>
 
       {/* Groups Card */}
-      <div className="card pad" style={{ marginTop: '20px' }}>
+      <div className="card pad">
         <div className="chead">
           <div className="ct">
             {gn[0].toUpperCase() + gn.slice(1)}s <span className="cnt">{t.groups.length}</span>
           </div>
           <button
             type="button"
-            className="btn"
+            className="btn sm pri"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
             onClick={() => {
               setState((prev) => {
                 const next = JSON.parse(JSON.stringify(prev));
@@ -2961,33 +3360,54 @@ const TripletPatternEditor: React.FC = () => {
               });
             }}
           >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 14 14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <path d="M7 2v10M2 7h10" />
+            </svg>
             Add {gn}
           </button>
         </div>
 
-        <div className="tbl">
-          <table className="tri-tbl">
+        <div className="tri-tbl-wrap tri-scroll">
+          <table className="tri-tbl" style={{ minWidth: `${180 + size * 145}px` }}>
+            <colgroup>
+              <col style={{ width: '132px' }} />
+              {Array.from({ length: size }, (_, j) => (
+                <col key={j} />
+              ))}
+              <col style={{ width: '46px' }} />
+            </colgroup>
             <thead>
               <tr>
                 <th>Name</th>
                 {Array.from({ length: size }, (_, j) => (
                   <th key={j}>Reagent {j + 1}</th>
                 ))}
-                <th />
+                <th className="act" aria-label="Actions" />
               </tr>
             </thead>
             <tbody>
               {t.groups.map((grp, i) => (
                 <tr key={grp.id}>
                   <td>
-                    <input
-                      type="text"
-                      className="f"
-                      value={grp.name}
-                      onChange={(e) => setPath(`tri.groups.${i}.name`, e.target.value)}
-                      style={{ width: '110px', height: '32px' }}
-                    />
-                    {grp.derived && <span className="chip mut">derived</span>}
+                    <div className="tri-name-cell">
+                      <input
+                        type="text"
+                        className="f mono"
+                        value={grp.name}
+                        onChange={(e) => setPath(`tri.groups.${i}.name`, e.target.value)}
+                        aria-label={`${gn} ${i + 1} name`}
+                      />
+                      {grp.derived && <span className="tri-derived-tag">derived</span>}
+                    </div>
                   </td>
                   {grp.members.map((m, j) => (
                     <td key={j}>
@@ -2997,6 +3417,8 @@ const TripletPatternEditor: React.FC = () => {
                         onChange={(e) =>
                           setPath(`tri.groups.${i}.members.${j}`, e.target.value)
                         }
+                        title={m ? reagentLabel(m) : grp.derived ? '(solvent)' : 'Pick reagent'}
+                        aria-label={`${grp.name || `${gn} ${i + 1}`} reagent ${j + 1}`}
                       >
                         <option value="">{grp.derived ? '(solvent)' : 'Pick…'}</option>
                         {state.reagents.map((r) => (
@@ -3007,10 +3429,12 @@ const TripletPatternEditor: React.FC = () => {
                       </select>
                     </td>
                   ))}
-                  <td>
+                  <td className="act">
                     <button
                       type="button"
-                      className="ib"
+                      className="ib del"
+                      title={`Remove ${grp.name || gn}`}
+                      aria-label={`Remove ${grp.name || `${gn} ${i + 1}`}`}
                       onClick={() => {
                         setState((prev) => {
                           const next = JSON.parse(JSON.stringify(prev));
@@ -3020,7 +3444,10 @@ const TripletPatternEditor: React.FC = () => {
                         });
                       }}
                     >
-                      ✕
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
+                        <line x1="4" y1="4" x2="12" y2="12" />
+                        <line x1="12" y1="4" x2="4" y2="12" />
+                      </svg>
                     </button>
                   </td>
                 </tr>
@@ -3031,69 +3458,61 @@ const TripletPatternEditor: React.FC = () => {
       </div>
 
       {/* Plates Card */}
-      <div className="card pad" style={{ marginTop: '20px' }}>
+      <div className="card pad">
         <div className="chead">
-          <div className="ct">Plates</div>
-        </div>
-        <p className="sub" style={{ marginTop: '-8px' }}>
-          Pick a {gn} for each section. Empty sections stay unfilled (all volumes 0).
-        </p>
-
-        {/* Derived Switch */}
-        <div
-          style={{
-            display: 'flex',
-            gap: '10px',
-            alignItems: 'center',
-            flexWrap: 'wrap',
-            margin: '0 0 6px',
-          }}
-        >
-          <span className="lbl" style={{ margin: 0 }}>
-            Doublet / singlet amounts
-          </span>
-          <div className="seg" role="group" aria-label="Doublet and singlet amounts">
-            <button
-              type="button"
-              className={t.derivedRatio !== 'equal' ? 'on' : ''}
-              onClick={() => {
-                setState((prev) => {
-                  const next = JSON.parse(JSON.stringify(prev));
-                  next.tri.derivedRatio = 'keep';
-                  next.tri.plates.forEach((pl: any) => {
-                    if (pl) pl.flat = false;
+          <div>
+            <div className="ct">Plates</div>
+            <p className="sub" style={{ margin: '4px 0 0' }}>
+              Pick a {gn} for each section. Empty sections stay unfilled (all volumes 0).
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span className="lbl" style={{ margin: 0 }}>
+              Doublet / singlet amounts
+            </span>
+            <div className="seg" role="group" aria-label="Doublet and singlet amounts">
+              <button
+                type="button"
+                className={t.derivedRatio !== 'equal' ? 'on' : ''}
+                onClick={() => {
+                  setState((prev) => {
+                    const next = JSON.parse(JSON.stringify(prev));
+                    next.tri.derivedRatio = 'keep';
+                    next.tri.plates.forEach((pl: any) => {
+                      if (pl) pl.flat = false;
+                    });
+                    Tri.triSync(next);
+                    return next;
                   });
-                  Tri.triSync(next);
-                  return next;
-                });
-              }}
-            >
-              Triplet ratios
-            </button>
-            <button
-              type="button"
-              className={t.derivedRatio === 'equal' ? 'on' : ''}
-              onClick={() => {
-                setState((prev) => {
-                  const next = JSON.parse(JSON.stringify(prev));
-                  next.tri.derivedRatio = 'equal';
-                  next.tri.plates.forEach((pl: any) => {
-                    if (pl) {
-                      pl.flat =
-                        pl.sections.some(Boolean) &&
-                        pl.sections.every(
-                          (id: string) =>
-                            !id || (next.tri.groups.find((x: any) => x.id === id) || {}).derived
-                        );
-                    }
+                }}
+              >
+                Triplet ratios
+              </button>
+              <button
+                type="button"
+                className={t.derivedRatio === 'equal' ? 'on' : ''}
+                onClick={() => {
+                  setState((prev) => {
+                    const next = JSON.parse(JSON.stringify(prev));
+                    next.tri.derivedRatio = 'equal';
+                    next.tri.plates.forEach((pl: any) => {
+                      if (pl) {
+                        pl.flat =
+                          pl.sections.some(Boolean) &&
+                          pl.sections.every(
+                            (id: string) =>
+                              !id || (next.tri.groups.find((x: any) => x.id === id) || {}).derived
+                          );
+                      }
+                    });
+                    Tri.triSync(next);
+                    return next;
                   });
-                  Tri.triSync(next);
-                  return next;
-                });
-              }}
-            >
-              Flat 1:1
-            </button>
+                }}
+              >
+                Flat 1:1
+              </button>
+            </div>
           </div>
         </div>
 
@@ -3105,10 +3524,10 @@ const TripletPatternEditor: React.FC = () => {
             <div
               key={p}
               className="rcard"
-              style={{ borderLeftColor: PAL[p % PAL.length], marginTop: '12px' }}
+              style={{ borderLeftColor: PAL[p % PAL.length], marginBottom: p === t.plates.length - 1 ? 0 : '14px' }}
             >
               <div className="rhead">
-                <b>plate{p}</b>
+                <b className="mono" style={{ fontSize: '14px' }}>plate{p}</b>
                 <span className="chip mut">
                   {pl
                     ? `${pl.sections.filter(Boolean).length} of ${slotsCount} ${
@@ -3228,37 +3647,48 @@ const TripletPatternEditor: React.FC = () => {
                     gridTemplateColumns: `repeat(${isFlat ? 3 : g.across}, minmax(0, 1fr))`,
                   }}
                 >
-                  {pl.sections.map((id, si) => (
-                    <label key={si}>
-                      <span className="l">
-                        {isFlat
-                          ? `Vials ${si * Tri.triBlock(state) + 1}–${Math.min(
-                              54,
-                              (si + 1) * Tri.triBlock(state)
-                            )}`
-                          : `Section ${si + 1}`}
-                      </span>
-                      <select
-                        className="f"
-                        value={id}
-                        onChange={(e) => setPath(`tri.plates.${p}.sections.${si}`, e.target.value)}
-                      >
-                        <option value="">(empty)</option>
-                        {t.groups.map((grp) => (
-                          <option key={grp.id} value={grp.id}>
-                            {grp.name}
-                            {grp.derived && grp.name === grp.members.filter(Boolean).join('+')
-                              ? ''
-                              : ` (${
-                                  grp.derived
-                                    ? grp.members.filter(Boolean).join('+')
-                                    : grp.members.map((m) => m || '?').join('+')
-                                })`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  ))}
+                  {pl.sections.map((id, si) => {
+                    const selectedGrp = t.groups.find((grp) => grp.id === id);
+                    const fullTitle = selectedGrp
+                      ? `${selectedGrp.name} (${
+                          selectedGrp.derived
+                            ? selectedGrp.members.filter(Boolean).join('+')
+                            : selectedGrp.members.map((m) => m || '?').join('+')
+                        })`
+                      : 'Empty section';
+                    return (
+                      <label key={si}>
+                        <span className="l">
+                          {isFlat
+                            ? `Vials ${si * Tri.triBlock(state) + 1}–${Math.min(
+                                54,
+                                (si + 1) * Tri.triBlock(state)
+                              )}`
+                            : `Section ${si + 1}`}
+                        </span>
+                        <select
+                          className="f"
+                          value={id}
+                          title={fullTitle}
+                          onChange={(e) => setPath(`tri.plates.${p}.sections.${si}`, e.target.value)}
+                        >
+                          <option value="">(empty)</option>
+                          {t.groups.map((grp) => (
+                            <option key={grp.id} value={grp.id}>
+                              {grp.name}
+                              {grp.derived && grp.name === grp.members.filter(Boolean).join('+')
+                                ? ''
+                                : ` (${
+                                    grp.derived
+                                      ? grp.members.filter(Boolean).join('+')
+                                      : grp.members.map((m) => m || '?').join('+')
+                                  })`}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    );
+                  })}
                 </div>
               )}
             </div>

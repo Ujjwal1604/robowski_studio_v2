@@ -38,6 +38,7 @@ export function exampleState(): RunState {
       objective: '',
       reactionClass: '',
       temperatureC: 25,
+      waterPct: 2.0,
       reactionTimeHours: 16,
       atmosphere: 'N2 Glovebox',
       agitation: 'Tumble stirrer 800 rpm',
@@ -82,6 +83,7 @@ export function normalize(st: RunState): RunState {
       objective: '',
       reactionClass: '',
       temperatureC: 25,
+      waterPct: 2.0,
       reactionTimeHours: 16,
       atmosphere: 'N2 Glovebox',
       agitation: 'Tumble stirrer 800 rpm',
@@ -93,6 +95,25 @@ export function normalize(st: RunState): RunState {
   } else if (!st.eln.wells) {
     st.eln.wells = {};
   }
+
+  // Synchronize top-level reaction conditions with st.eln cleanly (preserves 0°C / 0% water and legacy saves)
+  const hasVal = (v: unknown) => v !== '' && v != null && Number.isFinite(Number(v));
+  const resolvedTemp = hasVal(st.eln.temperatureC)
+    ? Number(st.eln.temperatureC)
+    : hasVal(st.temperatureC)
+    ? Number(st.temperatureC)
+    : 25;
+  const resolvedWater = hasVal(st.eln.waterPct)
+    ? Math.max(0, Number(st.eln.waterPct))
+    : hasVal(st.waterPct)
+    ? Math.max(0, Number(st.waterPct))
+    : 2.0;
+
+  st.temperatureC = resolvedTemp;
+  st.eln.temperatureC = resolvedTemp;
+  st.waterPct = resolvedWater;
+  st.eln.waterPct = resolvedWater;
+
   Core.triSync(st);
   return st;
 }

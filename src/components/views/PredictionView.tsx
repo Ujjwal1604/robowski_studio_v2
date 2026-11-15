@@ -15,6 +15,7 @@ import {
   Search,
   Sparkles,
   Trash2,
+  X,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import {
@@ -23,10 +24,14 @@ import {
   PathwaySpeciesNode,
   PredictedSpecies,
   PredictorSubstrateInput,
+  SpeciesBondHighlights,
   WellConditionConfig,
   WellPredictionResult,
+  applyRunConditionsPatch,
+  computeSpeciesHighlightBonds,
   exportLcmsTargetListCsv,
   extractWellForPrediction,
+  getCanonicalRunConditions,
   getSuggestedWellDisplay,
   groupSpeciesByPathway,
   predictWellReactions,
@@ -191,14 +196,12 @@ export const PredictionView: React.FC = () => {
   const [rdkitLoading, setRdkitLoading] = useState<boolean>(true);
   const [mode, setMode] = useState<'plate' | 'sandbox'>(run && run.rows.length > 0 ? 'plate' : 'sandbox');
 
-  // Plate mode states
+  // Plate mode states (Temperature & Base Water read/write directly to canonical RunState so Setup/ELN/TLC/Compare stay synced)
   const [activePlate, setActivePlate] = useState<number>(0);
   const [selectedWellIdx, setSelectedWellIdx] = useState<number>(0);
-  const [plateTempC, setPlateTempC] = useState<number>(() => {
-    const t = Number(state.eln?.temperatureC);
-    return Number.isFinite(t) && t > 0 ? t : 80;
-  });
-  const [plateWaterPct, setPlateWaterPct] = useState<number>(2.0);
+  const canonicalCond = useMemo(() => getCanonicalRunConditions(state), [state]);
+  const plateTempC = canonicalCond.temperatureC;
+  const plateWaterPct = canonicalCond.baseWaterPct;
   const [mediumOverride, setMediumOverride] = useState<'auto' | 'acid' | 'base' | 'neutral'>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
 
@@ -294,34 +297,138 @@ export const PredictionView: React.FC = () => {
     return ov;
   }, [plateTempC, plateWaterPct, mediumOverride]);
 
+  const rowRecipeSig = useCallback((row: any): string => {
+    if (!row?.recipe) return '';
+    return (row.recipe as any[])
+      .filter((it) => Number(it.target_concentration) > 0)
+      .map((it) => `${it.code}=${Number(it.target_concentration)}:${it.equivalence ?? ''}`)
+      .join(';');
+  }, []);
+
+  const plateChemSig = useMemo(() => {
+    const reagentSig = (state.reagents || [])
+      .map((r) => `${r.code}:${r.name || ''}:${r.iupac || ''}:${r.smiles || ''}`)
+      .join('|');
+    const triAddSig = (state.tri?.adds || [])
+      .map((a) => `${a.code}:${a.equiv}`)
+      .join('|');
+    return [
+      state.mode,
+      canonicalCond.solvent,
+      canonicalCond.temperatureC,
+      canonicalCond.baseWaterPct,
+      canonicalCond.reactionTimeHours,
+      canonicalCond.atmosphere,
+      canonicalCond.agitation,
+      mediumOverride,
+      includeSpeculative ? '1' : '0',
+      reagentSig,
+      triAddSig,
+    ].join('::');
+  }, [
+    state.mode,
+    state.reagents,
+    state.tri?.adds,
+    canonicalCond.solvent,
+    canonicalCond.temperatureC,
+    canonicalCond.baseWaterPct,
+    canonicalCond.reactionTimeHours,
+    canonicalCond.atmosphere,
+    canonicalCond.agitation,
+    mediumOverride,
+    includeSpeculative,
+  ]);
+
+  const currentRowSig = useMemo(() => rowRecipeSig(currentRow), [rowRecipeSig, currentRow]);
+  const wellPredCacheRef = useRef<Map<string, WellPredictionResult>>(new Map());
+  const plateResultSigRef = useRef<Record<string, string>>({});
+
   const currentExtraction = useMemo(() => {
     if (!currentRow) return null;
     return extractWellForPrediction(state, currentRow, conditionOverrides);
-  }, [state, currentRow, conditionOverrides]);
+    // Only re-extract when chemical composition, row recipe concentrations, or reaction conditions change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plateChemSig, currentRowSig, activePlate, selectedWellIdx]);
+
+  const activeWellInputSig = currentRow ? `${plateChemSig}::${currentRowSig}` : '';
 
   const activeWellResult = useMemo<WellPredictionResult | null>(() => {
-    if (!rdkit || !currentExtraction || mode !== 'plate') return null;
+    if (!rdkit || !currentExtraction || mode !== 'plate' || !activeWellInputSig) return null;
     const validSubs = currentExtraction.substrates.filter((s) => s.smiles.trim().length > 0);
     if (validSubs.length === 0) return null;
+
+    const cached = wellPredCacheRef.current.get(activeWellInputSig);
+    if (cached) return cached;
+
     try {
-      return predictWellReactions(rdkit, validSubs, currentExtraction.condition, {
+      const res = predictWellReactions(rdkit, validSubs, currentExtraction.condition, {
         includeSpeculative,
       });
+      if (wellPredCacheRef.current.size > 600) {
+        const firstKey = wellPredCacheRef.current.keys().next().value;
+        if (firstKey !== undefined) wellPredCacheRef.current.delete(firstKey);
+      }
+      wellPredCacheRef.current.set(activeWellInputSig, res);
+      return res;
     } catch {
       return null;
     }
-  }, [rdkit, currentExtraction, mode, includeSpeculative]);
+  }, [rdkit, currentExtraction, mode, activeWellInputSig, includeSpeculative]);
+
+  // Synchronize plateResults matrix badges when chemistry/conditions/recipes change, hydrating immediately from cache when available
+  const prevChemSigRef = useRef<string>(plateChemSig);
+  useEffect(() => {
+    const chemChanged = prevChemSigRef.current !== plateChemSig;
+    prevChemSigRef.current = plateChemSig;
+
+    if (!chemChanged) {
+      let anyWellChanged = false;
+      for (const [key, prevSig] of Object.entries(plateResultSigRef.current)) {
+        const [pStr, wStr] = key.split('-');
+        const p = Number(pStr);
+        const w = Number(wStr);
+        const r = rowByPlateWell.get(key) ?? run?.rows?.[p * PLATE_SIZE + w];
+        const curSig = r ? `${plateChemSig}::${rowRecipeSig(r)}` : '';
+        if (prevSig !== curSig) {
+          anyWellChanged = true;
+          break;
+        }
+      }
+      if (!anyWellChanged) return;
+    }
+
+    const nextMap: Record<string, WellPredictionResult> = {};
+    const nextSigs: Record<string, string> = {};
+    if (run?.rows) {
+      for (let p = 0; p < numPlates; p++) {
+        for (let w = 0; w < PLATE_SIZE; w++) {
+          const key = `${p}-${w}`;
+          const r = rowByPlateWell.get(key) ?? run.rows[p * PLATE_SIZE + w];
+          if (!r) continue;
+          const sig = `${plateChemSig}::${rowRecipeSig(r)}`;
+          const hit = wellPredCacheRef.current.get(sig);
+          if (hit) {
+            nextMap[key] = hit;
+            nextSigs[key] = sig;
+          }
+        }
+      }
+    }
+    plateResultSigRef.current = nextSigs;
+    setPlateResults(nextMap);
+  }, [plateChemSig, run, numPlates, rowByPlateWell, rowRecipeSig]);
 
   // Cache single-well calculation back into plateResults map for matrix badges & CSV export
   const activeKey = `${activePlate}-${selectedWellIdx}`;
   useEffect(() => {
-    if (activeWellResult) {
+    if (activeWellResult && activeWellInputSig) {
+      plateResultSigRef.current[activeKey] = activeWellInputSig;
       setPlateResults((prev) => {
         if (prev[activeKey] === activeWellResult) return prev;
         return { ...prev, [activeKey]: activeWellResult };
       });
     }
-  }, [activeKey, activeWellResult]);
+  }, [activeKey, activeWellResult, activeWellInputSig]);
 
   // Run Sandbox prediction automatically when RDKit ready and inputs update
   const runSandboxNow = useCallback(() => {
@@ -345,7 +452,7 @@ export const PredictionView: React.FC = () => {
     }
   }, [mode, rdkit, runSandboxNow]);
 
-  // Batch analyze active plate cleanly without freezing UI
+  // Batch analyze active plate cleanly without freezing UI (reusing cached & identical replicate wells)
   const runPlateBatch = async () => {
     if (!rdkit || !run) return;
     batchCancelRef.current = false;
@@ -365,19 +472,35 @@ export const PredictionView: React.FC = () => {
     for (let i = 0; i < wellsToRun.length; i++) {
       if (batchCancelRef.current) break;
       const { key, row } = wellsToRun[i];
-      const ext = extractWellForPrediction(state, row, conditionOverrides);
-      const validSubs = ext.substrates.filter((s) => s.smiles.trim().length > 0);
-      if (validSubs.length > 0) {
-        try {
-          accumulated[key] = predictWellReactions(rdkit, validSubs, ext.condition, {
-            includeSpeculative,
-          });
-        } catch {}
+      const sig = `${plateChemSig}::${rowRecipeSig(row)}`;
+      const cached = wellPredCacheRef.current.get(sig);
+      if (cached) {
+        accumulated[key] = cached;
+        plateResultSigRef.current[key] = sig;
+      } else {
+        const ext = extractWellForPrediction(state, row, conditionOverrides);
+        const validSubs = ext.substrates.filter((s) => s.smiles.trim().length > 0);
+        if (validSubs.length > 0) {
+          try {
+            const res = predictWellReactions(rdkit, validSubs, ext.condition, {
+              includeSpeculative,
+            });
+            if (wellPredCacheRef.current.size > 600) {
+              const firstKey = wellPredCacheRef.current.keys().next().value;
+              if (firstKey !== undefined) wellPredCacheRef.current.delete(firstKey);
+            }
+            wellPredCacheRef.current.set(sig, res);
+            accumulated[key] = res;
+            plateResultSigRef.current[key] = sig;
+          } catch {}
+        }
       }
       setBatchProgress({ running: true, done: i + 1, total: wellsToRun.length });
       if ((i + 1) % 3 === 0 || i === wellsToRun.length - 1) {
         setPlateResults({ ...accumulated });
-        await new Promise((res) => setTimeout(res, 0));
+        if (!cached) {
+          await new Promise((res) => setTimeout(res, 0));
+        }
       }
     }
     setBatchProgress({ running: false, done: wellsToRun.length, total: wellsToRun.length });
@@ -677,6 +800,13 @@ export const PredictionView: React.FC = () => {
                 fontSize: '12.5px',
               }}
             >
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }} title="Synced with Setup & ELN reaction conditions">
+                <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Solvent</span>
+                <span className="mono" style={{ fontWeight: 600, color: 'var(--fg2)' }}>
+                  {canonicalCond.solvent}
+                </span>
+              </label>
+
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                 <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Temp (°C)</span>
                 <input
@@ -685,27 +815,68 @@ export const PredictionView: React.FC = () => {
                   style={{ width: '72px', height: '30px', fontSize: '12px' }}
                   value={plateTempC}
                   onChange={(e) => {
-                    setPlateTempC(Number(e.target.value) || 25);
+                    const val = e.target.value;
+                    if (val === '' || val === '-') return;
+                    const num = Number(val);
+                    if (!Number.isFinite(num)) return;
+                    setState((prev) => applyRunConditionsPatch(prev, { temperatureC: num }));
                     setPlateResults({});
                   }}
                 />
               </label>
 
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Water</span>
+                <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Base Water (%)</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="100"
+                  className="f mono"
+                  style={{ width: '66px', height: '30px', fontSize: '12px' }}
+                  value={plateWaterPct}
+                  onChange={(e) => {
+                    const num = Math.max(0, Number(e.target.value) || 0);
+                    setState((prev) => applyRunConditionsPatch(prev, { baseWaterPct: num }));
+                    setPlateResults({});
+                  }}
+                />
                 <select
                   className="f"
-                  style={{ height: '30px', fontSize: '12px', padding: '0 8px' }}
-                  value={String(plateWaterPct)}
+                  aria-label="Base water preset"
+                  style={{ height: '30px', fontSize: '12px', padding: '0 6px' }}
+                  value={[0.2, 2, 10].some((x) => Math.abs(plateWaterPct - x) < 0.01) ? String(plateWaterPct === 2 ? 2 : plateWaterPct) : 'custom'}
                   onChange={(e) => {
-                    setPlateWaterPct(Number(e.target.value));
+                    if (e.target.value === 'custom') return;
+                    setState((prev) => applyRunConditionsPatch(prev, { baseWaterPct: Number(e.target.value) }));
                     setPlateResults({});
                   }}
                 >
                   <option value="0.2">Dry (0.2%)</option>
                   <option value="2">Ambient (2%)</option>
                   <option value="10">Wet (10%)</option>
+                  {![0.2, 2, 10].some((x) => Math.abs(plateWaterPct - x) < 0.01) && (
+                    <option value="custom">Custom ({plateWaterPct.toFixed(1)}%)</option>
+                  )}
                 </select>
+                {(currentExtraction?.condition.hydrateWaterPct || 0) > 0 && (
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      color: 'var(--acc)',
+                      background: 'color-mix(in srgb, var(--acc) 10%, var(--soft))',
+                      padding: '2px 7px',
+                      borderRadius: '5px',
+                      border: '1px solid color-mix(in srgb, var(--acc) 30%, var(--line))',
+                    }}
+                    title={(currentExtraction?.condition.hydrateSources || []).join(', ')}
+                  >
+                    +{(currentExtraction?.condition.hydrateWaterPct || 0).toFixed(2)}% hydrate ={' '}
+                    {currentExtraction?.condition.waterPct.toFixed(2)}% H₂O
+                  </span>
+                )}
               </label>
 
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
@@ -1059,18 +1230,36 @@ export const PredictionView: React.FC = () => {
               </label>
 
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Water %</span>
+                <span style={{ color: 'var(--mut)', fontWeight: 500 }}>Base Water %</span>
                 <input
                   type="number"
-                  step="0.5"
+                  step="0.1"
                   min="0"
-                  max="50"
+                  max="100"
                   className="f mono"
                   style={{ width: '62px', height: '30px', fontSize: '12px' }}
                   value={sandboxCond.waterPct}
                   onChange={(e) => setSandboxCond((c) => ({ ...c, waterPct: Math.max(0, Number(e.target.value) || 0) }))}
                 />
               </label>
+
+              <button
+                type="button"
+                className="btn sm"
+                style={{ height: '28px', padding: '0 9px', fontSize: '11.5px' }}
+                onClick={() => {
+                  setSandboxCond((c) => ({
+                    ...c,
+                    solvent: canonicalCond.solvent,
+                    temperatureC: canonicalCond.temperatureC,
+                    waterPct: canonicalCond.baseWaterPct,
+                  }));
+                  toast(`Applied Setup conditions (${canonicalCond.solvent}, ${canonicalCond.temperatureC} °C, ${canonicalCond.baseWaterPct}% H₂O).`);
+                }}
+                title="Copy solvent, temperature, and base water % from Run Setup"
+              >
+                Use Setup ({canonicalCond.temperatureC} °C · {canonicalCond.solvent})
+              </button>
 
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--fg2)' }}>
                 <input
@@ -1209,16 +1398,144 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'products' | 'fragments'>('products');
   const [groupMode, setGroupMode] = useState<'pathway' | 'score'>('pathway');
-  const [viewLayout, setViewLayout] = useState<'grid' | 'list'>('grid');
+  const [viewLayout, setViewLayout] = useState<'flow' | 'table' | 'cards'>('flow');
+  const [tierFilter, setTierFilter] = useState<'all' | 'major' | 'equil'>('all');
+  const [massQuery, setMassQuery] = useState<string>('');
   const [showEquilibriumDetails, setShowEquilibriumDetails] = useState<boolean>(false);
   const [expandedTrails, setExpandedTrails] = useState<Record<string, boolean>>({});
   const [expandedMinorFamilies, setExpandedMinorFamilies] = useState<Record<string, boolean>>({});
+  const [expandedSideRoutes, setExpandedSideRoutes] = useState<Record<string, boolean>>({});
+  const [familyOpenOverrides, setFamilyOpenOverrides] = useState<Record<string, boolean>>({});
+  const [inspectedByFamily, setInspectedByFamily] = useState<Record<string, string | null>>({});
+  const [selectedTableKey, setSelectedTableKey] = useState<string | null>(null);
+  const [highlightBondsMode, setHighlightBondsMode] = useState<'all' | 'last' | 'off'>('all');
+  const [pulsedTileKey, setPulsedTileKey] = useState<string | null>(null);
+  const [rdkitInst, setRdkitInst] = useState<any>(null);
+  const tileRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
+  const pulseTimerRef = useRef<number | null>(null);
   const { acidBase, species, releasedFragments, alerts, substrates, stats, condition } = result;
 
-  const families: PathwayFamily[] = useMemo(
-    () => groupSpeciesByPathway(species, substrates),
-    [species, substrates]
-  );
+  useEffect(() => {
+    let alive = true;
+    getRDKitInstance().then((inst) => {
+      if (alive && inst) setRdkitInst(inst);
+    });
+    return () => {
+      alive = false;
+      if (pulseTimerRef.current) window.clearTimeout(pulseTimerRef.current);
+    };
+  }, []);
+
+  const highlightBySpeciesKey = useMemo(() => {
+    const map = new Map<string, SpeciesBondHighlights>();
+    if (!rdkitInst || highlightBondsMode === 'off') return map;
+    for (const sp of species) {
+      map.set(sp.key, computeSpeciesHighlightBonds(rdkitInst, sp));
+    }
+    return map;
+  }, [rdkitInst, species, highlightBondsMode]);
+
+  const getHighlightsFor = (sp: PredictedSpecies): number[] | undefined => {
+    if (highlightBondsMode === 'off') return undefined;
+    const h = highlightBySpeciesKey.get(sp.key);
+    if (!h) return undefined;
+    const arr = highlightBondsMode === 'last' ? h.lastStepBonds : h.allNewBonds;
+    return arr.length > 0 ? arr : undefined;
+  };
+
+  const jumpToBranchParent = (famId: string, branchKey: string | null) => {
+    if (!branchKey) return;
+    setExpandedSideRoutes((prev) => ({ ...prev, [famId]: true }));
+    setExpandedMinorFamilies((prev) => ({ ...prev, [famId]: true }));
+    setInspectedByFamily((prev) => ({ ...prev, [famId]: branchKey }));
+    const refKey = `${famId}::${branchKey}`;
+    setPulsedTileKey(refKey);
+    if (pulseTimerRef.current) window.clearTimeout(pulseTimerRef.current);
+    pulseTimerRef.current = window.setTimeout(() => {
+      setPulsedTileKey((cur) => (cur === refKey ? null : cur));
+    }, 1800);
+    window.setTimeout(() => {
+      const el = tileRefs.current.get(refKey);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+    }, 55);
+  };
+
+  const filteredSpecies = useMemo(() => {
+    let list = species;
+    if (tierFilter === 'major') {
+      list = list.filter((sp) => sp.tier === 'High' || sp.tier === 'Medium');
+    } else if (tierFilter === 'equil') {
+      list = list.filter((sp) => sp.status === 'transient');
+    }
+    const q = massQuery.trim().toLowerCase();
+    if (q) {
+      const numericMz = /^\d+(\.\d+)?$/.test(q) ? parseFloat(q) : NaN;
+      list = list.filter((sp) => {
+        if (
+          sp.formula.toLowerCase().includes(q) ||
+          sp.mechanismSummary.toLowerCase().includes(q) ||
+          sp.smiles.toLowerCase().includes(q) ||
+          sp.mhPlus.toFixed(4).includes(q) ||
+          sp.mNaPlus.toFixed(3).includes(q) ||
+          sp.bestChain.some((st) => st.description.toLowerCase().includes(q)) ||
+          (sp.lossIons ?? []).some(
+            (l) => l.label.toLowerCase().includes(q) || l.mz.toFixed(4).includes(q)
+          )
+        ) {
+          return true;
+        }
+        if (Number.isFinite(numericMz) && numericMz >= 20) {
+          const masses = [
+            sp.mhPlus,
+            sp.mNaPlus,
+            sp.mHMinus,
+            sp.exactMass,
+            ...(sp.lossIons ?? []).map((l) => l.mz),
+          ];
+          return masses.some((m) => Math.abs(m - numericMz) <= 0.6);
+        }
+        return false;
+      });
+    }
+    return list;
+  }, [species, tierFilter, massQuery]);
+
+  const rankLookup = useMemo(() => {
+    const map = new Map<string, number>();
+    species.forEach((sp, idx) => map.set(sp.key, idx + 1));
+    return map;
+  }, [species]);
+
+  const families: PathwayFamily[] = useMemo(() => {
+    const allFams = groupSpeciesByPathway(species, substrates);
+    if (filteredSpecies.length === species.length) return allFams;
+    const allowed = new Set(filteredSpecies.map((s) => s.key));
+    return allFams
+      .map((f) => {
+        const primaryNodes = f.primaryNodes.filter((n) => allowed.has(n.species.key));
+        const minorNodes = f.minorNodes.filter((n) => allowed.has(n.species.key));
+        const nodes = f.nodes.filter((n) => allowed.has(n.species.key));
+        const primaryRoutes = f.primaryRoutes
+          .map((r) => ({ ...r, nodes: r.nodes.filter((n) => allowed.has(n.species.key)) }))
+          .filter((r) => r.nodes.length > 0);
+        return { ...f, nodes, primaryNodes, minorNodes, primaryRoutes };
+      })
+      .filter((f) => f.nodes.length > 0);
+  }, [species, filteredSpecies, substrates]);
+
+  // Default open state: expand up to top 3 High/Medium pathways (or top 1 if all are Low);
+  // auto-expand all matching pathways when the user filters/searches.
+  const isFamilyOpen = (fam: PathwayFamily, idx: number): boolean => {
+    if (massQuery.trim() || tierFilter !== 'all') return true;
+    if (fam.id in familyOpenOverrides) return familyOpenOverrides[fam.id];
+    const hasMajor = fam.peakScore >= 0.28;
+    return hasMajor ? idx < 3 : idx === 0;
+  };
+
+  const toggleFamilyOpen = (fam: PathwayFamily, idx: number) => {
+    const cur = isFamilyOpen(fam, idx);
+    setFamilyOpenOverrides((prev) => ({ ...prev, [fam.id]: !cur }));
+  };
 
   const toggleTrail = (key: string) => {
     setExpandedTrails((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1315,13 +1632,27 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
           >
             <div className="mono" style={{ fontSize: '11.5px', fontWeight: 600, color: 'var(--fg2)', textAlign: 'center' }}>
               {condition.solvent} · {condition.temperatureC} °C
+              {condition.reactionTimeHours ? ` · ${condition.reactionTimeHours} h` : ''}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: '4px', color: 'var(--acc)' }}>
-              <div style={{ flex: 1, height: '2px', background: 'currentColor', borderRadius: '2px' }} />
-              <ArrowRight size={18} strokeWidth={2.2} />
+            <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 0, color: 'var(--acc)' }}>
+              <div style={{ flex: 1, height: '2px', background: 'currentColor', borderRadius: '2px 0 0 2px', marginRight: '-1px' }} />
+              <svg width="10" height="12" viewBox="0 0 10 12" aria-hidden="true" style={{ flexShrink: 0, display: 'block' }}>
+                <polygon points="0,1 10,6 0,11" fill="currentColor" />
+              </svg>
             </div>
-            <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)', textAlign: 'center' }}>
-              {mediumLabel(acidBase.effectiveMedium)} · pH {acidBase.effectivePhDmso.toFixed(1)} · {condition.waterPct.toFixed(1)}% H₂O
+            <div
+              className="mono"
+              style={{ fontSize: '11px', color: 'var(--mut)', textAlign: 'center' }}
+              title={
+                (condition.hydrateWaterPct || 0) > 0
+                  ? `Base ${Number(condition.baseWaterPct ?? condition.waterPct).toFixed(2)}% + Hydrate +${Number(condition.hydrateWaterPct).toFixed(2)}% (${(condition.hydrateSources || []).join(', ')})`
+                  : undefined
+              }
+            >
+              {mediumLabel(acidBase.effectiveMedium)} · pH {acidBase.effectivePhDmso.toFixed(1)} ·{' '}
+              {(condition.hydrateWaterPct || 0) > 0
+                ? `${condition.waterPct.toFixed(2)}% H₂O (+${Number(condition.hydrateWaterPct).toFixed(2)}% hydrate)`
+                : `${condition.waterPct.toFixed(1)}% H₂O`}
             </div>
           </div>
         </div>
@@ -1439,56 +1770,228 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
 
           {activeTab === 'products' && species.length > 0 && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <div className="seg" role="group" aria-label="Product grouping mode">
+              {viewLayout !== 'table' && (
+                <div className="seg" role="group" aria-label="Product grouping mode">
+                  <button
+                    type="button"
+                    className={groupMode === 'pathway' ? 'on' : ''}
+                    onClick={() => setGroupMode('pathway')}
+                    title="Group products by shared mechanistic pathway, sorted by peak confidence score"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                  >
+                    <GitBranch size={12} />
+                    <span>By Pathway ({families.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={groupMode === 'score' ? 'on' : ''}
+                    onClick={() => setGroupMode('score')}
+                    title="Flat list ranked strictly by individual confidence score"
+                  >
+                    <span>By Confidence</span>
+                  </button>
+                </div>
+              )}
+
+              <div className="seg" role="group" aria-label="Product arrangement">
                 <button
                   type="button"
-                  className={groupMode === 'pathway' ? 'on' : ''}
-                  onClick={() => setGroupMode('pathway')}
-                  title="Group products by shared mechanistic pathway, sorted by peak confidence score"
+                  className={viewLayout === 'flow' ? 'on' : ''}
+                  onClick={() => {
+                    setViewLayout('flow');
+                    setGroupMode('pathway');
+                  }}
+                  title="Compact horizontal pathway strips with collapsible secondary pathways"
                   style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                 >
                   <GitBranch size={12} />
-                  <span>By Pathway ({families.length})</span>
+                  <span>Cascade</span>
                 </button>
                 <button
                   type="button"
-                  className={groupMode === 'score' ? 'on' : ''}
-                  onClick={() => setGroupMode('score')}
-                  title="Flat list ranked strictly by individual confidence score"
-                >
-                  <span>By Confidence</span>
-                </button>
-              </div>
-
-              <div className="seg" role="group" aria-label="Product card layout">
-                <button
-                  type="button"
-                  className={viewLayout === 'grid' ? 'on' : ''}
-                  onClick={() => setViewLayout('grid')}
-                  title="Structure-first visual grid"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                >
-                  <LayoutGrid size={12} />
-                  <span>Visual Grid</span>
-                </button>
-                <button
-                  type="button"
-                  className={viewLayout === 'list' ? 'on' : ''}
-                  onClick={() => setViewLayout('list')}
-                  title="Detailed side-by-side list"
+                  className={viewLayout === 'table' ? 'on' : ''}
+                  onClick={() => setViewLayout('table')}
+                  title="Compact LC-MS peak table + side structure inspector (no scrolling)"
                   style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                 >
                   <List size={12} />
-                  <span>List</span>
+                  <span>LC-MS Table</span>
+                </button>
+                <button
+                  type="button"
+                  className={viewLayout === 'cards' ? 'on' : ''}
+                  onClick={() => setViewLayout('cards')}
+                  title="Full-size structure cards"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                >
+                  <LayoutGrid size={12} />
+                  <span>Cards</span>
                 </button>
               </div>
             </div>
           )}
         </div>
 
+        {/* Smart Tier Filter & LC-MS m/z Search Strip */}
+        {activeTab === 'products' && species.length > 0 && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '10px',
+              flexWrap: 'wrap',
+              padding: '8px 10px',
+              background: 'var(--bg)',
+              border: '1px solid var(--line2)',
+              borderRadius: '8px',
+              marginBottom: '12px',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <div className="seg" role="group" aria-label="Confidence filter">
+                <button
+                  type="button"
+                  className={tierFilter === 'all' ? 'on' : ''}
+                  onClick={() => setTierFilter('all')}
+                >
+                  All ({species.length})
+                </button>
+                <button
+                  type="button"
+                  className={tierFilter === 'major' ? 'on' : ''}
+                  onClick={() => setTierFilter('major')}
+                >
+                  High + Med ({stats.highCount + stats.mediumCount})
+                </button>
+                <button
+                  type="button"
+                  className={tierFilter === 'equil' ? 'on' : ''}
+                  onClick={() => setTierFilter('equil')}
+                >
+                  Equil. / Imine ({stats.transientCount})
+                </button>
+              </div>
+
+              <div className="seg" role="group" aria-label="New bond highlighting" title="Highlight newly formed bonds on predicted structures">
+                <button
+                  type="button"
+                  className={highlightBondsMode === 'all' ? 'on' : ''}
+                  onClick={() => setHighlightBondsMode('all')}
+                >
+                  New Bonds: All
+                </button>
+                <button
+                  type="button"
+                  className={highlightBondsMode === 'last' ? 'on' : ''}
+                  onClick={() => setHighlightBondsMode('last')}
+                >
+                  Last Step
+                </button>
+                <button
+                  type="button"
+                  className={highlightBondsMode === 'off' ? 'on' : ''}
+                  onClick={() => setHighlightBondsMode('off')}
+                >
+                  Off
+                </button>
+              </div>
+
+              {viewLayout !== 'table' && groupMode === 'pathway' && families.length > 1 && (
+                <div style={{ display: 'flex', gap: '4px' }}>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                    onClick={() => {
+                      const next: Record<string, boolean> = {};
+                      families.forEach((f) => {
+                        next[f.id] = true;
+                      });
+                      setFamilyOpenOverrides(next);
+                    }}
+                  >
+                    Expand all
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                    onClick={() => {
+                      const next: Record<string, boolean> = {};
+                      families.forEach((f) => {
+                        next[f.id] = false;
+                      });
+                      setFamilyOpenOverrides(next);
+                    }}
+                  >
+                    Collapse all
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                background: 'var(--panel)',
+                border: '1px solid var(--line)',
+                borderRadius: '7px',
+                padding: '0 8px',
+                height: '28px',
+                minWidth: '230px',
+                flex: '0 1 280px',
+              }}
+            >
+              <Search size={12} style={{ color: 'var(--mut)', flexShrink: 0 }} />
+              <input
+                type="text"
+                value={massQuery}
+                onChange={(e) => setMassQuery(e.target.value)}
+                placeholder="Find m/z (e.g. 246.1), formula, step..."
+                style={{
+                  border: 'none',
+                  outline: 'none',
+                  background: 'transparent',
+                  color: 'var(--fg)',
+                  fontSize: '12px',
+                  width: '100%',
+                }}
+              />
+              {massQuery && (
+                <button
+                  type="button"
+                  onClick={() => setMassQuery('')}
+                  aria-label="Clear filter"
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--mut)',
+                    cursor: 'pointer',
+                    padding: 0,
+                    display: 'inline-flex',
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {activeTab === 'products' ? (
-          species.length > 0 ? (
+          filteredSpecies.length > 0 ? (
             (() => {
+              const stoichOf = (sp: PredictedSpecies) =>
+                substrates
+                  .map((s, sIdx) =>
+                    sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null
+                  )
+                  .filter(Boolean)
+                  .join(' + ');
+
               const formatLineageText = (node?: PathwaySpeciesNode): string | null => {
                 if (!node) return null;
                 if (node.isPureTautomer) return 'Pre-tautomer · feeds pathway';
@@ -1501,20 +2004,387 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                 return `Step 1 entry (${node.lastStepLabel})`;
               };
 
-              const renderGridCard = (sp: PredictedSpecies, rankNum: number, node?: PathwaySpeciesNode) => {
+              const renderFullInspector = (sp: PredictedSpecies, rankNum: number, node?: PathwaySpeciesNode) => {
                 const tc = tierColor(sp.tier);
-                const isOpen = Boolean(expandedTrails[sp.key]);
-                const stoichLabel = substrates
-                  .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
-                  .filter(Boolean)
-                  .join(' + ');
+                const stoichLabel = stoichOf(sp);
                 const lineageText = formatLineageText(node);
+                return (
+                  <div
+                    style={{
+                      border: '1px solid color-mix(in srgb, var(--acc) 35%, var(--line))',
+                      borderRadius: '10px',
+                      padding: '12px 14px',
+                      background: 'var(--panel)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '10px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '8px',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <span className="mono" style={{ fontWeight: 700, fontSize: '13.5px' }}>
+                          #{rankNum}
+                        </span>
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: '11.5px',
+                            fontWeight: 700,
+                            padding: '2px 8px',
+                            borderRadius: '6px',
+                            color: tc.fg,
+                            background: tc.bg,
+                            border: `1px solid ${tc.bd}`,
+                          }}
+                        >
+                          {sp.score.toFixed(2)} · {sp.tier}
+                        </span>
+                        <span className="mono" style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+                          {sp.status === 'sink' ? 'Stable' : 'Equil.'} · L {sp.likelihood.toFixed(2)} · P{' '}
+                          {sp.persistence.toFixed(2)}
+                          {sp.reversibleEnd ? ' · reversible' : ''}
+                          {sp.tautomerForms > 1 ? ` · ${sp.tautomerForms} tautomer forms` : ''}
+                        </span>
+                        {stoichLabel && (
+                          <span className="mono" style={{ fontSize: '12px', fontWeight: 600, color: 'var(--fg2)' }}>
+                            · {stoichLabel}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                          onClick={() => {
+                            navigator.clipboard.writeText(sp.smiles);
+                            toast('Copied product SMILES.');
+                          }}
+                        >
+                          <Copy size={11} />
+                          <span style={{ marginLeft: '4px' }}>SMILES</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                          onClick={() => {
+                            navigator.clipboard.writeText(sp.mhPlus.toFixed(4));
+                            toast(`Copied [M+H]+ = ${sp.mhPlus.toFixed(4)}`);
+                          }}
+                        >
+                          Copy [M+H]⁺
+                        </button>
+                      </div>
+                    </div>
+
+                    {lineageText && (
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: '11.5px',
+                          fontWeight: node?.isLead ? 700 : 500,
+                          color: node?.isLead ? 'var(--acc)' : 'var(--fg2)',
+                          marginTop: '-4px',
+                        }}
+                      >
+                        {lineageText}
+                      </div>
+                    )}
+
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(92px, 1fr))',
+                        gap: '8px',
+                        padding: '8px 10px',
+                        borderRadius: '7px',
+                        background: 'var(--soft)',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+H]⁺</div>
+                        <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--acc)' }}>
+                          {sp.mhPlus.toFixed(4)}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+Na]⁺</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.mNaPlus.toFixed(4)}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M−H]⁻</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.mHMinus.toFixed(4)}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>Formula</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.formula}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>cLogP · TPSA</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)} Å²
+                        </div>
+                      </div>
+                    </div>
+
+                    {sp.lossIons && sp.lossIons.length > 0 && (
+                      <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
+                        In-source LC-MS:{' '}
+                        {sp.lossIons.map((l) => `${l.label} ${l.mz.toFixed(4)} (${l.note})`).join(' · ')}
+                      </div>
+                    )}
+
+                    {node && node.alsoViaLabels.length > 0 && (
+                      <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+                        Convergent: also reached via {node.alsoViaLabels.join(', ')}
+                      </div>
+                    )}
+
+                    {sp.alerts.length > 0 && (
+                      <div style={{ fontSize: '11.5px', color: 'var(--warn)' }}>
+                        {sp.alerts.map((a) => a.message).join(' · ')}
+                      </div>
+                    )}
+
+                    <div
+                      style={{
+                        padding: '8px 10px',
+                        background: 'var(--bg)',
+                        borderRadius: '6px',
+                        border: '1px solid var(--line2)',
+                        fontSize: '11.5px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '4px',
+                      }}
+                    >
+                      <div className="mono" style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg2)' }}>
+                        {sp.mechanismSummary} · {sp.stepsCount} step{sp.stepsCount === 1 ? '' : 's'}
+                      </div>
+                      {sp.bestChain.map((st, sIdx) => (
+                        <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                          <span>
+                            <b className="mono">{sIdx + 1}. {st.stepLabel}</b> — {st.description}
+                            {st.releasedFragment ? ` (${st.releasedFragment})` : ''}
+                            {st.releasedGas ? ` (${st.releasedGas})` : ''}
+                          </span>
+                          <span className="mono" style={{ color: 'var(--mut)' }}>
+                            w={st.stepWeight.toFixed(2)} · pH×{st.conditionFactor.toFixed(2)} · T×{st.tempFactor.toFixed(2)}
+                            {st.ringFactor > 1.05 ? ` · ring×${st.ringFactor.toFixed(2)}` : ''}
+                          </span>
+                        </div>
+                      ))}
+                      {sp.alternativeChains.length > 0 && (
+                        <div style={{ color: 'var(--mut)', paddingTop: '4px', borderTop: '1px dashed var(--line)' }}>
+                          Alt:{' '}
+                          {sp.alternativeChains.map((ac) => ac.map((x) => x.stepLabel).join(' → ')).join(' | ')}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              };
+
+              // Roomy 288px horizontal tile with crisp 264x172 SVG structure for Cascade mode
+              const renderCascadeTile = (
+                sp: PredictedSpecies,
+                rankNum: number,
+                familyId: string,
+                node?: PathwaySpeciesNode
+              ) => {
+                const tc = tierColor(sp.tier);
+                const stoichLabel = stoichOf(sp);
+                const isSelected = inspectedByFamily[familyId] === sp.key;
+                const refKey = `${familyId}::${sp.key}`;
+                const isPulsed = pulsedTileKey === refKey;
+                const shortRole = node
+                  ? node.isPureTautomer
+                    ? 'Pre-taut'
+                    : node.parentGlobalRank != null
+                    ? `${node.roleInPathway === 'divergence' ? '⑂' : '↳'} #${node.parentGlobalRank} · ${node.lastStepLabel}`
+                    : `Step 1 · ${node.lastStepLabel}`
+                  : sp.mechanismSummary;
 
                 return (
                   <div
                     key={sp.key}
+                    ref={(el) => {
+                      if (el) tileRefs.current.set(refKey, el);
+                      else tileRefs.current.delete(refKey);
+                    }}
+                    onClick={() =>
+                      setInspectedByFamily((prev) => ({
+                        ...prev,
+                        [familyId]: prev[familyId] === sp.key ? null : sp.key,
+                      }))
+                    }
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setInspectedByFamily((prev) => ({
+                          ...prev,
+                          [familyId]: prev[familyId] === sp.key ? null : sp.key,
+                        }));
+                      }
+                    }}
+                    title="Click tile to inspect LC-MS ions & mechanism steps (click structure to zoom)"
                     style={{
-                      border: node?.isLead ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))' : '1px solid var(--line)',
+                      flex: '0 0 288px',
+                      border: isPulsed
+                        ? '2px solid var(--acc)'
+                        : isSelected
+                        ? '1.5px solid var(--acc)'
+                        : node?.isLead
+                        ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))'
+                        : '1px solid var(--line)',
+                      boxShadow: isPulsed
+                        ? '0 0 0 4px color-mix(in srgb, var(--acc) 22%, transparent)'
+                        : undefined,
+                      borderRadius: '10px',
+                      padding: '10px 11px',
+                      background: isPulsed || isSelected
+                        ? 'color-mix(in srgb, var(--acc) 7%, var(--panel))'
+                        : 'var(--panel)',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '7px',
+                      transition: 'border-color 0.18s ease, box-shadow 0.25s ease',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '4px' }}>
+                      <span className="mono" style={{ fontWeight: 700, fontSize: '12.5px' }}>
+                        #{rankNum}
+                      </span>
+                      <span
+                        className="mono"
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          padding: '1px 7px',
+                          borderRadius: '5px',
+                          color: tc.fg,
+                          background: tc.bg,
+                          border: `1px solid ${tc.bd}`,
+                        }}
+                      >
+                        {sp.score.toFixed(2)} · {sp.tier}
+                      </span>
+                      {stoichLabel && (
+                        <span className="mono" style={{ fontSize: '11px', fontWeight: 600, color: 'var(--fg2)' }}>
+                          {stoichLabel}
+                        </span>
+                      )}
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        background: 'var(--soft)',
+                        borderRadius: '8px',
+                        padding: '4px',
+                        height: '182px',
+                      }}
+                    >
+                      <ChemicalStructure
+                        smiles={sp.smiles}
+                        name={`${stoichLabel || 'Product'} (${sp.formula})`}
+                        width={264}
+                        height={172}
+                        highlightBonds={getHighlightsFor(sp)}
+                      />
+                    </div>
+
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '6px' }}>
+                      <span
+                        className="mono"
+                        style={{ fontSize: '12px', fontWeight: 700, color: 'var(--acc)' }}
+                      >
+                        [M+H]⁺ {sp.mhPlus.toFixed(4)}
+                      </span>
+                      <span className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
+                        {sp.formula}
+                      </span>
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '6px',
+                      }}
+                    >
+                      <span
+                        className="mono"
+                        style={{
+                          fontSize: '10.5px',
+                          color: node?.isLead ? 'var(--acc)' : 'var(--mut)',
+                          fontWeight: node?.isLead ? 700 : 500,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {node?.isLead ? `★ Lead · ${shortRole}` : shortRole}
+                      </span>
+                      <span className="mono" style={{ fontSize: '10px', color: 'var(--mut)', flexShrink: 0 }}>
+                        {sp.status === 'transient' ? 'Equil.' : 'Stable'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              };
+
+              const renderGridCard = (
+                sp: PredictedSpecies,
+                rankNum: number,
+                node?: PathwaySpeciesNode,
+                familyId?: string
+              ) => {
+                const tc = tierColor(sp.tier);
+                const isOpen = Boolean(expandedTrails[sp.key]);
+                const stoichLabel = stoichOf(sp);
+                const lineageText = formatLineageText(node);
+                const refKey = familyId ? `${familyId}::${sp.key}` : null;
+                const isPulsed = refKey != null && pulsedTileKey === refKey;
+
+                return (
+                  <div
+                    key={sp.key}
+                    ref={(el) => {
+                      if (!refKey) return;
+                      if (el) tileRefs.current.set(refKey, el);
+                      else tileRefs.current.delete(refKey);
+                    }}
+                    style={{
+                      border: isPulsed
+                        ? '2px solid var(--acc)'
+                        : node?.isLead
+                        ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))'
+                        : '1px solid var(--line)',
+                      boxShadow: isPulsed
+                        ? '0 0 0 4px color-mix(in srgb, var(--acc) 22%, transparent)'
+                        : undefined,
                       borderRadius: '12px',
                       padding: '12px 14px',
                       background: 'var(--panel)',
@@ -1522,9 +2392,9 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       flexDirection: 'column',
                       gap: '10px',
                       minWidth: 0,
+                      transition: 'border-color 0.18s ease, box-shadow 0.25s ease',
                     }}
                   >
-                    {/* Slim Top Strip */}
                     <div
                       style={{
                         display: 'flex',
@@ -1558,7 +2428,9 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                           </span>
                         )}
                         <span style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-                          {sp.status === 'sink' ? 'Stable' : 'Equil.'}
+                          {sp.status === 'sink' ? 'Stable' : 'Equil.'} · L {sp.likelihood.toFixed(2)} · P {sp.persistence.toFixed(2)}
+                          {sp.reversibleEnd ? ' · reversible' : ''}
+                          {sp.tautomerForms > 1 ? ` · ${sp.tautomerForms} tautomer forms` : ''}
                         </span>
                       </div>
 
@@ -1604,7 +2476,6 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       </div>
                     )}
 
-                    {/* Large Hero 2D Chemical Structure */}
                     <div
                       style={{
                         display: 'flex',
@@ -1621,10 +2492,10 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                         name={`${stoichLabel || 'Product'} (${sp.formula})`}
                         width={310}
                         height={196}
+                        highlightBonds={getHighlightsFor(sp)}
                       />
                     </div>
 
-                    {/* Compact 4-Column Quantitative Strip */}
                     <div
                       style={{
                         display: 'grid',
@@ -1661,7 +2532,6 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       </div>
                     </div>
 
-                    {/* Compact Pathway & Trail Toggle */}
                     <div
                       style={{
                         display: 'flex',
@@ -1688,6 +2558,16 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                     {node && node.alsoViaLabels.length > 0 && (
                       <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
                         Convergent: also reached via {node.alsoViaLabels.join(', ')}
+                      </div>
+                    )}
+
+                    {sp.lossIons && sp.lossIons.length > 0 && (
+                      <div
+                        className="mono"
+                        style={{ fontSize: '11px', color: 'var(--fg2)' }}
+                        title={sp.lossIons.map((l) => `${l.label}: ${l.note}`).join(' | ')}
+                      >
+                        In-source: {sp.lossIons.map((l) => `${l.label} ${l.mz.toFixed(4)}`).join(' · ')}
                       </div>
                     )}
 
@@ -1737,248 +2617,182 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                 );
               };
 
-              const renderListRow = (sp: PredictedSpecies, rankNum: number, node?: PathwaySpeciesNode) => {
-                const tc = tierColor(sp.tier);
-                const isOpen = Boolean(expandedTrails[sp.key]);
-                const stoichLabel = substrates
-                  .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
-                  .filter(Boolean)
-                  .join(' + ');
-                const lineageText = formatLineageText(node);
+              // 1. LC-MS TABLE + STICKY STRUCTURE INSPECTOR (Zero page scroll!)
+              if (viewLayout === 'table') {
+                const activeKey =
+                  selectedTableKey && filteredSpecies.some((s) => s.key === selectedTableKey)
+                    ? selectedTableKey
+                    : filteredSpecies[0].key;
+                const activeSp = filteredSpecies.find((s) => s.key === activeKey) || filteredSpecies[0];
+                const activeRank = rankLookup.get(activeSp.key) ?? 1;
+                const activeNode = families
+                  .flatMap((f) => f.nodes)
+                  .find((n) => n.species.key === activeSp.key);
 
                 return (
                   <div
-                    key={sp.key}
                     style={{
-                      border: node?.isLead ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))' : '1px solid var(--line)',
-                      borderRadius: '10px',
-                      padding: '12px 14px',
-                      background: 'var(--panel)',
                       display: 'grid',
-                      gridTemplateColumns: 'minmax(240px, 268px) minmax(0, 1fr)',
-                      gap: '16px',
-                      alignItems: 'center',
-                      marginLeft: node && node.depth > 0 ? `${Math.min(node.depth, 3) * 14}px` : undefined,
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))',
+                      gap: '14px',
+                      alignItems: 'start',
                     }}
                   >
-                    {/* Left: Larger 2D Structure */}
-                    <ChemicalStructure
-                      smiles={sp.smiles}
-                      name={`${stoichLabel || 'Product'} (${sp.formula})`}
-                      width={260}
-                      height={175}
-                    />
+                    {/* Left: Compact Scrollable Peak Table */}
+                    <div
+                      style={{
+                        border: '1px solid var(--line)',
+                        borderRadius: '10px',
+                        overflow: 'auto',
+                        maxHeight: '560px',
+                        background: 'var(--bg)',
+                      }}
+                    >
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                        <thead
+                          style={{
+                            position: 'sticky',
+                            top: 0,
+                            background: 'var(--soft)',
+                            zIndex: 1,
+                            borderBottom: '1px solid var(--line)',
+                          }}
+                        >
+                          <tr style={{ textAlign: 'left', color: 'var(--mut)', fontSize: '11px' }}>
+                            <th style={{ padding: '8px 10px' }}>#</th>
+                            <th style={{ padding: '8px 8px' }}>Score (L·P)</th>
+                            <th style={{ padding: '8px 8px' }}>[M+H]⁺</th>
+                            <th style={{ padding: '8px 8px' }}>Formula</th>
+                            <th style={{ padding: '8px 8px' }}>Pathway / Route</th>
+                            <th style={{ padding: '8px 10px' }}>State</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filteredSpecies.map((sp) => {
+                            const rankNum = rankLookup.get(sp.key) ?? 1;
+                            const tc = tierColor(sp.tier);
+                            const sel = sp.key === activeSp.key;
+                            const lossHint = sp.lossIons?.[0]
+                              ? `${sp.lossIons[0].label} ${sp.lossIons[0].mz.toFixed(2)}`
+                              : '';
 
-                    {/* Right: Masses, Score, Pathway */}
-                    <div style={{ minWidth: 0 }}>
+                            return (
+                              <tr
+                                key={sp.key}
+                                onClick={() => setSelectedTableKey(sp.key)}
+                                style={{
+                                  cursor: 'pointer',
+                                  borderBottom: '1px solid var(--line2)',
+                                  background: sel
+                                    ? 'color-mix(in srgb, var(--acc) 10%, var(--panel))'
+                                    : 'transparent',
+                                }}
+                              >
+                                <td className="mono" style={{ padding: '7px 10px', fontWeight: 700 }}>
+                                  #{rankNum}
+                                </td>
+                                <td style={{ padding: '7px 8px', whiteSpace: 'nowrap' }}>
+                                  <span
+                                    className="mono"
+                                    style={{
+                                      fontSize: '11px',
+                                      fontWeight: 700,
+                                      padding: '1px 6px',
+                                      borderRadius: '5px',
+                                      color: tc.fg,
+                                      background: tc.bg,
+                                      border: `1px solid ${tc.bd}`,
+                                    }}
+                                  >
+                                    {sp.score.toFixed(2)} · {sp.tier}
+                                  </span>
+                                  <span className="mono" style={{ fontSize: '10.5px', color: 'var(--mut)', marginLeft: '5px' }}>
+                                    {sp.likelihood.toFixed(2)}/{sp.persistence.toFixed(2)}
+                                  </span>
+                                </td>
+                                <td className="mono" style={{ padding: '7px 8px', fontWeight: 700, color: 'var(--acc)' }}>
+                                  {sp.mhPlus.toFixed(4)}
+                                  {lossHint && (
+                                    <div style={{ fontSize: '10px', color: 'var(--mut)', fontWeight: 400 }}>
+                                      {lossHint}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="mono" style={{ padding: '7px 8px' }}>
+                                  {sp.formula}
+                                  {stoichOf(sp) && (
+                                    <div style={{ fontSize: '10px', color: 'var(--mut)' }}>{stoichOf(sp)}</div>
+                                  )}
+                                </td>
+                                <td className="mono" style={{ padding: '7px 8px', fontSize: '11px', color: 'var(--fg2)' }}>
+                                  {sp.mechanismSummary}
+                                </td>
+                                <td style={{ padding: '7px 10px', fontSize: '11px', color: 'var(--mut)' }}>
+                                  {sp.status === 'sink' ? 'Stable' : 'Equil.'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Right: Sticky Structure & Mechanism Inspector */}
+                    <div style={{ position: 'sticky', top: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                       <div
                         style={{
                           display: 'flex',
-                          justifyContent: 'space-between',
                           alignItems: 'center',
-                          flexWrap: 'wrap',
-                          gap: '8px',
-                          marginBottom: lineageText ? '4px' : '8px',
-                        }}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                          <span className="mono" style={{ fontWeight: 700, fontSize: '13.5px' }}>
-                            #{rankNum}
-                          </span>
-                          <span
-                            className="mono"
-                            style={{
-                              fontSize: '12px',
-                              fontWeight: 700,
-                              padding: '2px 8px',
-                              borderRadius: '6px',
-                              color: tc.fg,
-                              background: tc.bg,
-                              border: `1px solid ${tc.bd}`,
-                            }}
-                          >
-                            {sp.score.toFixed(2)} · {sp.tier}
-                          </span>
-                          <span style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                            {sp.status === 'sink' ? 'Stable Product' : 'Equilibrium'}
-                          </span>
-                          {stoichLabel && (
-                            <span className="mono" style={{ fontSize: '12px', color: 'var(--mut)' }}>
-                              · {stoichLabel}
-                            </span>
-                          )}
-                          <span className="mono" style={{ fontSize: '12px', color: 'var(--fg2)' }}>
-                            · {sp.formula}
-                          </span>
-                        </div>
-
-                        <div style={{ display: 'flex', gap: '6px' }}>
-                          <button
-                            type="button"
-                            className="btn sm"
-                            style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
-                            onClick={() => {
-                              navigator.clipboard.writeText(sp.smiles);
-                              toast('Copied product SMILES.');
-                            }}
-                            title="Copy canonical SMILES"
-                          >
-                            <Copy size={11} />
-                            <span style={{ marginLeft: '4px' }}>SMILES</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="btn sm"
-                            style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
-                            onClick={() => {
-                              navigator.clipboard.writeText(sp.mhPlus.toFixed(4));
-                              toast(`Copied [M+H]+ = ${sp.mhPlus.toFixed(4)}`);
-                            }}
-                            title="Copy [M+H]+ exact mass"
-                          >
-                            Copy [M+H]⁺
-                          </button>
-                        </div>
-                      </div>
-
-                      {lineageText && (
-                        <div
-                          className="mono"
-                          style={{
-                            fontSize: '11.5px',
-                            fontWeight: node?.isLead ? 700 : 500,
-                            color: node?.isLead ? 'var(--acc)' : 'var(--fg2)',
-                            marginBottom: '8px',
-                          }}
-                        >
-                          {lineageText}
-                        </div>
-                      )}
-
-                      {/* Tabular LC-MS & Chromatography Metrics */}
-                      <div
-                        style={{
-                          display: 'grid',
-                          gridTemplateColumns: 'repeat(auto-fit, minmax(95px, 1fr))',
-                          gap: '8px',
-                          padding: '8px 10px',
-                          borderRadius: '7px',
+                          justifyContent: 'center',
                           background: 'var(--soft)',
-                          marginBottom: '8px',
+                          borderRadius: '10px',
+                          border: '1px solid var(--line)',
+                          padding: '10px',
+                          minHeight: '220px',
                         }}
                       >
-                        <div>
-                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>Exact Mass</div>
-                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                            {sp.exactMass.toFixed(4)}
-                          </div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+H]⁺</div>
-                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--acc)' }}>
-                            {sp.mhPlus.toFixed(4)}
-                          </div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+Na]⁺</div>
-                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                            {sp.mNaPlus.toFixed(4)}
-                          </div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M−H]⁻</div>
-                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                            {sp.mHMinus.toFixed(4)}
-                          </div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>cLogP / TPSA</div>
-                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                            {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)} Å²
-                          </div>
-                        </div>
+                        <ChemicalStructure
+                          smiles={activeSp.smiles}
+                          name={`${stoichOf(activeSp) || 'Product'} (${activeSp.formula})`}
+                          width={340}
+                          height={210}
+                          highlightBonds={getHighlightsFor(activeSp)}
+                        />
                       </div>
-
-                      {/* Mechanism Summary & Expandable Steps */}
-                      <div
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: '8px',
-                          flexWrap: 'wrap',
-                        }}
-                      >
-                        <div style={{ fontSize: '12px', color: 'var(--fg2)' }}>
-                          <span className="mono" style={{ fontWeight: 600 }}>
-                            {sp.mechanismSummary}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          className="btn sm"
-                          style={{ height: '24px', fontSize: '11px', padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                          onClick={() => toggleTrail(sp.key)}
-                        >
-                          {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                          <span>Steps ({sp.stepsCount})</span>
-                        </button>
-                      </div>
-
-                      {node && node.alsoViaLabels.length > 0 && (
-                        <div style={{ marginTop: '6px', fontSize: '11.5px', color: 'var(--mut)' }}>
-                          Convergent: also reached via {node.alsoViaLabels.join(', ')}
-                        </div>
-                      )}
-
-                      {sp.alerts.length > 0 && (
-                        <div style={{ marginTop: '6px', fontSize: '11.5px', color: 'var(--warn)' }}>
-                          {sp.alerts.map((a) => a.message).join(' · ')}
-                        </div>
-                      )}
-
-                      {isOpen && (
-                        <div
-                          style={{
-                            marginTop: '8px',
-                            padding: '8px 10px',
-                            background: 'var(--bg)',
-                            borderRadius: '6px',
-                            border: '1px solid var(--line2)',
-                            fontSize: '11.5px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '5px',
-                          }}
-                        >
-                          {sp.bestChain.map((st, sIdx) => (
-                            <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
-                              <span>
-                                <b className="mono">{sIdx + 1}. {st.stepLabel}</b> — {st.description}
-                                {st.releasedFragment ? ` (releases ${st.releasedFragment})` : ''}
-                                {st.releasedGas ? ` (releases ${st.releasedGas})` : ''}
-                              </span>
-                              <span className="mono" style={{ color: 'var(--mut)' }}>
-                                w={st.stepWeight.toFixed(2)} · pH×{st.conditionFactor.toFixed(2)} · T×{st.tempFactor.toFixed(2)}
-                                {st.ringFactor > 1.05 ? ` · ring×${st.ringFactor.toFixed(2)}` : ''}
-                              </span>
-                            </div>
-                          ))}
-                          {sp.alternativeChains.length > 0 && (
-                            <div style={{ color: 'var(--mut)', paddingTop: '4px', borderTop: '1px dashed var(--line)' }}>
-                              Alternative route{sp.alternativeChains.length > 1 ? 's' : ''}:{' '}
-                              {sp.alternativeChains.map((ac) => ac.map((x) => x.stepLabel).join(' → ')).join(' | ')}
-                            </div>
-                          )}
-                        </div>
-                      )}
+                      {renderFullInspector(activeSp, activeRank, activeNode)}
                     </div>
                   </div>
                 );
-              };
+              }
 
+              // 2. FLAT BY CONFIDENCE IN CASCADE OR CARDS
               if (groupMode === 'score') {
-                return viewLayout === 'grid' ? (
+                if (viewLayout === 'flow') {
+                  const selScoreKey =
+                    inspectedByFamily['__flat__'] &&
+                    filteredSpecies.some((s) => s.key === inspectedByFamily['__flat__'])
+                      ? inspectedByFamily['__flat__']!
+                      : null;
+                  const selSp = selScoreKey ? filteredSpecies.find((s) => s.key === selScoreKey) || null : null;
+
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(276px, 1fr))',
+                          gap: '12px',
+                        }}
+                      >
+                        {filteredSpecies.map((sp) =>
+                          renderCascadeTile(sp, rankLookup.get(sp.key) ?? 1, '__flat__')
+                        )}
+                      </div>
+                      {selSp && renderFullInspector(selSp, rankLookup.get(selSp.key) ?? 1)}
+                    </div>
+                  );
+                }
+                return (
                   <div
                     style={{
                       display: 'grid',
@@ -1986,20 +2800,20 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       gap: '14px',
                     }}
                   >
-                    {species.map((sp, idx) => renderGridCard(sp, idx + 1))}
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    {species.map((sp, idx) => renderListRow(sp, idx + 1))}
+                    {filteredSpecies.map((sp) => renderGridCard(sp, rankLookup.get(sp.key) ?? 1))}
                   </div>
                 );
               }
 
+              // 3. BY PATHWAY (CAUSAL CASCADE ROUTES INSIDE COLLAPSIBLE PATHWAY ACCORDIONS)
               return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
-                  {families.map((fam) => {
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  {families.map((fam, famIdx) => {
                     const famTc = tierColor(fam.peakTier);
-                    const showMinor = Boolean(expandedMinorFamilies[fam.id]);
+                    const open = isFamilyOpen(fam, famIdx);
+                    const showMinor = Boolean(expandedMinorFamilies[fam.id]) || fam.primaryRoutes.length === 0;
+                    const showAllSideRoutes =
+                      Boolean(expandedSideRoutes[fam.id]) || Boolean(massQuery.trim()) || tierFilter !== 'all';
                     const extraCodes = fam.allSubstrateCodes.filter(
                       (c) => !fam.entrySubstrateCodes.includes(c)
                     );
@@ -2007,66 +2821,90 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       fam.entrySubstrateCodes.join(' + ') +
                       (extraCodes.length > 0 ? ` → +${extraCodes.join(' + ')}` : '');
                     const minorPeak = fam.minorNodes.reduce((mx, n) => Math.max(mx, n.species.score), 0);
+                    const inspectedKey = inspectedByFamily[fam.id] || null;
+                    const inspectedMinorNode = inspectedKey
+                      ? fam.minorNodes.find((n) => n.species.key === inspectedKey) || null
+                      : null;
+
+                    const allRoutes = fam.primaryRoutes;
+                    const visibleRoutes = showAllSideRoutes
+                      ? allRoutes
+                      : allRoutes.filter(
+                          (r, rIdx) =>
+                            r.isLeadRoute ||
+                            r.peakTier === 'High' ||
+                            r.peakTier === 'Medium' ||
+                            rIdx < 3
+                        );
+                    const hiddenRoutes = showAllSideRoutes
+                      ? []
+                      : allRoutes.filter((r) => !visibleRoutes.includes(r));
+                    const hiddenPeak = hiddenRoutes.reduce((mx, r) => Math.max(mx, r.peakScore), 0);
+                    const hasMultiRoutes = allRoutes.length > 1;
 
                     return (
                       <section
                         key={fam.id}
                         style={{
                           border: '1px solid var(--line)',
-                          borderRadius: '12px',
+                          borderRadius: '11px',
                           background: 'var(--bg)',
-                          padding: '14px 16px',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '12px',
+                          overflow: 'hidden',
                         }}
                       >
-                        {/* Pathway Family Header (Ordered Descending by Peak Score) */}
-                        <div
+                        {/* Clickable 1-Line Pathway Accordion Header */}
+                        <button
+                          type="button"
+                          onClick={() => toggleFamilyOpen(fam, famIdx)}
                           style={{
+                            width: '100%',
+                            border: 'none',
+                            background: open ? 'var(--panel)' : 'var(--bg)',
+                            borderBottom: open ? '1px solid var(--line2)' : 'none',
+                            padding: '10px 14px',
                             display: 'flex',
                             justifyContent: 'space-between',
                             alignItems: 'center',
                             gap: '10px',
                             flexWrap: 'wrap',
-                            paddingBottom: '10px',
-                            borderBottom: '1px solid var(--line2)',
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                            color: 'inherit',
                           }}
                         >
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                              <span style={{ fontWeight: 700, fontSize: '14px', color: 'var(--fg)' }}>
-                                Pathway {fam.pathwayNumber}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', minWidth: 0 }}>
+                            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                            <span style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--fg)' }}>
+                              Pathway {fam.pathwayNumber}
+                            </span>
+                            <span style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--fg2)' }}>
+                              {fam.entryStepLabel} — {fam.title}
+                            </span>
+                            {substrateRoute && (
+                              <span
+                                className="mono"
+                                style={{
+                                  fontSize: '11px',
+                                  fontWeight: 600,
+                                  color: 'var(--acc)',
+                                  padding: '1px 6px',
+                                  borderRadius: '5px',
+                                  background: 'var(--soft)',
+                                  border: '1px solid var(--line2)',
+                                }}
+                              >
+                                {substrateRoute}
                               </span>
-                              <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--fg2)' }}>
-                                {fam.entryStepLabel} — {fam.title}
-                              </span>
-                              {substrateRoute && (
-                                <span
-                                  className="mono"
-                                  style={{
-                                    fontSize: '11.5px',
-                                    fontWeight: 600,
-                                    color: 'var(--acc)',
-                                    padding: '1px 7px',
-                                    borderRadius: '5px',
-                                    background: 'var(--soft)',
-                                    border: '1px solid var(--line2)',
-                                  }}
-                                >
-                                  {substrateRoute}
-                                </span>
-                              )}
-                            </div>
+                            )}
                           </div>
 
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                             <span
                               className="mono"
                               style={{
-                                fontSize: '11.5px',
+                                fontSize: '11px',
                                 fontWeight: 700,
-                                padding: '2px 8px',
+                                padding: '2px 7px',
                                 borderRadius: '6px',
                                 color: famTc.fg,
                                 background: famTc.bg,
@@ -2076,72 +2914,344 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                               Peak {fam.peakScore.toFixed(2)} · {fam.peakTier}
                             </span>
                             <span className="mono" style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-                              Lead #{fam.leadGlobalRank} · [M+H]⁺ {fam.leadSpecies.mhPlus.toFixed(4)} · {fam.nodes.length}{' '}
-                              {fam.nodes.length === 1 ? 'species' : 'species'}
+                              Lead #{fam.leadGlobalRank} · [M+H]⁺ {fam.leadSpecies.mhPlus.toFixed(4)} ·{' '}
+                              {hasMultiRoutes ? `${allRoutes.length} routes · ` : ''}
+                              {fam.nodes.length} species
                             </span>
                           </div>
-                        </div>
+                        </button>
 
-                        {/* Primary Pathway Members */}
-                        {viewLayout === 'grid' ? (
-                          <div
-                            style={{
-                              display: 'grid',
-                              gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
-                              gap: '12px',
-                            }}
-                          >
-                            {fam.primaryNodes.map((n) => renderGridCard(n.species, n.globalRank, n))}
-                          </div>
-                        ) : (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                            {fam.primaryNodes.map((n) => renderListRow(n.species, n.globalRank, n))}
-                          </div>
-                        )}
+                        {open && (
+                          <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                            {viewLayout === 'flow' && visibleRoutes.length > 0 && (
+                              <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                                {hasMultiRoutes
+                                  ? 'Each row groups consecutive products along one cascade route; click any tile for full LC-MS ions & step weights.'
+                                  : 'Click any tile below for full LC-MS ions & step weights.'}
+                              </div>
+                            )}
 
-                        {/* Collapsible Minor / Low-Confidence Offshoots */}
-                        {fam.minorNodes.length > 0 && (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                            <div>
-                              <button
-                                type="button"
-                                className="btn sm"
-                                style={{
-                                  height: '26px',
-                                  fontSize: '11.5px',
-                                  padding: '0 10px',
-                                  display: 'inline-flex',
-                                  alignItems: 'center',
-                                  gap: '5px',
-                                  color: 'var(--fg2)',
-                                }}
-                                onClick={() => toggleMinorFamily(fam.id)}
-                              >
-                                {showMinor ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                                <span>
-                                  {showMinor
-                                    ? `Hide ${fam.minorNodes.length} lower-confidence branch${fam.minorNodes.length > 1 ? 'es' : ''}`
-                                    : `+ Show ${fam.minorNodes.length} lower-confidence branch${fam.minorNodes.length > 1 ? 'es' : ''} (max ${minorPeak.toFixed(2)})`}
-                                </span>
-                              </button>
-                            </div>
+                            {visibleRoutes.map((route) => {
+                              const rTc = tierColor(route.peakTier);
+                              const inspectedInRoute = inspectedKey
+                                ? route.nodes.find((n) => n.species.key === inspectedKey) || null
+                                : null;
 
-                            {showMinor &&
-                              (viewLayout === 'grid' ? (
+                              const routeContent =
+                                viewLayout === 'flow' ? (
+                                  <>
+                                    <div
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'stretch',
+                                        gap: '8px',
+                                        overflowX: 'auto',
+                                        paddingBottom: '4px',
+                                      }}
+                                    >
+                                      {route.branchFromRank != null && (
+                                        <div
+                                          style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '6px',
+                                            flexShrink: 0,
+                                          }}
+                                        >
+                                          <button
+                                            type="button"
+                                            className="btn sm"
+                                            title={
+                                              route.branchFromFormula
+                                                ? `Scroll to #${route.branchFromRank} (${route.branchFromFormula}) and inspect its structure`
+                                                : `Scroll to #${route.branchFromRank}`
+                                            }
+                                            onClick={() => jumpToBranchParent(fam.id, route.branchFromKey)}
+                                            style={{
+                                              height: 'auto',
+                                              padding: '6px 9px',
+                                              fontSize: '11px',
+                                              color: 'var(--fg2)',
+                                              background: 'var(--soft)',
+                                              borderColor: 'var(--line)',
+                                            }}
+                                          >
+                                            <span className="mono">
+                                              ↳ from #{route.branchFromRank}
+                                              {route.branchFromFormula ? ` (${route.branchFromFormula})` : ''}
+                                            </span>
+                                          </button>
+                                          <ArrowRight size={14} style={{ color: 'var(--mut)' }} />
+                                        </div>
+                                      )}
+                                      {route.nodes.map((n, nIdx) => (
+                                        <React.Fragment key={n.species.key}>
+                                          {nIdx > 0 && (
+                                            <div
+                                              aria-hidden="true"
+                                              style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                color: 'var(--mut)',
+                                                flexShrink: 0,
+                                              }}
+                                            >
+                                              <ArrowRight size={14} />
+                                            </div>
+                                          )}
+                                          {renderCascadeTile(n.species, n.globalRank, fam.id, n)}
+                                        </React.Fragment>
+                                      ))}
+                                    </div>
+
+                                    {inspectedInRoute &&
+                                      renderFullInspector(
+                                        inspectedInRoute.species,
+                                        inspectedInRoute.globalRank,
+                                        inspectedInRoute
+                                      )}
+                                  </>
+                                ) : (
+                                  <div
+                                    style={{
+                                      display: 'grid',
+                                      gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
+                                      gap: '12px',
+                                    }}
+                                  >
+                                    {route.nodes.map((n) => renderGridCard(n.species, n.globalRank, n, fam.id))}
+                                  </div>
+                                );
+
+                              if (!hasMultiRoutes) {
+                                return (
+                                  <div
+                                    key={route.id}
+                                    style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}
+                                  >
+                                    {routeContent}
+                                  </div>
+                                );
+                              }
+
+                              return (
                                 <div
+                                  key={route.id}
                                   style={{
-                                    display: 'grid',
-                                    gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
-                                    gap: '12px',
+                                    border: route.isLeadRoute
+                                      ? '1px solid color-mix(in srgb, var(--acc) 35%, var(--line))'
+                                      : '1px solid var(--line2)',
+                                    borderRadius: '9px',
+                                    padding: '10px 12px',
+                                    background: 'color-mix(in srgb, var(--panel) 65%, var(--bg))',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '8px',
                                   }}
                                 >
-                                  {fam.minorNodes.map((n) => renderGridCard(n.species, n.globalRank, n))}
+                                  <div
+                                    style={{
+                                      display: 'flex',
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      gap: '8px',
+                                      flexWrap: 'wrap',
+                                    }}
+                                  >
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap' }}>
+                                      <span
+                                        className="mono"
+                                        style={{
+                                          fontSize: '11.5px',
+                                          fontWeight: 700,
+                                          color: route.isLeadRoute ? 'var(--acc)' : 'var(--fg)',
+                                        }}
+                                      >
+                                        {route.isLeadRoute
+                                          ? `Route ${route.routeNumber} · Lead Cascade`
+                                          : `Route ${route.routeNumber}`}
+                                      </span>
+                                      {route.branchFromRank != null && (
+                                        <button
+                                          type="button"
+                                          onClick={() => jumpToBranchParent(fam.id, route.branchFromKey)}
+                                          title={`Scroll to #${route.branchFromRank}`}
+                                          className="mono"
+                                          style={{
+                                            border: 'none',
+                                            background: 'transparent',
+                                            padding: 0,
+                                            cursor: route.branchFromKey ? 'pointer' : 'default',
+                                            fontSize: '11px',
+                                            color: 'var(--acc)',
+                                            textDecoration: 'underline',
+                                          }}
+                                        >
+                                          · diverges at #{route.branchFromRank}
+                                          {route.branchFromStepLabel ? ` (${route.branchFromStepLabel})` : ''}
+                                        </button>
+                                      )}
+                                      {route.substrateCodes.length > 0 && (
+                                        <span
+                                          className="mono"
+                                          style={{
+                                            fontSize: '10.5px',
+                                            color: 'var(--fg2)',
+                                            padding: '1px 5px',
+                                            borderRadius: '4px',
+                                            background: 'var(--soft)',
+                                          }}
+                                        >
+                                          {route.substrateCodes.join(' + ')}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                      <span
+                                        className="mono"
+                                        style={{
+                                          fontSize: '10.5px',
+                                          fontWeight: 700,
+                                          padding: '1px 6px',
+                                          borderRadius: '5px',
+                                          color: rTc.fg,
+                                          background: rTc.bg,
+                                          border: `1px solid ${rTc.bd}`,
+                                        }}
+                                      >
+                                        Peak {route.peakScore.toFixed(2)} · {route.peakTier}
+                                      </span>
+                                      <span className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                                        {route.nodes.length} product{route.nodes.length === 1 ? '' : 's'}
+                                      </span>
+                                    </div>
+                                  </div>
+
+                                  {routeContent}
                                 </div>
-                              ) : (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                                  {fam.minorNodes.map((n) => renderListRow(n.species, n.globalRank, n))}
+                              );
+                            })}
+
+                            {hiddenRoutes.length > 0 && (
+                              <div>
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{
+                                    height: '24px',
+                                    fontSize: '11px',
+                                    padding: '0 9px',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px',
+                                    color: 'var(--fg2)',
+                                  }}
+                                  onClick={() =>
+                                    setExpandedSideRoutes((prev) => ({
+                                      ...prev,
+                                      [fam.id]: !prev[fam.id],
+                                    }))
+                                  }
+                                >
+                                  <ChevronRight size={12} />
+                                  <span>
+                                    + Show {hiddenRoutes.length} lower-scoring side route
+                                    {hiddenRoutes.length > 1 ? 's' : ''} (max {hiddenPeak.toFixed(2)})
+                                  </span>
+                                </button>
+                              </div>
+                            )}
+
+                            {showAllSideRoutes && allRoutes.length > 3 && expandedSideRoutes[fam.id] && (
+                              <div>
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{
+                                    height: '24px',
+                                    fontSize: '11px',
+                                    padding: '0 9px',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px',
+                                    color: 'var(--mut)',
+                                  }}
+                                  onClick={() =>
+                                    setExpandedSideRoutes((prev) => ({
+                                      ...prev,
+                                      [fam.id]: false,
+                                    }))
+                                  }
+                                >
+                                  <ChevronDown size={12} />
+                                  <span>Collapse lower-scoring side routes</span>
+                                </button>
+                              </div>
+                            )}
+
+                            {fam.minorNodes.length > 0 && (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                <div>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{
+                                      height: '24px',
+                                      fontSize: '11px',
+                                      padding: '0 9px',
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '4px',
+                                      color: 'var(--fg2)',
+                                    }}
+                                    onClick={() => toggleMinorFamily(fam.id)}
+                                  >
+                                    {showMinor ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                    <span>
+                                      {showMinor
+                                        ? `Hide ${fam.minorNodes.length} speculative branch${fam.minorNodes.length > 1 ? 'es' : ''}`
+                                        : `+ Show ${fam.minorNodes.length} speculative branch${fam.minorNodes.length > 1 ? 'es' : ''} (max ${minorPeak.toFixed(2)})`}
+                                    </span>
+                                  </button>
                                 </div>
-                              ))}
+
+                                {showMinor &&
+                                  (viewLayout === 'flow' ? (
+                                    <>
+                                      <div
+                                        style={{
+                                          display: 'flex',
+                                          alignItems: 'stretch',
+                                          gap: '8px',
+                                          overflowX: 'auto',
+                                          paddingBottom: '4px',
+                                        }}
+                                      >
+                                        {fam.minorNodes.map((n) =>
+                                          renderCascadeTile(n.species, n.globalRank, fam.id, n)
+                                        )}
+                                      </div>
+                                      {inspectedMinorNode &&
+                                        renderFullInspector(
+                                          inspectedMinorNode.species,
+                                          inspectedMinorNode.globalRank,
+                                          inspectedMinorNode
+                                        )}
+                                    </>
+                                  ) : (
+                                    <div
+                                      style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
+                                        gap: '12px',
+                                      }}
+                                    >
+                                      {fam.minorNodes.map((n) => renderGridCard(n.species, n.globalRank, n, fam.id))}
+                                    </div>
+                                  ))}
+                              </div>
+                            )}
                           </div>
                         )}
                       </section>
@@ -2150,6 +3260,10 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                 </div>
               );
             })()
+          ) : species.length > 0 ? (
+            <div style={{ textAlign: 'center', padding: '24px', color: 'var(--mut)', fontSize: '13px' }}>
+              No products match the current filter or m/z query.
+            </div>
           ) : (
             <div style={{ textAlign: 'center', padding: '24px', color: 'var(--mut)', fontSize: '13px' }}>
               No reactive products predicted under these conditions (adjust temperature, pH/additive, or enable speculative candidates).

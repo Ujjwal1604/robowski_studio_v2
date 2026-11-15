@@ -13,11 +13,17 @@ export function robotSheetsToRun(
     : input || {};
   const normKey = (s: string) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const findSheet = (...aliases: string[]): any[][] | null => {
+    const keys = Object.keys(sh);
+    // Exact (normalized) match for any alias wins over a partial match
     for (const a of aliases) {
       const target = normKey(a);
-      const k = Object.keys(sh).find(
-        (sheetName) => normKey(sheetName) === target || normKey(sheetName).includes(target)
-      );
+      const k = keys.find((sheetName) => normKey(sheetName) === target);
+      if (k && sh[k]) return sh[k];
+    }
+    for (const a of aliases) {
+      const target = normKey(a);
+      if (target.length < 5) continue; // too short to match partially ("meta", "desc")
+      const k = keys.find((sheetName) => normKey(sheetName).includes(target));
       if (k && sh[k]) return sh[k];
     }
     return null;
@@ -90,16 +96,32 @@ export function robotSheetsToRun(
   const H = (rx[0] || []).map((x) => String(x || ''));
   const volCols = H.map((h, i) => [h, i] as [string, number])
     .filter(([h]) => h.startsWith('vol#'))
-    .map(([h, i]) => ({ key: h.slice(4), i }));
+    .map(([h, i]) => ({ key: h.slice(4).trim(), i }));
 
-  const hdr = (cc[1] || []).map((x) => (x == null ? '' : String(x)));
+  // Find the header row of the concentration sheet instead of assuming it is row 2:
+  // it is the first of the top rows that has text in 1+ cells after column A and is followed by a row
+  // whose column A is non-empty and has at least one positive number.
+  const isText = (x: any) => x != null && String(x).trim() !== '' && !Number.isFinite(Number(x));
+  let hdrRow = -1;
+  for (let i = 0; i < Math.min(6, cc.length - 1); i++) {
+    const r = cc[i] || [];
+    const nextR = cc[i + 1] || [];
+    const texts = r.slice(1).filter(isText).length;
+    const nextNums = nextR.slice(1).filter((x: any) => num(x) > 0).length;
+    if (texts >= 1 && nextR[0] != null && String(nextR[0]).trim() !== '' && nextNums >= 1) {
+      hdrRow = i;
+      break;
+    }
+  }
+  if (hdrRow < 0) hdrRow = 1; // legacy layout: title row, header row, then data
+  const hdr = (cc[hdrRow] || []).map((x) => (x == null ? '' : String(x).trim()));
   const codes = hdr.slice(1).filter((x) => x);
   if (!codes.length) throw new Error('Could not read the reagent names from stock_solution_concentration.');
 
   const concOf: Record<string, number> = {};
-  for (const row of cc.slice(2)) {
+  for (const row of cc.slice(hdrRow + 1)) {
     if (!row || row[0] == null) continue;
-    const nm = String(row[0]);
+    const nm = String(row[0]).trim();
     hdr.forEach((h, j) => {
       if (j > 0 && h && num(row[j]) > 0) concOf[nm] = num(row[j]);
     });
@@ -130,7 +152,7 @@ export function robotSheetsToRun(
   const sol: Record<string, any> = {};
   for (const r of ss.slice(1)) {
     if (r && r[0] != null) {
-      sol[String(r[0])] = {
+      sol[String(r[0]).trim()] = {
         plate: num(r[1]),
         pos: num(r[2]),
         solvent: canonicalSolvent(r[3]),
@@ -158,11 +180,15 @@ export function robotSheetsToRun(
   }
 
   // Detect mode: 'triplet' | 'equivalence' | 'concentration'
+  // Order of trust: explicit workbook/saved mode > description text > plate layout > numbers.
   let detectedMode: 'concentration' | 'equivalence' | 'triplet' = 'concentration';
+  let modeSource: 'workbook' | 'description' | 'layout' | 'numbers' | 'default' = 'default';
   if (metaObj['mode'] && ['concentration', 'equivalence', 'triplet'].includes(metaObj['mode'])) {
     detectedMode = metaObj['mode'] as any;
+    modeSource = 'workbook';
   } else if (savedState?.mode) {
     detectedMode = savedState.mode;
+    modeSource = 'workbook';
   } else if (desc && desc.length > 1) {
     const textAll = desc
       .slice(1)
@@ -177,8 +203,25 @@ export function robotSheetsToRun(
       /plate \d+, well \d+/i.test(textAll)
     ) {
       detectedMode = 'triplet';
+      modeSource = 'description';
     } else if (/\beq \(|\b\d+(\.\d+)?\s*eq\b/i.test(textAll)) {
       detectedMode = 'equivalence';
+      modeSource = 'description';
+    }
+  }
+
+  // Plate layout: a triplet plate is a whole number of 54-well plates in which some wells get no reagent
+  // (blank, solvent only or nothing at all). Normal concentration/equivalence runs never contain such wells.
+  if (modeSource === 'default') {
+    const dataRows = rx.slice(1).filter((row) => row && !row.every((x) => x == null || String(x).trim() === ''));
+    let emptyWells = 0;
+    for (const row of dataRows) {
+      const nonSolvent = volCols.filter((v) => v.key !== 'solvent').reduce((a, v) => a + num(row[v.i]), 0);
+      if (!(nonSolvent > 0)) emptyWells++;
+    }
+    if (dataRows.length > 0 && dataRows.length % 54 === 0 && emptyWells > 0 && emptyWells < dataRows.length) {
+      detectedMode = 'triplet';
+      modeSource = 'layout';
     }
   }
 
@@ -251,13 +294,85 @@ export function robotSheetsToRun(
     }
   });
 
+  // Equivalence runs keep the first reagent at one fixed concentration while the others vary around it.
+  // The sheets do not say so, so when nothing else decided the mode, look at the numbers.
+  if (modeSource === 'default' && order.length >= 2) {
+    const active = rows.filter((_, i) => !blankRows.has(i));
+    if (active.length >= 3) {
+      const first = active.map((r) => r[0]);
+      const fixed = first[0] > 0 && first.every((x) => Math.abs(x - first[0]) <= 1e-6 * first[0]);
+      const othersVary = order.slice(1).some((_, k) => new Set(active.map((r) => r[k + 1])).size > 1);
+      if (fixed && othersVary) {
+        detectedMode = 'equivalence';
+        modeSource = 'numbers';
+      }
+    }
+  }
+
+  // Names and structures from the description sheet (substrate_code / substrate_IUPAC_names / substrate_smiles).
+  const infoByCode: Record<string, { name?: string; smiles?: string }> = {};
+  if (desc && desc.length > 1) {
+    const dh = (desc[0] || []).map((x: any) => normKey(String(x || '')));
+    const cCode = dh.indexOf('substratecode');
+    const cName = dh.indexOf('substrateiupacnames');
+    const cSmi = dh.indexOf('substratesmiles');
+    const split = (v: any) =>
+      String(v ?? '')
+        .split(';')
+        .map((x) => x.trim());
+    if (cCode >= 0) {
+      for (const r of desc.slice(1)) {
+        if (!r) continue;
+        const cs = split(r[cCode]);
+        const ns = cName >= 0 ? split(r[cName]) : [];
+        const ms = cSmi >= 0 ? split(r[cSmi]) : [];
+        cs.forEach((c, i) => {
+          if (!c) return;
+          const info = (infoByCode[c] = infoByCode[c] || {});
+          if (!info.name && ns.length === cs.length && ns[i] && ns[i] !== c) info.name = ns[i];
+          if (!info.smiles && ms.length === cs.length && ms[i]) info.smiles = ms[i];
+        });
+      }
+    }
+  }
+
+  // Triplet labels list "name conc mM; ..." in reagent order. Match them to the real concentrations to learn
+  // which reagent code carries which name. The concentrations must agree, otherwise the row is ignored.
+  const labelNameOf: Record<string, string> = {};
+  if (detectedMode === 'triplet' && desc && desc.length > 1) {
+    desc.slice(1).forEach((r, di) => {
+      const ri = srcIdx.indexOf(di);
+      if (ri < 0 || !r) return;
+      const cond = String(r[2] || '');
+      const tail = cond.split('|').pop() || '';
+      const entries = tail
+        .split(';')
+        .map((e) => /^\s*(.*\S)\s+([\d.]+)\s*mM\s*$/.exec(e))
+        .filter((m): m is RegExpExecArray => !!m);
+      const present = order.map((b, k) => ({ b, c: rows[ri][k] })).filter((x) => x.c > 0);
+      if (!entries.length || entries.length !== present.length) return;
+      const agree = entries.every((m, k) => Math.abs(num(m[2]) - present[k].c) <= 0.01 * Math.max(1, present[k].c));
+      if (!agree) return;
+      entries.forEach((m, k) => {
+        if (!labelNameOf[present[k].b]) labelNameOf[present[k].b] = m[1].trim();
+      });
+    });
+  }
+  const nameToCode: Record<string, string> = {};
+  for (const b of order) {
+    nameToCode[b] = b;
+    const nm = labelNameOf[b] || infoByCode[b]?.name;
+    if (nm && !(nm in nameToCode)) nameToCode[nm] = b;
+  }
+
   const solv = sol['solvent'] || {};
   const reactionSolvent = canonicalSolvent(solv.solvent || 'ethanol');
   const reagents = order.map((b) => {
     const key = Object.keys(sol).find((k) => k === b) || Object.keys(sol).find((k) => stockOf(k).base === b);
     return {
       code: b,
-      name: b,
+      name: labelNameOf[b] || infoByCode[b]?.name || b,
+      smiles: infoByCode[b]?.smiles || '',
       molarMass: 0,
       density: 0,
       stock: Math.round(baseStock[b] * 1e6) / 1e6,
@@ -304,9 +419,12 @@ export function robotSheetsToRun(
     ];
 
     let detectedBase = 50;
+    let baseFromData = 0;
+    const addConc: Record<string, number> = {};
 
-    desc.slice(1).forEach((r) => {
+    desc.slice(1).forEach((r, di) => {
       if (!r) return;
+      const ri = srcIdx.indexOf(di);
       const rxName = String(r[1] || '').trim();
       const cond = String(r[2] || '').trim();
 
@@ -315,7 +433,11 @@ export function robotSheetsToRun(
       let groupId = '';
       if (grpMatch && !rxName.toLowerCase().startsWith('blank')) {
         const gName = grpMatch[1].trim();
-        const members = grpMatch[2].split('+').map((m) => m.trim()).filter(Boolean);
+        const members = grpMatch[2]
+          .split(' + ')
+          .map((m) => m.trim())
+          .filter(Boolean)
+          .map((m) => nameToCode[m] || nameToCode[m.replace(/\s+/g, ' ')] || m);
         if (!groupByName[gName]) {
           groupId = Math.random().toString(36).slice(2, 8);
           const grp: TripletGroup = { id: groupId, name: gName, members };
@@ -330,7 +452,8 @@ export function robotSheetsToRun(
       const pMatch = /plate\s*(\d+)/i.exec(cond);
       const sMatch = /section\s*(\d+)/i.exec(cond);
       const rMatch = /ratio\s*([\d.:]+)/i.exec(cond);
-      const addMatch = /\+\s*([A-Za-z0-9_-]+)/.exec(cond);
+      const ratioPart = cond.split('|')[1] || '';
+      const addMatch = /\+\s*([^\s|;]+)/.exec(ratioPart);
 
       if (pMatch && sMatch) {
         const pIdx = Math.max(0, parseInt(pMatch[1], 10) - 1);
@@ -357,6 +480,16 @@ export function robotSheetsToRun(
         if (code && !adds.some((a) => a.code === code)) {
           adds.push({ code, equiv: 0.5 });
         }
+        const k = order.indexOf(code);
+        if (code && k >= 0 && ri >= 0 && rows[ri][k] > 0 && !(code in addConc)) addConc[code] = rows[ri][k];
+      }
+
+      // Base concentration from the real numbers: first member's concentration divided by its ratio number.
+      if (!baseFromData && rMatch && ri >= 0 && grpMatch) {
+        const mem = groupByName[grpMatch[1].trim()]?.members || [];
+        const k = order.indexOf(mem[0]);
+        const r0 = num(rMatch[1].split(':')[0], 0);
+        if (k >= 0 && r0 > 0 && rows[ri][k] > 0) baseFromData = Math.round((rows[ri][k] / r0) * 1e6) / 1e6;
       }
 
       // Extract concentration / base if present
@@ -369,6 +502,11 @@ export function robotSheetsToRun(
         }
       }
     });
+
+    if (baseFromData > 0) detectedBase = baseFromData;
+    for (const a of adds) {
+      if (addConc[a.code] > 0 && detectedBase > 0) a.equiv = Math.round((addConc[a.code] / detectedBase) * 1000) / 1000;
+    }
 
     triSetup = {
       base: detectedBase,
@@ -395,6 +533,7 @@ export function robotSheetsToRun(
     desc: desc || null,
     volCols: volCols.map((v) => v.key),
     mode: detectedMode,
+    modeSource,
     tri: triSetup,
     blankRows,
     savedState,

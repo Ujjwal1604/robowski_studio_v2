@@ -1183,7 +1183,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         normalizedState.id = null;
         setState(normalizedState);
         setView('setup');
-        toast(`Opened ${f.name} (${mode} mode, ${d.rows.length} wells)`);
+        toast(
+          `Opened ${f.name} (${mode} mode, ${d.rows.length} wells)` +
+            (d.modeSource === 'layout' || d.modeSource === 'numbers'
+              ? ' - mode guessed from the layout, please check it.'
+              : '')
+        );
       } catch (e: any) {
         toast('Could not read that workbook: ' + (e?.message || e));
       }

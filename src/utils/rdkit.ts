@@ -6,6 +6,15 @@
 let rdkitInstance: any = null;
 let rdkitInitPromise: Promise<any> | null = null;
 
+export function getCachedRDKitInstance(): any {
+  if (rdkitInstance) return rdkitInstance;
+  if (typeof window !== 'undefined' && (window as any).RDKit) {
+    rdkitInstance = (window as any).RDKit;
+    return rdkitInstance;
+  }
+  return null;
+}
+
 export async function getRDKitInstance(): Promise<any> {
   if (rdkitInstance) return rdkitInstance;
   if (rdkitInitPromise) return rdkitInitPromise;
@@ -133,13 +142,12 @@ export function drawSmilesWithRDKit(
 
     if (!svg) return null;
 
-    // For dark mode: turn pure black bonds (#000000) into crisp accessible slate/white (#e2e8f0),
+    // For dark mode: turn pure black bonds/labels (#000000) into crisp white (#ffffff),
     // while leaving element colors (red Oxygen #FF0000, blue Nitrogen #0000FF, yellow Sulfur, etc.) intact.
     if (isDark) {
       svg = svg
-        .replace(/stroke:#000000/g, 'stroke:#e2e8f0')
-        .replace(/stroke: #000000/g, 'stroke: #e2e8f0')
-        .replace(/fill='#000000'/g, "fill='#e2e8f0'");
+        .replace(/(stroke|fill)\s*:\s*#000000\b/gi, '$1:#ffffff')
+        .replace(/(stroke|fill)\s*=\s*(['"])#000000\2/gi, '$1=$2#ffffff$2');
     }
 
     return svg;

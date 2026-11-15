@@ -99,6 +99,24 @@ describe('Chemical Structures & SMILES Integration', () => {
       expect(svg).toContain('<svg');
       expect(svg).toContain('</svg>');
     });
+
+    // Light mode renders black carbon bonds; dark mode renders white carbon bonds while keeping heteroatom colors
+    const lightSvg = drawSmilesWithRDKit(rdkit, 'O=C1CC=CC1', {
+      width: 200,
+      height: 140,
+      isDark: false,
+    })!;
+    expect(lightSvg).toContain('#000000');
+    expect(lightSvg).not.toContain('#ffffff');
+
+    const darkSvg = drawSmilesWithRDKit(rdkit, 'O=C1CC=CC1', {
+      width: 200,
+      height: 140,
+      isDark: true,
+    })!;
+    expect(darkSvg).toContain('#ffffff');
+    expect(darkSvg).not.toMatch(/#000000/i);
+    expect(darkSvg).toMatch(/#FF0000/i);
   });
 
   it('computes molecular weight offline directly from SMILES using RDKit descriptors', async () => {

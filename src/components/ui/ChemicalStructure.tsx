@@ -1,6 +1,51 @@
 import React, { useEffect, useRef, useState } from 'react';
 import SmilesDrawer from 'smiles-drawer';
-import { getRDKitInstance, drawSmilesWithRDKit, computeMolecularWeightFromSmiles } from '../../utils/rdkit';
+import {
+  getRDKitInstance,
+  getCachedRDKitInstance,
+  drawSmilesWithRDKit,
+  computeMolecularWeightFromSmiles,
+} from '../../utils/rdkit';
+
+function getIsDarkTheme(): boolean {
+  if (typeof document === 'undefined') return false;
+  const attr = document.documentElement.getAttribute('data-theme');
+  if (attr === 'dark') return true;
+  if (attr === 'light') return false;
+  return (
+    typeof window !== 'undefined' &&
+    !!window.matchMedia &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+}
+
+function useIsDarkTheme(): boolean {
+  const [isDark, setIsDark] = useState<boolean>(getIsDarkTheme);
+
+  useEffect(() => {
+    const update = () => setIsDark(getIsDarkTheme());
+    update();
+
+    let observer: MutationObserver | null = null;
+    if (typeof MutationObserver !== 'undefined') {
+      observer = new MutationObserver(update);
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+    }
+
+    const mq = typeof window !== 'undefined' ? window.matchMedia?.('(prefers-color-scheme: dark)') : null;
+    mq?.addEventListener?.('change', update);
+
+    return () => {
+      observer?.disconnect();
+      mq?.removeEventListener?.('change', update);
+    };
+  }, []);
+
+  return isDark;
+}
 
 export interface ChemicalResolutionResult {
   smiles: string;
@@ -155,6 +200,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
   const [renderError, setRenderError] = useState(false);
   const [rdkitSvg, setRdkitSvg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const isDark = useIsDarkTheme();
 
   // Sync external smiles prop
   useEffect(() => {
@@ -196,33 +242,39 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
       return;
     }
 
-    const isDark =
-      document.documentElement.getAttribute('data-theme') === 'dark' ||
-      (window.matchMedia &&
-        window.matchMedia('(prefers-color-scheme: dark)').matches &&
-        document.documentElement.getAttribute('data-theme') !== 'light');
+    const renderWithRdkit = (rdkit: any): boolean => {
+      if (!rdkit) return false;
+      const svg = drawSmilesWithRDKit(rdkit, activeSmiles, {
+        width,
+        height,
+        isDark,
+        bondLineWidth: width >= 200 ? 2.1 : 1.8,
+        highlightBonds,
+        highlightAtoms,
+        highlightColor,
+      });
+      if (svg) {
+        const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
+        setRdkitSvg(clean);
+        setRenderError(false);
+        return true;
+      }
+      return false;
+    };
+
+    // Render immediately if RDKit WASM is already cached (avoids 1-frame stale color flash on theme toggle)
+    const cachedRdkit = getCachedRDKitInstance();
+    if (cachedRdkit && renderWithRdkit(cachedRdkit)) {
+      return () => {
+        isCancelled = true;
+      };
+    }
 
     // 1. Try RDKit WebAssembly engine first (standard Python/C++ publication layout)
     getRDKitInstance()
       .then((rdkit) => {
         if (isCancelled) return;
-        if (rdkit) {
-          const svg = drawSmilesWithRDKit(rdkit, activeSmiles, {
-            width,
-            height,
-            isDark,
-            bondLineWidth: width >= 200 ? 2.1 : 1.8,
-            highlightBonds,
-            highlightAtoms,
-            highlightColor,
-          });
-          if (svg) {
-            const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
-            setRdkitSvg(clean);
-            setRenderError(false);
-            return;
-          }
-        }
+        if (renderWithRdkit(rdkit)) return;
         renderSmilesDrawerFallback();
       })
       .catch(() => {
@@ -248,7 +300,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
           compactDrawing: true,
           themes: {
             light: {
-              C: '#14211e',
+              C: '#111827',
               O: '#dc2626',
               N: '#2563eb',
               F: '#059669',
@@ -263,7 +315,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
               BACKGROUND: 'transparent',
             },
             dark: {
-              C: '#e8f0ec',
+              C: '#ffffff',
               O: '#f87171',
               N: '#60a5fa',
               F: '#34d399',
@@ -301,7 +353,7 @@ export const ChemicalStructure: React.FC<ChemicalStructureProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [activeSmiles, width, height, highlightBonds, highlightAtoms, highlightColor]);
+  }, [activeSmiles, width, height, isDark, highlightBonds, highlightAtoms, highlightColor]);
 
   const handleManualResolve = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -731,6 +783,7 @@ const ModalEnlargedStructure: React.FC<{
 }) => {
   const modalSvgRef = useRef<SVGSVGElement | null>(null);
   const [modalRdkitSvg, setModalRdkitSvg] = useState<string | null>(null);
+  const isDark = useIsDarkTheme();
 
   useEffect(() => {
     let isCancelled = false;
@@ -739,32 +792,37 @@ const ModalEnlargedStructure: React.FC<{
       return;
     }
 
-    const isDark =
-      document.documentElement.getAttribute('data-theme') === 'dark' ||
-      (window.matchMedia &&
-        window.matchMedia('(prefers-color-scheme: dark)').matches &&
-        document.documentElement.getAttribute('data-theme') !== 'light');
+    const renderWithRdkit = (rdkit: any): boolean => {
+      if (!rdkit) return false;
+      const svg = drawSmilesWithRDKit(rdkit, smiles, {
+        width,
+        height,
+        isDark,
+        bondLineWidth: 2.0,
+        highlightBonds,
+        highlightAtoms,
+        highlightColor,
+      });
+      if (svg) {
+        const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
+        setModalRdkitSvg(clean);
+        return true;
+      }
+      return false;
+    };
+
+    const cachedRdkit = getCachedRDKitInstance();
+    if (cachedRdkit && renderWithRdkit(cachedRdkit)) {
+      return () => {
+        isCancelled = true;
+      };
+    }
 
     // Try RDKit WebAssembly engine first
     getRDKitInstance()
       .then((rdkit) => {
         if (isCancelled) return;
-        if (rdkit) {
-          const svg = drawSmilesWithRDKit(rdkit, smiles, {
-            width,
-            height,
-            isDark,
-            bondLineWidth: 2.0,
-            highlightBonds,
-            highlightAtoms,
-            highlightColor,
-          });
-          if (svg) {
-            const clean = svg.replace(/<\?xml.*?\?>/i, '').replace(/<!--.*?-->/g, '').trim();
-            setModalRdkitSvg(clean);
-            return;
-          }
-        }
+        if (renderWithRdkit(rdkit)) return;
         renderFallback();
       })
       .catch(() => {
@@ -790,7 +848,7 @@ const ModalEnlargedStructure: React.FC<{
           compactDrawing: false,
           themes: {
             light: {
-              C: '#14211e',
+              C: '#111827',
               O: '#dc2626',
               N: '#2563eb',
               F: '#059669',
@@ -805,7 +863,7 @@ const ModalEnlargedStructure: React.FC<{
               BACKGROUND: 'transparent',
             },
             dark: {
-              C: '#e8f0ec',
+              C: '#ffffff',
               O: '#f87171',
               N: '#60a5fa',
               F: '#34d399',
@@ -838,7 +896,7 @@ const ModalEnlargedStructure: React.FC<{
     return () => {
       isCancelled = true;
     };
-  }, [smiles, width, height, highlightBonds, highlightAtoms, highlightColor]);
+  }, [smiles, width, height, isDark, highlightBonds, highlightAtoms, highlightColor]);
 
   if (modalRdkitSvg) {
     return (

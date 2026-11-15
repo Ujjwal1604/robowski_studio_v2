@@ -2088,14 +2088,19 @@ export const TlcView: React.FC = () => {
                     border: 'none',
                     background: 'transparent',
                     cursor: 'pointer',
-                    color: 'var(--mut)',
+                    color: 'inherit',
+                    opacity: i === cur ? 0.82 : 0.65,
                     padding: '2px 4px',
                     fontSize: '12px',
                     lineHeight: 1,
-                    borderRadius: '3px',
+                    borderRadius: '4px',
                   }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--mut)')}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.opacity = '1';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.opacity = i === cur ? '0.82' : '0.65';
+                  }}
                 >
                   ✕
                 </button>
@@ -2132,73 +2137,47 @@ export const TlcView: React.FC = () => {
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: '8px',
+              gap: '10px',
               flexWrap: 'wrap',
-              padding: '8px 10px',
+              padding: '8px 12px',
               marginBottom: '10px',
               background: 'var(--soft)',
-              borderRadius: '8px',
+              borderRadius: '10px',
               border: '1px solid var(--line)',
             }}
           >
             <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--fg)', marginRight: '2px' }}>
               Active Plate:
             </span>
-            {Array.from({ length: selectablePlatesCount }, (_, pIdx) => {
-              const imgCount = tlcSetPlateImageCount(currentSet, pIdx);
-              const slice = getTlcPlateSlice(currentSet, pIdx);
-              const hasLanes = Boolean(slice.cfg?.lanes?.length);
-              const isActive = pIdx === plate;
-              return (
-                <button
-                  key={pIdx}
-                  type="button"
-                  onClick={() => {
-                    setPlate(pIdx);
-                    setHoverRf(null);
-                    setHoverY(null);
-                    setHoverSpot(null);
-                  }}
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    padding: '5px 12px',
-                    borderRadius: '6px',
-                    border: isActive ? '2px solid var(--acc)' : '1px solid var(--line)',
-                    background: isActive ? 'var(--acc)' : 'var(--panel)',
-                    color: isActive ? 'var(--acc-fg)' : 'var(--fg)',
-                    fontWeight: isActive ? 700 : 600,
-                    fontSize: '12px',
-                    cursor: 'pointer',
-                  }}
-                  title={`Switch to Plate ${pIdx + 1} (${imgCount} photo${imgCount === 1 ? '' : 's'}, ${hasLanes ? `${slice.cfg?.lanes.length} lanes` : 'no lanes'})`}
-                >
-                  <span>Plate {pIdx + 1}</span>
-                  <span
-                    style={{
-                      fontSize: '10px',
-                      padding: '1px 5px',
-                      borderRadius: '4px',
-                      background: isActive
-                        ? 'color-mix(in srgb, var(--acc-fg) 18%, transparent)'
-                        : imgCount > 0
-                        ? 'rgba(16, 185, 129, 0.14)'
-                        : 'rgba(148, 163, 184, 0.14)',
-                      color: isActive
-                        ? 'var(--acc-fg)'
-                        : imgCount > 0
-                        ? '#059669'
-                        : 'var(--mut)',
-                      fontWeight: 700,
+            <div className="seg" style={{ background: 'transparent', border: 'none', padding: 0 }}>
+              {Array.from({ length: selectablePlatesCount }, (_, pIdx) => {
+                const imgCount = tlcSetPlateImageCount(currentSet, pIdx);
+                const slice = getTlcPlateSlice(currentSet, pIdx);
+                const hasLanes = Boolean(slice.cfg?.lanes?.length);
+                const isActive = pIdx === plate;
+                return (
+                  <button
+                    key={pIdx}
+                    type="button"
+                    className={isActive ? 'on' : ''}
+                    style={!isActive ? { borderColor: 'var(--line)', background: 'var(--panel)' } : undefined}
+                    onClick={() => {
+                      setPlate(pIdx);
+                      setHoverRf(null);
+                      setHoverY(null);
+                      setHoverSpot(null);
                     }}
+                    title={`Switch to Plate ${pIdx + 1} (${imgCount} photo${imgCount === 1 ? '' : 's'}, ${hasLanes ? `${slice.cfg?.lanes.length} lanes` : 'no lanes'})`}
                   >
-                    {imgCount > 0 ? `${imgCount} img${imgCount === 1 ? '' : 's'}${hasLanes ? ' ✓' : ''}` : hasLanes ? 'lanes ✓' : 'empty'}
-                  </span>
-                </button>
-              );
-            })}
-            <span style={{ fontSize: '11px', color: 'var(--mut)', marginLeft: 'auto' }}>
+                    <span>Plate {pIdx + 1}</span>
+                    <span className={`seg-badge ${!isActive && imgCount > 0 ? 'ok' : ''}`}>
+                      {imgCount > 0 ? `${imgCount} img${imgCount === 1 ? '' : 's'}${hasLanes ? ' ✓' : ''}` : hasLanes ? 'lanes ✓' : 'empty'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <span style={{ fontSize: '11.5px', color: 'var(--mut)', marginLeft: 'auto' }}>
               Each plate stores its own photos, lane grid &amp; Rf data independently.
             </span>
           </div>
@@ -2229,10 +2208,14 @@ export const TlcView: React.FC = () => {
           <button
             type="button"
             className="btn sm bad"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
             onClick={() => handleRemoveSetIndex(cur)}
             title={sets.length > 1 ? `Delete "${currentSet.name}"` : 'Clear images and reset this set'}
           >
-            {sets.length > 1 ? '🗑️ Delete Set' : '🗑️ Clear Set'}
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M2.5 4.5h11M6 4.5V3h4v1.5M4.5 4.5l.7 9h5.6l.7-9" />
+            </svg>
+            {sets.length > 1 ? 'Delete Set' : 'Clear Set'}
           </button>
 
           <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
@@ -2312,38 +2295,50 @@ export const TlcView: React.FC = () => {
             className="btn"
             onClick={handleLoadDemoTlc}
             title="Generate and display sample UV 254 nm and 365 nm TLC plate images with spots and densitograms"
-            style={{ background: 'rgba(16, 185, 129, 0.15)', borderColor: '#10b981', color: '#10b981', fontWeight: 600 }}
+            style={{
+              background: 'rgba(16, 185, 129, 0.12)',
+              borderColor: 'rgba(16, 185, 129, 0.5)',
+              color: '#10b981',
+              fontWeight: 600,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+            }}
           >
-            🧪 Try Demo Plate
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M6 2v4l-3.5 6.5A1.2 1.2 0 0 0 3.6 14h8.8a1.2 1.2 0 0 0 1.1-1.5L10 6V2M4.5 2h7" />
+            </svg>
+            Try Demo Plate
           </button>
 
           <div style={{ height: '20px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
 
           {/* View Mode Switcher */}
-          <div
-            style={{
-              display: 'inline-flex',
-              background: 'var(--soft)',
-              padding: '2px',
-              borderRadius: '6px',
-              border: '1px solid var(--line)',
-            }}
-          >
+          <div className="seg sm" role="group" aria-label="TLC view mode">
             <button
               type="button"
-              className={`btn sm ${viewMode === 'grid' ? 'pri' : ''}`}
+              className={viewMode === 'grid' ? 'on' : ''}
               onClick={() => setViewMode('grid')}
-              style={{ fontSize: '11px', padding: '3px 8px' }}
             >
-              🔲 54-Well Sliced Grid
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                <rect x="2" y="2" width="5" height="5" rx="1" />
+                <rect x="9" y="2" width="5" height="5" rx="1" />
+                <rect x="2" y="9" width="5" height="5" rx="1" />
+                <rect x="9" y="9" width="5" height="5" rx="1" />
+              </svg>
+              54-Well Sliced Grid
             </button>
             <button
               type="button"
-              className={`btn sm ${viewMode === 'full-plate' ? 'pri' : ''}`}
+              className={viewMode === 'full-plate' ? 'on' : ''}
               onClick={() => setViewMode('full-plate')}
-              style={{ fontSize: '11px', padding: '3px 8px' }}
             >
-              📷 Full Plate Photo
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="2" y="3" width="12" height="10" rx="1.5" />
+                <circle cx="5.5" cy="6.5" r="1" />
+                <path d="M2.5 11.5l3-3 2.5 2.5 2.5-2 3 2.5" />
+              </svg>
+              Full Plate Photo
             </button>
           </div>
 

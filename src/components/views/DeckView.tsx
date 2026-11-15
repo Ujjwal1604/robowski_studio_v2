@@ -356,6 +356,7 @@ export const DeckView: React.FC = () => {
           <div className="fld">
             <label className="lbl">Solvent position</label>
             <select
+              className="f"
               value={run.deck.solvent_container}
               onChange={(e) =>
                 setPath('deckPlates', { ...dp, solventPos: +e.target.value })

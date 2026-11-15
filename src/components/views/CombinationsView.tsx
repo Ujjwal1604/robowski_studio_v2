@@ -238,25 +238,40 @@ export const CombinationsView: React.FC = () => {
                 className="btn sm"
                 onClick={handleCopyEln}
                 title="Copy entire reaction table formatted for Benchling / Electronic Lab Notebook"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '11px' }}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
               >
-                📋 Copy for ELN
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="5" y="2" width="6" height="2.5" rx="1" />
+                  <path d="M5 3.5H3.5A1.5 1.5 0 0 0 2 5v8.5A1.5 1.5 0 0 0 3.5 15h9a1.5 1.5 0 0 0 1.5-1.5V5A1.5 1.5 0 0 0 12.5 3.5H11" />
+                </svg>
+                Copy for ELN
               </button>
 
-              <div className="seg" role="group" aria-label="Combinations view mode">
+              <div className="seg sm" role="group" aria-label="Combinations view mode">
                 <button
                   type="button"
                   className={viewMode === 'table' ? 'on' : ''}
                   onClick={() => setViewMode('table')}
                 >
-                  ≡ Table List
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                    <line x1="2" y1="4" x2="14" y2="4" />
+                    <line x1="2" y1="8" x2="14" y2="8" />
+                    <line x1="2" y1="12" x2="14" y2="12" />
+                  </svg>
+                  Table List
                 </button>
                 <button
                   type="button"
                   className={viewMode === 'matrix' ? 'on' : ''}
                   onClick={() => setViewMode('matrix')}
                 >
-                  ▦ 2D Plate Heatmap
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                    <rect x="2" y="2" width="5" height="5" rx="1" />
+                    <rect x="9" y="2" width="5" height="5" rx="1" />
+                    <rect x="2" y="9" width="5" height="5" rx="1" />
+                    <rect x="9" y="9" width="5" height="5" rx="1" />
+                  </svg>
+                  2D Plate Heatmap
                 </button>
               </div>
             </div>
@@ -266,7 +281,7 @@ export const CombinationsView: React.FC = () => {
           <div
             style={{
               display: 'flex',
-              gap: '6px',
+              gap: '8px',
               flexWrap: 'wrap',
               alignItems: 'center',
               marginBottom: '14px',
@@ -279,77 +294,75 @@ export const CombinationsView: React.FC = () => {
                 color: 'var(--mut)',
                 textTransform: 'uppercase',
                 letterSpacing: '0.04em',
-                marginRight: '2px',
               }}
             >
               Filter:
             </span>
-            <button
-              type="button"
-              className={`btn sm ${filterMode === 'all' && !vialFocus ? 'pri' : ''}`}
-              onClick={() => {
-                setFilterMode('all');
-                setFilterBad(false);
-                setVialFocus(null);
-                setPage(0);
-              }}
-            >
-              All ({allRows.length})
-            </button>
-            <button
-              type="button"
-              className={`btn sm ${filterMode === 'diluted' ? 'pri' : ''}`}
-              onClick={() => {
-                setFilterMode('diluted');
-                setFilterBad(false);
-                setVialFocus(null);
-                setPage(0);
-              }}
-            >
-              Diluted ({dilutedN})
-            </button>
-            <button
-              type="button"
-              className={`btn sm ${filterMode === 'high_solvent' ? 'pri' : ''}`}
-              onClick={() => {
-                setFilterMode('high_solvent');
-                setFilterBad(false);
-                setVialFocus(null);
-                setPage(0);
-              }}
-            >
-              High Solvent ({highSolvN})
-            </button>
-            <button
-              type="button"
-              className={`btn sm ${filterMode === 'low_solvent' ? 'pri' : ''}`}
-              onClick={() => {
-                setFilterMode('low_solvent');
-                setFilterBad(false);
-                setVialFocus(null);
-                setPage(0);
-              }}
-            >
-              Low Solvent ({lowSolvN})
-            </button>
-            {badN > 0 && (
+            <div className="seg sm" role="group" aria-label="Condition filters">
               <button
                 type="button"
-                className={`btn sm ${filterMode === 'bad' ? 'pri' : ''}`}
-                style={{
-                  color: filterMode === 'bad' ? 'var(--acc-fg)' : 'var(--bad)',
-                  borderColor: 'var(--bad)',
-                }}
+                className={filterMode === 'all' && !vialFocus ? 'on' : ''}
                 onClick={() => {
-                  setFilterMode('bad');
-                  setFilterBad(true);
+                  setFilterMode('all');
+                  setFilterBad(false);
                   setVialFocus(null);
                   setPage(0);
                 }}
               >
-                Flagged ({badN})
+                All ({allRows.length})
               </button>
-            )}
+              <button
+                type="button"
+                className={filterMode === 'diluted' ? 'on' : ''}
+                onClick={() => {
+                  setFilterMode('diluted');
+                  setFilterBad(false);
+                  setVialFocus(null);
+                  setPage(0);
+                }}
+              >
+                Diluted ({dilutedN})
+              </button>
+              <button
+                type="button"
+                className={filterMode === 'high_solvent' ? 'on' : ''}
+                onClick={() => {
+                  setFilterMode('high_solvent');
+                  setFilterBad(false);
+                  setVialFocus(null);
+                  setPage(0);
+                }}
+              >
+                High Solvent ({highSolvN})
+              </button>
+              <button
+                type="button"
+                className={filterMode === 'low_solvent' ? 'on' : ''}
+                onClick={() => {
+                  setFilterMode('low_solvent');
+                  setFilterBad(false);
+                  setVialFocus(null);
+                  setPage(0);
+                }}
+              >
+                Low Solvent ({lowSolvN})
+              </button>
+              {badN > 0 && (
+                <button
+                  type="button"
+                  className={filterMode === 'bad' ? 'on' : ''}
+                  style={filterMode !== 'bad' ? { color: 'var(--bad)' } : undefined}
+                  onClick={() => {
+                    setFilterMode('bad');
+                    setFilterBad(true);
+                    setVialFocus(null);
+                    setPage(0);
+                  }}
+                >
+                  Flagged ({badN})
+                </button>
+              )}
+            </div>
 
             {/* Quick Well Jump Input */}
             <div

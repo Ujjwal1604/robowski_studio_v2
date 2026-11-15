@@ -1116,13 +1116,12 @@ export const ElnView: React.FC = () => {
         {/* Right Controls on Well Observations Tab */}
         {subTab === 'observations' && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', paddingBottom: '6px' }}>
-            <div className="seg" role="group" aria-label="Observation Entry Mode">
+            <div className="seg sm" role="group" aria-label="Observation Entry Mode">
               <button
                 type="button"
                 className={workspaceMode === 'matrix' ? 'on' : ''}
                 onClick={() => setWorkspaceMode('matrix')}
                 title="Visual 6×9 plate grid with keyboard shortcuts and inspector"
-                style={{ height: '30px', padding: '0 11px', fontSize: '12.5px', gap: '6px' }}
               >
                 <Grid3x3 size={13} />
                 <span>Plate Grid</span>
@@ -1132,7 +1131,6 @@ export const ElnView: React.FC = () => {
                 className={workspaceMode === 'spreadsheet' ? 'on' : ''}
                 onClick={() => setWorkspaceMode('spreadsheet')}
                 title="Editable spreadsheet table with CSV & XLSX export/import"
-                style={{ height: '30px', padding: '0 11px', fontSize: '12.5px', gap: '6px' }}
               >
                 <Table2 size={13} />
                 <span>Spreadsheet</span>
@@ -1195,13 +1193,12 @@ export const ElnView: React.FC = () => {
                   54-Well Plate
                 </span>
                 {numPlates > 1 && (
-                  <div className="seg" role="group" aria-label="Plate selection">
+                  <div className="seg sm" role="group" aria-label="Plate selection">
                     {Array.from({ length: numPlates }).map((_, i) => (
                       <button
                         key={i}
                         type="button"
                         className={activePlate === i ? 'on' : ''}
-                        style={{ height: '28px', padding: '0 10px', fontSize: '12px' }}
                         onClick={() => {
                           setActivePlate(i);
                           setBatchSelection([]);

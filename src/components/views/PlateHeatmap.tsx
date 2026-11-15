@@ -290,7 +290,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
           <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--mut)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
             Plate:
           </span>
-          <div className="seg" role="tablist">
+          <div className="seg sm" role="tablist">
             {Array.from({ length: run.plates }, (_, p) => (
               <button
                 key={p}
@@ -299,7 +299,6 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
                 aria-selected={plateIndex === p}
                 className={plateIndex === p ? 'on' : ''}
                 onClick={() => onPlateChange(p)}
-                style={{ fontSize: '12px', padding: '0 12px', height: '26px' }}
               >
                 Plate {p + 1}
               </button>
@@ -314,19 +313,10 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
           </label>
           <select
             id="heatmap-metric-select"
+            className="f sm"
             value={metric}
             onChange={(e) => onMetricChange(e.target.value)}
-            style={{
-              height: '28px',
-              fontSize: '12px',
-              padding: '0 26px 0 8px',
-              borderRadius: '6px',
-              border: '1px solid var(--line)',
-              background: 'var(--soft)',
-              color: 'var(--fg)',
-              cursor: 'pointer',
-              fontWeight: 500,
-            }}
+            style={{ cursor: 'pointer', fontWeight: 500 }}
           >
             {metricOptions.map((opt) => (
               <option key={opt.id} value={opt.id}>

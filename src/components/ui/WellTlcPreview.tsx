@@ -350,12 +350,11 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           TLC Lane #{laneIdx + 1}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-          <div className="seg" style={{ padding: '2px', borderRadius: '8px' }}>
+          <div className="seg xs">
             {hasComposite && (
               <button
                 type="button"
                 className={activeMode === 'composite' ? 'on' : ''}
-                style={{ height: '24px', padding: '0 8px', fontSize: '11px', borderRadius: '6px' }}
                 onClick={() => setSelectedMode('composite')}
               >
                 Composite
@@ -366,7 +365,6 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                 key={ch}
                 type="button"
                 className={activeMode === ch ? 'on' : ''}
-                style={{ height: '24px', padding: '0 8px', fontSize: '11px', borderRadius: '6px' }}
                 onClick={() => setSelectedMode(ch)}
               >
                 {ch === 'White' ? 'Vis' : ch}

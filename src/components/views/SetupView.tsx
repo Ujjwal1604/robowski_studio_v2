@@ -1010,22 +1010,14 @@ export const SetupView: React.FC = () => {
               </div>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginLeft: 'auto' }}>
                 {/* View Mode Segmented Switcher */}
-                <div style={{ display: 'inline-flex', background: 'var(--soft)', borderRadius: '8px', padding: '2px', border: '1px solid var(--line)' }}>
+                <div className="seg sm" role="group" aria-label="Reagent view mode">
                   <button
                     type="button"
-                    className={`btn sm ${reagentViewMode === 'cards' ? 'pri' : ''}`}
-                    style={{
-                      height: '28px',
-                      padding: '0 10px',
-                      borderRadius: '6px',
-                      border: 'none',
-                      fontSize: '12px',
-                      boxShadow: reagentViewMode === 'cards' ? 'var(--shadow-sm)' : 'none',
-                    }}
+                    className={reagentViewMode === 'cards' ? 'on' : ''}
                     onClick={() => setReagentViewMode('cards')}
                     title="Modern spacious reagent studio cards"
                   >
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '5px' }}>
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
                       <rect x="2" y="2" width="5" height="5" rx="1" />
                       <rect x="9" y="2" width="5" height="5" rx="1" />
                       <rect x="2" y="9" width="5" height="5" rx="1" />
@@ -1035,19 +1027,11 @@ export const SetupView: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    className={`btn sm ${reagentViewMode === 'table' ? 'pri' : ''}`}
-                    style={{
-                      height: '28px',
-                      padding: '0 10px',
-                      borderRadius: '6px',
-                      border: 'none',
-                      fontSize: '12px',
-                      boxShadow: reagentViewMode === 'table' ? 'var(--shadow-sm)' : 'none',
-                    }}
+                    className={reagentViewMode === 'table' ? 'on' : ''}
                     onClick={() => setReagentViewMode('table')}
                     title="Compact spreadsheet table view"
                   >
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ marginRight: '5px' }}>
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
                       <line x1="2" y1="4" x2="14" y2="4" />
                       <line x1="2" y1="8" x2="14" y2="8" />
                       <line x1="2" y1="12" x2="14" y2="12" />
@@ -2751,25 +2735,16 @@ const VialSetsCard: React.FC = () => {
   };
 
   return (
-    <div className="card" style={{ marginTop: '20px' }}>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          gap: '10px',
-          flexWrap: 'wrap',
-          marginBottom: '8px',
-        }}
-      >
+    <div className="card pad">
+      <div className="chead">
         <div>
-          <h2>Vial sets</h2>
-          <p className="sub" style={{ margin: 0 }}>
+          <div className="ct">Vial sets</div>
+          <p className="sub" style={{ margin: '4px 0 0' }}>
             Each set picks which reagents go in and their ranges. The vials of all sets are added
             together.
           </p>
         </div>
-        <button type="button" className="btn" onClick={addSet}>
+        <button type="button" className="btn sm pri" onClick={addSet}>
           Add set
         </button>
       </div>
@@ -2785,6 +2760,7 @@ const VialSetsCard: React.FC = () => {
             <div className="rhead">
               <input
                 type="text"
+                className="f"
                 value={set.name}
                 onChange={(e) => setPath(`sets.${si}.name`, e.target.value)}
                 style={{ width: '170px', height: '32px', fontWeight: 600 }}
@@ -2840,12 +2816,13 @@ const VialSetsCard: React.FC = () => {
                             <input
                               type="number"
                               step="any"
+                              className="f mono"
                               value={it[f]}
                               disabled={!it.on}
                               onChange={(e) =>
                                 setPath(`sets.${si}.items.${i}.${f}`, e.target.value)
                               }
-                              style={{ width: '84px', height: '30px' }}
+                              style={{ width: '84px', height: '32px' }}
                             />
                           </td>
                         ))}
@@ -3194,6 +3171,9 @@ const TripletPatternEditor: React.FC = () => {
                 </tbody>
               </table>
             </div>
+            <div className="tri-subpanel-foot">
+              <span>Each ratio defines one column per section.</span>
+            </div>
           </div>
 
           {/* Additives Subpanel */}
@@ -3312,6 +3292,9 @@ const TripletPatternEditor: React.FC = () => {
                 </tbody>
               </table>
             </div>
+            <div className="tri-subpanel-foot">
+              <span>Each additive defines one row per section.</span>
+            </div>
           </div>
         </div>
 
@@ -3332,7 +3315,6 @@ const TripletPatternEditor: React.FC = () => {
               className="tri-prev"
               style={{
                 gridTemplateColumns: `repeat(${g.c}, minmax(92px, 1fr))`,
-                maxWidth: `${Math.max(280, g.c * 148)}px`,
               }}
             >
               {cells}

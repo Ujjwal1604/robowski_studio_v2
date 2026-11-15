@@ -604,7 +604,8 @@ export const PredictionView: React.FC = () => {
                 onClick={() => setMode('plate')}
                 title={run && run.rows.length > 0 ? 'Predict reactions directly inside your designed HTE plate wells' : 'Configure a run on Setup first to inspect plate wells'}
               >
-                ▦ Plate &amp; Well Mode
+                <LayoutGrid size={13} />
+                <span>Plate &amp; Well Mode</span>
               </button>
               <button
                 type="button"
@@ -612,7 +613,8 @@ export const PredictionView: React.FC = () => {
                 onClick={() => setMode('sandbox')}
                 title="Test any arbitrary 1 to N substrates, salts, and conditions"
               >
-                ⚗ Any-Component Sandbox
+                <FlaskConical size={13} />
+                <span>Any-Component Sandbox</span>
               </button>
             </div>
           </div>

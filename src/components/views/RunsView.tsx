@@ -295,10 +295,14 @@ export const RunsView: React.FC = () => {
               <button
                 type="button"
                 className="btn"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                 onClick={() => archiveFileInputRef.current?.click()}
                 title="Open a self-contained .robowski experiment archive package"
               >
-                📂 Open .robowski archive
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12V4.5z" />
+                </svg>
+                Open .robowski archive
               </button>
               <button
                 type="button"

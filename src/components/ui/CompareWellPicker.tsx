@@ -87,13 +87,12 @@ export const CompareWellPicker: React.FC<CompareWellPickerProps> = ({
               Select Well
             </span>
             {platesCount > 1 && (
-              <div className="seg" style={{ padding: '2px' }}>
+              <div className="seg xs">
                 {Array.from({ length: platesCount }, (_, p) => (
                   <button
                     key={p}
                     type="button"
                     className={plateIndex === p ? 'on' : ''}
-                    style={{ height: '22px', padding: '0 8px', fontSize: '11px' }}
                     onClick={() => onChange(p, wellIndex)}
                   >
                     P{p + 1}

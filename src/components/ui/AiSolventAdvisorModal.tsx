@@ -1175,6 +1175,16 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     {spot.tailingReason}
                                   </div>
                                 )}
+                                {spot.uvActive === false && (
+                                  <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center' }}>
+                                    No chromophore: not visible under UV, use a stain
+                                  </div>
+                                )}
+                                {spot.mayDecompose && (
+                                  <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center' }}>
+                                    Reversible product: may decompose on silica
+                                  </div>
+                                )}
                               </div>
                             ))}
                           </div>

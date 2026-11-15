@@ -102,6 +102,28 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     stericRule: 'nucleophile_crowding',
   },
   {
+    id: 'NA_N_carbonyl_hydrazine',
+    stepLabel: 'NA(N)',
+    name: 'Hydrazine / hydroxylamine / hydrazide addition to carbonyl',
+    description:
+      'Terminal NH2 of a hydrazine, hydrazide, semicarbazide or hydroxylamine adds to an aldehyde/ketone (then dehydrates to a hydrazone or oxime)',
+    smarts: `${ALDEHYDE_OR_KETONE}.[NX3;H2;$(N-[NX3,OX2]);!$(N-C=[O,S]);!$(N-S=O);!$(N-N=*);!$(N-n);!$([N+]):3]>>[C:1]([OX2H1:2])[N:3]`,
+    intramolecular: false,
+    numReactants: 2,
+    acidFactor: 0.95, // hydrazone / oxime formation is best under mild acid
+    baseFactor: 0.7,
+    neutralFactor: 0.9,
+    t50: 15,
+    width: 15,
+    prior: 0.9,
+    reversible: true,
+    kClass: 'favorable', // alpha-effect nucleophile, C=N conjugated with the lone pair is much more stable than a plain imine
+    thermoBonus: 0.05,
+    confidenceClass: 'A',
+    reactiveSiteKind: 'amine_nuc',
+    stericRule: 'nucleophile_crowding',
+  },
+  {
     id: 'NA_N_carbonyl_intra',
     stepLabel: 'NA(N)',
     name: 'Intramolecular amine-carbonyl cyclization',
@@ -335,7 +357,7 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     stepLabel: 'DH',
     name: 'Carbinolamine dehydration to enamine',
     description: 'Dehydration across α-C-H when N has no H (2° amine) or conjugated α-EWG',
-    smarts: '[CX4;H3,H2,H1:3][CX4:1]([OX2H1])[NX3;!$(N-C=O):2]>>[C:3]=[C:1][N:2]',
+    smarts: '[CX4;H3,H2,H1:3][CX4:1]([OX2H1])[NX3;H0;!$(N-C=O):2]>>[C:3]=[C:1][N:2]',
     intramolecular: false,
     numReactants: 1,
     acidFactor: 0.95,
@@ -795,7 +817,7 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     neutralFactor: 0.35,
     t50: 80,
     width: 22,
-    prior: 0.5,
+    prior: 0.12, // unactivated aryl halides need Pd/Cu catalysis; uncatalysed substitution is rare
     reversible: false,
     kClass: 'favorable',
     thermoBonus: 0.14,
@@ -816,7 +838,7 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     neutralFactor: 0.4,
     t50: 78,
     width: 22,
-    prior: 0.52,
+    prior: 0.12, // unactivated aryl halides need Pd/Cu catalysis; uncatalysed substitution is rare
     reversible: false,
     kClass: 'favorable',
     thermoBonus: 0.14,

@@ -537,6 +537,8 @@ export interface TlcMolProfile {
   azoleCount: number;
   pyridineCount: number;
   carboxylicAcidCount: number;
+  /** has a chromophore that shows under UV254/366 (aromatic ring or conjugated C=C/C=O/C=N) */
+  uvActive: boolean;
 }
 
 export interface WellTlcContext {
@@ -557,6 +559,10 @@ export interface SimulatedSpot {
   tier?: PredictedSpecies['tier'];
   tailing: boolean;
   tailingReason?: string;
+  /** false: no chromophore, only visible with a stain */
+  uvActive?: boolean;
+  /** reversible species that is expected to fall apart on acidic silica */
+  mayDecompose?: boolean;
 }
 
 export interface SimulatedWellLane {
@@ -613,12 +619,17 @@ export interface PlateSolventPlanOptions {
 const TLCMOTIF_SMARTS: Array<[keyof Pick<TlcMolProfile, 'aliphAmineCount' | 'azoleCount' | 'pyridineCount' | 'carboxylicAcidCount'>, string]> = [
   [
     'aliphAmineCount',
-    '[$([NX3;H2,H1,H0;$(N-[#6;X4]);!$(N-C=[O,S,N]);!$(N-c);!$(N-S=O)]),$([NX3;H2,H1,H0;!$(N-C=O)]-[CX3]=[NX2])]',
+    // basic N: not nitro / N-oxide / N-N / N-O, not attached to an aromatic ring, acyl, sulfonyl or a C=C (enamine);
+    // amidines and guanidines are counted through their N-C=N pattern; free hydrazine NH2 is counted too.
+    '[$([NX3;H2,H1,H0;+0;$(N-[#6;X4]);!$(N-C=[O,S,N]);!$(N-c);!$(N-S=O);!$(N-[#7,#8]);!$(N-[CX3]=[CX3])]),$([NX3;H2,H1,H0;+0;!$(N-C=O);!$(N-[#8])]-[CX3]=[NX2]),$([NX3;H2;+0;$(N-[NX3;!$(N-C=[O,S])]);!$(N-C=[O,S,N]);!$(N-N=*)])]',
   ],
   ['azoleCount', '[nX2r5,nX3H1r5]'],
   ['pyridineCount', '[nX2r6]'],
   ['carboxylicAcidCount', '[CX3](=[OX1])[OX2H1]'],
 ];
+
+const CONJUGATED_SMARTS =
+  '[$([CX3]=[CX3]-[CX3]=[CX3,OX1,NX2]),$([CX3]=[CX3]-[CX2]#[NX1]),$([CX3]=[CX3]-[NX2]=[#6,#7]),$([CX3]=[NX2]-[CX3]=[CX3,OX1,NX2]),$([NX2]=[NX2])]';
 
 let tlcQueryCache: WeakMap<object, Map<string, any>> = new WeakMap();
 
@@ -658,6 +669,7 @@ export function profileMoleculeForTlc(
     azoleCount: 0,
     pyridineCount: 0,
     carboxylicAcidCount: 0,
+    uvActive: true,
   };
   if (!rdkit || !clean) return fallback;
 
@@ -685,6 +697,15 @@ export function profileMoleculeForTlc(
       }
     }
 
+    let conjugated = false;
+    const cq = getTlcQuery(rdkit, 'conjugated', CONJUGATED_SMARTS);
+    if (cq) {
+      try {
+        const cm = JSON.parse(mol.get_substruct_matches(cq) || '[]');
+        conjugated = Array.isArray(cm) && cm.length > 0;
+      } catch {}
+    }
+
     const prof: TlcMolProfile = {
       smiles: clean,
       tpsa: Number(desc.tpsa) || 0,
@@ -696,6 +717,7 @@ export function profileMoleculeForTlc(
       azoleCount: counts.azoleCount,
       pyridineCount: counts.pyridineCount,
       carboxylicAcidCount: counts.carboxylicAcidCount,
+      uvActive: (Number(desc.NumAromaticRings) || 0) > 0 || conjugated,
     };
     cache?.set(clean, prof);
     return prof;
@@ -935,6 +957,8 @@ interface WellCandidateData {
     weight: number;
     label: string;
     profile: TlcMolProfile;
+    persistence: number;
+    reversibleEnd: boolean;
   }>;
 }
 
@@ -954,6 +978,7 @@ function evaluateWellInSolvent(
       rf: pred.rf,
       tailing: pred.tailing,
       tailingReason: pred.tailingReason,
+      uvActive: s.profile.uvActive,
     };
   });
 
@@ -970,6 +995,8 @@ function evaluateWellInSolvent(
       tier: p.tier,
       tailing: pred.tailing,
       tailingReason: pred.tailingReason,
+      uvActive: p.profile.uvActive,
+      mayDecompose: system.stationaryPhase === 'SiO2' && p.reversibleEnd && p.persistence < 0.6,
     };
   });
 
@@ -1009,26 +1036,42 @@ function evaluateWellInSolvent(
   let primaryDelta = 0;
   let primaryRf: number | null = null;
 
+  const STAIN_ONLY_FACTOR = 0.4; // no chromophore: needs a stain, cannot be judged under UV
+  const DECOMPOSE_FACTOR = 0.7; // reversible product that may fall apart on acidic silica
+
   well.products.forEach((p, idx) => {
     const pSpot = prodSpots[idx];
+    // Only substrates that show under UV can be used to judge separation by eye.
+    const visibleSubs = subSpots.filter((s) => s.uvActive !== false);
     const minSubDelta =
-      subSpots.length > 0 ? Math.min(...subSpots.map((s) => Math.abs(pSpot.rf - s.rf))) : 0.25;
+      visibleSubs.length > 0 ? Math.min(...visibleSubs.map((s) => Math.abs(pSpot.rf - s.rf))) : 0.25;
 
+    // Products that sit on top of each other are hard to tell apart; for the products that matter
+    // (High / Medium) the penalty is stronger and starts at a wider gap.
     let crowdFactor = 1.0;
+    const important = (t: PredictedSpecies['tier'] | undefined) => t === 'High' || t === 'Medium';
     for (let j = 0; j < idx; j++) {
-      if (Math.abs(pSpot.rf - prodSpots[j].rf) < 0.04) {
+      const gap = Math.abs(pSpot.rf - prodSpots[j].rf);
+      if (important(pSpot.tier) && important(prodSpots[j].tier)) {
+        if (gap < 0.04) crowdFactor *= 0.6;
+        else if (gap < 0.08) crowdFactor *= 0.8;
+      } else if (gap < 0.04) {
         crowdFactor *= 0.85;
       }
     }
 
     const tailFactor = pSpot.tailing ? 0.52 : 1.0;
     const subTailPenalty = subSpots.some((s) => s.tailing) ? 0.88 : 1.0;
+    const visFactor = pSpot.uvActive === false ? STAIN_ONLY_FACTOR : 1.0;
+    const decompFactor = pSpot.mayDecompose ? DECOMPOSE_FACTOR : 1.0;
     const qual =
       windowScore(pSpot.rf) *
       deltaScore(minSubDelta) *
       tailFactor *
       subTailPenalty *
       crowdFactor *
+      visFactor *
+      decompFactor *
       additiveOverheadFactor;
 
     if (idx === 0) {
@@ -1280,9 +1323,19 @@ export async function optimizePlateTlcSolvents(
         };
       });
 
-    const rawProds = (pred?.species || []).slice(0, 8);
+    // One spot per compound: tautomers / mobile-H forms of the same structure run as a single spot.
+    const seenForms = new Set<string>();
+    const rawProds = (pred?.species || [])
+      .filter((sp) => {
+        const k = sp.tautomerKey || sp.key;
+        if (seenForms.has(k)) return false;
+        seenForms.add(k);
+        return true;
+      })
+      .slice(0, 8);
     const products = rawProds.map((sp) => {
-      const imp = tierImportance(sp.tier) * Math.max(0.08, sp.score * sp.score);
+      const imp =
+        tierImportance(sp.tier) * Math.max(0.08, sp.score * sp.score) * (0.5 + 0.5 * (sp.persistence ?? 1));
       return {
         key: sp.key,
         smiles: sp.smiles,
@@ -1292,6 +1345,8 @@ export async function optimizePlateTlcSolvents(
         weight: imp,
         label: sp.mechanismSummary || sp.formula,
         profile: profileMoleculeForTlc(rdkit, sp.smiles, profileCache),
+        persistence: sp.persistence ?? 1,
+        reversibleEnd: Boolean(sp.reversibleEnd),
       };
     });
 
@@ -1304,8 +1359,13 @@ export async function optimizePlateTlcSolvents(
       : 0.16;
 
     const saltPattern = /\.(Cl|Br|I|F)\b|FC\(F\)\(F\)C\(=O\)O|S\(=O\)\(=O\)O|hydrochloride|trifluoroacetate|tosylate|mesylate/i;
+    // A salt shows up as a separate fragment in the SMILES; a sulfonate ester or sulfonamide inside one
+    // molecule is not a counterion.
     const hasSaltCounterion = validSubs.some(
-      (s) => saltPattern.test(s.smiles) || saltPattern.test(s.name || '') || saltPattern.test(s.iupac || '')
+      (s) =>
+        (s.smiles.includes('.') && saltPattern.test(s.smiles)) ||
+        saltPattern.test(s.name || '') ||
+        saltPattern.test(s.iupac || '')
     );
     const hasAcidAdditive =
       ext.condition.medium === 'acid' ||

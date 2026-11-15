@@ -108,6 +108,7 @@ export const ElnView: React.FC = () => {
     setView,
     setVisited,
     setTargetWell,
+    addWellToCompare,
     toast,
   } = useApp();
 
@@ -1601,6 +1602,17 @@ export const ElnView: React.FC = () => {
                   >
                     <ExternalLink size={12} />
                     <span>Predict</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() =>
+                      addWellToCompare({ plateIndex: activePlate, wellIndex: selectedWellIdx })
+                    }
+                    title="Add this well to Compare Studio"
+                    style={{ height: '26px', padding: '0 8px', fontSize: '11.5px', display: 'inline-flex', alignItems: 'center', gap: '4px', marginRight: '4px' }}
+                  >
+                    <span>+ Compare</span>
                   </button>
                   <label
                     style={{

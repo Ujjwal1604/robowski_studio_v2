@@ -27,6 +27,7 @@ export * from './barcode';
 export * from './demoTlc';
 export * from './elnSpreadsheet';
 export * from './predictor';
+export * from './comparison';
 
 import * as constants from './constants';
 import * as combinations from './combinations';

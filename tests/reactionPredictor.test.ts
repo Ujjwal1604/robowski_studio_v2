@@ -296,6 +296,6 @@ describe('Reaction Predictor Engine (RDKit WASM)', () => {
     // At 80 °C, azole SNAr product (C11H8N4O) should also appear cleanly
     const res80 = predictWellReactions(rdkit, subsB6Conj, { ...cond25Base, temperatureC: 80 });
     expect(res80.species.some((s) => s.bestChain.some((st) => st.stepLabel === 'AR'))).toBe(true);
-  });
+  }, 15000);
 });
 

@@ -21,6 +21,7 @@ export const RunsView: React.FC = () => {
     setRunSearch,
     compareIds,
     setCompareIds,
+    setCompareMode,
     setView,
     openPreview,
     importRobotFile,
@@ -339,16 +340,45 @@ export const RunsView: React.FC = () => {
                 {compareIds.length} run{compareIds.length === 1 ? '' : 's'} selected
               </b>
 
-              {compareIds.length === 2 && (
+              {compareIds.length >= 2 && (
+                <>
+                  <button
+                    type="button"
+                    className="btn sm pri"
+                    onClick={() => {
+                      setCompareMode('runs');
+                      setView('compare');
+                      window.scrollTo(0, 0);
+                    }}
+                  >
+                    Compare Runs ({compareIds.length})
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      setCompareMode('wells');
+                      setView('compare');
+                      window.scrollTo(0, 0);
+                    }}
+                  >
+                    Compare Wells Across Selected
+                  </button>
+                </>
+              )}
+
+              {compareIds.length === 1 && (
                 <button
                   type="button"
                   className="btn sm"
                   onClick={() => {
+                    setCompareIds((prev) => ['__current__', ...prev.filter((x) => x !== '__current__')]);
+                    setCompareMode('runs');
                     setView('compare');
                     window.scrollTo(0, 0);
                   }}
                 >
-                  Compare them
+                  Compare with Active Run
                 </button>
               )}
 

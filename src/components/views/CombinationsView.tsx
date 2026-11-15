@@ -26,6 +26,7 @@ export const CombinationsView: React.FC = () => {
     toast,
     targetWell,
     setTargetWell,
+    addWellToCompare,
   } = useApp();
 
   const [hoverRow, setHoverRow] = useState<number | null>(null);
@@ -643,6 +644,23 @@ export const CombinationsView: React.FC = () => {
                     title="Switch to TLC Map view and inspect this well's TLC lane"
                   >
                     🔬 View in TLC
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    style={{ height: '22px', padding: '0 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                    onClick={() => {
+                      const rowData = run.rows[activeDetailRow];
+                      if (rowData) {
+                        addWellToCompare({
+                          plateIndex: rowData.plate_number,
+                          wellIndex: rowData.container_id,
+                        });
+                      }
+                    }}
+                    title="Add this well to the Compare Studio"
+                  >
+                    ⇄ + Compare
                   </button>
                   {selectedVial === activeDetailRow && (
                     <button

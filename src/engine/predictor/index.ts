@@ -6,4 +6,5 @@ export * from './scoring';
 export * from './engine';
 export * from './plateBridge';
 export * from './tlcSolventAdvisor';
+export * from './pathwayGrouping';
 

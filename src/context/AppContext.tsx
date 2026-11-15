@@ -86,6 +86,17 @@ export interface AppContextType {
   setRunSearch: (s: string) => void;
   compareIds: string[];
   setCompareIds: React.Dispatch<React.SetStateAction<string[]>>;
+  compareMode: 'wells' | 'runs';
+  setCompareMode: React.Dispatch<React.SetStateAction<'wells' | 'runs'>>;
+  compareWells: Core.WellCompareSlotRef[];
+  setCompareWells: React.Dispatch<React.SetStateAction<Core.WellCompareSlotRef[]>>;
+  addWellToCompare: (
+    slot: { runId?: string; plateIndex: number; wellIndex: number },
+    navigate?: boolean
+  ) => void;
+  openWellCompare: (
+    slots: Array<{ runId?: string; plateIndex: number; wellIndex: number }>
+  ) => void;
   theme: 'light' | 'dark';
   toggleTheme: () => void;
   toast: (msg: string, undo?: () => void) => void;
@@ -183,6 +194,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [runFilter, setRunFilter] = useState<string>('all');
   const [runSearch, setRunSearch] = useState<string>('');
   const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [compareMode, setCompareMode] = useState<'wells' | 'runs'>('wells');
+  const [compareWells, setCompareWells] = useState<Core.WellCompareSlotRef[]>([]);
   const [previewModal, setPreviewModal] = useState<{ kind: string; data?: any } | null>(null);
   const [draftSavedAt, setDraftSavedAt] = useState<number>(Date.now());
 
@@ -1179,6 +1192,58 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [importRobotFile]
   );
 
+  const addWellToCompare = useCallback(
+    (
+      slot: { runId?: string; plateIndex: number; wellIndex: number },
+      navigate: boolean = false
+    ) => {
+      const runId = slot.runId || Core.CURRENT_RUN_ID;
+      setCompareWells((prev) => {
+        const exists = prev.some(
+          (x) =>
+            x.runId === runId &&
+            x.plateIndex === slot.plateIndex &&
+            x.wellIndex === slot.wellIndex
+        );
+        if (exists) return prev;
+        return [
+          ...prev,
+          {
+            uid: `slot_${Math.random().toString(36).slice(2, 9)}`,
+            runId,
+            plateIndex: slot.plateIndex,
+            wellIndex: slot.wellIndex,
+          },
+        ];
+      });
+      setCompareMode('wells');
+      if (navigate) {
+        setView('compare');
+        window.scrollTo(0, 0);
+      } else {
+        toast(`Added P${slot.plateIndex + 1} · ${Core.wellLabel(slot.wellIndex)} to Compare.`);
+      }
+    },
+    [toast]
+  );
+
+  const openWellCompare = useCallback(
+    (slots: Array<{ runId?: string; plateIndex: number; wellIndex: number }>) => {
+      setCompareWells(
+        slots.map((s, idx) => ({
+          uid: `slot_${idx}_${Math.random().toString(36).slice(2, 7)}`,
+          runId: s.runId || Core.CURRENT_RUN_ID,
+          plateIndex: s.plateIndex,
+          wellIndex: s.wellIndex,
+        }))
+      );
+      setCompareMode('wells');
+      setView('compare');
+      window.scrollTo(0, 0);
+    },
+    []
+  );
+
   const inlineRanges = !state.imported && state.mode !== 'triplet' && (state.sets?.length || 0) === 1;
 
   return (
@@ -1220,6 +1285,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setRunSearch,
         compareIds,
         setCompareIds,
+        compareMode,
+        setCompareMode,
+        compareWells,
+        setCompareWells,
+        addWellToCompare,
+        openWellCompare,
         theme,
         toggleTheme,
         toast,

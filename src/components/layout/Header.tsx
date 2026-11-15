@@ -98,6 +98,15 @@ export const Header: React.FC = () => {
 
           <button
             type="button"
+            className={`runsl ${view === 'compare' ? 'on' : ''}`}
+            onClick={() => setView('compare')}
+            title="Compare multiple wells or runs side by side"
+          >
+            Compare
+          </button>
+
+          <button
+            type="button"
             className={`runsl ${view === 'runs' ? 'on' : ''}`}
             onClick={() => setView('runs')}
           >

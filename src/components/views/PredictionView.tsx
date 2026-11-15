@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   FlaskConical,
+  GitBranch,
   Layers,
   LayoutGrid,
   List,
@@ -18,6 +19,8 @@ import {
 import { useApp } from '../../context/AppContext';
 import {
   MediumMode,
+  PathwayFamily,
+  PathwaySpeciesNode,
   PredictedSpecies,
   PredictorSubstrateInput,
   WellConditionConfig,
@@ -25,6 +28,7 @@ import {
   exportLcmsTargetListCsv,
   extractWellForPrediction,
   getSuggestedWellDisplay,
+  groupSpeciesByPathway,
   predictWellReactions,
   wellLabel,
 } from '../../engine';
@@ -179,6 +183,7 @@ export const PredictionView: React.FC = () => {
     triMeta,
     targetWell,
     setTargetWell,
+    addWellToCompare,
     toast,
   } = useApp();
 
@@ -732,6 +737,18 @@ export const PredictionView: React.FC = () => {
                 />
                 <span>Include speculative candidates</span>
               </label>
+
+              <button
+                type="button"
+                className="btn sm"
+                style={{ marginLeft: 'auto', height: '28px', padding: '0 10px', fontSize: '12px' }}
+                onClick={() =>
+                  addWellToCompare({ plateIndex: activePlate, wellIndex: selectedWellIdx })
+                }
+                title="Queue this well into Compare Studio"
+              >
+                + Compare Well {activeCoord}
+              </button>
             </div>
           </div>
 
@@ -1191,13 +1208,24 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
   toast,
 }) => {
   const [activeTab, setActiveTab] = useState<'products' | 'fragments'>('products');
+  const [groupMode, setGroupMode] = useState<'pathway' | 'score'>('pathway');
   const [viewLayout, setViewLayout] = useState<'grid' | 'list'>('grid');
   const [showEquilibriumDetails, setShowEquilibriumDetails] = useState<boolean>(false);
   const [expandedTrails, setExpandedTrails] = useState<Record<string, boolean>>({});
+  const [expandedMinorFamilies, setExpandedMinorFamilies] = useState<Record<string, boolean>>({});
   const { acidBase, species, releasedFragments, alerts, substrates, stats, condition } = result;
+
+  const families: PathwayFamily[] = useMemo(
+    () => groupSpeciesByPathway(species, substrates),
+    [species, substrates]
+  );
 
   const toggleTrail = (key: string) => {
     setExpandedTrails((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const toggleMinorFamily = (familyId: string) => {
+    setExpandedMinorFamilies((prev) => ({ ...prev, [familyId]: !prev[familyId] }));
   };
 
   return (
@@ -1410,83 +1438,359 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
           </div>
 
           {activeTab === 'products' && species.length > 0 && (
-            <div className="seg" role="group" aria-label="Product card layout">
-              <button
-                type="button"
-                className={viewLayout === 'grid' ? 'on' : ''}
-                onClick={() => setViewLayout('grid')}
-                title="Structure-first visual grid"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-              >
-                <LayoutGrid size={12} />
-                <span>Visual Grid</span>
-              </button>
-              <button
-                type="button"
-                className={viewLayout === 'list' ? 'on' : ''}
-                onClick={() => setViewLayout('list')}
-                title="Detailed side-by-side list"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-              >
-                <List size={12} />
-                <span>List</span>
-              </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <div className="seg" role="group" aria-label="Product grouping mode">
+                <button
+                  type="button"
+                  className={groupMode === 'pathway' ? 'on' : ''}
+                  onClick={() => setGroupMode('pathway')}
+                  title="Group products by shared mechanistic pathway, sorted by peak confidence score"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                >
+                  <GitBranch size={12} />
+                  <span>By Pathway ({families.length})</span>
+                </button>
+                <button
+                  type="button"
+                  className={groupMode === 'score' ? 'on' : ''}
+                  onClick={() => setGroupMode('score')}
+                  title="Flat list ranked strictly by individual confidence score"
+                >
+                  <span>By Confidence</span>
+                </button>
+              </div>
+
+              <div className="seg" role="group" aria-label="Product card layout">
+                <button
+                  type="button"
+                  className={viewLayout === 'grid' ? 'on' : ''}
+                  onClick={() => setViewLayout('grid')}
+                  title="Structure-first visual grid"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                >
+                  <LayoutGrid size={12} />
+                  <span>Visual Grid</span>
+                </button>
+                <button
+                  type="button"
+                  className={viewLayout === 'list' ? 'on' : ''}
+                  onClick={() => setViewLayout('list')}
+                  title="Detailed side-by-side list"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                >
+                  <List size={12} />
+                  <span>List</span>
+                </button>
+              </div>
             </div>
           )}
         </div>
 
         {activeTab === 'products' ? (
           species.length > 0 ? (
-            viewLayout === 'grid' ? (
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
-                  gap: '14px',
-                }}
-              >
-                {species.map((sp, idx) => {
-                  const tc = tierColor(sp.tier);
-                  const isOpen = Boolean(expandedTrails[sp.key]);
-                  const stoichLabel = substrates
-                    .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
-                    .filter(Boolean)
-                    .join(' + ');
+            (() => {
+              const formatLineageText = (node?: PathwaySpeciesNode): string | null => {
+                if (!node) return null;
+                if (node.isPureTautomer) return 'Pre-tautomer · feeds pathway';
+                if (node.parentGlobalRank != null) {
+                  const verb = node.roleInPathway === 'divergence' ? 'Diverges from' : 'Extends';
+                  const prefix = node.isLead ? 'Lead · ' : '';
+                  return `${prefix}↳ ${verb} #${node.parentGlobalRank} via ${node.lastStepLabel}`;
+                }
+                if (node.isLead) return `Lead · Step 1 (${node.lastStepLabel})`;
+                return `Step 1 entry (${node.lastStepLabel})`;
+              };
 
-                  return (
+              const renderGridCard = (sp: PredictedSpecies, rankNum: number, node?: PathwaySpeciesNode) => {
+                const tc = tierColor(sp.tier);
+                const isOpen = Boolean(expandedTrails[sp.key]);
+                const stoichLabel = substrates
+                  .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
+                  .filter(Boolean)
+                  .join(' + ');
+                const lineageText = formatLineageText(node);
+
+                return (
+                  <div
+                    key={sp.key}
+                    style={{
+                      border: node?.isLead ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))' : '1px solid var(--line)',
+                      borderRadius: '12px',
+                      padding: '12px 14px',
+                      background: 'var(--panel)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '10px',
+                      minWidth: 0,
+                    }}
+                  >
+                    {/* Slim Top Strip */}
                     <div
-                      key={sp.key}
                       style={{
-                        border: '1px solid var(--line)',
-                        borderRadius: '12px',
-                        padding: '12px 14px',
-                        background: 'var(--panel)',
                         display: 'flex',
-                        flexDirection: 'column',
-                        gap: '10px',
-                        minWidth: 0,
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '6px',
+                        flexWrap: 'wrap',
                       }}
                     >
-                      {/* Slim Top Strip */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                        <span className="mono" style={{ fontWeight: 700, fontSize: '13px' }}>
+                          #{rankNum}
+                        </span>
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: '11.5px',
+                            fontWeight: 700,
+                            padding: '2px 7px',
+                            borderRadius: '6px',
+                            color: tc.fg,
+                            background: tc.bg,
+                            border: `1px solid ${tc.bd}`,
+                          }}
+                        >
+                          {sp.score.toFixed(2)} · {sp.tier}
+                        </span>
+                        {stoichLabel && (
+                          <span className="mono" style={{ fontSize: '12px', fontWeight: 600, color: 'var(--fg2)' }}>
+                            {stoichLabel}
+                          </span>
+                        )}
+                        <span style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+                          {sp.status === 'sink' ? 'Stable' : 'Equil.'}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ height: '24px', fontSize: '11px', padding: '0 7px' }}
+                          onClick={() => {
+                            navigator.clipboard.writeText(sp.smiles);
+                            toast('Copied product SMILES.');
+                          }}
+                          title="Copy canonical SMILES"
+                        >
+                          <Copy size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          style={{ height: '24px', fontSize: '11px', padding: '0 7px' }}
+                          onClick={() => {
+                            navigator.clipboard.writeText(sp.mhPlus.toFixed(4));
+                            toast(`Copied [M+H]+ = ${sp.mhPlus.toFixed(4)}`);
+                          }}
+                          title="Copy [M+H]+ exact mass"
+                        >
+                          [M+H]⁺
+                        </button>
+                      </div>
+                    </div>
+
+                    {lineageText && (
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: node?.isLead ? 700 : 500,
+                          color: node?.isLead ? 'var(--acc)' : 'var(--fg2)',
+                          marginTop: '-4px',
+                        }}
+                      >
+                        {lineageText}
+                      </div>
+                    )}
+
+                    {/* Large Hero 2D Chemical Structure */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        background: 'var(--soft)',
+                        borderRadius: '9px',
+                        padding: '6px',
+                        minHeight: '208px',
+                      }}
+                    >
+                      <ChemicalStructure
+                        smiles={sp.smiles}
+                        name={`${stoichLabel || 'Product'} (${sp.formula})`}
+                        width={310}
+                        height={196}
+                      />
+                    </div>
+
+                    {/* Compact 4-Column Quantitative Strip */}
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                        gap: '6px',
+                        padding: '7px 9px',
+                        borderRadius: '7px',
+                        background: 'var(--soft)',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+H]⁺</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 700, color: 'var(--acc)' }}>
+                          {sp.mhPlus.toFixed(4)}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+Na]⁺</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.mNaPlus.toFixed(3)}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>Formula</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {sp.formula}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '10px', color: 'var(--mut)' }}>cLogP · TPSA</div>
+                        <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
+                          {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Compact Pathway & Trail Toggle */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '6px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <span className="mono" style={{ fontSize: '11.5px', fontWeight: 600, color: 'var(--fg2)' }}>
+                        {sp.mechanismSummary}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn sm"
+                        style={{ height: '22px', fontSize: '11px', padding: '0 7px', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                        onClick={() => toggleTrail(sp.key)}
+                      >
+                        {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                        <span>Steps ({sp.stepsCount})</span>
+                      </button>
+                    </div>
+
+                    {node && node.alsoViaLabels.length > 0 && (
+                      <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                        Convergent: also reached via {node.alsoViaLabels.join(', ')}
+                      </div>
+                    )}
+
+                    {sp.alerts.length > 0 && (
+                      <div style={{ fontSize: '11px', color: 'var(--warn)' }}>
+                        {sp.alerts.map((a) => a.message).join(' · ')}
+                      </div>
+                    )}
+
+                    {isOpen && (
+                      <div
+                        style={{
+                          padding: '8px 10px',
+                          background: 'var(--bg)',
+                          borderRadius: '6px',
+                          border: '1px solid var(--line2)',
+                          fontSize: '11.5px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px',
+                        }}
+                      >
+                        <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                          Exact {sp.exactMass.toFixed(4)} · [M−H]⁻ {sp.mHMinus.toFixed(4)}
+                        </div>
+                        {sp.bestChain.map((st, sIdx) => (
+                          <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                            <span>
+                              <b className="mono">{sIdx + 1}. {st.stepLabel}</b> — {st.description}
+                              {st.releasedFragment ? ` (${st.releasedFragment})` : ''}
+                              {st.releasedGas ? ` (${st.releasedGas})` : ''}
+                            </span>
+                            <span className="mono" style={{ color: 'var(--mut)' }}>
+                              w={st.stepWeight.toFixed(2)}
+                            </span>
+                          </div>
+                        ))}
+                        {sp.alternativeChains.length > 0 && (
+                          <div style={{ color: 'var(--mut)', paddingTop: '4px', borderTop: '1px dashed var(--line)' }}>
+                            Alt:{' '}
+                            {sp.alternativeChains.map((ac) => ac.map((x) => x.stepLabel).join(' → ')).join(' | ')}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              };
+
+              const renderListRow = (sp: PredictedSpecies, rankNum: number, node?: PathwaySpeciesNode) => {
+                const tc = tierColor(sp.tier);
+                const isOpen = Boolean(expandedTrails[sp.key]);
+                const stoichLabel = substrates
+                  .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
+                  .filter(Boolean)
+                  .join(' + ');
+                const lineageText = formatLineageText(node);
+
+                return (
+                  <div
+                    key={sp.key}
+                    style={{
+                      border: node?.isLead ? '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))' : '1px solid var(--line)',
+                      borderRadius: '10px',
+                      padding: '12px 14px',
+                      background: 'var(--panel)',
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(240px, 268px) minmax(0, 1fr)',
+                      gap: '16px',
+                      alignItems: 'center',
+                      marginLeft: node && node.depth > 0 ? `${Math.min(node.depth, 3) * 14}px` : undefined,
+                    }}
+                  >
+                    {/* Left: Larger 2D Structure */}
+                    <ChemicalStructure
+                      smiles={sp.smiles}
+                      name={`${stoichLabel || 'Product'} (${sp.formula})`}
+                      width={260}
+                      height={175}
+                    />
+
+                    {/* Right: Masses, Score, Pathway */}
+                    <div style={{ minWidth: 0 }}>
                       <div
                         style={{
                           display: 'flex',
                           justifyContent: 'space-between',
                           alignItems: 'center',
-                          gap: '6px',
                           flexWrap: 'wrap',
+                          gap: '8px',
+                          marginBottom: lineageText ? '4px' : '8px',
                         }}
                       >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-                          <span className="mono" style={{ fontWeight: 700, fontSize: '13px' }}>
-                            #{idx + 1}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <span className="mono" style={{ fontWeight: 700, fontSize: '13.5px' }}>
+                            #{rankNum}
                           </span>
                           <span
                             className="mono"
                             style={{
-                              fontSize: '11.5px',
+                              fontSize: '12px',
                               fontWeight: 700,
-                              padding: '2px 7px',
+                              padding: '2px 8px',
                               borderRadius: '6px',
                               color: tc.fg,
                               background: tc.bg,
@@ -1495,21 +1799,24 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                           >
                             {sp.score.toFixed(2)} · {sp.tier}
                           </span>
+                          <span style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                            {sp.status === 'sink' ? 'Stable Product' : 'Equilibrium'}
+                          </span>
                           {stoichLabel && (
-                            <span className="mono" style={{ fontSize: '12px', fontWeight: 600, color: 'var(--fg2)' }}>
-                              {stoichLabel}
+                            <span className="mono" style={{ fontSize: '12px', color: 'var(--mut)' }}>
+                              · {stoichLabel}
                             </span>
                           )}
-                          <span style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-                            {sp.status === 'sink' ? 'Stable' : 'Equil.'}
+                          <span className="mono" style={{ fontSize: '12px', color: 'var(--fg2)' }}>
+                            · {sp.formula}
                           </span>
                         </div>
 
-                        <div style={{ display: 'flex', gap: '4px' }}>
+                        <div style={{ display: 'flex', gap: '6px' }}>
                           <button
                             type="button"
                             className="btn sm"
-                            style={{ height: '24px', fontSize: '11px', padding: '0 7px' }}
+                            style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
                             onClick={() => {
                               navigator.clipboard.writeText(sp.smiles);
                               toast('Copied product SMILES.');
@@ -1517,105 +1824,115 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                             title="Copy canonical SMILES"
                           >
                             <Copy size={11} />
+                            <span style={{ marginLeft: '4px' }}>SMILES</span>
                           </button>
                           <button
                             type="button"
                             className="btn sm"
-                            style={{ height: '24px', fontSize: '11px', padding: '0 7px' }}
+                            style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
                             onClick={() => {
                               navigator.clipboard.writeText(sp.mhPlus.toFixed(4));
                               toast(`Copied [M+H]+ = ${sp.mhPlus.toFixed(4)}`);
                             }}
                             title="Copy [M+H]+ exact mass"
                           >
-                            [M+H]⁺
+                            Copy [M+H]⁺
                           </button>
                         </div>
                       </div>
 
-                      {/* Large Hero 2D Chemical Structure */}
-                      <div
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          background: 'var(--soft)',
-                          borderRadius: '9px',
-                          padding: '6px',
-                          minHeight: '208px',
-                        }}
-                      >
-                        <ChemicalStructure
-                          smiles={sp.smiles}
-                          name={`${stoichLabel || 'Product'} (${sp.formula})`}
-                          width={310}
-                          height={196}
-                        />
-                      </div>
+                      {lineageText && (
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: '11.5px',
+                            fontWeight: node?.isLead ? 700 : 500,
+                            color: node?.isLead ? 'var(--acc)' : 'var(--fg2)',
+                            marginBottom: '8px',
+                          }}
+                        >
+                          {lineageText}
+                        </div>
+                      )}
 
-                      {/* Compact 4-Column Quantitative Strip */}
+                      {/* Tabular LC-MS & Chromatography Metrics */}
                       <div
                         style={{
                           display: 'grid',
-                          gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-                          gap: '6px',
-                          padding: '7px 9px',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(95px, 1fr))',
+                          gap: '8px',
+                          padding: '8px 10px',
                           borderRadius: '7px',
                           background: 'var(--soft)',
+                          marginBottom: '8px',
                         }}
                       >
                         <div>
-                          <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+H]⁺</div>
-                          <div className="mono" style={{ fontSize: '12px', fontWeight: 700, color: 'var(--acc)' }}>
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>Exact Mass</div>
+                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                            {sp.exactMass.toFixed(4)}
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+H]⁺</div>
+                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--acc)' }}>
                             {sp.mhPlus.toFixed(4)}
                           </div>
                         </div>
                         <div>
-                          <div style={{ fontSize: '10px', color: 'var(--mut)' }}>[M+Na]⁺</div>
-                          <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
-                            {sp.mNaPlus.toFixed(3)}
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+Na]⁺</div>
+                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                            {sp.mNaPlus.toFixed(4)}
                           </div>
                         </div>
                         <div>
-                          <div style={{ fontSize: '10px', color: 'var(--mut)' }}>Formula</div>
-                          <div className="mono" style={{ fontSize: '12px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                            {sp.formula}
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M−H]⁻</div>
+                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                            {sp.mHMinus.toFixed(4)}
                           </div>
                         </div>
                         <div>
-                          <div style={{ fontSize: '10px', color: 'var(--mut)' }}>cLogP · TPSA</div>
-                          <div className="mono" style={{ fontSize: '12px', fontWeight: 600 }}>
-                            {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)}
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>cLogP / TPSA</div>
+                          <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                            {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)} Å²
                           </div>
                         </div>
                       </div>
 
-                      {/* Compact Pathway & Trail Toggle */}
+                      {/* Mechanism Summary & Expandable Steps */}
                       <div
                         style={{
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
-                          gap: '6px',
+                          gap: '8px',
                           flexWrap: 'wrap',
                         }}
                       >
-                        <span className="mono" style={{ fontSize: '11.5px', fontWeight: 600, color: 'var(--fg2)' }}>
-                          {sp.mechanismSummary}
-                        </span>
+                        <div style={{ fontSize: '12px', color: 'var(--fg2)' }}>
+                          <span className="mono" style={{ fontWeight: 600 }}>
+                            {sp.mechanismSummary}
+                          </span>
+                        </div>
                         <button
                           type="button"
                           className="btn sm"
-                          style={{ height: '22px', fontSize: '11px', padding: '0 7px', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                          style={{ height: '24px', fontSize: '11px', padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                           onClick={() => toggleTrail(sp.key)}
                         >
-                          {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                          {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                           <span>Steps ({sp.stepsCount})</span>
                         </button>
                       </div>
 
+                      {node && node.alsoViaLabels.length > 0 && (
+                        <div style={{ marginTop: '6px', fontSize: '11.5px', color: 'var(--mut)' }}>
+                          Convergent: also reached via {node.alsoViaLabels.join(', ')}
+                        </div>
+                      )}
+
                       {sp.alerts.length > 0 && (
-                        <div style={{ fontSize: '11px', color: 'var(--warn)' }}>
+                        <div style={{ marginTop: '6px', fontSize: '11.5px', color: 'var(--warn)' }}>
                           {sp.alerts.map((a) => a.message).join(' · ')}
                         </div>
                       )}
@@ -1623,6 +1940,7 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       {isOpen && (
                         <div
                           style={{
+                            marginTop: '8px',
                             padding: '8px 10px',
                             background: 'var(--bg)',
                             borderRadius: '6px',
@@ -1630,257 +1948,208 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                             fontSize: '11.5px',
                             display: 'flex',
                             flexDirection: 'column',
-                            gap: '4px',
+                            gap: '5px',
                           }}
                         >
-                          <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            Exact {sp.exactMass.toFixed(4)} · [M−H]⁻ {sp.mHMinus.toFixed(4)}
-                          </div>
                           {sp.bestChain.map((st, sIdx) => (
-                            <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                            <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
                               <span>
                                 <b className="mono">{sIdx + 1}. {st.stepLabel}</b> — {st.description}
-                                {st.releasedFragment ? ` (${st.releasedFragment})` : ''}
-                                {st.releasedGas ? ` (${st.releasedGas})` : ''}
+                                {st.releasedFragment ? ` (releases ${st.releasedFragment})` : ''}
+                                {st.releasedGas ? ` (releases ${st.releasedGas})` : ''}
                               </span>
                               <span className="mono" style={{ color: 'var(--mut)' }}>
-                                w={st.stepWeight.toFixed(2)}
+                                w={st.stepWeight.toFixed(2)} · pH×{st.conditionFactor.toFixed(2)} · T×{st.tempFactor.toFixed(2)}
+                                {st.ringFactor > 1.05 ? ` · ring×${st.ringFactor.toFixed(2)}` : ''}
                               </span>
                             </div>
                           ))}
                           {sp.alternativeChains.length > 0 && (
                             <div style={{ color: 'var(--mut)', paddingTop: '4px', borderTop: '1px dashed var(--line)' }}>
-                              Alt:{' '}
+                              Alternative route{sp.alternativeChains.length > 1 ? 's' : ''}:{' '}
                               {sp.alternativeChains.map((ac) => ac.map((x) => x.stepLabel).join(' → ')).join(' | ')}
                             </div>
                           )}
                         </div>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                {species.map((sp, idx) => {
-                  const tc = tierColor(sp.tier);
-                  const isOpen = Boolean(expandedTrails[sp.key]);
-                  const stoichLabel = substrates
-                    .map((s, sIdx) => (sp.inventory[sIdx] > 0 ? `${sp.inventory[sIdx] > 1 ? sp.inventory[sIdx] : ''}${s.code}` : null))
-                    .filter(Boolean)
-                    .join(' + ');
+                  </div>
+                );
+              };
 
-                  return (
-                    <div
-                      key={sp.key}
-                      style={{
-                        border: '1px solid var(--line)',
-                        borderRadius: '10px',
-                        padding: '12px 14px',
-                        background: 'var(--panel)',
-                        display: 'grid',
-                        gridTemplateColumns: 'minmax(240px, 268px) minmax(0, 1fr)',
-                        gap: '16px',
-                        alignItems: 'center',
-                      }}
-                    >
-                      {/* Left: Larger 2D Structure */}
-                      <ChemicalStructure
-                        smiles={sp.smiles}
-                        name={`${stoichLabel || 'Product'} (${sp.formula})`}
-                        width={260}
-                        height={175}
-                      />
+              if (groupMode === 'score') {
+                return viewLayout === 'grid' ? (
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
+                      gap: '14px',
+                    }}
+                  >
+                    {species.map((sp, idx) => renderGridCard(sp, idx + 1))}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    {species.map((sp, idx) => renderListRow(sp, idx + 1))}
+                  </div>
+                );
+              }
 
-                      {/* Right: Masses, Score, Pathway */}
-                      <div style={{ minWidth: 0 }}>
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
+                  {families.map((fam) => {
+                    const famTc = tierColor(fam.peakTier);
+                    const showMinor = Boolean(expandedMinorFamilies[fam.id]);
+                    const extraCodes = fam.allSubstrateCodes.filter(
+                      (c) => !fam.entrySubstrateCodes.includes(c)
+                    );
+                    const substrateRoute =
+                      fam.entrySubstrateCodes.join(' + ') +
+                      (extraCodes.length > 0 ? ` → +${extraCodes.join(' + ')}` : '');
+                    const minorPeak = fam.minorNodes.reduce((mx, n) => Math.max(mx, n.species.score), 0);
+
+                    return (
+                      <section
+                        key={fam.id}
+                        style={{
+                          border: '1px solid var(--line)',
+                          borderRadius: '12px',
+                          background: 'var(--bg)',
+                          padding: '14px 16px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px',
+                        }}
+                      >
+                        {/* Pathway Family Header (Ordered Descending by Peak Score) */}
                         <div
                           style={{
                             display: 'flex',
                             justifyContent: 'space-between',
                             alignItems: 'center',
+                            gap: '10px',
                             flexWrap: 'wrap',
-                            gap: '8px',
-                            marginBottom: '8px',
+                            paddingBottom: '10px',
+                            borderBottom: '1px solid var(--line2)',
                           }}
                         >
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                              <span style={{ fontWeight: 700, fontSize: '14px', color: 'var(--fg)' }}>
+                                Pathway {fam.pathwayNumber}
+                              </span>
+                              <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--fg2)' }}>
+                                {fam.entryStepLabel} — {fam.title}
+                              </span>
+                              {substrateRoute && (
+                                <span
+                                  className="mono"
+                                  style={{
+                                    fontSize: '11.5px',
+                                    fontWeight: 600,
+                                    color: 'var(--acc)',
+                                    padding: '1px 7px',
+                                    borderRadius: '5px',
+                                    background: 'var(--soft)',
+                                    border: '1px solid var(--line2)',
+                                  }}
+                                >
+                                  {substrateRoute}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                            <span className="mono" style={{ fontWeight: 700, fontSize: '13.5px' }}>
-                              #{idx + 1}
-                            </span>
                             <span
                               className="mono"
                               style={{
-                                fontSize: '12px',
+                                fontSize: '11.5px',
                                 fontWeight: 700,
                                 padding: '2px 8px',
                                 borderRadius: '6px',
-                                color: tc.fg,
-                                background: tc.bg,
-                                border: `1px solid ${tc.bd}`,
+                                color: famTc.fg,
+                                background: famTc.bg,
+                                border: `1px solid ${famTc.bd}`,
                               }}
                             >
-                              {sp.score.toFixed(2)} · {sp.tier}
+                              Peak {fam.peakScore.toFixed(2)} · {fam.peakTier}
                             </span>
-                            <span style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                              {sp.status === 'sink' ? 'Stable Product' : 'Equilibrium'}
+                            <span className="mono" style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+                              Lead #{fam.leadGlobalRank} · [M+H]⁺ {fam.leadSpecies.mhPlus.toFixed(4)} · {fam.nodes.length}{' '}
+                              {fam.nodes.length === 1 ? 'species' : 'species'}
                             </span>
-                            {stoichLabel && (
-                              <span className="mono" style={{ fontSize: '12px', color: 'var(--mut)' }}>
-                                · {stoichLabel}
-                              </span>
-                            )}
-                            <span className="mono" style={{ fontSize: '12px', color: 'var(--fg2)' }}>
-                              · {sp.formula}
-                            </span>
-                          </div>
-
-                          <div style={{ display: 'flex', gap: '6px' }}>
-                            <button
-                              type="button"
-                              className="btn sm"
-                              style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
-                              onClick={() => {
-                                navigator.clipboard.writeText(sp.smiles);
-                                toast('Copied product SMILES.');
-                              }}
-                              title="Copy canonical SMILES"
-                            >
-                              <Copy size={11} />
-                              <span style={{ marginLeft: '4px' }}>SMILES</span>
-                            </button>
-                            <button
-                              type="button"
-                              className="btn sm"
-                              style={{ height: '26px', fontSize: '11px', padding: '0 8px' }}
-                              onClick={() => {
-                                navigator.clipboard.writeText(sp.mhPlus.toFixed(4));
-                                toast(`Copied [M+H]+ = ${sp.mhPlus.toFixed(4)}`);
-                              }}
-                              title="Copy [M+H]+ exact mass"
-                            >
-                              Copy [M+H]⁺
-                            </button>
                           </div>
                         </div>
 
-                        {/* Tabular LC-MS & Chromatography Metrics */}
-                        <div
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: 'repeat(auto-fit, minmax(95px, 1fr))',
-                            gap: '8px',
-                            padding: '8px 10px',
-                            borderRadius: '7px',
-                            background: 'var(--soft)',
-                            marginBottom: '8px',
-                          }}
-                        >
-                          <div>
-                            <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>Exact Mass</div>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                              {sp.exactMass.toFixed(4)}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+H]⁺</div>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--acc)' }}>
-                              {sp.mhPlus.toFixed(4)}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M+Na]⁺</div>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                              {sp.mNaPlus.toFixed(4)}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>[M−H]⁻</div>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                              {sp.mHMinus.toFixed(4)}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>cLogP / TPSA</div>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 600 }}>
-                              {sp.clogP.toFixed(1)} · {sp.tpsa.toFixed(0)} Å²
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Mechanism Summary & Expandable Steps */}
-                        <div
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            gap: '8px',
-                            flexWrap: 'wrap',
-                          }}
-                        >
-                          <div style={{ fontSize: '12px', color: 'var(--fg2)' }}>
-                            <span className="mono" style={{ fontWeight: 600 }}>
-                              {sp.mechanismSummary}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            className="btn sm"
-                            style={{ height: '24px', fontSize: '11px', padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            onClick={() => toggleTrail(sp.key)}
-                          >
-                            {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                            <span>Steps ({sp.stepsCount})</span>
-                          </button>
-                        </div>
-
-                        {sp.alerts.length > 0 && (
-                          <div style={{ marginTop: '6px', fontSize: '11.5px', color: 'var(--warn)' }}>
-                            {sp.alerts.map((a) => a.message).join(' · ')}
-                          </div>
-                        )}
-
-                        {isOpen && (
+                        {/* Primary Pathway Members */}
+                        {viewLayout === 'grid' ? (
                           <div
                             style={{
-                              marginTop: '8px',
-                              padding: '8px 10px',
-                              background: 'var(--bg)',
-                              borderRadius: '6px',
-                              border: '1px solid var(--line2)',
-                              fontSize: '11.5px',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: '5px',
+                              display: 'grid',
+                              gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
+                              gap: '12px',
                             }}
                           >
-                            {sp.bestChain.map((st, sIdx) => (
-                              <div key={sIdx} style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
-                                <span>
-                                  <b className="mono">{sIdx + 1}. {st.stepLabel}</b> — {st.description}
-                                  {st.releasedFragment ? ` (releases ${st.releasedFragment})` : ''}
-                                  {st.releasedGas ? ` (releases ${st.releasedGas})` : ''}
-                                </span>
-                                <span className="mono" style={{ color: 'var(--mut)' }}>
-                                  w={st.stepWeight.toFixed(2)} · pH×{st.conditionFactor.toFixed(2)} · T×{st.tempFactor.toFixed(2)}
-                                  {st.ringFactor > 1.05 ? ` · ring×${st.ringFactor.toFixed(2)}` : ''}
-                                </span>
-                              </div>
-                            ))}
-                            {sp.alternativeChains.length > 0 && (
-                              <div style={{ color: 'var(--mut)', paddingTop: '4px', borderTop: '1px dashed var(--line)' }}>
-                                Alternative route{sp.alternativeChains.length > 1 ? 's' : ''}:{' '}
-                                {sp.alternativeChains.map((ac) => ac.map((x) => x.stepLabel).join(' → ')).join(' | ')}
-                              </div>
-                            )}
+                            {fam.primaryNodes.map((n) => renderGridCard(n.species, n.globalRank, n))}
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                            {fam.primaryNodes.map((n) => renderListRow(n.species, n.globalRank, n))}
                           </div>
                         )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )
+
+                        {/* Collapsible Minor / Low-Confidence Offshoots */}
+                        {fam.minorNodes.length > 0 && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                            <div>
+                              <button
+                                type="button"
+                                className="btn sm"
+                                style={{
+                                  height: '26px',
+                                  fontSize: '11.5px',
+                                  padding: '0 10px',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '5px',
+                                  color: 'var(--fg2)',
+                                }}
+                                onClick={() => toggleMinorFamily(fam.id)}
+                              >
+                                {showMinor ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                <span>
+                                  {showMinor
+                                    ? `Hide ${fam.minorNodes.length} lower-confidence branch${fam.minorNodes.length > 1 ? 'es' : ''}`
+                                    : `+ Show ${fam.minorNodes.length} lower-confidence branch${fam.minorNodes.length > 1 ? 'es' : ''} (max ${minorPeak.toFixed(2)})`}
+                                </span>
+                              </button>
+                            </div>
+
+                            {showMinor &&
+                              (viewLayout === 'grid' ? (
+                                <div
+                                  style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
+                                    gap: '12px',
+                                  }}
+                                >
+                                  {fam.minorNodes.map((n) => renderGridCard(n.species, n.globalRank, n))}
+                                </div>
+                              ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                  {fam.minorNodes.map((n) => renderListRow(n.species, n.globalRank, n))}
+                                </div>
+                              ))}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              );
+            })()
           ) : (
             <div style={{ textAlign: 'center', padding: '24px', color: 'var(--mut)', fontSize: '13px' }}>
               No reactive products predicted under these conditions (adjust temperature, pH/additive, or enable speculative candidates).

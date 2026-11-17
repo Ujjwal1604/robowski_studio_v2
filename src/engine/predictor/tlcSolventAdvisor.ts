@@ -293,7 +293,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     ratio: '3:96:1 v/v/v MeOH / DCM / AcOH',
     chamberPrep20mL: '0.6 mL MeOH + 19.2 mL DCM + 0.2 mL AcOH',
     stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
+    preferenceTier: 'primary',
     family: 'acid_mod',
     strength: 0.64,
     alcoholPct: 3,

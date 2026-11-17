@@ -314,7 +314,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
   const activeSystemPlan: RecommendedPlateSolvent | null = useMemo(() => {
     if (!platePlan) return null;
-    const all = [...platePlan.recommendedSystems, ...(platePlan.otherSystems || [])];
+    const all = [
+      ...platePlan.recommendedSystems,
+      ...(platePlan.otherGroups || []).flatMap((g) => g.systems),
+      ...(platePlan.otherSystems || []),
+    ];
     return all.find((x) => x.system.id === selectedSystemId) || platePlan.recommendedSystems[0] || null;
   }, [platePlan, selectedSystemId]);
 
@@ -718,9 +722,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         rec.system.name,
                         platePlan.stationaryPhase || stationaryPhasePref
                       );
+                      const alt = rec.alternatives?.[0];
+                      const altSel = alt ? activeSystemPlan?.system.id === alt.id : false;
+                      const altTabName = alt
+                        ? formatTlcTabName(alt.name, platePlan.stationaryPhase || stationaryPhasePref)
+                        : '';
                       return (
+                        <div key={rec.system.id} style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                         <div
-                          key={rec.system.id}
                           onClick={() => {
                             setSelectedSystemId(rec.system.id);
                             if (rec.assignedWellIndices.length > 0) {
@@ -797,22 +806,12 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                           <div style={{ fontSize: '15px', fontWeight: 700 }}>{rec.system.name}</div>
 
                           <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
-                            20 mL: {rec.system.chamberPrep20mL}
+                            50 mL: {rec.system.chamberPrep50mL}
                           </div>
 
                           <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
                             {rec.system.bestFor}
                           </div>
-
-                          {rec.alternatives && rec.alternatives.length > 0 && (
-                            <div style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
-                              <strong>or</strong> {rec.alternatives[0].name}{' '}
-                              <span className="mono" style={{ color: 'var(--mut)' }}>
-                                (20 mL: {rec.alternatives[0].chamberPrep20mL})
-                              </span>{' '}
-                              — resolves about the same wells; use whichever base you have.
-                            </div>
-                          )}
 
                           <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }} onClick={(e) => e.stopPropagation()}>
                             {onApplyToCurrentSet && (
@@ -842,6 +841,61 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               </button>
                             )}
                           </div>
+                        </div>
+                        {alt && (
+                          <div
+                            onClick={() => {
+                              setSelectedSystemId(alt.id);
+                              if (rec.assignedWellIndices.length > 0) setSelectedLaneIdx(rec.assignedWellIndices[0]);
+                            }}
+                            style={{
+                              cursor: 'pointer',
+                              padding: '10px 14px',
+                              borderRadius: '10px',
+                              background: altSel ? 'color-mix(in srgb, #10b981 9%, var(--panel))' : 'var(--panel)',
+                              border: altSel ? '2px dashed #10b981' : '1px dashed var(--line)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '4px',
+                            }}
+                          >
+                            <div style={{ fontSize: '10.5px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--mut)' }}>
+                              OR · same wells, other base
+                            </div>
+                            <div style={{ fontSize: '13px', fontWeight: 700 }}>{alt.name}</div>
+                            <div className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
+                              50 mL: {alt.chamberPrep50mL}
+                            </div>
+                            <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }} onClick={(e) => e.stopPropagation()}>
+                              {onApplyToCurrentSet && (
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                                  onClick={() => {
+                                    onApplyToCurrentSet(altTabName);
+                                    toast(`Applied "${altTabName}" to active TLC tab.`);
+                                  }}
+                                >
+                                  Apply to Tab
+                                </button>
+                              )}
+                              {onCreateNewSet && (
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                                  onClick={() => {
+                                    onCreateNewSet(altTabName);
+                                    toast(`Created TLC tab "${altTabName}".`);
+                                  }}
+                                >
+                                  + Tab
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
                         </div>
                       );
                     })}
@@ -899,7 +953,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{activeSystemPlan.system.name}</span>
                           </div>
                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 20 mL: {activeSystemPlan.system.chamberPrep20mL}
+                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {activeSystemPlan.system.chamberPrep50mL}
                           </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
@@ -1227,7 +1281,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         }}
                       >
                         <div style={{ fontSize: '12.5px', fontWeight: 700 }}>
-                          Other Available Systems (Click any to preview simulated 54-well plate)
+                          Other Available Systems, grouped into complementary sets (click any to preview the simulated 54-well plate)
                         </div>
                         <button
                           type="button"
@@ -1239,15 +1293,9 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         </button>
                       </div>
 
-                      {showOtherSystems && (
-                        <div
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: 'repeat(auto-fill, minmax(215px, 1fr))',
-                            gap: '8px',
-                          }}
-                        >
-                          {platePlan.otherSystems.map((rec) => {
+                      {showOtherSystems &&
+                        (() => {
+                          const renderCard = (rec: RecommendedPlateSolvent) => {
                             const isSel = activeSystemPlan?.system.id === rec.system.id;
                             const badge = stationaryPhaseBadge(
                               rec.system.stationaryPhase,
@@ -1276,7 +1324,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   gap: '3px',
                                   color: 'var(--fg)',
                                 }}
-                                title={`${rec.system.chamberPrep20mL} — ${rec.system.bestFor}`}
+                                title={`${rec.system.chamberPrep50mL} — ${rec.system.bestFor}`}
                               >
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '4px' }}>
                                   <span style={{ fontSize: '12px', fontWeight: 700 }}>{rec.system.shortLabel}</span>
@@ -1292,13 +1340,44 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   </span>
                                 </div>
                                 <div style={{ fontSize: '10.5px', color: 'var(--mut)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                  {rec.system.chamberPrep20mL}
+                                  {rec.system.chamberPrep50mL}
                                 </div>
                               </button>
                             );
-                          })}
-                        </div>
-                      )}
+                          };
+                          const groups = platePlan.otherGroups || [];
+                          const groupedIds = new Set(groups.flatMap((g) => g.systems.map((e) => e.system.id)));
+                          const leftovers = platePlan.otherSystems.filter((r) => !groupedIds.has(r.system.id));
+                          const gridStyle = {
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fill, minmax(215px, 1fr))',
+                            gap: '8px',
+                          } as const;
+                          return (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                              {groups.map((grp) => (
+                                <div key={grp.label} style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                  <div style={{ fontSize: '12px', fontWeight: 700 }}>
+                                    {grp.label}{' '}
+                                    <span className="mono" style={{ fontWeight: 600, color: 'var(--mut)' }}>
+                                      · est. {grp.resolvedWellCount}/{platePlan.activeWellCount} wells resolved ({grp.coveragePct}%) as a set
+                                    </span>
+                                  </div>
+                                  <div style={gridStyle}>{grp.systems.map((rec) => renderCard(rec))}</div>
+                                </div>
+                              ))}
+                              {leftovers.length > 0 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                  <div style={{ fontSize: '12px', fontWeight: 700 }}>
+                                    Other single systems{' '}
+                                    <span style={{ fontWeight: 400, color: 'var(--mut)' }}>(not part of a set)</span>
+                                  </div>
+                                  <div style={gridStyle}>{leftovers.map((rec) => renderCard(rec))}</div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                     </div>
                   )}
                 </>

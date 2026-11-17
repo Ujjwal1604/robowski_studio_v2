@@ -30,7 +30,7 @@ export interface TlcSolventSystemDef {
   name: string;
   shortLabel: string;
   ratio: string;
-  chamberPrep20mL: string;
+  chamberPrep50mL: string;
   stationaryPhase: TlcStationaryPhase;
   preferenceTier: SolventPreferenceTier;
   family: SolventFamily;
@@ -59,7 +59,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '10% EtOAc / Hexanes',
     shortLabel: '10% EtOAc/Hex',
     ratio: '1:9 v/v EtOAc / Hexanes',
-    chamberPrep20mL: '2.0 mL EtOAc + 18.0 mL Hexanes',
+    chamberPrep50mL: '5.0 mL EtOAc + 45.0 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'etoac_hex',
@@ -73,7 +73,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '25% EtOAc / Hexanes',
     shortLabel: '25% EtOAc/Hex',
     ratio: '1:3 v/v EtOAc / Hexanes',
-    chamberPrep20mL: '5.0 mL EtOAc + 15.0 mL Hexanes',
+    chamberPrep50mL: '12.5 mL EtOAc + 37.5 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'etoac_hex',
@@ -87,7 +87,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '50% EtOAc / Hexanes',
     shortLabel: '50% EtOAc/Hex',
     ratio: '1:1 v/v EtOAc / Hexanes',
-    chamberPrep20mL: '10.0 mL EtOAc + 10.0 mL Hexanes',
+    chamberPrep50mL: '25.0 mL EtOAc + 25.0 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'etoac_hex',
@@ -101,7 +101,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '80% EtOAc / Hexanes',
     shortLabel: '80% EtOAc/Hex',
     ratio: '4:1 v/v EtOAc / Hexanes',
-    chamberPrep20mL: '16.0 mL EtOAc + 4.0 mL Hexanes',
+    chamberPrep50mL: '40.0 mL EtOAc + 10.0 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'etoac_hex',
@@ -115,7 +115,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '100% EtOAc',
     shortLabel: '100% EtOAc',
     ratio: 'Neat Ethyl Acetate',
-    chamberPrep20mL: '20.0 mL EtOAc',
+    chamberPrep50mL: '50.0 mL EtOAc',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'etoac_hex',
@@ -129,7 +129,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '3% MeOH / DCM',
     shortLabel: '3% MeOH/DCM',
     ratio: '3:97 v/v MeOH / DCM',
-    chamberPrep20mL: '0.6 mL MeOH + 19.4 mL DCM',
+    chamberPrep50mL: '1.5 mL MeOH + 48.5 mL DCM',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'meoh_dcm',
@@ -143,7 +143,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '7% MeOH / DCM',
     shortLabel: '7% MeOH/DCM',
     ratio: '7:93 v/v MeOH / DCM',
-    chamberPrep20mL: '1.4 mL MeOH + 18.6 mL DCM',
+    chamberPrep50mL: '3.5 mL MeOH + 46.5 mL DCM',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'meoh_dcm',
@@ -157,7 +157,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '12% MeOH / DCM',
     shortLabel: '12% MeOH/DCM',
     ratio: '12:88 v/v MeOH / DCM',
-    chamberPrep20mL: '2.4 mL MeOH + 17.6 mL DCM',
+    chamberPrep50mL: '6.0 mL MeOH + 44.0 mL DCM',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'meoh_dcm',
@@ -171,7 +171,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '30% EtOAc / Hexanes + 1% Et₃N',
     shortLabel: '30% EtOAc/Hex + Et₃N',
     ratio: '30:69:1 v/v/v EtOAc / Hexanes / Et₃N',
-    chamberPrep20mL: '6.0 mL EtOAc + 13.8 mL Hexanes + 0.2 mL Et₃N',
+    chamberPrep50mL: '15.0 mL EtOAc + 34.5 mL Hexanes + 0.5 mL Et₃N',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -186,7 +186,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '60% EtOAc / Hexanes + 1% Et₃N',
     shortLabel: '60% EtOAc/Hex + Et₃N',
     ratio: '60:39:1 v/v/v EtOAc / Hexanes / Et₃N',
-    chamberPrep20mL: '12.0 mL EtOAc + 7.8 mL Hexanes + 0.2 mL Et₃N',
+    chamberPrep50mL: '30.0 mL EtOAc + 19.5 mL Hexanes + 0.5 mL Et₃N',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -201,7 +201,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '5% MeOH / DCM + 1% Et₃N',
     shortLabel: '5% MeOH/DCM + Et₃N',
     ratio: '5:94:1 v/v/v MeOH / DCM / Et₃N',
-    chamberPrep20mL: '1.0 mL MeOH + 18.8 mL DCM + 0.2 mL Et₃N',
+    chamberPrep50mL: '2.5 mL MeOH + 47.0 mL DCM + 0.5 mL Et₃N',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -216,7 +216,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: 'DCM / (2M NH₃ in MeOH) (99:1)',
     shortLabel: '99:1 DCM/NH₃-MeOH',
     ratio: '99:1 v/v DCM / (2M NH₃ in MeOH)',
-    chamberPrep20mL: '19.8 mL DCM + 0.2 mL (2M NH₃ in MeOH)',
+    chamberPrep50mL: '49.5 mL DCM + 0.5 mL (2M NH₃ in MeOH)',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -231,7 +231,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: 'DCM / (2M NH₃ in MeOH) (98:2)',
     shortLabel: '98:2 DCM/NH₃-MeOH',
     ratio: '98:2 v/v DCM / (2M NH₃ in MeOH)',
-    chamberPrep20mL: '19.6 mL DCM + 0.4 mL (2M NH₃ in MeOH)',
+    chamberPrep50mL: '49.0 mL DCM + 1.0 mL (2M NH₃ in MeOH)',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -246,7 +246,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: 'DCM / MeOH / (2M NH₃ in MeOH) (95:3:2)',
     shortLabel: '95:3:2 DCM/MeOH/NH₃',
     ratio: '95:3:2 v/v/v DCM / MeOH / (2M NH₃ in MeOH)',
-    chamberPrep20mL: '19.0 mL DCM + 0.6 mL MeOH + 0.4 mL (2M NH₃ in MeOH)',
+    chamberPrep50mL: '47.5 mL DCM + 1.5 mL MeOH + 1.0 mL (2M NH₃ in MeOH)',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -261,7 +261,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: 'DCM / MeOH / (2M NH₃ in MeOH) (88:10:2)',
     shortLabel: '88:10:2 DCM/MeOH/NH₃',
     ratio: '88:10:2 v/v/v DCM / MeOH / (2M NH₃ in MeOH)',
-    chamberPrep20mL: '17.6 mL DCM + 2.0 mL MeOH + 0.4 mL (2M NH₃ in MeOH)',
+    chamberPrep50mL: '44.0 mL DCM + 5.0 mL MeOH + 1.0 mL (2M NH₃ in MeOH)',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -276,7 +276,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '12% MeOH / DCM + 1% Et₃N',
     shortLabel: '12% MeOH/DCM + Et₃N',
     ratio: '12:87:1 v/v/v MeOH / DCM / Et₃N',
-    chamberPrep20mL: '2.4 mL MeOH + 17.4 mL DCM + 0.2 mL Et₃N',
+    chamberPrep50mL: '6.0 mL MeOH + 43.5 mL DCM + 0.5 mL Et₃N',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'basic_mod',
@@ -291,7 +291,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '30% EtOAc / Hexanes + 1% AcOH',
     shortLabel: '30% EtOAc/Hex + AcOH',
     ratio: '30:69:1 v/v/v EtOAc / Hexanes / AcOH',
-    chamberPrep20mL: '6.0 mL EtOAc + 13.8 mL Hexanes + 0.2 mL AcOH',
+    chamberPrep50mL: '15.0 mL EtOAc + 34.5 mL Hexanes + 0.5 mL AcOH',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'acid_mod',
@@ -306,7 +306,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '60% EtOAc / Hexanes + 1% AcOH',
     shortLabel: '60% EtOAc/Hex + AcOH',
     ratio: '60:39:1 v/v/v EtOAc / Hexanes / AcOH',
-    chamberPrep20mL: '12.0 mL EtOAc + 7.8 mL Hexanes + 0.2 mL AcOH',
+    chamberPrep50mL: '30.0 mL EtOAc + 19.5 mL Hexanes + 0.5 mL AcOH',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'acid_mod',
@@ -321,7 +321,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '3% MeOH / DCM + 1% AcOH',
     shortLabel: '3% MeOH/DCM + AcOH',
     ratio: '3:96:1 v/v/v MeOH / DCM / AcOH',
-    chamberPrep20mL: '0.6 mL MeOH + 19.2 mL DCM + 0.2 mL AcOH',
+    chamberPrep50mL: '1.5 mL MeOH + 48.0 mL DCM + 0.5 mL AcOH',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'acid_mod',
@@ -336,7 +336,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '8% MeOH / DCM + 1% AcOH',
     shortLabel: '8% MeOH/DCM + AcOH',
     ratio: '8:91:1 v/v/v MeOH / DCM / AcOH',
-    chamberPrep20mL: '1.6 mL MeOH + 18.2 mL DCM + 0.2 mL AcOH',
+    chamberPrep50mL: '4.0 mL MeOH + 45.5 mL DCM + 0.5 mL AcOH',
     stationaryPhase: 'SiO2',
     preferenceTier: 'primary',
     family: 'acid_mod',
@@ -355,7 +355,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '25% Acetone / Hexanes',
     shortLabel: '25% Acetone/Hex',
     ratio: '1:3 v/v Acetone / Hexanes',
-    chamberPrep20mL: '5.0 mL Acetone + 15.0 mL Hexanes',
+    chamberPrep50mL: '12.5 mL Acetone + 37.5 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'acetone_hex',
@@ -369,7 +369,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '50% Acetone / Hexanes',
     shortLabel: '50% Acetone/Hex',
     ratio: '1:1 v/v Acetone / Hexanes',
-    chamberPrep20mL: '10.0 mL Acetone + 10.0 mL Hexanes',
+    chamberPrep50mL: '25.0 mL Acetone + 25.0 mL Hexanes',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'acetone_hex',
@@ -383,7 +383,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '5% MeOH / EtOAc',
     shortLabel: '5% MeOH/EtOAc',
     ratio: '1:19 v/v MeOH / EtOAc',
-    chamberPrep20mL: '1.0 mL MeOH + 19.0 mL EtOAc',
+    chamberPrep50mL: '2.5 mL MeOH + 47.5 mL EtOAc',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'meoh_etoac',
@@ -397,7 +397,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '10% MeOH / EtOAc',
     shortLabel: '10% MeOH/EtOAc',
     ratio: '1:9 v/v MeOH / EtOAc',
-    chamberPrep20mL: '2.0 mL MeOH + 18.0 mL EtOAc',
+    chamberPrep50mL: '5.0 mL MeOH + 45.0 mL EtOAc',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'meoh_etoac',
@@ -411,7 +411,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '5% MeOH / Toluene',
     shortLabel: '5% MeOH/Toluene',
     ratio: '1:19 v/v MeOH / Toluene',
-    chamberPrep20mL: '1.0 mL MeOH + 19.0 mL Toluene',
+    chamberPrep50mL: '2.5 mL MeOH + 47.5 mL Toluene',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'meoh_toluene',
@@ -425,7 +425,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '10% MeOH / Toluene',
     shortLabel: '10% MeOH/Toluene',
     ratio: '1:9 v/v MeOH / Toluene',
-    chamberPrep20mL: '2.0 mL MeOH + 18.0 mL Toluene',
+    chamberPrep50mL: '5.0 mL MeOH + 45.0 mL Toluene',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'meoh_toluene',
@@ -439,7 +439,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '20% EtOAc / DCM',
     shortLabel: '20% EtOAc/DCM',
     ratio: '1:4 v/v EtOAc / DCM',
-    chamberPrep20mL: '4.0 mL EtOAc + 16.0 mL DCM',
+    chamberPrep50mL: '10.0 mL EtOAc + 40.0 mL DCM',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'etoac_dcm',
@@ -453,7 +453,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '40% Et₂O / Pentane',
     shortLabel: '40% Et₂O/Pentane',
     ratio: '2:3 v/v Et₂O / Pentane',
-    chamberPrep20mL: '8.0 mL Et₂O + 12.0 mL Pentane',
+    chamberPrep50mL: '20.0 mL Et₂O + 30.0 mL Pentane',
     stationaryPhase: 'SiO2',
     preferenceTier: 'secondary',
     family: 'ether_pentane',
@@ -467,7 +467,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '15% MeCN / H₂O (C18 RP)',
     shortLabel: '15% MeCN/H₂O (C18)',
     ratio: '3:17 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep20mL: '3.0 mL MeCN + 17.0 mL H₂O (C18 plate)',
+    chamberPrep50mL: '7.5 mL MeCN + 42.5 mL H₂O (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -482,7 +482,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '30% MeCN / H₂O (C18 RP)',
     shortLabel: '30% MeCN/H₂O (C18)',
     ratio: '3:7 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep20mL: '6.0 mL MeCN + 14.0 mL H₂O (C18 plate)',
+    chamberPrep50mL: '15.0 mL MeCN + 35.0 mL H₂O (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -497,7 +497,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '45% MeCN / H₂O + 0.1% TFA (C18 RP)',
     shortLabel: '45% MeCN/H₂O + TFA (C18)',
     ratio: '45:55:0.1 MeCN / H₂O / TFA on C18',
-    chamberPrep20mL: '9.0 mL MeCN + 11.0 mL H₂O + 20 µL TFA (C18 plate)',
+    chamberPrep50mL: '22.5 mL MeCN + 27.5 mL H₂O + 50.0 µL TFA (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -513,7 +513,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '60% MeCN / H₂O (C18 RP)',
     shortLabel: '60% MeCN/H₂O (C18)',
     ratio: '3:2 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep20mL: '12.0 mL MeCN + 8.0 mL H₂O (C18 plate)',
+    chamberPrep50mL: '30.0 mL MeCN + 20.0 mL H₂O (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -528,7 +528,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '85% MeCN / H₂O (C18 RP)',
     shortLabel: '85% MeCN/H₂O (C18)',
     ratio: '17:3 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep20mL: '17.0 mL MeCN + 3.0 mL H₂O (C18 plate)',
+    chamberPrep50mL: '42.5 mL MeCN + 7.5 mL H₂O (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -543,7 +543,7 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     name: '50% MeOH / H₂O + 0.1% TFA (C18 RP)',
     shortLabel: '50% MeOH/H₂O + TFA (C18)',
     ratio: '50:50:0.1 MeOH / H₂O / TFA on C18',
-    chamberPrep20mL: '10.0 mL MeOH + 10.0 mL H₂O + 20 µL TFA (C18 plate)',
+    chamberPrep50mL: '25.0 mL MeOH + 25.0 mL H₂O + 50.0 µL TFA (C18 plate)',
     stationaryPhase: 'C18',
     preferenceTier: 'secondary',
     family: 'c18_rp',
@@ -623,6 +623,13 @@ export interface RecommendedPlateSolvent {
   alternatives?: TlcSolventSystemDef[];
 }
 
+export interface PlateSolventGroup {
+  label: string;
+  systems: RecommendedPlateSolvent[];
+  resolvedWellCount: number;
+  coveragePct: number;
+}
+
 export type SolventPoolMode = 'prefer_primary' | 'primary_only' | 'balanced';
 
 export interface PlateSolventPlanResult {
@@ -635,6 +642,8 @@ export interface PlateSolventPlanResult {
   totalCoveragePct: number;
   recommendedSystems: RecommendedPlateSolvent[];
   otherSystems: RecommendedPlateSolvent[];
+  /** remaining systems grouped into complementary sets (best first); leftovers stay in otherSystems only */
+  otherGroups: PlateSolventGroup[];
   wellPredictions: Record<number, WellPredictionResult>;
   summaryNotes: string[];
 }
@@ -1142,8 +1151,20 @@ function evaluateWellInSolvent(
     scoreSum += p.weight * qual;
   });
 
+  // Every spot that could be on the plate (starting materials and ALL predicted products) should sit in the
+  // readable Rf window and be visible; this gates the separation score so unlikely-product guesses cannot
+  // hide a system that pushes known spots onto the baseline or the front.
+  const allSpots = [...subSpots, ...prodSpots];
+  const allVisible =
+    allSpots.reduce(
+      (acc, sp) =>
+        acc + windowScore(sp.rf) * (sp.tailing ? 0.65 : 1) * (sp.uvActive === false ? STAIN_ONLY_FACTOR : 1),
+      0
+    ) / allSpots.length;
+  const visibilityGate = 0.4 + 0.6 * allVisible;
+
   return {
-    score: Math.round((wSum > 0 ? scoreSum / wSum : 0) * 1000) / 1000,
+    score: Math.round((wSum > 0 ? (scoreSum / wSum) * visibilityGate : 0) * 1000) / 1000,
     deltaRf: primaryDelta,
     bestProductRf: primaryRf,
     spots: [...subSpots, ...prodSpots],
@@ -1393,8 +1414,8 @@ export async function optimizePlateTlcSolvents(
       })
       .slice(0, 8);
     const products = rawProds.map((sp) => {
-      const imp =
-        tierImportance(sp.tier) * Math.max(0.08, sp.score * sp.score) * (0.5 + 0.5 * (sp.persistence ?? 1));
+      // Predicted products are only candidates: any of them may or may not form, so none outweighs the others.
+      const imp = 1;
       return {
         key: sp.key,
         smiles: sp.smiles,
@@ -1411,11 +1432,8 @@ export async function optimizePlateTlcSolvents(
 
     const hasHighOrMed = products.some((p) => p.tier === 'High' || p.tier === 'Medium');
     const topScore = products[0]?.score ?? 0;
-    const importanceWeight = hasHighOrMed
-      ? 1.0 + (products[0]?.tier === 'High' ? 1.4 : 0.7) * topScore
-      : products.length > 0
-      ? 0.45 + 0.4 * topScore
-      : 0.16;
+    const importanceWeight = hasHighOrMed ? 1.0 : products.length > 0 ? 0.9 : 0.5;
+    void topScore;
 
     const saltPattern = /\.(Cl|Br|I|F)\b|FC\(F\)\(F\)C\(=O\)O|S\(=O\)\(=O\)O|hydrochloride|trifluoroacetate|tosylate|mesylate/i;
     // A salt shows up as a separate fragment in the SMILES; a sulfonate ester or sulfonamide inside one
@@ -1591,12 +1609,15 @@ export async function optimizePlateTlcSolvents(
   const effK = Math.min(requestedK, poolLen);
   const combos = generateCombinations(poolLen, effK);
 
-  let bestComboIdx: number[] = [0];
-  let bestObjective = -1e9;
   const assignedCounts = new Int32Array(effK);
 
+  // Best combination of effK systems from the pool, skipping any system index in `excluded`.
+  const searchBestCombo = async (excluded: Set<number>): Promise<{ combo: number[]; objective: number }> => {
+  let bestComboIdx: number[] = [];
+  let bestObjective = -1e9;
   for (let cNum = 0; cNum < combos.length; cNum++) {
     const combo = combos[cNum];
+    if (excluded.size > 0 && combo.some((ci) => excluded.has(ci))) continue;
     assignedCounts.fill(0);
     let weightedSum = 0;
 
@@ -1659,6 +1680,11 @@ export async function optimizePlateTlcSolvents(
       await yieldIfFrameExceeded();
     }
   }
+  return { combo: bestComboIdx, objective: bestObjective };
+  };
+
+  const mainSearch = await searchBestCombo(new Set<number>());
+  const bestComboIdx = mainSearch.combo.length > 0 ? mainSearch.combo : [0];
 
   let chosenSystems = bestComboIdx.map((idx) => searchPool[idx]);
 
@@ -1763,6 +1789,49 @@ export async function optimizePlateTlcSolvents(
       return b.meanResolutionScore - a.meanResolutionScore;
     });
 
+  // Group the remaining systems into complementary sets, the same way the main suggestion is built:
+  // repeat the combination search without the systems already used.
+  const otherGroups: PlateSolventGroup[] = [];
+  const usedIdx = new Set<number>(bestComboIdx);
+  const MAX_GROUPS = 3;
+  for (let g = 0; g < MAX_GROUPS; g++) {
+    if (searchPool.length - usedIdx.size < effK) break;
+    const found = await searchBestCombo(usedIdx);
+    if (found.combo.length === 0) break;
+    found.combo.forEach((ci) => usedIdx.add(ci));
+    const groupSystems = found.combo.map((ci) => searchPool[ci]);
+    const owner = new Map<number, string>();
+    let groupResolved = 0;
+    for (const w of activeWells) {
+      let top = groupSystems[0];
+      let topSc = -1;
+      for (const sys of groupSystems) {
+        const sc = evalMatrix.get(sys.id)!.get(w.wellIndex)!.score;
+        if (sc > topSc) {
+          topSc = sc;
+          top = sys;
+        }
+      }
+      if (topSc >= RESOLVED_SCORE) {
+        owner.set(w.wellIndex, top.id);
+        groupResolved++;
+      }
+    }
+    if (groupResolved === 0) break;
+    const entries = groupSystems
+      .map((sys) => buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, owner))
+      .sort((a, b) => b.assignedWellIndices.length - a.assignedWellIndices.length)
+      .map((entry, i) => ({ ...entry, rank: i + 1 }));
+    otherGroups.push({
+      label: `Alternative set ${String.fromCharCode(66 + g)}`,
+      systems: entries,
+      resolvedWellCount: groupResolved,
+      coveragePct: activeWells.length > 0 ? Math.round((groupResolved / activeWells.length) * 100) : 0,
+    });
+  }
+  const groupedIds = new Set(otherGroups.flatMap((gr) => gr.systems.map((e) => e.system.id)));
+  void groupedIds;
+
 
   const highRankedWellCount = activeWells.filter((w) => w.hasHighOrMed).length;
   const totalCoveragePct =
@@ -1817,6 +1886,7 @@ export async function optimizePlateTlcSolvents(
     totalCoveragePct,
     recommendedSystems,
     otherSystems,
+    otherGroups,
     wellPredictions,
     summaryNotes,
   };

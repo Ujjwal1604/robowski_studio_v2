@@ -199,6 +199,19 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
       }
     }
 
+    // Remaining systems are grouped into complementary sets that do not reuse the main suggestion
+    const recIds = new Set(plan.recommendedSystems.map((r) => r.system.id));
+    expect(plan.otherGroups.length).toBeGreaterThan(0);
+    const seen = new Set<string>();
+    for (const g of plan.otherGroups) {
+      expect(g.systems.length).toBeGreaterThanOrEqual(1);
+      for (const e of g.systems) {
+        expect(recIds.has(e.system.id)).toBe(false);
+        expect(seen.has(e.system.id)).toBe(false);
+        seen.add(e.system.id);
+      }
+    }
+
     expect(plan.activeWellCount).toBe(53);
     expect(plan.highRankedWellCount).toBeGreaterThan(20);
     expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(2);
@@ -275,8 +288,8 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     const etoac30AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_30_acoh')!;
     const meoh8AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_acoh')!;
     expect(etoac30AcOH.name).toContain('EtOAc / Hexanes + 1% AcOH');
-    expect(etoac30AcOH.chamberPrep20mL).toContain('EtOAc');
-    expect(etoac30AcOH.chamberPrep20mL).toContain('AcOH');
+    expect(etoac30AcOH.chamberPrep50mL).toContain('EtOAc');
+    expect(etoac30AcOH.chamberPrep50mL).toContain('AcOH');
 
     const benzoicInEtoac = predictNormalPhaseRf(benzoicProf, etoac30AcOH);
     const benzoicInMeoh = predictNormalPhaseRf(benzoicProf, meoh8AcOH);
@@ -366,7 +379,7 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     for (const rec of neutralPlan.recommendedSystems) {
       expect(rec.system.baseModifier).toBeUndefined();
       expect(rec.system.acidModifier).toBeUndefined();
-      expect(rec.system.chamberPrep20mL).toMatch(/EtOAc|Hexanes|DCM|MeOH|Acetone|Toluene|MeCN/i);
+      expect(rec.system.chamberPrep50mL).toMatch(/EtOAc|Hexanes|DCM|MeOH|Acetone|Toluene|MeCN|Et₂O|Pentane/i);
     }
   });
 

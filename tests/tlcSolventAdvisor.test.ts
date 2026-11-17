@@ -189,6 +189,11 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     expect(plan.recommendedSystems.length).toBeLessThanOrEqual(3);
     expect(plan.totalCoveragePct).toBeGreaterThanOrEqual(80);
 
+    // Honest reporting: only resolved wells are assigned; the rest are listed as unresolved
+    const assignedTotal = plan.recommendedSystems.reduce((n, r) => n + r.assignedWellIndices.length, 0);
+    expect(assignedTotal).toBe(plan.resolvedWellCount);
+    expect(plan.resolvedWellCount + plan.unresolvedWellIndices.length).toBe(plan.activeWellCount);
+
     // Each recommended solvent system renders a complete 54-lane simulated plate
     for (const rec of plan.recommendedSystems) {
       expect(rec.lanes).toHaveLength(54);

@@ -597,6 +597,7 @@ export interface PlateSolventPlanResult {
   activeWellCount: number;
   highRankedWellCount: number;
   resolvedWellCount: number;
+  unresolvedWellIndices: number[];
   totalCoveragePct: number;
   recommendedSystems: RecommendedPlateSolvent[];
   otherSystems: RecommendedPlateSolvent[];
@@ -932,11 +933,27 @@ function windowScore(rf: number): number {
   return 0.05;
 }
 
+// Rf predictions are hand-tuned guesses (error roughly +-0.12), so separation is scored as the
+// probability that two spots really are apart, not as a point estimate of the gap.
+const RF_SIGMA = 0.12;
+const RF_MIN_VISIBLE_GAP = 0.03;
+
+function erf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * ax);
+  const y =
+    1 -
+    (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
+      t *
+      Math.exp(-ax * ax);
+  return sign * y;
+}
+
 function deltaScore(deltaRf: number): number {
-  if (deltaRf >= 0.16) return 1.0;
-  if (deltaRf >= 0.10) return 0.65 + ((deltaRf - 0.10) / 0.06) * 0.35;
-  if (deltaRf >= 0.05) return 0.25 + ((deltaRf - 0.05) / 0.05) * 0.4;
-  return Math.max(0.05, (deltaRf / 0.05) * 0.25);
+  const z = (Math.abs(deltaRf) - RF_MIN_VISIBLE_GAP) / (RF_SIGMA * Math.SQRT2);
+  const p = 0.5 * (1 + erf(z));
+  return Math.max(0.03, Math.min(1, p));
 }
 
 interface WellCandidateData {
@@ -1161,7 +1178,7 @@ function buildSystemPlanEntry(
 
     const isAssignedHere = bestOwnerByWell.get(w) === sys.id;
     if (isAssignedHere) assignedWellIndices.push(w);
-    if (evalRes.score >= 0.48) {
+    if (evalRes.score >= 0.55) {
       resCount++;
       if (wData.hasHighOrMed) highMedCount++;
     }
@@ -1584,9 +1601,9 @@ export async function optimizePlateTlcSolvents(
 
     const obj =
       weightedSum / totalImportance +
-      activeSystemsUsed * 0.012 +
-      distinctFamilies * 0.014 +
-      distinctBands * 0.012 +
+      activeSystemsUsed * 0.004 +
+      distinctFamilies * 0.005 +
+      distinctBands * 0.004 +
       primaryBonus -
       unneededModCount * 0.03 -
       redundancyPenalty;
@@ -1601,11 +1618,44 @@ export async function optimizePlateTlcSolvents(
     }
   }
 
-  const chosenSystems = bestComboIdx.map((idx) => searchPool[idx]);
-  const chosenIds = new Set(chosenSystems.map((s) => s.id));
+  let chosenSystems = bestComboIdx.map((idx) => searchPool[idx]);
 
-  // 4. Assign each active well to its best eluent inside chosenSystems (favoring primary on near-ties)
+  const RESOLVED_SCORE = 0.55;
+  const resolvedCountFor = (systems: TlcSolventSystemDef[]): number => {
+    let n = 0;
+    for (const w of activeWells) {
+      let best = 0;
+      for (const sys of systems) {
+        const sc = evalMatrix.get(sys.id)!.get(w.wellIndex)!.score;
+        if (sc > best) best = sc;
+      }
+      if (best >= RESOLVED_SCORE) n++;
+    }
+    return n;
+  };
+
+  // Drop eluents that add almost nothing: requested count is an upper bound, not a target.
+  const minUniqueGain = Math.max(2, Math.ceil(activeWells.length * 0.05));
+  let droppedForSmallGain = 0;
+  while (chosenSystems.length > 1) {
+    const full = resolvedCountFor(chosenSystems);
+    let weakest = -1;
+    let weakestLoss = Infinity;
+    for (let i = 0; i < chosenSystems.length; i++) {
+      const loss = full - resolvedCountFor(chosenSystems.filter((_, j) => j !== i));
+      if (loss < weakestLoss) {
+        weakestLoss = loss;
+        weakest = i;
+      }
+    }
+    if (weakest < 0 || weakestLoss >= minUniqueGain) break;
+    chosenSystems = chosenSystems.filter((_, j) => j !== weakest);
+    droppedForSmallGain++;
+  }
+
+  // 4. Assign a well to an eluent only if it is actually resolved there (favoring primary on near-ties).
   const bestOwnerByWell = new Map<number, string>();
+  const unresolvedWellIndices: number[] = [];
   let resolvedWellCount = 0;
   for (const w of activeWells) {
     let topSys = chosenSystems[0];
@@ -1619,8 +1669,12 @@ export async function optimizePlateTlcSolvents(
         topSys = sys;
       }
     }
-    bestOwnerByWell.set(w.wellIndex, topSys.id);
-    if (topScore >= 0.48) resolvedWellCount++;
+    if (topScore >= RESOLVED_SCORE) {
+      bestOwnerByWell.set(w.wellIndex, topSys.id);
+      resolvedWellCount++;
+    } else {
+      unresolvedWellIndices.push(w.wellIndex);
+    }
   }
 
   const recommendedSystems = chosenSystems
@@ -1644,8 +1698,6 @@ export async function optimizePlateTlcSolvents(
       return b.meanResolutionScore - a.meanResolutionScore;
     });
 
-  // Also ensure any recommended primary/secondary flags don't leave chosenIds stale
-  void chosenIds;
 
   const highRankedWellCount = activeWells.filter((w) => w.hasHighOrMed).length;
   const totalCoveragePct =
@@ -1654,7 +1706,17 @@ export async function optimizePlateTlcSolvents(
   const summaryNotes: string[] = [];
   if (recommendedSystems.length > 0) {
     summaryNotes.push(
-      `${recommendedSystems.length} complementary eluent${recommendedSystems.length > 1 ? 's' : ''} resolve ${resolvedWellCount}/${activeWells.length} active wells (${totalCoveragePct}% coverage across all predicted SM & products).`
+      `${recommendedSystems.length} eluent${recommendedSystems.length > 1 ? 's' : ''} estimated to resolve ${resolvedWellCount}/${activeWells.length} active wells (~${totalCoveragePct}%; model-based estimate, not measured).`
+    );
+  }
+  if (droppedForSmallGain > 0) {
+    summaryNotes.push(
+      `${recommendedSystems.length} eluent${recommendedSystems.length > 1 ? 's are' : ' is'} enough: ${droppedForSmallGain} more would each rescue fewer than ${minUniqueGain} extra wells.`
+    );
+  }
+  if (unresolvedWellIndices.length > 0) {
+    summaryNotes.push(
+      `${unresolvedWellIndices.length} well${unresolvedWellIndices.length > 1 ? 's' : ''} not resolved in any recommended eluent (${unresolvedWellIndices.slice(0, 12).map((i) => wellLabel(i)).join(', ')}${unresolvedWellIndices.length > 12 ? ', …' : ''}); try another solvent pool or run them by LCMS.`
     );
   }
   if (stationaryPhasePref === 'Al2O3_basic') {
@@ -1686,6 +1748,7 @@ export async function optimizePlateTlcSolvents(
     activeWellCount: activeWells.length,
     highRankedWellCount,
     resolvedWellCount,
+    unresolvedWellIndices,
     totalCoveragePct,
     recommendedSystems,
     otherSystems,

@@ -790,7 +790,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               )}
                             </div>
                             <span className="mono" style={{ fontSize: '11.5px', fontWeight: 700, color: '#10b981' }}>
-                              {rec.wellCoveragePct}% resolved
+                              est. {rec.wellCoveragePct}% resolved
                             </span>
                           </div>
 
@@ -854,7 +854,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                     <div>
                       <strong>Plate {plateIdx + 1} Set Coverage:</strong>{' '}
                       <span className="mono" style={{ color: '#10b981', fontWeight: 700 }}>
-                        {platePlan.resolvedWellCount} / {platePlan.activeWellCount} active wells ({platePlan.totalCoveragePct}%)
+                        est. {platePlan.resolvedWellCount} / {platePlan.activeWellCount} active wells resolved ({platePlan.totalCoveragePct}%)
+                        {platePlan.unresolvedWellIndices.length > 0 && ` · ${platePlan.unresolvedWellIndices.length} unresolved`}
                       </span>
                       {platePlan.highRankedWellCount > 0 && (
                         <span style={{ color: 'var(--mut)', marginLeft: '8px' }}>

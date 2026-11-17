@@ -307,6 +307,77 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     expect(Math.abs(frontDiff - diffuseTarget)).toBeLessThanOrEqual(4);
   });
 
+  it('prefers one continuous solvent front line over patchy high-Rf spot bands, both near a dark border and on borderless half-runs', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    const L = cfg.lanes[0].length;
+
+    // Case A: Upper side (lanes 27..53) stops ~24 px before a dark plate divider/gap, while 16/27 lanes have a high-Rf smudge/spot band at 86%
+    const frontNearGap = Math.round(L * 0.94); // 1009
+    const smudgePos = Math.round(L * 0.86);    // 923
+    const setNearGap: TlcSet = {
+      uid: 'front-near-gap',
+      name: 'Side 2 Near Midline Gap',
+      imgs: { UV254: { name: 'uv254_gap.png', bmp: {} as any } },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const resGap = tlcFront(setNearGap, cfg.lanes[27], (_s, _k, l) => {
+      const idx = l.id % 27;
+      const hasSmudge = idx >= 3 && idx <= 18; // 16/27 lanes (~59%) have fast spots/smudge; blank lanes stay clean
+      return Array.from({ length: L }, (_, i) => {
+        const bg = i > frontNearGap + 24 ? 115 : 240;
+        const gapFront = 48 * Math.exp(-((i - frontNearGap) ** 2) / (2 * 2.2 * 2.2));
+        const smudge = hasSmudge ? 60 * Math.exp(-((i - (smudgePos + (idx % 3) * 4)) ** 2) / (2 * 9 * 9)) : 0;
+        return Math.max(20, bg - gapFront - smudge);
+      });
+    });
+    expect(Math.abs(resGap - frontNearGap)).toBeLessThanOrEqual(3);
+
+    // Case B: Half-plate run with NO dark plate border past the front (e.g. uncut plate run to ~68%) plus spots in 55% of lanes
+    const halfFront = Math.round(L * 0.68);
+    const setHalfPlate: TlcSet = {
+      uid: 'front-half-run',
+      name: 'Half-Run Uncut Plate',
+      imgs: { UV254: { name: 'uv254_half.png', bmp: {} as any } },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const resHalf = tlcFront(setHalfPlate, cfg.lanes[27], (_s, _k, l) => {
+      const idx = l.id % 27;
+      const hasSpot = idx % 2 === 0 || idx < 6; // ~16/27 lanes have a spot near 58%
+      return Array.from({ length: L }, (_, i) => {
+        const spot = hasSpot ? 95 * Math.exp(-((i - Math.round(L * 0.58)) ** 2) / (2 * 10 * 10)) : 0;
+        const line = 34 * Math.exp(-((i - halfFront) ** 2) / (2 * 2.2 * 2.2));
+        return 220 - spot - line;
+      });
+    });
+    expect(Math.abs(resHalf - halfFront)).toBeLessThanOrEqual(3);
+
+    // Case C: Patchy smudge across 16/27 lanes (~59%, leaving blank lanes flat) and NO true front falls back cleanly instead of locking on spots
+    const setPatchyOnly: TlcSet = {
+      uid: 'front-patchy-only',
+      name: 'Patchy Smudge Only',
+      imgs: { UV254: { name: 'uv254_patchy.png', bmp: {} as any } },
+      cfg,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+    const resPatchy = tlcFront(setPatchyOnly, cfg.lanes[27], (_s, _k, l) => {
+      const idx = l.id % 27;
+      const hasSmudge = idx >= 4 && idx <= 19; // 16/27 lanes
+      return Array.from({ length: L }, (_, i) => {
+        const smudge = hasSmudge ? 75 * Math.exp(-((i - Math.round(L * 0.86)) ** 2) / (2 * 11 * 11)) : 0;
+        return 235 - smudge;
+      });
+    });
+    expect(resPatchy).toBe(Math.round(L * 0.93));
+  });
+
   it('finds TLC spots and computes exact Rf and strength', () => {
     // 300 pixel lane, origin at 30, front at 270 (span = 240)
     // Dark spot at pixel 150 -> Rf = (150 - 30) / 240 = 0.50
@@ -426,6 +497,163 @@ describe('TLC Lanes & Coordinate Transforms', () => {
       return Array.from({ length: len }, (_, i) => 18 + 95 * Math.exp(-((i - 132) ** 2) / (2 * 6 * 6)));
     });
     expect(Math.abs(originPos - 132)).toBeLessThanOrEqual(2);
+  });
+
+  it('centers tlcOrigin accurately on huge saturated flat-core dots while keeping blank lanes smoothly linear', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.lanes.forEach((l) => { l.zeroRf = null; });
+    const L = cfgNoZero.lanes[27].length;
+    const setMixed: TlcSet = {
+      uid: 'origin-huge-and-blanks',
+      name: 'Origin Huge Dots + Blanks',
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+
+    const hugeCols = new Set([3, 9, 15, 21]);
+    const medCols = new Set([1, 4, 10, 16, 22, 23]);
+    const faintCols = new Set([7, 11]);
+    const smearOnly = new Set([2, 24]);
+    const baseAt = (col: number) => Math.round(136 - 0.3 * col);
+    const jitter = new Map<number, number>([[4, 4], [10, 3], [16, 4], [22, 4]]);
+
+    const getProf = (_s: TlcSet, _k: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const col = l.id % 27;
+      const base = baseAt(col);
+      const c = base + (jitter.get(col) ?? 0);
+      return Array.from({ length: L }, (_, i) => {
+        if (hugeCols.has(col)) {
+          const d = Math.abs(i - c) / 22;
+          let dark = d < 0.55 ? 175 : d < 1.3 ? 175 * Math.exp(-(((d - 0.55) / 0.36) ** 2)) : 0;
+          if (i > c) dark = Math.max(dark, 90 * Math.exp(-((i - c) / 34)));
+          return Math.max(25, 230 - dark);
+        }
+        if (medCols.has(col) || faintCols.has(col)) {
+          const depth = faintCols.has(col) ? 55 : 120;
+          return 230 - depth * Math.exp(-(((i - c) / 11) ** 2));
+        }
+        if (smearOnly.has(col)) {
+          return 230 - 16 * Math.exp(-(((i - (base + 22)) / 18) ** 2));
+        }
+        return 230;
+      });
+    };
+
+    const detected = cfgNoZero.lanes
+      .filter((l) => l.id >= 27)
+      .map((l) => tlcOrigin(setMixed, l, getProf));
+
+    for (const col of hugeCols) {
+      expect(Math.abs(detected[col] - baseAt(col))).toBeLessThanOrEqual(3);
+    }
+    for (const col of [0, 2, 5, 6, 8, 12, 13, 14, 17, 18, 19, 20, 24, 25, 26]) {
+      expect(Math.abs(detected[col] - baseAt(col))).toBeLessThanOrEqual(3);
+    }
+  });
+
+  it('ignores dark border/handwriting ridges near 4-7% while centering smeared dots without blank-lane zigzag', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.lanes.forEach((l) => { l.zeroRf = null; });
+    const L = cfgNoZero.lanes[0].length;
+    const setBorderAndSmear: TlcSet = {
+      uid: 'origin-border-smear',
+      name: 'Origin Border + Smear + Blanks',
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+
+    const hugeCols = new Set([3, 9, 15, 21]);
+    const smearCols = new Set([4, 10, 16, 22]);
+    const cleanCols = new Set([1, 7, 11, 23]);
+    const baseAt = (col: number) => Math.round(134 - 0.35 * col);
+    const jitter = new Map<number, number>([[4, 4], [10, -4], [16, 4], [22, 4]]);
+
+    const getProf = (_s: TlcSet, _k: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const col = l.id % 27;
+      const base = baseAt(col);
+      const c = base + (jitter.get(col) ?? 0);
+      return Array.from({ length: L }, (_, i) => {
+        // Strong plate cut/handwriting ridge across ALL 27 lanes at ~4.8% (pos 45..58)
+        let dark = 95 * Math.exp(-(((i - 52) / 5) ** 2));
+        if (hugeCols.has(col)) {
+          const d = Math.abs(i - base) / 22;
+          const core = d < 0.58 ? 175 : d < 1.3 ? 175 * Math.exp(-(((d - 0.58) / 0.35) ** 2)) : 0;
+          const tail = i > base ? 95 * Math.exp(-(i - base) / 36) : 0;
+          dark = Math.max(dark, core, tail);
+        } else if (smearCols.has(col)) {
+          const core = 135 * Math.exp(-(((i - c) / 10) ** 2));
+          const tail = i > c ? 105 * Math.exp(-(i - c) / 42) : 0;
+          dark = Math.max(dark, core, tail);
+        } else if (cleanCols.has(col)) {
+          const depth = col === 7 || col === 11 ? 58 : 120;
+          dark = Math.max(dark, depth * Math.exp(-(((i - c) / 10) ** 2)));
+        }
+        return Math.max(20, 232 - dark);
+      });
+    };
+
+    const detected = cfgNoZero.lanes.filter((l) => l.id < 27).map((l) => tlcOrigin(setBorderAndSmear, l, getProf));
+    for (const col of smearCols) {
+      expect(Math.abs(detected[col] - (baseAt(col) + (jitter.get(col) ?? 0)))).toBeLessThanOrEqual(3);
+    }
+    for (const col of hugeCols) {
+      expect(Math.abs(detected[col] - baseAt(col))).toBeLessThanOrEqual(3);
+    }
+    const blankCols = [0, 2, 5, 6, 8, 12, 13, 14, 17, 18, 19, 20, 24, 25, 26];
+    for (const col of blankCols) {
+      expect(Math.abs(detected[col] - baseAt(col))).toBeLessThanOrEqual(3);
+    }
+    for (let k = 0; k < blankCols.length - 1; k++) {
+      if (blankCols[k + 1] === blankCols[k] + 1) {
+        expect(Math.abs(detected[blankCols[k + 1]] - detected[blankCols[k]])).toBeLessThanOrEqual(2);
+      }
+    }
+  });
+
+  it('does not let low-noise dark UV366 SNR inflation override a solid UV254 origin row', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.lanes.forEach((l) => { l.zeroRf = null; });
+    const L = cfgNoZero.lanes[0].length;
+    const setBoth: TlcSet = {
+      uid: 'origin-uv254-priority',
+      name: 'UV254 Priority Over UV366 Noise Inflation',
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        UV366: { name: 'uv366.png', bmp: {} as any },
+      },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+    };
+
+    const uv254Cols = new Set([1, 3, 4, 7, 9, 10, 15, 16, 21, 22]); // 10/27 clear dark origin dots at pos 132
+    const getProf = (_s: TlcSet, key: 'UV254' | 'UV366' | 'White', l: TlcLane) => {
+      const col = l.id % 27;
+      if (key === 'UV254') {
+        return Array.from({ length: L }, (_, i) => {
+          const noise = ((i * 7 + col * 13) % 5) - 2; // small ~2-unit silica texture
+          const dot = uv254Cols.has(col) ? 130 * Math.exp(-(((i - 132) / 10) ** 2)) : 0;
+          return 225 + noise - dot;
+        });
+      }
+      // UV366 has dead-flat zero-noise dark background (noiseFloor=1.0) + weak fluorescent eluted spots around pos 168
+      return Array.from({ length: L }, (_, i) => {
+        const spot = col % 3 === 0 ? 18 * Math.exp(-(((i - 168) / 9) ** 2)) : 0;
+        return 12 + spot;
+      });
+    };
+
+    const origin0 = tlcOrigin(setBoth, cfgNoZero.lanes[0], getProf);
+    const origin9 = tlcOrigin(setBoth, cfgNoZero.lanes[9], getProf);
+    expect(Math.abs(origin0 - 132)).toBeLessThanOrEqual(3);
+    expect(Math.abs(origin9 - 132)).toBeLessThanOrEqual(3);
   });
 
   it('correctly maps inverted/opposing 180-degree upper tier lanes without coordinate distortion', () => {
@@ -626,6 +854,89 @@ describe('TLC Lanes & Coordinate Transforms', () => {
     };
     for (let i = 0; i < 12; i++) {
       expect(Math.abs(tlcOrigin(setTailing, cfgNoZero.lanes[i], getTailProf) - tailOrig(i))).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it('prefers an outer origin dot cluster over a larger inner row of low-Rf eluted spots', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.hasZeroRf = false;
+    cfgNoZero.lanes = cfgNoZero.lanes.map((l) => ({ ...l, zeroRf: undefined }));
+
+    const originCols = new Set([1, 3, 4, 7, 9, 10, 11, 15, 16, 21, 22]); // 11 lanes with un-eluted origin dots
+    const spotCols = new Set([0, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 22, 24, 25]); // 20 lanes with low-Rf spots at pos 230
+    const len = 1073;
+    const setMixed: any = {
+      uid: 'set-outer-origin',
+      name: 'Outer Origin Priority',
+      imgs: { UV254: { name: 'mixed.png' } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+      originAutoByLane: {},
+    };
+    const getMixedProf = (_set: any, _key: any, l: TlcLane) => {
+      const col = l.id % 27;
+      const arr = new Array(len).fill(210);
+      for (let i = 0; i < len; i++) {
+        if (originCols.has(col)) arr[i] -= 115 * Math.exp(-(((i - 134) / 10) ** 2));
+        if (spotCols.has(col)) arr[i] -= 125 * Math.exp(-(((i - 230) / 13) ** 2));
+      }
+      return arr;
+    };
+
+    const o0 = tlcOrigin(setMixed, cfgNoZero.lanes[0], getMixedProf);
+    const o15 = tlcOrigin(setMixed, cfgNoZero.lanes[15], getMixedProf);
+    expect(Math.abs(o0 - 134)).toBeLessThanOrEqual(4);
+    expect(Math.abs(o15 - 134)).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps missing-origin lanes smoothly on baseline instead of zig-zagging toward faint smudges', () => {
+    const cfgNoZero = createDefaultLaneConfig(3280, 'two-tier');
+    cfgNoZero.hasZeroRf = false;
+    cfgNoZero.lanes = cfgNoZero.lanes.map((l) => ({ ...l, zeroRf: undefined }));
+
+    const len = 1073;
+    const sharpCols = new Set([1, 3, 4, 7, 9, 10, 11, 15, 16, 21, 22, 23]);
+    const localOffsets: Record<number, number> = { 4: 4, 10: -4, 16: 4, 22: 5 };
+    const smearCols = new Set([0, 2, 13, 25]);
+    const trueLine = (col: number) => Math.round(122 - 0.25 * col);
+
+    const setMissing: any = {
+      uid: 'set-missing-smooth',
+      name: 'Missing Origin Smooth',
+      imgs: { UV254: { name: 'smooth.png' } },
+      cfg: cfgNoZero,
+      prof: {},
+      frontAuto: {},
+      originAuto: {},
+      originAutoByLane: {},
+    };
+    const getProf = (_s: any, _k: any, l: TlcLane) => {
+      const col = l.id % 27;
+      const base = trueLine(col);
+      return Array.from({ length: len }, (_, y) => {
+        let val = 235;
+        if (sharpCols.has(col)) {
+          const depth = col === 7 || col === 11 ? 55 : 150;
+          const pos = base + (localOffsets[col] ?? 0);
+          val -= depth * Math.exp(-(((y - pos) / 9) ** 2));
+        } else if (smearCols.has(col)) {
+          val -= 14 * Math.exp(-(((y - (base + 16)) / 12) ** 2));
+        }
+        return val;
+      });
+    };
+
+    const origins = Array.from({ length: 27 }, (_, col) =>
+      tlcOrigin(setMissing, cfgNoZero.lanes[col], getProf)
+    );
+
+    for (const col of [0, 2, 12, 13, 14, 24, 25, 26]) {
+      expect(Math.abs(origins[col] - trueLine(col))).toBeLessThanOrEqual(4);
+    }
+    for (const col of [12, 13, 24, 25]) {
+      expect(Math.abs(origins[col + 1] - origins[col])).toBeLessThanOrEqual(2);
     }
   });
 

@@ -37,6 +37,13 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     expect(amineInBaseMod.tailing).toBe(false);
     expect(amineInBaseMod.rf).toBeGreaterThan(amineInNeutral.rf);
 
+    // NH3/MeOH streaks less than Et3N, so any Et3N eluent carries a small residual-streak penalty for basic amines
+    const nh3Sys = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_10')!;
+    const etHex = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_60_et3n')!;
+    expect(predictNormalPhaseRf(amineProf, baseMod).mildStreak).toBe(true);
+    expect(predictNormalPhaseRf(amineProf, nh3Sys).mildStreak).toBeFalsy();
+    expect(predictNormalPhaseRf(amineProf, etHex).mildStreak).toBe(true);
+
     const acidInNeutral = predictNormalPhaseRf(acidProf, neutralEtOAc);
     const acidInAcidMod = predictNormalPhaseRf(acidProf, acidMod);
     expect(acidInNeutral.tailing).toBe(true);
@@ -183,11 +190,50 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
       cachedPredictions: cached,
     });
 
+    // Et3N <-> NH3/MeOH swaps are offered as 'or' alternatives
+    for (const r of plan.recommendedSystems) {
+      for (const alt of r.alternatives ?? []) {
+        expect(alt.baseModifier).toBeTruthy();
+        expect(alt.id).not.toBe(r.system.id);
+        expect(plan.recommendedSystems.some((o) => o.system.id === alt.id)).toBe(false);
+      }
+    }
+
+    // Remaining systems are grouped into complementary sets that do not reuse the main suggestion
+    const recIds = new Set(plan.recommendedSystems.map((r) => r.system.id));
+    expect(plan.otherGroups.length).toBeGreaterThan(0);
+    const seen = new Set<string>();
+    for (const g of plan.otherGroups) {
+      expect(g.systems.length).toBeGreaterThanOrEqual(1);
+      for (const e of g.systems) {
+        expect(recIds.has(e.system.id)).toBe(false);
+        expect(seen.has(e.system.id)).toBe(false);
+        seen.add(e.system.id);
+      }
+    }
+
     expect(plan.activeWellCount).toBe(53);
+
+    // the Low-weight option is accepted and keeps the plan valid at both extremes
+    for (const lowTierWeight of [0, 1]) {
+      const p2 = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+        plateIndex: 0,
+        maxSystems: 3,
+        cachedPredictions: cached,
+        includeSpeculative: true,
+        lowTierWeight,
+      });
+      expect(p2.recommendedSystems.length).toBeGreaterThanOrEqual(1);
+    }
     expect(plan.highRankedWellCount).toBeGreaterThan(20);
     expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(2);
     expect(plan.recommendedSystems.length).toBeLessThanOrEqual(3);
     expect(plan.totalCoveragePct).toBeGreaterThanOrEqual(80);
+
+    // Honest reporting: only resolved wells are assigned; the rest are listed as unresolved
+    const assignedTotal = plan.recommendedSystems.reduce((n, r) => n + r.assignedWellIndices.length, 0);
+    expect(assignedTotal).toBe(plan.resolvedWellCount);
+    expect(plan.resolvedWellCount + plan.unresolvedWellIndices.length).toBe(plan.activeWellCount);
 
     // Each recommended solvent system renders a complete 54-lane simulated plate
     for (const rec of plan.recommendedSystems) {
@@ -254,8 +300,8 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     const etoac30AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_30_acoh')!;
     const meoh8AcOH = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_acoh')!;
     expect(etoac30AcOH.name).toContain('EtOAc / Hexanes + 1% AcOH');
-    expect(etoac30AcOH.chamberPrep20mL).toContain('EtOAc');
-    expect(etoac30AcOH.chamberPrep20mL).toContain('AcOH');
+    expect(etoac30AcOH.chamberPrep50mL).toContain('EtOAc');
+    expect(etoac30AcOH.chamberPrep50mL).toContain('AcOH');
 
     const benzoicInEtoac = predictNormalPhaseRf(benzoicProf, etoac30AcOH);
     const benzoicInMeoh = predictNormalPhaseRf(benzoicProf, meoh8AcOH);
@@ -345,7 +391,7 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     for (const rec of neutralPlan.recommendedSystems) {
       expect(rec.system.baseModifier).toBeUndefined();
       expect(rec.system.acidModifier).toBeUndefined();
-      expect(rec.system.chamberPrep20mL).toMatch(/EtOAc|Hexanes|DCM|MeOH|Acetone|Toluene|MeCN/i);
+      expect(rec.system.chamberPrep50mL).toMatch(/EtOAc|Hexanes|DCM|MeOH|Acetone|Toluene|MeCN|Et₂O|Pentane/i);
     }
   });
 

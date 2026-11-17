@@ -1104,6 +1104,7 @@ function evaluateWellInSolvent(
 
   let wSum = 0;
   let scoreSum = 0;
+  let bestQual = 0;
   let primaryDelta = 0;
   let primaryRf: number | null = null;
 
@@ -1155,6 +1156,7 @@ function evaluateWellInSolvent(
 
     wSum += p.weight;
     scoreSum += p.weight * qual;
+    if (p.weight > 0.0001 && qual > bestQual) bestQual = qual;
   });
 
   // Every spot that could be on the plate (starting materials and ALL predicted products) should sit in the
@@ -1170,10 +1172,13 @@ function evaluateWellInSolvent(
     visW += wgt;
   }
   const allVisible = visW > 0 ? visSum / visW : 0;
-  const visibilityGate = 0.4 + 0.6 * allVisible;
+  const visibilityGate = 0.7 + 0.3 * allVisible;
+  // One badly placed product must not sink a well whose other products read fine: any of them may not form.
+  // Blend the weighted mean with the best-placed product.
+  const blendedQual = wSum > 0 ? 0.5 * (scoreSum / wSum) + 0.5 * bestQual : 0;
 
   return {
-    score: Math.round((wSum > 0 ? (scoreSum / wSum) * visibilityGate : 0) * 1000) / 1000,
+    score: Math.round(blendedQual * visibilityGate * 1000) / 1000,
     deltaRf: primaryDelta,
     bestProductRf: primaryRf,
     spots: [...subSpots, ...prodSpots],

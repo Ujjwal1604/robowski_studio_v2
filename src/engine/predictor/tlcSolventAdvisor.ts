@@ -563,6 +563,8 @@ export interface SimulatedSpot {
   uvActive?: boolean;
   /** reversible species that is expected to fall apart on acidic silica */
   mayDecompose?: boolean;
+  /** basic amine in an Et₃N eluent where NH₃/MeOH is available: slight residual streaking expected */
+  mildStreak?: boolean;
 }
 
 export interface SimulatedWellLane {
@@ -739,7 +741,7 @@ export function predictTlcRf(
   system: TlcSolventSystemDef,
   wellCtx?: WellTlcContext,
   stationaryPhasePref: TlcStationaryPhasePreference = 'auto'
-): { rf: number; tailing: boolean; tailingReason?: string } {
+): { rf: number; tailing: boolean; tailingReason?: string; mildStreak?: boolean } {
   // -------------------------------------------------------------------------
   // CASE A: REVERSE-PHASE C18 TLC (Polarity & elution order inverted!)
   // -------------------------------------------------------------------------
@@ -911,7 +913,12 @@ export function predictTlcRf(
   const rawRf = 1 / (1 + Math.exp(-z));
   const rf = Math.round(Math.max(0.02, Math.min(0.96, rawRf)) * 100) / 100;
 
-  return { rf, tailing, tailingReason };
+  // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
+  // an Et₃N eluent keeps a small residual-streak penalty; EtOAc/Hex has no NH₃ option, so no penalty there.
+  const mildStreak =
+    !tailing && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N') && system.alcoholPct > 0;
+
+  return { rf, tailing, tailingReason, mildStreak };
 }
 
 /** Backwards-compatible alias for predictTlcRf */
@@ -1014,6 +1021,7 @@ function evaluateWellInSolvent(
       tailingReason: pred.tailingReason,
       uvActive: p.profile.uvActive,
       mayDecompose: system.stationaryPhase === 'SiO2' && p.reversibleEnd && p.persistence < 0.6,
+      mildStreak: pred.mildStreak,
     };
   });
 
@@ -1081,6 +1089,7 @@ function evaluateWellInSolvent(
     const subTailPenalty = subSpots.some((s) => s.tailing) ? 0.88 : 1.0;
     const visFactor = pSpot.uvActive === false ? STAIN_ONLY_FACTOR : 1.0;
     const decompFactor = pSpot.mayDecompose ? DECOMPOSE_FACTOR : 1.0;
+    const mildStreakFactor = pSpot.mildStreak ? 0.92 : 1.0;
     const qual =
       windowScore(pSpot.rf) *
       deltaScore(minSubDelta) *
@@ -1089,6 +1098,7 @@ function evaluateWellInSolvent(
       crowdFactor *
       visFactor *
       decompFactor *
+      mildStreakFactor *
       additiveOverheadFactor;
 
     if (idx === 0) {

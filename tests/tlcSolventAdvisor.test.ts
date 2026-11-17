@@ -37,6 +37,13 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     expect(amineInBaseMod.tailing).toBe(false);
     expect(amineInBaseMod.rf).toBeGreaterThan(amineInNeutral.rf);
 
+    // NH3/MeOH streaks less than Et3N in MeOH/DCM; EtOAc/Hex has no NH3 option, so no penalty there
+    const nh3Sys = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_10')!;
+    const etHex = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_60_et3n')!;
+    expect(predictNormalPhaseRf(amineProf, baseMod).mildStreak).toBe(true);
+    expect(predictNormalPhaseRf(amineProf, nh3Sys).mildStreak).toBeFalsy();
+    expect(predictNormalPhaseRf(amineProf, etHex).mildStreak).toBeFalsy();
+
     const acidInNeutral = predictNormalPhaseRf(acidProf, neutralEtOAc);
     const acidInAcidMod = predictNormalPhaseRf(acidProf, acidMod);
     expect(acidInNeutral.tailing).toBe(true);

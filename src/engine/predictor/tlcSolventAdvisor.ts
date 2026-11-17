@@ -965,6 +965,9 @@ export function predictTlcRf(
 /** Backwards-compatible alias for predictTlcRf */
 export const predictNormalPhaseRf = predictTlcRf;
 
+// Low-confidence products are unlikely to be on the plate; they count for little so they cannot crowd the choice.
+const LOW_TIER_WEIGHT = 0.2;
+
 function tierImportance(tier: PredictedSpecies['tier']): number {
   if (tier === 'High') return 1.65;
   if (tier === 'Medium') return 1.05;
@@ -1121,7 +1124,8 @@ function evaluateWellInSolvent(
       if (important(pSpot.tier) && important(prodSpots[j].tier)) {
         if (gap < 0.04) crowdFactor *= 0.6;
         else if (gap < 0.08) crowdFactor *= 0.8;
-      } else if (gap < 0.04) {
+      } else if (gap < 0.04 && !(important(pSpot.tier) && !important(prodSpots[j].tier))) {
+        // a Low-confidence neighbour does not spoil a likely product
         crowdFactor *= 0.85;
       }
     }
@@ -1154,13 +1158,17 @@ function evaluateWellInSolvent(
   // Every spot that could be on the plate (starting materials and ALL predicted products) should sit in the
   // readable Rf window and be visible; this gates the separation score so unlikely-product guesses cannot
   // hide a system that pushes known spots onto the baseline or the front.
+  const spotWeight = (sp: SimulatedSpot): number =>
+    sp.kind === 'product' && sp.tier !== 'High' && sp.tier !== 'Medium' ? LOW_TIER_WEIGHT : 1;
   const allSpots = [...subSpots, ...prodSpots];
-  const allVisible =
-    allSpots.reduce(
-      (acc, sp) =>
-        acc + windowScore(sp.rf) * (sp.tailing ? 0.65 : 1) * (sp.uvActive === false ? STAIN_ONLY_FACTOR : 1),
-      0
-    ) / allSpots.length;
+  let visSum = 0;
+  let visW = 0;
+  for (const sp of allSpots) {
+    const wgt = spotWeight(sp);
+    visSum += wgt * windowScore(sp.rf) * (sp.tailing ? 0.65 : 1) * (sp.uvActive === false ? STAIN_ONLY_FACTOR : 1);
+    visW += wgt;
+  }
+  const allVisible = visW > 0 ? visSum / visW : 0;
   const visibilityGate = 0.4 + 0.6 * allVisible;
 
   return {
@@ -1415,7 +1423,7 @@ export async function optimizePlateTlcSolvents(
       .slice(0, 8);
     const products = rawProds.map((sp) => {
       // Predicted products are only candidates: any of them may or may not form, so none outweighs the others.
-      const imp = 1;
+      const imp = sp.tier === 'High' || sp.tier === 'Medium' ? 1 : LOW_TIER_WEIGHT;
       return {
         key: sp.key,
         smiles: sp.smiles,

@@ -212,6 +212,36 @@ export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
     bestFor: 'Medium-polar basic amines & azoles where 12% MeOH elutes too close to the front',
   },
   {
+    id: 'nh3_meoh_dcm_1',
+    name: 'DCM / (2M NH₃ in MeOH) (99:1)',
+    shortLabel: '99:1 DCM/NH₃-MeOH',
+    ratio: '99:1 v/v DCM / (2M NH₃ in MeOH)',
+    chamberPrep20mL: '19.8 mL DCM + 0.2 mL (2M NH₃ in MeOH)',
+    stationaryPhase: 'SiO2',
+    preferenceTier: 'primary',
+    family: 'basic_mod',
+    strength: 0.45,
+    alcoholPct: 1,
+    baseModifier: '1% (2M NH₃ in MeOH)',
+    polarityClass: 'Basic Polar',
+    bestFor: 'Lipophilic tertiary/secondary amines that run too high in 5% MeOH — NH₃ keeps them from streaking',
+  },
+  {
+    id: 'nh3_meoh_dcm_2',
+    name: 'DCM / (2M NH₃ in MeOH) (98:2)',
+    shortLabel: '98:2 DCM/NH₃-MeOH',
+    ratio: '98:2 v/v DCM / (2M NH₃ in MeOH)',
+    chamberPrep20mL: '19.6 mL DCM + 0.4 mL (2M NH₃ in MeOH)',
+    stationaryPhase: 'SiO2',
+    preferenceTier: 'primary',
+    family: 'basic_mod',
+    strength: 0.54,
+    alcoholPct: 2,
+    baseModifier: '2% (2M NH₃ in MeOH)',
+    polarityClass: 'Basic Polar',
+    bestFor: 'Medium-polar amines & azoles that need only a little MeOH, with NH₃ against streaking',
+  },
+  {
     id: 'nh3_meoh_dcm_5',
     name: 'DCM / MeOH / (2M NH₃ in MeOH) (95:3:2)',
     shortLabel: '95:3:2 DCM/MeOH/NH₃',
@@ -914,9 +944,9 @@ export function predictTlcRf(
   const rf = Math.round(Math.max(0.02, Math.min(0.96, rawRf)) * 100) / 100;
 
   // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
-  // an Et₃N eluent keeps a small residual-streak penalty; EtOAc/Hex has no NH₃ option, so no penalty there.
+  // any Et₃N eluent keeps a residual-streak penalty for basic amines, so DCM/MeOH/NH₃ wins when it is competitive.
   const mildStreak =
-    !tailing && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N') && system.alcoholPct > 0;
+    !tailing && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N');
 
   return { rf, tailing, tailingReason, mildStreak };
 }
@@ -1089,7 +1119,7 @@ function evaluateWellInSolvent(
     const subTailPenalty = subSpots.some((s) => s.tailing) ? 0.88 : 1.0;
     const visFactor = pSpot.uvActive === false ? STAIN_ONLY_FACTOR : 1.0;
     const decompFactor = pSpot.mayDecompose ? DECOMPOSE_FACTOR : 1.0;
-    const mildStreakFactor = pSpot.mildStreak ? 0.92 : 1.0;
+    const mildStreakFactor = pSpot.mildStreak ? 0.85 : 1.0;
     const qual =
       windowScore(pSpot.rf) *
       deltaScore(minSubDelta) *

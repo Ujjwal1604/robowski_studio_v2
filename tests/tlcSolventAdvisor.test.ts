@@ -213,6 +213,18 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     }
 
     expect(plan.activeWellCount).toBe(53);
+
+    // the Low-weight option is accepted and keeps the plan valid at both extremes
+    for (const lowTierWeight of [0, 1]) {
+      const p2 = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+        plateIndex: 0,
+        maxSystems: 3,
+        cachedPredictions: cached,
+        includeSpeculative: true,
+        lowTierWeight,
+      });
+      expect(p2.recommendedSystems.length).toBeGreaterThanOrEqual(1);
+    }
     expect(plan.highRankedWellCount).toBeGreaterThan(20);
     expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(2);
     expect(plan.recommendedSystems.length).toBeLessThanOrEqual(3);

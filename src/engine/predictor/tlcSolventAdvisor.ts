@@ -656,6 +656,8 @@ export interface PlateSolventPlanOptions {
   conditionOverrides?: Partial<WellConditionConfig>;
   cachedPredictions?: Record<string, WellPredictionResult>;
   includeSpeculative?: boolean;
+  /** weight of Low-confidence products relative to High/Medium (0..1, default 0.2); only matters when they are included */
+  lowTierWeight?: number;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
 }
@@ -966,7 +968,7 @@ export function predictTlcRf(
 export const predictNormalPhaseRf = predictTlcRf;
 
 // Low-confidence products are unlikely to be on the plate; they count for little so they cannot crowd the choice.
-const LOW_TIER_WEIGHT = 0.2;
+export const DEFAULT_LOW_TIER_WEIGHT = 0.2;
 
 function tierImportance(tier: PredictedSpecies['tier']): number {
   if (tier === 'High') return 1.65;
@@ -1158,13 +1160,12 @@ function evaluateWellInSolvent(
   // Every spot that could be on the plate (starting materials and ALL predicted products) should sit in the
   // readable Rf window and be visible; this gates the separation score so unlikely-product guesses cannot
   // hide a system that pushes known spots onto the baseline or the front.
-  const spotWeight = (sp: SimulatedSpot): number =>
-    sp.kind === 'product' && sp.tier !== 'High' && sp.tier !== 'Medium' ? LOW_TIER_WEIGHT : 1;
   const allSpots = [...subSpots, ...prodSpots];
   let visSum = 0;
   let visW = 0;
-  for (const sp of allSpots) {
-    const wgt = spotWeight(sp);
+  for (let si = 0; si < allSpots.length; si++) {
+    const sp = allSpots[si];
+    const wgt = si < subSpots.length ? 1 : Math.max(0.0001, well.products[si - subSpots.length].weight);
     visSum += wgt * windowScore(sp.rf) * (sp.tailing ? 0.65 : 1) * (sp.uvActive === false ? STAIN_ONLY_FACTOR : 1);
     visW += wgt;
   }
@@ -1300,6 +1301,7 @@ export async function optimizePlateTlcSolvents(
   const poolMode: SolventPoolMode = options.poolMode ?? 'prefer_primary';
   const stationaryPhasePref: TlcStationaryPhasePreference = options.stationaryPhase ?? 'auto';
   const includeSpeculative = options.includeSpeculative ?? false;
+  const lowTierWeight = Math.max(0, Math.min(1, options.lowTierWeight ?? DEFAULT_LOW_TIER_WEIGHT));
 
   const rowMap = new Map<number, any>();
   if (run?.rows) {
@@ -1423,7 +1425,7 @@ export async function optimizePlateTlcSolvents(
       .slice(0, 8);
     const products = rawProds.map((sp) => {
       // Predicted products are only candidates: any of them may or may not form, so none outweighs the others.
-      const imp = sp.tier === 'High' || sp.tier === 'Medium' ? 1 : LOW_TIER_WEIGHT;
+      const imp = sp.tier === 'High' || sp.tier === 'Medium' ? 1 : lowTierWeight;
       return {
         key: sp.key,
         smiles: sp.smiles,

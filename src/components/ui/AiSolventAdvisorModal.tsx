@@ -122,6 +122,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [poolMode, setPoolMode] = useState<SolventPoolMode>('prefer_primary');
   const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
+  const [lowWeightPct, setLowWeightPct] = useState<number>(20);
   const [plateLoading, setPlateLoading] = useState<boolean>(false);
   const [plateProgress, setPlateProgress] = useState<{ done: number; total: number }>({ done: 0, total: 54 });
   const [platePlan, setPlatePlan] = useState<PlateSolventPlanResult | null>(null);
@@ -249,6 +250,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
         conditionOverrides,
         cachedPredictions: mergedCached,
         includeSpeculative,
+        lowTierWeight: lowWeightPct / 100,
         signal: controller.signal,
         onProgress: (done, total) => {
           if (runSeqRef.current === seq) {
@@ -297,6 +299,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     conditionOverrides,
     cachedPlatePredictions,
     includeSpeculative,
+    lowWeightPct,
     cacheSignature,
   ]);
 
@@ -641,6 +644,23 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                       onChange={(e) => setIncludeSpeculative(e.target.checked)}
                     />
                     <span>Include Low/Speculative</span>
+                  </label>
+
+                  <label
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', opacity: includeSpeculative ? 1 : 0.5 }}
+                    title="How much Low-confidence products count compared with High/Medium ones when choosing eluents"
+                  >
+                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>Low weight</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={lowWeightPct}
+                      disabled={!includeSpeculative}
+                      onChange={(e) => setLowWeightPct(Number(e.target.value))}
+                    />
+                    <span className="mono" style={{ minWidth: '32px' }}>{lowWeightPct}%</span>
                   </label>
                 </div>
 

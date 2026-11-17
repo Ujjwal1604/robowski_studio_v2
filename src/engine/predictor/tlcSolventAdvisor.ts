@@ -619,6 +619,8 @@ export interface RecommendedPlateSolvent {
   wellCoveragePct: number;
   meanResolutionScore: number;
   lanes: SimulatedWellLane[];
+  /** Et₃N <-> NH₃/MeOH swap that resolves (almost) the same wells: use whichever base you have at hand */
+  alternatives?: TlcSolventSystemDef[];
 }
 
 export type SolventPoolMode = 'prefer_primary' | 'primary_only' | 'balanced';
@@ -944,7 +946,7 @@ export function predictTlcRf(
   const rf = Math.round(Math.max(0.02, Math.min(0.96, rawRf)) * 100) / 100;
 
   // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
-  // any Et₃N eluent keeps a residual-streak penalty for basic amines, so DCM/MeOH/NH₃ wins when it is competitive.
+  // tiny tie-break only (NH₃ listed first when equal); the real answer is the "or" alternative shown on the card.
   const mildStreak =
     !tailing && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N');
 
@@ -1119,7 +1121,7 @@ function evaluateWellInSolvent(
     const subTailPenalty = subSpots.some((s) => s.tailing) ? 0.88 : 1.0;
     const visFactor = pSpot.uvActive === false ? STAIN_ONLY_FACTOR : 1.0;
     const decompFactor = pSpot.mayDecompose ? DECOMPOSE_FACTOR : 1.0;
-    const mildStreakFactor = pSpot.mildStreak ? 0.85 : 1.0;
+    const mildStreakFactor = pSpot.mildStreak ? 0.98 : 1.0;
     const qual =
       windowScore(pSpot.rf) *
       deltaScore(minSubDelta) *
@@ -1724,6 +1726,29 @@ export async function optimizePlateTlcSolvents(
     .filter((entry, _idx, arr) => entry.assignedWellIndices.length > 0 || arr.length === 1)
     .sort((a, b) => b.assignedWellIndices.length - a.assignedWellIndices.length)
     .map((entry, idx) => ({ ...entry, rank: idx + 1 }));
+
+  // "Either/or": an Et3N eluent and an NH3/MeOH eluent that resolve (nearly) the same wells are interchangeable.
+  const baseKind = (sys: TlcSolventSystemDef): 'et3n' | 'nh3' | null =>
+    sys.baseModifier?.includes('Et₃N') ? 'et3n' : sys.baseModifier?.includes('NH₃') ? 'nh3' : null;
+  const recIds = new Set(recommendedSystems.map((r) => r.system.id));
+  for (const rec of recommendedSystems) {
+    const kind = baseKind(rec.system);
+    if (!kind || rec.assignedWellIndices.length === 0) continue;
+    const need = Math.ceil(rec.assignedWellIndices.length * 0.9);
+    const alts = phaseFilteredLibrary
+      .filter((c) => c.stationaryPhase === rec.system.stationaryPhase && !recIds.has(c.id))
+      .filter((c) => {
+        const k = baseKind(c);
+        return k !== null && k !== kind;
+      })
+      .map((c) => {
+        const ok = rec.assignedWellIndices.filter((wi) => evalMatrix.get(c.id)!.get(wi)!.score >= RESOLVED_SCORE).length;
+        return { c, ok };
+      })
+      .filter((x) => x.ok >= need)
+      .sort((a, b) => b.ok - a.ok);
+    if (alts.length > 0) rec.alternatives = alts.slice(0, 1).map((x) => x.c);
+  }
 
   // Ensure every system in this stationary phase not in final recommendedSystems is still available for plate simulation & inspection
   const chosenFinalIds = new Set(recommendedSystems.map((r) => r.system.id));

@@ -804,6 +804,16 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             {rec.system.bestFor}
                           </div>
 
+                          {rec.alternatives && rec.alternatives.length > 0 && (
+                            <div style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
+                              <strong>or</strong> {rec.alternatives[0].name}{' '}
+                              <span className="mono" style={{ color: 'var(--mut)' }}>
+                                (20 mL: {rec.alternatives[0].chamberPrep20mL})
+                              </span>{' '}
+                              — resolves about the same wells; use whichever base you have.
+                            </div>
+                          )}
+
                           <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }} onClick={(e) => e.stopPropagation()}>
                             {onApplyToCurrentSet && (
                               <button

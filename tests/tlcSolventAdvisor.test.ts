@@ -190,6 +190,15 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
       cachedPredictions: cached,
     });
 
+    // Et3N <-> NH3/MeOH swaps are offered as 'or' alternatives
+    for (const r of plan.recommendedSystems) {
+      for (const alt of r.alternatives ?? []) {
+        expect(alt.baseModifier).toBeTruthy();
+        expect(alt.id).not.toBe(r.system.id);
+        expect(plan.recommendedSystems.some((o) => o.system.id === alt.id)).toBe(false);
+      }
+    }
+
     expect(plan.activeWellCount).toBe(53);
     expect(plan.highRankedWellCount).toBeGreaterThan(20);
     expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(2);

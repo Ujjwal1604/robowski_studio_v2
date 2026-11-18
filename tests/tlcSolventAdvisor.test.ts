@@ -962,4 +962,81 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     expect(prismaSpecs.length).toBeGreaterThan(0);
     expect(prismaSpecs.every((p) => p.family === 'prisma_ternary' && Boolean(p.ternaryCoSolvent))).toBe(true);
   });
+
+  it('tracks every UV-active starting material on at least one plate while resolving polar/acidic products via weak-to-strong bracketing', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: '4-Imidazolecarboxaldehyde', smiles: 'O=Cc1c[nH]cn1', molarMass: 96.09, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '5-Aminobenzimidazole', smiles: 'Nc1ccc2[nH]cnc2c1', molarMass: 133.15, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: '2-(Trichloroacetyl)pyrrole', smiles: 'O=C(C(Cl)(Cl)Cl)c1ccc[nH]1', molarMass: 212.46, density: 1.4, stock: 500, solvent: 'DMSO' },
+      { code: 'D', name: '2-Butyl-1H-imidazole-4-carbaldehyde', smiles: 'CCCCc1nc(C=O)c[nH]1', molarMass: 152.19, density: 1.1, stock: 500, solvent: 'DMSO' },
+      { code: 'E', name: '2-Cyclopenten-1-one', smiles: 'O=C1C=CCC1', molarMass: 82.10, density: 0.98, stock: 500, solvent: 'DMSO' },
+      { code: 'F', name: 'Benzyl bromide', smiles: 'BrCc1ccccc1', molarMass: 171.03, density: 1.44, stock: 500, solvent: 'DMSO' },
+      { code: 'G', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+
+    // Mix of polar/acidic wells (like A1) and wide-polarity-span wells (like A8 with Benzyl bromide + Cyclopentenone + Butyl-imidazole)
+    const rows: any[] = [];
+    for (let w = 0; w < 12; w++) {
+      const isA1Type = w < 6;
+      rows.push({
+        local_index: w,
+        global_index: w,
+        combo_index: w,
+        plate_number: 0,
+        container_id: w,
+        recipe: isA1Type
+          ? [
+              { code: 'A', name: '4-Imidazolecarboxaldehyde', target_concentration: 50, equivalence: 1 },
+              { code: 'B', name: '5-Aminobenzimidazole', target_concentration: 50, equivalence: 1 },
+              { code: 'C', name: '2-(Trichloroacetyl)pyrrole', target_concentration: 50, equivalence: 1 },
+              { code: 'G', name: 'TsOH·H2O', target_concentration: 25, equivalence: 0.5 },
+            ]
+          : [
+              { code: 'D', name: '2-Butyl-1H-imidazole-4-carbaldehyde', target_concentration: 50, equivalence: 1 },
+              { code: 'E', name: '2-Cyclopenten-1-one', target_concentration: 50, equivalence: 1 },
+              { code: 'F', name: 'Benzyl bromide', target_concentration: 50, equivalence: 1 },
+              ...(w >= 9 ? [{ code: 'G', name: 'TsOH·H2O', target_concentration: 25, equivalence: 0.5 }] : []),
+            ],
+        'vol#solvent': 400,
+      });
+    }
+
+    const plan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 12, rows } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 3 }
+    );
+
+    expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(2);
+    expect(plan.recommendedSystems.every((r) => r.system.stationaryPhase === 'SiO2')).toBe(true);
+    expect(plan.totalCoveragePct).toBeGreaterThanOrEqual(80);
+    // Weak-to-strong ordering: Plate #1 is milder than the final polar rescue plate
+    const s0 = plan.recommendedSystems[0].system;
+    const sLast = plan.recommendedSystems[plan.recommendedSystems.length - 1].system;
+    expect(s0.strength).toBeLessThan(sLast.strength);
+
+    // On both representative wells (0 = A1-type, 6 = A8-type), EVERY UV-active SM must sit in 0.10..0.85 on at least one recommended plate!
+    for (const wi of [0, 6]) {
+      const subCodes = Array.from(
+        new Set(
+          plan.recommendedSystems[0].lanes[wi].spots
+            .filter((s) => s.kind === 'substrate' && s.uvActive !== false)
+            .map((s) => s.code)
+        )
+      );
+      expect(subCodes.length).toBe(3);
+      for (const code of subCodes) {
+        const clearlyTrackedOnSomePlate = plan.recommendedSystems.some((rec) => {
+          const sp = rec.lanes[wi].spots.find((s) => s.kind === 'substrate' && s.code === code);
+          return sp ? sp.rf >= 0.10 && sp.rf <= 0.85 : false;
+        });
+        expect(clearlyTrackedOnSomePlate).toBe(true);
+      }
+    }
+  });
 });

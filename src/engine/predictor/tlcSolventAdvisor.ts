@@ -1379,6 +1379,19 @@ function windowScore(rf: number): number {
   return 0.05;
 }
 
+/**
+ * Starting-material tracking window: chemists only need a crisp SM spot cleanly off the
+ * origin and below the solvent front (Rf ~0.16-0.83). Front-blown SMs (>0.85) lose tracking credit.
+ */
+function smWindowScore(rf: number): number {
+  if (rf >= 0.16 && rf <= 0.74) return 1.0;
+  if (rf >= 0.10 && rf < 0.16) return 0.58 + ((rf - 0.10) / 0.06) * 0.42;
+  if (rf > 0.74 && rf <= 0.83) return 1.0 - ((rf - 0.74) / 0.09) * 0.38;
+  if (rf > 0.83 && rf <= 0.89) return 0.14 + ((0.89 - rf) / 0.06) * 0.48;
+  if (rf >= 0.06 && rf < 0.10) return 0.16 + ((rf - 0.06) / 0.04) * 0.42;
+  return 0.04;
+}
+
 // Rf predictions are hand-tuned guesses (error roughly +-0.12), so separation is scored as the
 // probability that two spots really are apart, not as a point estimate of the gap.
 export const RF_SIGMA = 0.12;
@@ -1454,12 +1467,21 @@ function resolveCalibrationOffsets(
   };
 }
 
+interface WellSolventEvaluation {
+  score: number;
+  deltaRf: number;
+  bestProductRf: number | null;
+  spots: SimulatedSpot[];
+  smReadability: number[];
+  prodReadability: number[];
+}
+
 function evaluateWellInSolvent(
   well: WellCandidateData,
   system: TlcSolventSystemDef,
   stationaryPhasePref: TlcStationaryPhasePreference = 'auto',
   calibration?: TlcCalibrationModel
-): { score: number; deltaRf: number; bestProductRf: number | null; spots: SimulatedSpot[] } {
+): WellSolventEvaluation {
   const { demandShift, demandSlope, sigma, featureWeights } = resolveCalibrationOffsets(calibration, system, stationaryPhasePref);
   const subSpots: SimulatedSpot[] = well.substrates.map((s) => {
     const pred = predictTlcRf(s.profile, system, well.wellCtx, stationaryPhasePref, demandShift, demandSlope, featureWeights);
@@ -1514,31 +1536,67 @@ function evaluateWellInSolvent(
     }
   }
 
+  // Per-SM readability on THIS plate (gates front blow-out, baseline pinning, tailing, and SM-SM co-elution)
+  const smReadability: number[] = subSpots.map((sSpot, si) => {
+    let minOtherSmDelta = 0.25;
+    for (let sj = 0; sj < subSpots.length; sj++) {
+      if (sj === si) continue;
+      if (sSpot.uvActive !== false && subSpots[sj].uvActive !== false) {
+        const d = Math.abs(sSpot.rf - subSpots[sj].rf);
+        if (d < minOtherSmDelta) minOtherSmDelta = d;
+      }
+    }
+    const smOverlapFactor = subSpots.length > 1 ? 0.68 + 0.32 * deltaScore(minOtherSmDelta, sigma) : 1.0;
+    const smTailFactor = sSpot.tailing ? 0.50 : sSpot.mildStreak ? 0.92 : 1.0;
+    const smVisFactor = sSpot.uvActive === false ? 0.55 : 1.0;
+    return (
+      smWindowScore(sSpot.rf) *
+      smOverlapFactor *
+      smTailFactor *
+      smVisFactor *
+      additiveOverheadFactor
+    );
+  });
+
+  const trackIndices = subSpots
+    .map((s, idx) => (s.uvActive !== false ? idx : -1))
+    .filter((idx) => idx >= 0);
+  const effTrack = trackIndices.length > 0 ? trackIndices : subSpots.map((_, idx) => idx);
+  let smSum = 0;
+  let smMin = 1;
+  for (const idx of effTrack) {
+    const r = smReadability[idx];
+    smSum += r;
+    if (r < smMin) smMin = r;
+  }
+  const smMean = effTrack.length > 0 ? smSum / effTrack.length : 1;
+  const smCoverageSingle = effTrack.length > 0 ? 0.55 * smMean + 0.45 * smMin : 1;
+
   if (well.products.length === 0) {
-    const readableFrac =
-      subSpots.length > 0
-        ? subSpots.reduce((acc, s) => acc + windowScore(s.rf) * (s.tailing ? 0.65 : 1), 0) / subSpots.length
-        : 0;
     return {
-      score: Math.round(readableFrac * additiveOverheadFactor * 1000) / 1000,
+      score: Math.round(smCoverageSingle * 1000) / 1000,
       deltaRf: 0,
       bestProductRf: null,
       spots: [...subSpots],
+      smReadability,
+      prodReadability: [],
     };
   }
 
   let wSum = 0;
   let scoreSum = 0;
   let bestQual = 0;
+  let prodVisSum = 0;
   let primaryDelta = 0;
   let primaryRf: number | null = null;
+  const prodReadability: number[] = new Array(well.products.length).fill(0);
 
   const STAIN_ONLY_FACTOR = 0.4; // no chromophore: needs a stain, cannot be judged under UV
   const DECOMPOSE_FACTOR = 0.7; // reversible product that may fall apart on acidic silica
 
   well.products.forEach((p, idx) => {
     const pSpot = prodSpots[idx];
-    // Only substrates that show under UV can be used to judge separation by eye.
+    // Only substrates that show under UV can be used to judge separation by eye on THIS same plate.
     const visibleSubs = subSpots.filter((s) => s.uvActive !== false);
     const minSubDelta =
       visibleSubs.length > 0 ? Math.min(...visibleSubs.map((s) => Math.abs(pSpot.rf - s.rf))) : 0.25;
@@ -1582,6 +1640,7 @@ function evaluateWellInSolvent(
       mildStreakFactor *
       additiveOverheadFactor;
 
+    prodReadability[idx] = qual;
     if (idx === 0) {
       primaryDelta = Math.round(minSubDelta * 100) / 100;
       primaryRf = pSpot.rf;
@@ -1589,32 +1648,23 @@ function evaluateWellInSolvent(
 
     wSum += p.weight;
     scoreSum += p.weight * qual;
+    prodVisSum += p.weight * windowScore(pSpot.rf) * (pSpot.tailing ? 0.65 : 1) * visFactor;
     if (p.weight > 0.0001 && qual > bestQual) bestQual = qual;
   });
 
-  // Every spot that could be on the plate (starting materials and ALL predicted products) should sit in the
-  // readable Rf window and be visible; this gates the separation score so unlikely-product guesses cannot
-  // hide a system that pushes known spots onto the baseline or the front.
-  const allSpots = [...subSpots, ...prodSpots];
-  let visSum = 0;
-  let visW = 0;
-  for (let si = 0; si < allSpots.length; si++) {
-    const sp = allSpots[si];
-    const wgt = si < subSpots.length ? 1 : Math.max(0.0001, well.products[si - subSpots.length].weight);
-    visSum += wgt * windowScore(sp.rf) * (sp.tailing ? 0.65 : 1) * (sp.uvActive === false ? STAIN_ONLY_FACTOR : 1);
-    visW += wgt;
-  }
-  const allVisible = visW > 0 ? visSum / visW : 0;
-  const visibilityGate = 0.7 + 0.3 * allVisible;
-  // One badly placed product must not sink a well whose other products read fine: any of them may not form.
-  // Blend the weighted mean with the best-placed product.
+  // Single-plate score blends product resolution with known SM visibility so a single tank cannot
+  // hide front-blown starting materials behind speculative predicted products.
   const blendedQual = wSum > 0 ? 0.5 * (scoreSum / wSum) + 0.5 * bestQual : 0;
+  const smGate = effTrack.length > 0 ? 0.45 + 0.55 * smCoverageSingle : 1;
+  const prodVisGate = wSum > 0 ? 0.80 + 0.20 * (prodVisSum / wSum) : 1;
 
   return {
-    score: Math.round(blendedQual * visibilityGate * 1000) / 1000,
+    score: Math.round(blendedQual * smGate * prodVisGate * 1000) / 1000,
     deltaRf: primaryDelta,
     bestProductRf: primaryRf,
     spots: [...subSpots, ...prodSpots],
+    smReadability,
+    prodReadability,
   };
 }
 
@@ -1862,8 +1912,14 @@ export async function optimizePlateTlcSolvents(
       })
       .slice(0, 8);
     const products = rawProds.map((sp) => {
-      // Predicted products are only candidates: any of them may or may not form, so none outweighs the others.
-      const imp = sp.tier === 'High' || sp.tier === 'Medium' ? 1 : lowTierWeight;
+      // Weight each candidate product continuously by mechanistic confidence & step depth so
+      // high-confidence primary adducts anchor the eluent choice over deep speculative cascades.
+      const tierBase =
+        sp.tier === 'High' ? 1.15 : sp.tier === 'Medium' ? 0.85 : lowTierWeight;
+      const scoreFactor = 0.35 + 0.65 * Math.max(0.1, Math.min(1, sp.score ?? 0.5));
+      const steps = sp.stepsCount ?? 1;
+      const depthFactor = steps <= 2 ? 1.0 : steps === 3 ? 0.88 : 0.76;
+      const imp = tierBase * scoreFactor * depthFactor;
       return {
         key: sp.key,
         smiles: sp.smiles,
@@ -1950,6 +2006,7 @@ export async function optimizePlateTlcSolvents(
   let maxAcidStress = 0;
   let maxAcidLabel: string | undefined;
   const wellBestStrengths: number[] = [];
+  const wellSmTrackStrengths: number[] = [];
 
   for (const w of activeWells) {
     const allProfs = [...w.substrates.map((s) => s.profile), ...w.products.map((p) => p.profile)];
@@ -1963,18 +2020,30 @@ export async function optimizePlateTlcSolvents(
         maxAcidLabel = stress.label;
       }
     }
-    // Estimate ideal eluent strength for this well across baseline SiO2 library
+    // Estimate ideal eluent strength for this well AND ideal SM-tracking strength across baseline SiO2 library
     let wBestSc = -1;
     let wBestStr = 0.50;
+    let wBestSmSc = -1;
+    let wBestSmStr = 0.30;
     for (const cs of phaseFilteredLibrary) {
       if (cs.stationaryPhase !== 'SiO2') continue;
-      const sc = evaluateWellInSolvent(w, cs, stationaryPhasePref, options.calibration).score;
-      if (sc > wBestSc) {
-        wBestSc = sc;
+      const ev = evaluateWellInSolvent(w, cs, stationaryPhasePref, options.calibration);
+      if (ev.score > wBestSc) {
+        wBestSc = ev.score;
         wBestStr = cs.strength;
+      }
+      if (ev.smReadability.length > 0) {
+        const smMinHere = Math.min(...ev.smReadability);
+        const smMeanHere = ev.smReadability.reduce((a, b) => a + b, 0) / ev.smReadability.length;
+        const smMetric = 0.55 * smMeanHere + 0.45 * smMinHere;
+        if (smMetric > wBestSmSc) {
+          wBestSmSc = smMetric;
+          wBestSmStr = cs.strength;
+        }
       }
     }
     wellBestStrengths.push(wBestStr);
+    wellSmTrackStrengths.push(wBestSmStr);
   }
 
   const meanAromaticRings = molCount > 0 ? Math.round((totalArom / molCount) * 100) / 100 : 0;
@@ -1982,13 +2051,19 @@ export async function optimizePlateTlcSolvents(
   const aromaticHeavyPlate = meanAromaticRings >= 1.5;
 
   wellBestStrengths.sort((a, b) => a - b);
-  const qIdx = (q: number) =>
-    wellBestStrengths.length > 0
-      ? wellBestStrengths[Math.min(wellBestStrengths.length - 1, Math.floor(q * (wellBestStrengths.length - 1)))]
+  wellSmTrackStrengths.sort((a, b) => a - b);
+  const qIdx = (arr: number[], q: number) =>
+    arr.length > 0
+      ? arr[Math.min(arr.length - 1, Math.floor(q * (arr.length - 1)))]
       : 0.5;
-  const rawTargets = [qIdx(0.15), qIdx(0.5), qIdx(0.85)];
+  const rawTargets = [
+    qIdx(wellSmTrackStrengths, 0.15),
+    qIdx(wellBestStrengths, 0.15),
+    qIdx(wellBestStrengths, 0.5),
+    qIdx(wellBestStrengths, 0.85),
+  ];
   const targetStrengths = Array.from(new Set(rawTargets.map((v) => Math.round(v * 20) / 20)));
-  const targetStrengthMin = wellBestStrengths.length > 0 ? wellBestStrengths[0] : 0.25;
+  const targetStrengthMin = wellBestStrengths.length > 0 ? Math.min(wellBestStrengths[0], wellSmTrackStrengths[0] ?? wellBestStrengths[0]) : 0.25;
   const targetStrengthMax = wellBestStrengths.length > 0 ? wellBestStrengths[wellBestStrengths.length - 1] : 0.75;
 
   const coreIds = new Set(phaseFilteredLibrary.map((s) => s.id));
@@ -2115,12 +2190,75 @@ export async function optimizePlateTlcSolvents(
   const numActive = activeWells.length;
   const importanceArr = new Float64Array(numActive);
   let totalImportance = 0;
+  const wellTrackIndices: number[][] = new Array(numActive);
+  const wellProdWeights: number[][] = new Array(numActive);
+  const wellProdWeightSum = new Float64Array(numActive);
+
   for (let wi = 0; wi < numActive; wi++) {
-    const imp = activeWells[wi].importanceWeight;
+    const w = activeWells[wi];
+    const imp = w.importanceWeight;
     importanceArr[wi] = imp;
     totalImportance += imp;
+
+    const uvIdx = w.substrates
+      .map((s, idx) => (s.profile.uvActive !== false ? idx : -1))
+      .filter((idx) => idx >= 0);
+    wellTrackIndices[wi] = uvIdx.length > 0 ? uvIdx : w.substrates.map((_, idx) => idx);
+
+    const pw = w.products.map((p) => p.weight);
+    wellProdWeights[wi] = pw;
+    wellProdWeightSum[wi] = pw.reduce((a, b) => a + b, 0);
   }
   if (totalImportance <= 0) totalImportance = 1;
+
+  // Compute joint cross-plate species coverage score for any arbitrary subset of systems on well index `wi`.
+  // Each SM is credited at its best readability across the plate set; each product is credited at its best
+  // same-plate-resolved readability across the plate set.
+  const evaluateSystemsOnWell = (systems: TlcSolventSystemDef[], wi: number): number => {
+    const w = activeWells[wi];
+    if (systems.length === 0) return 0;
+    if (systems.length === 1) {
+      return evalMatrix.get(systems[0].id)?.get(w.wellIndex)?.score ?? 0;
+    }
+
+    const evals = systems.map((sys) => evalMatrix.get(sys.id)!.get(w.wellIndex)!);
+    const trackIdx = wellTrackIndices[wi];
+    let smSum = 0;
+    let smMin = 1;
+    for (let t = 0; t < trackIdx.length; t++) {
+      const smIdx = trackIdx[t];
+      let bestSm = 0;
+      for (let m = 0; m < evals.length; m++) {
+        const val = evals[m].smReadability[smIdx] ?? 0;
+        if (val > bestSm) bestSm = val;
+      }
+      smSum += bestSm;
+      if (bestSm < smMin) smMin = bestSm;
+    }
+    const smCov = trackIdx.length > 0 ? 0.55 * (smSum / trackIdx.length) + 0.45 * smMin : 1;
+
+    const pw = wellProdWeights[wi];
+    const pwSum = wellProdWeightSum[wi];
+    if (pw.length === 0 || pwSum <= 0) {
+      return smCov;
+    }
+
+    let prodWeightedSum = 0;
+    let bestProdQual = 0;
+    for (let pIdx = 0; pIdx < pw.length; pIdx++) {
+      const wgt = pw[pIdx];
+      let bestP = 0;
+      for (let m = 0; m < evals.length; m++) {
+        const val = evals[m].prodReadability[pIdx] ?? 0;
+        if (val > bestP) bestP = val;
+      }
+      prodWeightedSum += wgt * bestP;
+      if (wgt > 0.0001 && bestP > bestProdQual) bestProdQual = bestP;
+    }
+    const prodCov = 0.50 * (prodWeightedSum / pwSum) + 0.50 * bestProdQual;
+    const smGate = trackIdx.length > 0 ? 0.35 + 0.65 * smCov : 1;
+    return (0.38 * smCov + 0.62 * prodCov) * smGate;
+  };
 
   const poolLen = searchPool.length;
   const scoreGrid: Float64Array[] = searchPool.map((sys) => {
@@ -2130,6 +2268,19 @@ export async function optimizePlateTlcSolvents(
       arr[wi] = sysMap.get(activeWells[wi].wellIndex)!.score;
     }
     return arr;
+  });
+
+  // Flat typed per-species readability grids for ultra-fast cross-plate combination search
+  const smGrid: number[][][] = searchPool.map((sys) => {
+    const sysMap = evalMatrix.get(sys.id)!;
+    return activeWells.map((w, wi) => {
+      const ev = sysMap.get(w.wellIndex)!;
+      return wellTrackIndices[wi].map((smIdx) => ev.smReadability[smIdx] ?? 0);
+    });
+  });
+  const prodGrid: number[][][] = searchPool.map((sys) => {
+    const sysMap = evalMatrix.get(sys.id)!;
+    return activeWells.map((w) => sysMap.get(w.wellIndex)!.prodReadability);
   });
 
   const famIndexMap = new Map<string, number>();
@@ -2193,78 +2344,151 @@ export async function optimizePlateTlcSolvents(
   const effK = Math.min(requestedK, poolLen);
   const combos = generateCombinations(poolLen, effK);
 
-  const assignedCounts = new Int32Array(effK);
+  const activePlateUsed = new Uint8Array(effK);
 
-  // Best combination of effK systems from the pool, skipping any system index in `excluded`.
+  // Best combination of effK systems from the pool using cross-plate SM + product species set coverage,
+  // skipping any system index in `excluded`.
   const searchBestCombo = async (excluded: Set<number>): Promise<{ combo: number[]; objective: number }> => {
-  let bestComboIdx: number[] = [];
-  let bestObjective = -1e9;
-  for (let cNum = 0; cNum < combos.length; cNum++) {
-    const combo = combos[cNum];
-    if (excluded.size > 0 && combo.some((ci) => excluded.has(ci))) continue;
-    assignedCounts.fill(0);
-    let weightedSum = 0;
+    let bestComboIdx: number[] = [];
+    let bestObjective = -1e9;
+    for (let cNum = 0; cNum < combos.length; cNum++) {
+      const combo = combos[cNum];
+      if (excluded.size > 0 && combo.some((ci) => excluded.has(ci))) continue;
+      activePlateUsed.fill(0);
+      let weightedSum = 0;
 
-    for (let wi = 0; wi < numActive; wi++) {
-      let bestW = -1;
-      let bestOwner = 0;
-      for (let cIdx = 0; cIdx < effK; cIdx++) {
-        const sc = scoreGrid[combo[cIdx]][wi];
-        if (sc > bestW) {
-          bestW = sc;
-          bestOwner = cIdx;
+      for (let wi = 0; wi < numActive; wi++) {
+        if (effK === 1) {
+          const sc = scoreGrid[combo[0]][wi];
+          if (sc > 0.35) activePlateUsed[0] = 1;
+          if (sc > 0) weightedSum += importanceArr[wi] * sc;
+          continue;
+        }
+
+        // Cross-plate SM tracking across the combo
+        const numSm = wellTrackIndices[wi].length;
+        let smSum = 0;
+        let smMin = 1;
+        for (let t = 0; t < numSm; t++) {
+          let bestSm = 0;
+          let secondSm = 0;
+          let bestM = 0;
+          for (let cIdx = 0; cIdx < effK; cIdx++) {
+            const val = smGrid[combo[cIdx]][wi][t];
+            if (val > bestSm) {
+              secondSm = bestSm;
+              bestSm = val;
+              bestM = cIdx;
+            } else if (val > secondSm) {
+              secondSm = val;
+            }
+          }
+          if (bestSm - secondSm >= 0.06 && bestSm >= 0.35) {
+            activePlateUsed[bestM] = 1;
+          }
+          smSum += bestSm;
+          if (bestSm < smMin) smMin = bestSm;
+        }
+        const smCov = numSm > 0 ? 0.55 * (smSum / numSm) + 0.45 * smMin : 1;
+
+        const pw = wellProdWeights[wi];
+        const pwSum = wellProdWeightSum[wi];
+        let wellJointScore = smCov;
+        if (pw.length > 0 && pwSum > 0) {
+          let prodWeightedSum = 0;
+          let bestProdQual = 0;
+          for (let pIdx = 0; pIdx < pw.length; pIdx++) {
+            const wgt = pw[pIdx];
+            let bestP = 0;
+            let secondP = 0;
+            let bestM = 0;
+            for (let cIdx = 0; cIdx < effK; cIdx++) {
+              const val = prodGrid[combo[cIdx]][wi][pIdx];
+              if (val > bestP) {
+                secondP = bestP;
+                bestP = val;
+                bestM = cIdx;
+              } else if (val > secondP) {
+                secondP = val;
+              }
+            }
+            if (wgt > 0.0001 && bestP - secondP >= 0.06 && bestP >= 0.35) {
+              activePlateUsed[bestM] = 1;
+            }
+            prodWeightedSum += wgt * bestP;
+            if (wgt > 0.0001 && bestP > bestProdQual) bestProdQual = bestP;
+          }
+          const prodCov = 0.50 * (prodWeightedSum / pwSum) + 0.50 * bestProdQual;
+          const smGate = numSm > 0 ? 0.35 + 0.65 * smCov : 1;
+          wellJointScore = (0.38 * smCov + 0.62 * prodCov) * smGate;
+        }
+
+        // Also mark best overall single plate for this well as actively used
+        let bestSingle = -1;
+        let bestSingleOwner = 0;
+        for (let cIdx = 0; cIdx < effK; cIdx++) {
+          const sc = scoreGrid[combo[cIdx]][wi];
+          if (sc > bestSingle) {
+            bestSingle = sc;
+            bestSingleOwner = cIdx;
+          }
+        }
+        if (wellJointScore > 0.35) activePlateUsed[bestSingleOwner] = 1;
+        if (wellJointScore > 0) weightedSum += importanceArr[wi] * wellJointScore;
+      }
+
+      let activeSystemsUsed = 0;
+      let famMask = 0;
+      let bandMask = 0;
+      let primaryCount = 0;
+      let unneededModCount = 0;
+      let c18AutoCount = 0;
+      let redundancyPenalty = 0;
+
+      for (let i = 0; i < effK; i++) {
+        const si = combo[i];
+        if (activePlateUsed[i] > 0) activeSystemsUsed++;
+        if (unneededModFlag[si]) {
+          unneededModCount++;
+        } else {
+          famMask |= famBit[si];
+          bandMask |= bandBit[si];
+        }
+        if (stationaryPhasePref === 'auto' && searchPool[si].stationaryPhase === 'C18') {
+          c18AutoCount++;
+        }
+        primaryCount += primaryFlag[si];
+        for (let j = i + 1; j < effK; j++) {
+          redundancyPenalty += pairPenalty[si * poolLen + combo[j]];
         }
       }
-      if (bestW > 0.35) assignedCounts[bestOwner]++;
-      if (bestW > 0) weightedSum += importanceArr[wi] * bestW;
-    }
 
-    let activeSystemsUsed = 0;
-    let famMask = 0;
-    let bandMask = 0;
-    let primaryCount = 0;
-    let unneededModCount = 0;
-    let redundancyPenalty = 0;
+      const distinctFamilies = popCount(famMask);
+      const distinctBands = popCount(bandMask);
+      const primaryBonus =
+        poolMode === 'prefer_primary' ? 0.055 * (primaryCount / effK) : 0;
+      const c18AutoPenalty = stationaryPhasePref === 'auto' ? c18AutoCount * 0.065 : 0;
 
-    for (let i = 0; i < effK; i++) {
-      const si = combo[i];
-      if (assignedCounts[i] > 0) activeSystemsUsed++;
-      if (unneededModFlag[si]) {
-        unneededModCount++;
-      } else {
-        famMask |= famBit[si];
-        bandMask |= bandBit[si];
+      const obj =
+        weightedSum / totalImportance +
+        activeSystemsUsed * 0.004 +
+        distinctFamilies * 0.005 +
+        distinctBands * 0.004 +
+        primaryBonus -
+        unneededModCount * 0.03 -
+        c18AutoPenalty -
+        redundancyPenalty;
+
+      if (obj > bestObjective) {
+        bestObjective = obj;
+        bestComboIdx = combo;
       }
-      primaryCount += primaryFlag[si];
-      for (let j = i + 1; j < effK; j++) {
-        redundancyPenalty += pairPenalty[si * poolLen + combo[j]];
+
+      if ((cNum & 1023) === 1023) {
+        await yieldIfFrameExceeded();
       }
     }
-
-    const distinctFamilies = popCount(famMask);
-    const distinctBands = popCount(bandMask);
-    const primaryBonus =
-      poolMode === 'prefer_primary' ? 0.055 * (primaryCount / effK) : 0;
-
-    const obj =
-      weightedSum / totalImportance +
-      activeSystemsUsed * 0.004 +
-      distinctFamilies * 0.005 +
-      distinctBands * 0.004 +
-      primaryBonus -
-      unneededModCount * 0.03 -
-      redundancyPenalty;
-
-    if (obj > bestObjective) {
-      bestObjective = obj;
-      bestComboIdx = combo;
-    }
-
-    if ((cNum & 1023) === 1023) {
-      await yieldIfFrameExceeded();
-    }
-  }
-  return { combo: bestComboIdx, objective: bestObjective };
+    return { combo: bestComboIdx, objective: bestObjective };
   };
 
   const mainSearch = await searchBestCombo(new Set<number>());
@@ -2275,19 +2499,14 @@ export async function optimizePlateTlcSolvents(
   const RESOLVED_SCORE = 0.55;
   const resolvedCountFor = (systems: TlcSolventSystemDef[]): number => {
     let n = 0;
-    for (const w of activeWells) {
-      let best = 0;
-      for (const sys of systems) {
-        const sc = evalMatrix.get(sys.id)!.get(w.wellIndex)!.score;
-        if (sc > best) best = sc;
-      }
-      if (best >= RESOLVED_SCORE) n++;
+    for (let wi = 0; wi < numActive; wi++) {
+      if (evaluateSystemsOnWell(systems, wi) >= RESOLVED_SCORE) n++;
     }
     return n;
   };
 
-  // Drop eluents that add almost nothing: requested count is an upper bound, not a target.
-  const minUniqueGain = Math.max(2, Math.ceil(activeWells.length * 0.05));
+  // Drop eluents that add almost nothing to cross-plate species coverage: requested count is an upper bound.
+  const minUniqueGain = activeWells.length <= 2 ? 1 : Math.max(2, Math.ceil(activeWells.length * 0.05));
   let droppedForSmallGain = 0;
   while (chosenSystems.length > 1) {
     const full = resolvedCountFor(chosenSystems);
@@ -2312,11 +2531,14 @@ export async function optimizePlateTlcSolvents(
     droppedForSmallGain++;
   }
 
-  // 4. Assign a well to an eluent only if it is actually resolved there (favoring primary on near-ties).
+  // 4. Mark each well as resolved if the cross-plate set covers its SMs + products (>= 0.55),
+  // and assign it to its best contributing recommended plate (favoring primary on near-ties).
   const bestOwnerByWell = new Map<number, string>();
   const unresolvedWellIndices: number[] = [];
   let resolvedWellCount = 0;
-  for (const w of activeWells) {
+  for (let wi = 0; wi < numActive; wi++) {
+    const w = activeWells[wi];
+    const setScore = evaluateSystemsOnWell(chosenSystems, wi);
     let topSys = chosenSystems[0];
     let topScore = -1;
     for (const sys of chosenSystems) {
@@ -2328,7 +2550,7 @@ export async function optimizePlateTlcSolvents(
         topSys = sys;
       }
     }
-    if (topScore >= RESOLVED_SCORE) {
+    if (setScore >= RESOLVED_SCORE) {
       bestOwnerByWell.set(w.wellIndex, topSys.id);
       resolvedWellCount++;
     } else {
@@ -2336,12 +2558,21 @@ export async function optimizePlateTlcSolvents(
     }
   }
 
+  // Order final recommended plates Weak-to-Strong (SiO2 ascending strength, C18 fallback after SiO2)
+  // so Plate #1 serves as the mild SM-tracking plate and Plate #2/#3 rescue polar/ionic products.
   const recommendedSystems = chosenSystems
     .map((sys) =>
       buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, bestOwnerByWell)
     )
-    .filter((entry, _idx, arr) => entry.assignedWellIndices.length > 0 || arr.length === 1)
-    .sort((a, b) => b.assignedWellIndices.length - a.assignedWellIndices.length)
+    .sort((a, b) => {
+      if (a.system.stationaryPhase !== b.system.stationaryPhase) {
+        return a.system.stationaryPhase === 'SiO2' ? -1 : 1;
+      }
+      if (Math.abs(a.system.strength - b.system.strength) > 0.02) {
+        return a.system.strength - b.system.strength;
+      }
+      return b.assignedWellIndices.length - a.assignedWellIndices.length;
+    })
     .map((entry, idx) => ({ ...entry, rank: idx + 1 }));
 
   // "Either/or": an Et3N eluent and an NH3/MeOH eluent that resolve (nearly) the same wells are interchangeable.
@@ -2381,7 +2612,7 @@ export async function optimizePlateTlcSolvents(
       return b.meanResolutionScore - a.meanResolutionScore;
     });
 
-  // Group the remaining systems into complementary sets, the same way the main suggestion is built:
+  // Group the remaining systems into complementary sets, using the same cross-plate set coverage logic:
   // repeat the combination search without the systems already used.
   const otherGroups: PlateSolventGroup[] = [];
   const usedIdx = new Set<number>(bestComboIdx);
@@ -2394,7 +2625,9 @@ export async function optimizePlateTlcSolvents(
     const groupSystems = found.combo.map((ci) => searchPool[ci]);
     const owner = new Map<number, string>();
     let groupResolved = 0;
-    for (const w of activeWells) {
+    for (let wi = 0; wi < numActive; wi++) {
+      const w = activeWells[wi];
+      const setSc = evaluateSystemsOnWell(groupSystems, wi);
       let top = groupSystems[0];
       let topSc = -1;
       for (const sys of groupSystems) {
@@ -2404,7 +2637,7 @@ export async function optimizePlateTlcSolvents(
           top = sys;
         }
       }
-      if (topSc >= RESOLVED_SCORE) {
+      if (setSc >= RESOLVED_SCORE) {
         owner.set(w.wellIndex, top.id);
         groupResolved++;
       }
@@ -2412,7 +2645,12 @@ export async function optimizePlateTlcSolvents(
     if (groupResolved === 0) break;
     const entries = groupSystems
       .map((sys) => buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, owner))
-      .sort((a, b) => b.assignedWellIndices.length - a.assignedWellIndices.length)
+      .sort((a, b) => {
+        if (a.system.stationaryPhase !== b.system.stationaryPhase) {
+          return a.system.stationaryPhase === 'SiO2' ? -1 : 1;
+        }
+        return a.system.strength - b.system.strength;
+      })
       .map((entry, i) => ({ ...entry, rank: i + 1 }));
     otherGroups.push({
       label: `Alternative set ${String.fromCharCode(66 + g)}`,

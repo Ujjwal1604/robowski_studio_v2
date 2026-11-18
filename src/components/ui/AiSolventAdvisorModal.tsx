@@ -2377,8 +2377,18 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 </span>
                               )}
                             </div>
-                            <span className="mono" style={{ fontSize: '11.5px', fontWeight: 700, color: '#10b981' }}>
-                              est. {rec.wellCoveragePct}% resolved
+                            <span
+                              className="mono"
+                              style={{ fontSize: '11.5px', fontWeight: 700, color: '#10b981' }}
+                              title={
+                                rec.resolvedWellCount < rec.assignedWellIndices.length
+                                  ? `Solo plate resolves ${rec.wellCoveragePct}%; assigned ${rec.assignedWellIndices.length}/${platePlan.activeWellCount} wells via cross-plate SM + product coverage`
+                                  : `Single-plate estimated well coverage`
+                              }
+                            >
+                              {rec.resolvedWellCount < rec.assignedWellIndices.length && platePlan.activeWellCount > 0
+                                ? `est. ${Math.round((rec.assignedWellIndices.length / platePlan.activeWellCount) * 100)}% set-share`
+                                : `est. ${rec.wellCoveragePct}% resolved`}
                             </span>
                           </div>
 
@@ -2882,17 +2892,52 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             gap: '8px',
                           }}
                         >
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                            <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700 }}>
-                              Well {inspectedLane.wellCoord} (Spotter Lane {tlcLane(inspectedLane.wellIndex) + 1}) in {activeSystemPlan.system.shortLabel} · ΔRf = {inspectedLane.deltaRf.toFixed(2)} · Separation{' '}
-                              <span style={{ color: laneScoreColor(inspectedLane.resolutionScore) }}>
-                                {Math.round(inspectedLane.resolutionScore * 100)}%
-                              </span>
-                            </div>
-                            <span style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                              Click any lane above to inspect its spots &amp; structures
-                            </span>
-                          </div>
+                          {(() => {
+                            const recList = platePlan.recommendedSystems || [];
+                            const uvSubs = inspectedLane.spots.filter(
+                              (s) => s.kind === 'substrate' && s.uvActive !== false
+                            );
+                            const trackedCount = uvSubs.filter((sub) =>
+                              recList.some((rec) => {
+                                const match = rec.lanes[inspectedLane.wellIndex]?.spots.find(
+                                  (rs) => rs.kind === 'substrate' && rs.code === sub.code
+                                );
+                                return match ? match.rf >= 0.10 && match.rf <= 0.84 : false;
+                              })
+                            ).length;
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                                <div className="mono" style={{ fontSize: '12.5px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                  <span>
+                                    Well {inspectedLane.wellCoord} (Spotter Lane {tlcLane(inspectedLane.wellIndex) + 1}) in {activeSystemPlan.system.shortLabel} · ΔRf = {inspectedLane.deltaRf.toFixed(2)} · Separation{' '}
+                                    <span style={{ color: laneScoreColor(inspectedLane.resolutionScore) }}>
+                                      {Math.round(inspectedLane.resolutionScore * 100)}%
+                                    </span>
+                                  </span>
+                                  {recList.length >= 2 && uvSubs.length > 0 && (
+                                    <span
+                                      style={{
+                                        fontSize: '10.5px',
+                                        padding: '1px 6px',
+                                        borderRadius: '4px',
+                                        background:
+                                          trackedCount === uvSubs.length
+                                            ? 'color-mix(in srgb, #10b981 15%, transparent)'
+                                            : 'color-mix(in srgb, #f59e0b 16%, transparent)',
+                                        color: trackedCount === uvSubs.length ? '#10b981' : '#f59e0b',
+                                      }}
+                                      title="Starting materials clearly readable (Rf 0.10–0.84) on at least one recommended sister plate"
+                                    >
+                                      Set SM Tracking {trackedCount}/{uvSubs.length}
+                                    </span>
+                                  )}
+                                </div>
+                                <span style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                                  Click any lane above to inspect its spots &amp; structures
+                                </span>
+                              </div>
+                            );
+                          })()}
 
                           <div
                             style={{
@@ -2901,7 +2946,30 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               gap: '10px',
                             }}
                           >
-                            {inspectedLane.spots.slice(0, 6).map((spot, idx) => (
+                            {inspectedLane.spots.slice(0, 6).map((spot, idx) => {
+                              const isOffWindowHere = spot.rf > 0.84 || spot.rf < 0.09;
+                              let bestSister: { rank: number; label: string; rf: number } | null = null;
+                              if (isOffWindowHere) {
+                                let bestMidDist = Infinity;
+                                for (const rec of platePlan.recommendedSystems) {
+                                  if (rec.system.id === activeSystemPlan.system.id) continue;
+                                  const match = rec.lanes[inspectedLane.wellIndex]?.spots.find(
+                                    (rs) => rs.kind === spot.kind && rs.code === spot.code
+                                  );
+                                  if (match && match.rf >= 0.10 && match.rf <= 0.84) {
+                                    const d = Math.abs(match.rf - 0.45);
+                                    if (d < bestMidDist) {
+                                      bestMidDist = d;
+                                      bestSister = {
+                                        rank: rec.rank,
+                                        label: rec.system.shortLabel,
+                                        rf: match.rf,
+                                      };
+                                    }
+                                  }
+                                }
+                              }
+                              return (
                               <div
                                 key={idx}
                                 style={{
@@ -2938,6 +3006,16 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     ? `${spot.formula}${spot.tier ? ` · ${spot.tier} (${spot.score?.toFixed(2)})` : ''}`
                                     : spot.label}
                                 </div>
+                                {bestSister && (
+                                  <div style={{ fontSize: '10px', color: '#10b981', textAlign: 'center', fontWeight: 600 }}>
+                                    ✓ Clear on #{bestSister.rank} {bestSister.label} (Rf {bestSister.rf.toFixed(2)})
+                                  </div>
+                                )}
+                                {!bestSister && isOffWindowHere && spot.kind === 'substrate' && spot.uvActive !== false && (
+                                  <div style={{ fontSize: '10px', color: '#f59e0b', textAlign: 'center' }}>
+                                    ⚠ {spot.rf > 0.84 ? 'Near front' : 'Near baseline'} across recommended set
+                                  </div>
+                                )}
                                 {spot.tailing && (
                                   <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center' }}>
                                     {spot.tailingReason}
@@ -2959,7 +3037,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   </div>
                                 )}
                               </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         </div>
                       )}

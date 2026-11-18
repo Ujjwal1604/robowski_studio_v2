@@ -6,6 +6,8 @@ import {
   TlcChannelKey,
   computeLaneRowIntensity,
   extractDensitogram,
+  findMultiChannelSpots,
+  getChannelHistogram,
   getEffectiveLaneSpots,
   laneMatrix,
   renderFalseColorLane,
@@ -85,7 +87,7 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
     return keys;
   }, [tlcSet]);
 
-  const hasComposite = availableChannels.includes('UV254') && availableChannels.includes('UV366');
+  const hasComposite = availableChannels.length >= 2;
 
   const activeMode: 'composite' | TlcChannelKey | null = useMemo(() => {
     if (preferredMode === 'composite' && hasComposite) return 'composite';
@@ -98,24 +100,44 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
 
   const info = useMemo(() => {
     if (!tlcSet || !lane || !availableChannels.length) return null;
-    const traceKey: TlcChannelKey =
-      activeMode && activeMode !== 'composite'
-        ? activeMode
-        : availableChannels.includes('UV254')
-        ? 'UV254'
-        : availableChannels[0];
-    const profile = extractProfile(tlcSet, traceKey, lane);
-    if (!profile.length) return null;
     const origin = tlcOrigin(tlcSet, lane, extractProfile);
     const front = tlcFront(tlcSet, lane, extractProfile);
-    const dens = extractDensitogram(profile, {
-      sign: TLC_SIGNAL[traceKey].sign,
-      origin,
-      front,
-      radius: lane.spotRadius ?? undefined,
-      minProminence: tlcSet.spotProminence ?? 0.28,
-    });
-    const spots = getEffectiveLaneSpots(lane, dens.spots);
+    let autoSpots: TlcSpot[] = [];
+    if (activeMode === 'composite') {
+      const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+      const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+      for (const ch of availableChannels) {
+        const p = extractProfile(tlcSet, ch, lane);
+        if (p.length) {
+          profiles[ch] = p;
+          const chHist = getChannelHistogram(tlcSet, ch, extractProfile);
+          if (chHist) histograms[ch] = chHist;
+        }
+      }
+      autoSpots = findMultiChannelSpots({
+        profiles,
+        origin,
+        front,
+        radius: lane.spotRadius ?? undefined,
+        minProminence: tlcSet.spotProminence ?? 0.28,
+        histograms,
+      });
+    } else {
+      const traceKey: TlcChannelKey =
+        activeMode || (availableChannels.includes('UV254') ? 'UV254' : availableChannels[0]);
+      const profile = extractProfile(tlcSet, traceKey, lane);
+      if (!profile.length) return null;
+      const dens = extractDensitogram(profile, {
+        sign: TLC_SIGNAL[traceKey].sign,
+        origin,
+        front,
+        radius: lane.spotRadius ?? undefined,
+        minProminence: tlcSet.spotProminence ?? 0.28,
+        plateHistogram: getChannelHistogram(tlcSet, traceKey, extractProfile),
+      });
+      autoSpots = dens.spots;
+    }
+    const spots = getEffectiveLaneSpots(lane, autoSpots);
     return { origin, front, spots };
   }, [tlcSet, lane, availableChannels, activeMode]);
 

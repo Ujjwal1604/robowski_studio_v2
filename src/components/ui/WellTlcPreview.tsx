@@ -7,6 +7,8 @@ import {
   TlcChannelKey,
   computeLaneRowIntensity,
   extractDensitogram,
+  findMultiChannelSpots,
+  getChannelHistogram,
   getEffectiveLaneSpots,
   laneMatrix,
   renderFalseColorLane,
@@ -93,7 +95,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     return keys;
   }, [tlcSet]);
 
-  const hasComposite = availableChannels.includes('UV254') && availableChannels.includes('UV366');
+  const hasComposite = availableChannels.length >= 2;
   const [selectedMode, setSelectedMode] = useState<'composite' | TlcChannelKey>('UV254');
 
   const activeMode: 'composite' | TlcChannelKey | null = useMemo(() => {
@@ -123,27 +125,61 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       front,
       radius: lane.spotRadius ?? undefined,
       minProminence: tlcSet.spotProminence ?? 0.08,
+      plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileLocal),
     });
-    const effectiveSpots = getEffectiveLaneSpots(lane, dens.spots);
 
     let uv366Dens = null;
-    if (activeMode === 'composite' && availableChannels.includes('UV366')) {
-      const p366 = extractLaneProfileLocal(tlcSet, 'UV366', lane);
-      if (p366.length) {
-        uv366Dens = extractDensitogram(p366, {
+    let whiteDens = null;
+    let effectiveSpots: TlcSpot[];
+    if (activeMode === 'composite') {
+      const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+      const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+      for (const ch of availableChannels) {
+        const p = extractLaneProfileLocal(tlcSet, ch, lane);
+        if (p.length) {
+          profiles[ch] = p;
+          const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileLocal);
+          if (chHist) histograms[ch] = chHist;
+        }
+      }
+      if (availableChannels.includes('UV366') && profiles.UV366 && traceKey !== 'UV366') {
+        uv366Dens = extractDensitogram(profiles.UV366, {
           sign: TLC_SIGNAL.UV366.sign,
           origin,
           front,
           radius: lane.spotRadius ?? undefined,
           minProminence: tlcSet.spotProminence ?? 0.08,
+          plateHistogram: histograms.UV366,
         });
       }
+      if (availableChannels.includes('White') && profiles.White && traceKey !== 'White') {
+        whiteDens = extractDensitogram(profiles.White, {
+          sign: TLC_SIGNAL.White.sign,
+          origin,
+          front,
+          radius: lane.spotRadius ?? undefined,
+          minProminence: tlcSet.spotProminence ?? 0.08,
+          plateHistogram: histograms.White,
+        });
+      }
+      const multiSpots = findMultiChannelSpots({
+        profiles,
+        origin,
+        front,
+        radius: lane.spotRadius ?? undefined,
+        minProminence: tlcSet.spotProminence ?? 0.08,
+        histograms,
+      });
+      effectiveSpots = getEffectiveLaneSpots(lane, multiSpots);
+    } else {
+      effectiveSpots = getEffectiveLaneSpots(lane, dens.spots);
     }
 
     return {
       traceKey,
       dens,
       uv366Dens,
+      whiteDens,
       spots: effectiveSpots,
       origin,
       front,
@@ -322,6 +358,9 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
   const uv366Trace = densitogramInfo?.uv366Dens
     ? buildPath(densitogramInfo.uv366Dens.points, densitogramInfo.uv366Dens.maxSignal)
     : { line: '', area: '' };
+  const whiteTrace = densitogramInfo?.whiteDens
+    ? buildPath(densitogramInfo.whiteDens.points, densitogramInfo.whiteDens.maxSignal)
+    : { line: '', area: '' };
 
   const traceColor =
     activeMode === 'UV366' ? '#a855f7' : activeMode === 'White' ? '#f59e0b' : '#10b981';
@@ -461,6 +500,9 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
 
               {uv366Trace.line && (
                 <path d={uv366Trace.line} fill="none" stroke="#a855f7" strokeWidth="1.4" strokeDasharray="3,2" />
+              )}
+              {whiteTrace.line && (
+                <path d={whiteTrace.line} fill="none" stroke="#f59e0b" strokeWidth="1.4" strokeDasharray="2,2" />
               )}
 
               {spotsToShow.slice(0, 6).map((sp, idx) => {

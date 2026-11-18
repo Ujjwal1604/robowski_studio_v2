@@ -20,6 +20,11 @@ import {
   detectFront,
   tlcDetectionNotes,
   findSpots,
+  findMultiChannelSpots,
+  mergeMultiChannelSpots,
+  getLoadedTlcChannels,
+  getChannelHistogram,
+  hasCompositeChannels,
   extractDensitogram,
   computeLaneRowIntensity,
   tlcHalf,
@@ -217,10 +222,10 @@ function drawLanePanels(
     const w = ws[j];
     const h = k * l.length;
 
-    // Check if dual-channel false color composite can be rendered
+    // Check if multi-channel false color composite can be rendered (any 2+ of UV254, UV366, White)
     let renderedFalseColor = false;
     const isExplicitComposite = (p as any).isComposite || (compositeFalseColor && panels.length === 1);
-    if (isExplicitComposite && p.s.imgs?.UV254?.bmp && p.s.imgs?.UV366?.bmp) {
+    if (isExplicitComposite && hasCompositeChannels(p.s.imgs, true)) {
       const fc = renderFalseColorLane(p.s, l, w, h);
       if (fc) {
         ctx.save();
@@ -335,8 +340,17 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
 
   const rcol = (i: number) => PAL[i % PAL.length];
 
-  // Primary panel spots for summary label below cell
-  const primarySpots = panels[0]?.spots;
+  // Merge detected spots across all displayed channel panels for the cell's Rf summary
+  const primarySpots = useMemo(() => {
+    const withSpots = panels.filter((p) => Array.isArray(p.spots));
+    if (!withSpots.length) return undefined;
+    if (withSpots.length === 1) return withSpots[0].spots;
+    const byCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
+    for (const p of withSpots) {
+      if (p.spots) byCh[p.key] = p.spots;
+    }
+    return mergeMultiChannelSpots(byCh);
+  }, [panels]);
 
   const cssFilter =
     filters.invert || filters.brightness !== 100 || filters.contrast !== 100
@@ -556,7 +570,7 @@ export const TlcView: React.FC = () => {
 
   useEffect(() => {
     if (fullPlateChannel === 'composite') {
-      if (!activePlateSet.imgs?.UV254 || !activePlateSet.imgs?.UV366) {
+      if (!hasCompositeChannels(activePlateSet.imgs, false)) {
         const firstAvail = TLC_KEYS.find((k) => Boolean(activePlateSet.imgs?.[k]));
         if (firstAvail) setFullPlateChannel(firstAvail);
       }
@@ -927,6 +941,7 @@ export const TlcView: React.FC = () => {
       const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
       const origin = tlcOrigin(set, lane, get);
       const front = tlcFront(set, lane, get);
+      const plateHistogram = getChannelHistogram(set, key, get);
       return {
         prof,
         origin,
@@ -936,6 +951,7 @@ export const TlcView: React.FC = () => {
           front,
           radius: lane.spotRadius || 24,
           minProminence: spotProminence,
+          plateHistogram,
         },
       };
     },
@@ -949,21 +965,41 @@ export const TlcView: React.FC = () => {
       const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
       const hit = edgeCache.current.get(cacheMapKey);
       if (hit && hit.key === key) return hit.fits;
-      const ch = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).find((k) => !!set.imgs[k]);
+      const loadedChs = getLoadedTlcChannels(set.imgs, false);
       let fits: (EdgeFit | null)[] = [null, null];
-      if (ch && set.cfg) {
+      if (loadedChs.length > 0 && set.cfg) {
         const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
         const auto: EdgePoint[][] = [[], []];
         for (const lane of set.cfg.lanes) {
           if (lane.id < 0 || lane.id > 53) continue;
-          const d = detectOptsFor(set, ch, lane);
-          if (!d) continue;
-          const laneSpots = (lane.customSpots && lane.customSpots.length > 0)
-            ? lane.customSpots
-            : findSpots(d.prof, d.opts);
+          const oVal = tlcOrigin(set, lane, get);
+          const fVal = tlcFront(set, lane, get);
+          let laneSpots: TlcSpot[];
+          if (lane.customSpots && lane.customSpots.length > 0) {
+            laneSpots = lane.customSpots;
+          } else {
+            const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+            const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+            for (const ch of loadedChs) {
+              const p = get(set, ch, lane);
+              if (p && p.length >= 10) {
+                profiles[ch] = p;
+                const chHist = getChannelHistogram(set, ch, get);
+                if (chHist) histograms[ch] = chHist;
+              }
+            }
+            laneSpots = findMultiChannelSpots({
+              profiles,
+              origin: oVal,
+              front: fVal,
+              radius: lane.spotRadius || 24,
+              minProminence: spotProminence,
+              histograms,
+            });
+          }
           for (const sp of laneSpots) {
             if (sp.rf > 0.05 && sp.rf < 0.98 && (sp.source === 'manual' || sp.source === 'adjusted' || sp.strength > 0.15)) {
-              auto[tlcHalf(lane)].push({ lane: lane.id, x: lane.x0, h: sp.pos - d.origin });
+              auto[tlcHalf(lane)].push({ lane: lane.id, x: lane.x0, h: sp.pos - oVal });
             }
           }
         }
@@ -989,7 +1025,7 @@ export const TlcView: React.FC = () => {
       edgeCache.current.set(cacheMapKey, { key, fits });
       return fits;
     },
-    [plate, spotProminence, coreFraction, detectOptsFor]
+    [plate, spotProminence, coreFraction]
   );
 
   const handlePickSpot = useCallback(
@@ -1062,6 +1098,44 @@ export const TlcView: React.FC = () => {
       return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
     },
     [detectOptsFor, edgeSettingFor, getEdgeFits]
+  );
+
+  // Unified 3-channel spot detection across UV254, UV366, and White for Composite mode
+  const getCompositeSpotsForLane = useCallback(
+    (set: TlcSet, lane: TlcLane): TlcSpot[] | null => {
+      const loaded = getLoadedTlcChannels(set.imgs, false);
+      if (!loaded.length) return null;
+      const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+      const origin = tlcOrigin(set, lane, get);
+      const front = tlcFront(set, lane, get);
+      const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+      const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+      for (const ch of loaded) {
+        const p = get(set, ch, lane);
+        if (p && p.length >= 10) {
+          profiles[ch] = p;
+          const chHist = getChannelHistogram(set, ch, get);
+          if (chHist) histograms[ch] = chHist;
+        }
+      }
+      const autoSpots = findMultiChannelSpots({
+        profiles,
+        origin,
+        front,
+        radius: lane.spotRadius || 24,
+        minProminence: spotProminence,
+        histograms,
+      });
+      const spots = getEffectiveLaneSpots(lane, autoSpots);
+      if (!spots.length) return spots;
+      const h = tlcHalf(lane);
+      const setting = edgeSettingFor(set, h);
+      if (setting.mode === 'off') return spots;
+      const fit = getEdgeFits(set)[h];
+      if (!edgeActive(fit, setting)) return spots;
+      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
+    },
+    [coreFraction, spotProminence, edgeSettingFor, getEdgeFits]
   );
 
   // Helper to extract panels for lane t
@@ -1176,17 +1250,18 @@ export const TlcView: React.FC = () => {
       });
     }
 
-    // 3. Dual-Channel False-Color Composite Overlay
-    if (activePlateSet.imgs.UV254 && activePlateSet.imgs.UV366) {
+    // 3. Multi-Channel False-Color Composite Overlay (any 2+ of UV254, UV366, White)
+    if (hasCompositeChannels(activePlateSet.imgs, false)) {
+      const compositeBaseKey = getLoadedTlcChannels(activePlateSet.imgs, false)[0] || 'UV254';
       panels.push({
         s: activePlateSet,
         i: cur,
-        key: 'UV254',
+        key: compositeBaseKey,
         lane,
         label: '✨ Composite',
-        channelTitle: '✨ Composite (Overlay)',
+        channelTitle: '✨ Composite (All Channels)',
         isComposite: true,
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
+        spots: markSpots ? getCompositeSpotsForLane(activePlateSet, lane) : null,
       });
     }
 
@@ -1204,7 +1279,7 @@ export const TlcView: React.FC = () => {
     }
 
     return panels.length > 0 ? panels : getPanelsForLane(t);
-  }, [inspectWell, activePlateSet, cur, densViewMode, markSpots, getSpotsForLane, getPanelsForLane]);
+  }, [inspectWell, activePlateSet, cur, densViewMode, markSpots, getSpotsForLane, getCompositeSpotsForLane, getPanelsForLane]);
 
   // Memoized panels for all 54 wells in the plate grid (only computed when viewing 54-well grid)
   const allPanels = useMemo(() => {
@@ -1249,6 +1324,8 @@ export const TlcView: React.FC = () => {
               10,
               Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
             );
+            const getDensProf = (st: TlcSet, ck: TlcChannelKey, ln: TlcLane) =>
+              extractLaneProfile(st, ck, ln, coreFraction);
             const rawDens = extractDensitogram(prof, {
               sign: TLC_SIGNAL[k].sign,
               origin,
@@ -1256,6 +1333,7 @@ export const TlcView: React.FC = () => {
               radius: l.spotRadius || 24,
               minProminence: spotProminence,
               minDistance,
+              plateHistogram: getChannelHistogram(s, k, getDensProf),
             });
             const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
             const corrSpots = isCorr ? correctSpots(baseSpots, gain, offset) : baseSpots;
@@ -1364,7 +1442,7 @@ export const TlcView: React.FC = () => {
     const rawPos = ph - mouseY;
 
     // Check if cursor is within 16px of a detected spot apex on this target panel
-    const spots = targetPanel.spots || activeDens?.spots || [];
+    const spots = targetPanel.spots || modalActiveSpots;
     const nearSpotIdx = spots.findIndex((sp) => Math.abs(sp.pos - rawPos) <= 16);
     const nearSpot = nearSpotIdx >= 0 ? spots[nearSpotIdx] : null;
 
@@ -1378,20 +1456,34 @@ export const TlcView: React.FC = () => {
     } else {
       setHoveredModalSpotIdx(null);
       // Local maximum check in profile within ±10 px
-      const prof = extractLaneProfile(targetPanel.s, targetPanel.key, l, coreFraction);
-      const sg = TLC_SIGNAL[targetPanel.key].sign;
+      const snapKeys: TlcChannelKey[] = (targetPanel as any).isComposite
+        ? getLoadedTlcChannels(targetPanel.s.imgs, false)
+        : [targetPanel.key];
       let best = Math.round(rawPos);
-      for (let d = -10; d <= 10; d++) {
-        const x = Math.round(rawPos) + d;
-        if (
-          x >= 0 &&
-          x < prof.length &&
-          sg * prof[x] > sg * prof[Math.max(0, Math.min(prof.length - 1, best))]
-        ) {
-          best = x;
+      let bestNorm = -Infinity;
+      for (const sk of snapKeys) {
+        const prof = extractLaneProfile(targetPanel.s, sk, l, coreFraction);
+        if (!prof.length) continue;
+        const sg = TLC_SIGNAL[sk].sign;
+        let chBest = Math.round(rawPos);
+        for (let d = -10; d <= 10; d++) {
+          const x = Math.round(rawPos) + d;
+          if (
+            x >= 0 &&
+            x < prof.length &&
+            sg * prof[x] > sg * prof[Math.max(0, Math.min(prof.length - 1, chBest))]
+          ) {
+            chBest = x;
+          }
+        }
+        const score = sg * (prof[Math.max(0, Math.min(prof.length - 1, chBest))] - prof[Math.max(0, Math.min(prof.length - 1, Math.round(rawPos)))]);
+        if (score > bestNorm) {
+          bestNorm = score;
+          best = chBest;
         }
       }
-      activePos = Math.max(0, Math.min(prof.length - 1, best));
+      const refProf = extractLaneProfile(targetPanel.s, snapKeys[0] || targetPanel.key, l, coreFraction);
+      activePos = Math.max(0, Math.min(Math.max(0, refProf.length - 1), best));
     }
 
     // Compute Rf (unclamped at top so positions beyond front aren't falsely reported as exactly 1.00)
@@ -1425,7 +1517,7 @@ export const TlcView: React.FC = () => {
     const ph = 1.0 * l.length;
     const rect = bigCanvasRef.current.getBoundingClientRect();
     const mouseY = e.clientY - rect.top;
-    const spots = primary.spots || activeDens?.spots || [];
+    const spots = modalActiveSpots;
 
     // Check if mouse clicked near a spot line (within 10px)
     const hitIdx = spots.findIndex((sp) => Math.abs(ph - sp.pos - mouseY) <= 10);
@@ -1463,7 +1555,7 @@ export const TlcView: React.FC = () => {
     }
     // Alt + Click: Delete spot if near
     if (e.altKey) {
-      const spots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const spots = modalActiveSpots;
       const ph = 1.0 * inspectPanels[0].lane.length;
       const clickedIdx = spots.findIndex((sp) => Math.abs(ph - sp.pos - hoverY) <= 12);
       if (clickedIdx >= 0) {
@@ -1769,10 +1861,31 @@ export const TlcView: React.FC = () => {
     return channelDensitograms[densViewMode] || null;
   }, [channelDensitograms, densViewMode]);
 
+  // Unified modal peak list: in Side-by-Side/Composite ('overlay') mode, merge detected peaks across all 3 channels;
+  // in single-channel mode, use that channel's spots (always respecting lane.customSpots)
+  const modalActiveSpots = useMemo<TlcSpot[]>(() => {
+    if (densViewMode === 'overlay') {
+      const compPanel = inspectPanels.find((p) => (p as any).isComposite);
+      if (compPanel?.spots) return compPanel.spots;
+      const byCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
+      if (channelDensitograms.UV254) byCh.UV254 = channelDensitograms.UV254.spots;
+      if (channelDensitograms.UV366) byCh.UV366 = channelDensitograms.UV366.spots;
+      if (channelDensitograms.White) byCh.White = channelDensitograms.White.spots;
+      const merged = mergeMultiChannelSpots(byCh);
+      if (inspectWell !== null && activePlateSet.cfg) {
+        const laneId = tlcLane(inspectWell, 'column');
+        const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
+        if (lane) return getEffectiveLaneSpots(lane, merged);
+      }
+      return merged;
+    }
+    return inspectPanels[0]?.spots || activeDens?.spots || [];
+  }, [densViewMode, inspectPanels, channelDensitograms, activeDens, inspectWell, activePlateSet.cfg]);
+
   // Separation calculations between detected spots
   const separationMetrics = useMemo(() => {
-    if (!activeDens || activeDens.spots.length < 2) return null;
-    const sorted = [...activeDens.spots].sort((a, b) => a.rf - b.rf);
+    if (modalActiveSpots.length < 2) return null;
+    const sorted = [...modalActiveSpots].sort((a, b) => a.rf - b.rf);
     const deltas: Array<{ s1: TlcSpot; s2: TlcSpot; delta: number; status: 'good' | 'fair' | 'poor' }> = [];
     for (let i = 0; i < sorted.length - 1; i++) {
       const s1 = sorted[i];
@@ -1782,7 +1895,7 @@ export const TlcView: React.FC = () => {
       deltas.push({ s1, s2, delta, status });
     }
     return deltas;
-  }, [activeDens]);
+  }, [modalActiveSpots]);
 
   // Spot management callbacks for the zoomed-in lane modal
   const handleAddSpotInModal = useCallback(
@@ -1800,7 +1913,7 @@ export const TlcView: React.FC = () => {
         ? tlcFront(primary.s, lane, (st, k, ln) => extractLaneProfile(st, k, ln, coreFraction))
         : lane.length * 0.9;
       const spanDist = Math.max(1, frontPos - originDist);
-      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const currentSpots = modalActiveSpots;
       const clampedRf = Math.max(0, Math.min(1.0, +targetRf.toFixed(3)));
       const pos = Math.round(originDist + clampedRf * spanDist);
       const newSpot: TlcSpot = {
@@ -1815,21 +1928,21 @@ export const TlcView: React.FC = () => {
       handleUpdateLane(laneId, { customSpots: nextSpots }, true);
       toast(`Added manual spot at Rf ${clampedRf.toFixed(2)}.`);
     },
-    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, inspectPanels, modalActiveSpots, coreFraction, handleSnapshotHistory]
   );
 
   const handleDeleteSpotInModal = useCallback(
     (spotIndex: number) => {
       if (inspectWell === null || !activePlateSet.cfg) return;
       const laneId = tlcLane(inspectWell, 'column');
-      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const currentSpots = modalActiveSpots;
       if (!currentSpots[spotIndex]) return;
       handleSnapshotHistory();
       const remaining = currentSpots.filter((_, idx) => idx !== spotIndex);
       handleUpdateLane(laneId, { customSpots: remaining }, true);
       toast(`Removed spot #${spotIndex + 1}.`);
     },
-    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, modalActiveSpots, handleSnapshotHistory]
   );
 
   const handleNudgeSpotInModal = useCallback(
@@ -1838,7 +1951,7 @@ export const TlcView: React.FC = () => {
       const laneId = tlcLane(inspectWell, 'column');
       const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
       if (!lane) return;
-      const currentSpots = inspectPanels[0]?.spots || activeDens?.spots || [];
+      const currentSpots = modalActiveSpots;
       if (!currentSpots[spotIndex]) return;
       handleSnapshotHistory();
       const primary = inspectPanels[0];
@@ -1865,7 +1978,7 @@ export const TlcView: React.FC = () => {
       });
       handleUpdateLane(laneId, { customSpots: updated }, true);
     },
-    [inspectWell, activePlateSet.cfg, inspectPanels, activeDens, coreFraction, handleSnapshotHistory]
+    [inspectWell, activePlateSet.cfg, inspectPanels, modalActiveSpots, coreFraction, handleSnapshotHistory]
   );
 
   const handleResetLaneSpotsInModal = useCallback(() => {
@@ -2921,7 +3034,7 @@ export const TlcView: React.FC = () => {
                 {TLC_LABEL[k]} {activePlateSet.imgs[k] ? '✓' : '(empty)'}
               </button>
             ))}
-            {activePlateSet.imgs.UV254 && activePlateSet.imgs.UV366 && (
+            {hasCompositeChannels(activePlateSet.imgs, false) && (
               <button
                 type="button"
                 className={`btn sm ${fullPlateChannel === 'composite' ? 'pri' : ''}`}
@@ -2934,9 +3047,9 @@ export const TlcView: React.FC = () => {
                   color: fullPlateChannel === 'composite' ? '#ffffff' : undefined,
                   fontWeight: 700,
                 }}
-                title="Dual-channel overlay blending UV254 quenching with UV365 fluorescence"
+                title="False-Color composite across all loaded channels (UV254, UV365, Visible)"
               >
-                ✨ Dual Composite (254+365) ✓
+                ✨ Composite ({getLoadedTlcChannels(activePlateSet.imgs, false).map((c) => (c === 'UV254' ? '254' : c === 'UV366' ? '365' : 'Vis')).join('+')}) ✓
               </button>
             )}
           </div>
@@ -3137,15 +3250,15 @@ export const TlcView: React.FC = () => {
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <span style={{ fontWeight: 600 }}>Channel View:</span>
                       <div className="tlcsets" style={{ display: 'inline-flex', gap: '4px', margin: 0 }}>
-                        {channelDensitograms.UV254 && channelDensitograms.UV366 && (
+                        {hasCompositeChannels(activePlateSet.imgs, false) && (
                           <button
                             type="button"
                             className={`tlcsetbtn ${densViewMode === 'overlay' ? 'on' : ''}`}
                             onClick={() => setDensViewMode('overlay')}
                             style={{ fontSize: '11px', padding: '3px 8px' }}
-                            title="Show UV 254 nm, UV 365 nm Fluorescence, and Composite Overlay side by side"
+                            title="Show loaded channels and False-Color Composite side by side with 3-channel peak detection"
                           >
-                            Side-by-Side (254 + 365 + Composite)
+                            Side-by-Side + Composite
                           </button>
                         )}
                         {channelDensitograms.UV254 && (
@@ -3328,7 +3441,7 @@ export const TlcView: React.FC = () => {
                         {/* Interactive Spot Guide Lines & Drag Grab Handles */}
                         {(() => {
                           const primary = inspectPanels[0];
-                          const spots = primary?.spots || activeDens?.spots || [];
+                          const spots = modalActiveSpots;
                           if (!primary || !spots.length) return null;
                           const l = primary.lane;
                           const ph = inspectHeight;
@@ -3533,8 +3646,8 @@ export const TlcView: React.FC = () => {
                         ))}
                       </div>
 
-                      {/* Dual-Channel False-Color Legend */}
-                      {densViewMode === 'overlay' && activePlateSet.imgs?.UV254?.bmp && activePlateSet.imgs?.UV366?.bmp && (
+                      {/* Multi-Channel False-Color Legend */}
+                      {densViewMode === 'overlay' && hasCompositeChannels(activePlateSet.imgs, true) && (
                         <div
                           style={{
                             marginTop: '8px',
@@ -3548,16 +3661,27 @@ export const TlcView: React.FC = () => {
                             gap: '12px',
                             fontSize: '10px',
                             fontFamily: 'monospace',
+                            flexWrap: 'wrap',
                           }}
                         >
-                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24', fontWeight: 600 }}>
-                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#fbbf24' }} />
-                            Amber: UV 254 (Quenching)
-                          </span>
-                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#22d3ee', fontWeight: 600 }}>
-                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#22d3ee' }} />
-                            Cyan: UV 365 (Fluorescent Product)
-                          </span>
+                          {activePlateSet.imgs?.UV254?.bmp && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24', fontWeight: 600 }}>
+                              <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#fbbf24' }} />
+                              Amber: UV 254 (Quenching)
+                            </span>
+                          )}
+                          {activePlateSet.imgs?.UV366?.bmp && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#22d3ee', fontWeight: 600 }}>
+                              <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#22d3ee' }} />
+                              Cyan: UV 365 (Fluorescent)
+                            </span>
+                          )}
+                          {activePlateSet.imgs?.White?.bmp && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#f472b6', fontWeight: 600 }}>
+                              <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#f472b6' }} />
+                              Rose: Visible (Stain)
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -3678,10 +3802,11 @@ export const TlcView: React.FC = () => {
                                   const d = channelDensitograms.UV254;
                                   const pts = d.points;
                                   if (!pts.length) return null;
+                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
                                   const dStr = pts
                                     .map((p) => {
                                       const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / d.maxSignal) * 230);
+                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
                                       return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
                                     })
                                     .join(' ');
@@ -3692,7 +3817,7 @@ export const TlcView: React.FC = () => {
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
                                         const spotColor = isDragged
                                           ? '#facc15'
@@ -3736,10 +3861,11 @@ export const TlcView: React.FC = () => {
                                   const d = channelDensitograms.UV366;
                                   const pts = d.points;
                                   if (!pts.length) return null;
+                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
                                   const dStr = pts
                                     .map((p) => {
                                       const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / d.maxSignal) * 230);
+                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
                                       return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
                                     })
                                     .join(' ');
@@ -3750,7 +3876,7 @@ export const TlcView: React.FC = () => {
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
                                         const spotColor = isDragged
                                           ? '#facc15'
@@ -3788,26 +3914,27 @@ export const TlcView: React.FC = () => {
                                 })()}
 
                               {/* Render Visible Densitogram Trace */}
-                              {densViewMode === 'White' &&
+                              {(densViewMode === 'overlay' || densViewMode === 'White') &&
                                 channelDensitograms.White &&
                                 (() => {
                                   const d = channelDensitograms.White;
                                   const pts = d.points;
                                   if (!pts.length) return null;
+                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
                                   const dStr = pts
                                     .map((p) => {
                                       const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / d.maxSignal) * 230);
+                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
                                       return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
                                     })
                                     .join(' ');
                                   return (
                                     <g key="white">
-                                      <path d={dStr} fill="none" stroke="#f59e0b" strokeWidth="2" />
+                                      <path d={dStr} fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '2,2' : undefined} />
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / d.maxSignal) * 230);
+                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
                                         const spotColor = isDragged
                                           ? '#facc15'
@@ -3884,6 +4011,12 @@ export const TlcView: React.FC = () => {
                             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#c084fc' }}>
                               <span style={{ width: '10px', height: '2px', background: '#a855f7', borderTop: densViewMode === 'overlay' ? '1px dashed #a855f7' : undefined }} />
                               UV 365 nm (Fluorescence)
+                            </span>
+                          )}
+                          {(densViewMode === 'overlay' || densViewMode === 'White') && channelDensitograms.White && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24' }}>
+                              <span style={{ width: '10px', height: '2px', background: '#f59e0b', borderTop: densViewMode === 'overlay' ? '1px dotted #f59e0b' : undefined }} />
+                              Visible (Stain)
                             </span>
                           )}
                         </div>
@@ -4363,19 +4496,19 @@ export const TlcView: React.FC = () => {
                           }
                           return null;
                         })()}
-                        {activeDens?.spots.length ? (
+                        {modalActiveSpots.length ? (
                           <span className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            {activeDens.spots.length} peak{activeDens.spots.length === 1 ? '' : 's'} identified
+                            {modalActiveSpots.length} peak{modalActiveSpots.length === 1 ? '' : 's'} identified
                           </span>
                         ) : null}
                       </div>
                     </div>
 
-                    {activeDens?.spots.length ? (
+                    {modalActiveSpots.length ? (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                         {/* Interactive Peak Adjustment Cards */}
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                          {activeDens.spots.map((sp, idx) => {
+                          {modalActiveSpots.map((sp, idx) => {
                             const isSelected = hoveredModalSpotIdx === idx || (isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx);
                             const cardBg = sp.source === 'manual'
                               ? 'rgba(245, 158, 11, 0.08)'
@@ -4449,8 +4582,24 @@ export const TlcView: React.FC = () => {
                                       Auto
                                     </span>
                                   )}
+                                  {sp.channels && sp.channels.length > 0 && sp.channels.map((ch) => (
+                                    <span
+                                      key={ch}
+                                      style={{
+                                        background: ch === 'UV254' ? 'rgba(16, 185, 129, 0.16)' : ch === 'UV366' ? 'rgba(6, 182, 212, 0.16)' : 'rgba(244, 114, 182, 0.16)',
+                                        color: ch === 'UV254' ? '#34d399' : ch === 'UV366' ? '#22d3ee' : '#f472b6',
+                                        border: `1px solid ${ch === 'UV254' ? 'rgba(16, 185, 129, 0.4)' : ch === 'UV366' ? 'rgba(6, 182, 212, 0.4)' : 'rgba(244, 114, 182, 0.4)'}`,
+                                        padding: '1px 5px',
+                                        borderRadius: '3px',
+                                        fontSize: '9.5px',
+                                        fontWeight: 700,
+                                      }}
+                                    >
+                                      {ch === 'UV254' ? '254' : ch === 'UV366' ? '365' : 'Vis'}
+                                    </span>
+                                  ))}
                                   {(() => {
-                                    if (channelDensitograms.UV366) {
+                                    if (channelDensitograms.UV366 && (!sp.channels || !sp.channels.includes('UV366'))) {
                                       const pts = channelDensitograms.UV366.points;
                                       const pt = pts[sp.pos];
                                       const emSignal = pt?.signal || 0;
@@ -4614,7 +4763,7 @@ export const TlcView: React.FC = () => {
                   {/* AI TLC Reaction & Spot Interpreter (Option 4) */}
                   <AiTlcInterpreter
                     laneLabel={`Well ${wellLabel(inspectWell)} (Lane ${tlcLane(inspectWell, 'column')}) · Plate ${plate + 1}`}
-                    spots={activeDens?.spots ? activeDens.spots.map((s) => ({ rf: s.rf, intensity: s.strength, note: s.source })) : []}
+                    spots={modalActiveSpots.map((s) => ({ rf: s.rf, intensity: s.strength, note: s.source }))}
                     wellRecipe={(() => {
                       const row = run?.rows?.find(
                         (r: any) => r.plate_number === plate && r.container_id === inspectWell
@@ -4622,7 +4771,7 @@ export const TlcView: React.FC = () => {
                       return row ? row.recipe : undefined;
                     })()}
                     mobilePhase={currentSet.name || '30% EtOAc / 70% Hexanes'}
-                    stain={densViewMode === 'White' ? 'Visible Stain' : 'UV 254 nm'}
+                    stain={densViewMode === 'White' ? 'Visible Stain' : densViewMode === 'overlay' ? 'Multi-Channel Composite' : 'UV 254 nm'}
                     onSaveToElnNotes={(analysisText) => {
                       if (inspectWell === null) return;
                       const key = `${plate}-${inspectWell}`;

@@ -348,6 +348,19 @@ export interface TlcSpot {
   edgeGain?: number; // relative migration speed g used for the correction
   edgeOffset?: number; // additive Rf shift used for the correction
   source?: 'auto' | 'adjusted' | 'manual';
+  channels?: ('UV254' | 'UV366' | 'White')[];
+}
+
+export interface ProfileHistogramStats {
+  bgMode: number;
+  bgSigma: number;
+  contrastSpan: number;
+  sigTail: number;
+  clipLowFrac: number;
+  clipHighFrac: number;
+  otsuThresh: number;
+  otsuEta: number;
+  sampleCount: number;
 }
 
 export interface TlcProfileOptions {
@@ -357,6 +370,7 @@ export interface TlcProfileOptions {
   radius?: number;
   minProminence?: number;
   minDistance?: number;
+  plateHistogram?: ProfileHistogramStats;
 }
 
 export interface TlcDensitogramPoint {

@@ -4,6 +4,15 @@ import { predictWellReactions } from './engine';
 import { extractWellForPrediction } from './plateBridge';
 import { wellLabel } from '../tlcLanes';
 import { RunResult, RunState } from '../../types';
+import {
+  CORE_ELUENT_SPECS,
+  MixturePhysicalDescriptors,
+  composeSolventSystem,
+  generateExtendedDynamicSpecs,
+  generatePrismaTernarySpecs,
+  synthesizePlateTailoredSpecs,
+  validateEluentCompatibility,
+} from './solventSystemModel';
 
 export type TlcStationaryPhase = 'SiO2' | 'C18';
 export type TlcStationaryPhasePreference =
@@ -23,6 +32,8 @@ export type SolventFamily =
   | 'meoh_toluene'
   | 'etoac_dcm'
   | 'ether_pentane'
+  | 'mtbe_hex'
+  | 'prisma_ternary'
   | 'c18_rp';
 
 export interface TlcSolventSystemDef {
@@ -34,10 +45,10 @@ export interface TlcSolventSystemDef {
   stationaryPhase: TlcStationaryPhase;
   preferenceTier: SolventPreferenceTier;
   family: SolventFamily;
-  strength: number; // Effective eluent strength (~0.10 to ~0.92 within its stationary phase)
+  strength: number; // Effective eluent strength (~0.00 to ~0.92 within its stationary phase)
   alcoholPct: number; // % MeOH / protic H-bond competitor
   organicPct?: number; // % organic co-solvent for C18 reverse phase
-  baseModifier?: string; // e.g. '1% Et₃N', '2M NH₃ in MeOH'
+  baseModifier?: string; // e.g. '1% Et₃N', '2% (2M NH₃ in MeOH)'
   acidModifier?: string; // e.g. '1% AcOH', '0.1% TFA'
   polarityClass:
     | 'Non-Polar'
@@ -48,516 +59,60 @@ export interface TlcSolventSystemDef {
     | 'Acidic Polar'
     | 'Reverse Phase (C18)';
   bestFor: string;
+  descriptors?: MixturePhysicalDescriptors;
+  isSynthesized?: boolean;
+  synthesisNote?: string;
+  composition?: {
+    strongSolvent: string;
+    weakSolvent: string;
+    ternaryCoSolvent?: { solvent: string; pct: number };
+    strongPct: number;
+    modifierId: string;
+  };
 }
 
-export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] = [
-  // =========================================================================
-  // PRIMARY / PREFERRED WORKHORSE SYSTEMS (EtOAc/Hex, MeOH/DCM, Et3N, 2M NH3/MeOH, AcOH)
-  // =========================================================================
-  {
-    id: 'etoac_hex_10',
-    name: '10% EtOAc / Hexanes',
-    shortLabel: '10% EtOAc/Hex',
-    ratio: '1:9 v/v EtOAc / Hexanes',
-    chamberPrep50mL: '5.0 mL EtOAc + 45.0 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'etoac_hex',
-    strength: 0.14,
-    alcoholPct: 0,
-    polarityClass: 'Non-Polar',
-    bestFor: 'Lipophilic arenes, halides, simple esters, nonpolar ketones',
-  },
-  {
-    id: 'etoac_hex_25',
-    name: '25% EtOAc / Hexanes',
-    shortLabel: '25% EtOAc/Hex',
-    ratio: '1:3 v/v EtOAc / Hexanes',
-    chamberPrep50mL: '12.5 mL EtOAc + 37.5 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'etoac_hex',
-    strength: 0.28,
-    alcoholPct: 0,
-    polarityClass: 'Low-Med Polarity',
-    bestFor: 'Aldehydes, ketones, indoles, moderately lipophilic adducts',
-  },
-  {
-    id: 'etoac_hex_50',
-    name: '50% EtOAc / Hexanes',
-    shortLabel: '50% EtOAc/Hex',
-    ratio: '1:1 v/v EtOAc / Hexanes',
-    chamberPrep50mL: '25.0 mL EtOAc + 25.0 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'etoac_hex',
-    strength: 0.45,
-    alcoholPct: 0,
-    polarityClass: 'Medium Polarity',
-    bestFor: 'Workhorse neutral organics, amides, mono-heterocycles',
-  },
-  {
-    id: 'etoac_hex_80',
-    name: '80% EtOAc / Hexanes',
-    shortLabel: '80% EtOAc/Hex',
-    ratio: '4:1 v/v EtOAc / Hexanes',
-    chamberPrep50mL: '40.0 mL EtOAc + 10.0 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'etoac_hex',
-    strength: 0.59,
-    alcoholPct: 0,
-    polarityClass: 'Medium Polarity',
-    bestFor: 'Polar carbonyls, sulfones, neutral heterocycles',
-  },
-  {
-    id: 'etoac_100',
-    name: '100% EtOAc',
-    shortLabel: '100% EtOAc',
-    ratio: 'Neat Ethyl Acetate',
-    chamberPrep50mL: '50.0 mL EtOAc',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'etoac_hex',
-    strength: 0.69,
-    alcoholPct: 0,
-    polarityClass: 'Polar',
-    bestFor: 'Strongly retained neutral products without MeOH alcoholysis risk',
-  },
-  {
-    id: 'meoh_dcm_3',
-    name: '3% MeOH / DCM',
-    shortLabel: '3% MeOH/DCM',
-    ratio: '3:97 v/v MeOH / DCM',
-    chamberPrep50mL: '1.5 mL MeOH + 48.5 mL DCM',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'meoh_dcm',
-    strength: 0.61,
-    alcoholPct: 3,
-    polarityClass: 'Medium Polarity',
-    bestFor: 'Secondary amides, alcohols, benzimidazoles, clean sharp spots',
-  },
-  {
-    id: 'meoh_dcm_7',
-    name: '7% MeOH / DCM',
-    shortLabel: '7% MeOH/DCM',
-    ratio: '7:93 v/v MeOH / DCM',
-    chamberPrep50mL: '3.5 mL MeOH + 46.5 mL DCM',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'meoh_dcm',
-    strength: 0.74,
-    alcoholPct: 7,
-    polarityClass: 'Polar',
-    bestFor: 'Imidazoles, ureas, poly-heterocycles, polar cascade adducts',
-  },
-  {
-    id: 'meoh_dcm_12',
-    name: '12% MeOH / DCM',
-    shortLabel: '12% MeOH/DCM',
-    ratio: '12:88 v/v MeOH / DCM',
-    chamberPrep50mL: '6.0 mL MeOH + 44.0 mL DCM',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'meoh_dcm',
-    strength: 0.85,
-    alcoholPct: 12,
-    polarityClass: 'Polar',
-    bestFor: 'Very polar multi-heterocycle / polyol / bis-amide targets',
-  },
-  {
-    id: 'etoac_hex_30_et3n',
-    name: '30% EtOAc / Hexanes + 1% Et₃N',
-    shortLabel: '30% EtOAc/Hex + Et₃N',
-    ratio: '30:69:1 v/v/v EtOAc / Hexanes / Et₃N',
-    chamberPrep50mL: '15.0 mL EtOAc + 34.5 mL Hexanes + 0.5 mL Et₃N',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.33,
-    alcoholPct: 0,
-    baseModifier: '1% Et₃N',
-    polarityClass: 'Basic Polar',
-    bestFor: 'Lipophilic-to-medium basic amines, anilines, pyridines & imines that streak in neutral EtOAc/Hex',
-  },
-  {
-    id: 'etoac_hex_60_et3n',
-    name: '60% EtOAc / Hexanes + 1% Et₃N',
-    shortLabel: '60% EtOAc/Hex + Et₃N',
-    ratio: '60:39:1 v/v/v EtOAc / Hexanes / Et₃N',
-    chamberPrep50mL: '30.0 mL EtOAc + 19.5 mL Hexanes + 0.5 mL Et₃N',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.51,
-    alcoholPct: 0,
-    baseModifier: '1% Et₃N',
-    polarityClass: 'Basic Polar',
-    bestFor: 'Medium-polarity basic heterocycles, tertiary amines & amino-esters without MeOH',
-  },
-  {
-    id: 'meoh_dcm_5_et3n',
-    name: '5% MeOH / DCM + 1% Et₃N',
-    shortLabel: '5% MeOH/DCM + Et₃N',
-    ratio: '5:94:1 v/v/v MeOH / DCM / Et₃N',
-    chamberPrep50mL: '2.5 mL MeOH + 47.0 mL DCM + 0.5 mL Et₃N',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.69,
-    alcoholPct: 5,
-    baseModifier: '1% Et₃N',
-    polarityClass: 'Basic Polar',
-    bestFor: 'Medium-polar basic amines & azoles where 12% MeOH elutes too close to the front',
-  },
-  {
-    id: 'nh3_meoh_dcm_1',
-    name: 'DCM / (2M NH₃ in MeOH) (99:1)',
-    shortLabel: '99:1 DCM/NH₃-MeOH',
-    ratio: '99:1 v/v DCM / (2M NH₃ in MeOH)',
-    chamberPrep50mL: '49.5 mL DCM + 0.5 mL (2M NH₃ in MeOH)',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.45,
-    alcoholPct: 1,
-    baseModifier: '1% (2M NH₃ in MeOH)',
-    polarityClass: 'Basic Polar',
-    bestFor: 'Lipophilic tertiary/secondary amines that run too high in 5% MeOH — NH₃ keeps them from streaking',
-  },
-  {
-    id: 'nh3_meoh_dcm_2',
-    name: 'DCM / (2M NH₃ in MeOH) (98:2)',
-    shortLabel: '98:2 DCM/NH₃-MeOH',
-    ratio: '98:2 v/v DCM / (2M NH₃ in MeOH)',
-    chamberPrep50mL: '49.0 mL DCM + 1.0 mL (2M NH₃ in MeOH)',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.54,
-    alcoholPct: 2,
-    baseModifier: '2% (2M NH₃ in MeOH)',
-    polarityClass: 'Basic Polar',
-    bestFor: 'Medium-polar amines & azoles that need only a little MeOH, with NH₃ against streaking',
-  },
-  {
-    id: 'nh3_meoh_dcm_5',
-    name: 'DCM / MeOH / (2M NH₃ in MeOH) (95:3:2)',
-    shortLabel: '95:3:2 DCM/MeOH/NH₃',
-    ratio: '95:3:2 v/v/v DCM / MeOH / (2M NH₃ in MeOH)',
-    chamberPrep50mL: '47.5 mL DCM + 1.5 mL MeOH + 1.0 mL (2M NH₃ in MeOH)',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.70,
-    alcoholPct: 5,
-    baseModifier: '2% (2M NH₃ in MeOH)',
-    polarityClass: 'Basic Polar',
-    bestFor: '5% total MeOH with controlled NH₃ — prevents amine/azole tailing without excess base',
-  },
-  {
-    id: 'nh3_meoh_dcm_10',
-    name: 'DCM / MeOH / (2M NH₃ in MeOH) (88:10:2)',
-    shortLabel: '88:10:2 DCM/MeOH/NH₃',
-    ratio: '88:10:2 v/v/v DCM / MeOH / (2M NH₃ in MeOH)',
-    chamberPrep50mL: '44.0 mL DCM + 5.0 mL MeOH + 1.0 mL (2M NH₃ in MeOH)',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.86,
-    alcoholPct: 12,
-    baseModifier: '2% (2M NH₃ in MeOH)',
-    polarityClass: 'Basic Polar',
-    bestFor: '12% total MeOH with 2% (2M NH₃/MeOH) — matches 12% MeOH ceiling for polar amines, guanidines & diamines',
-  },
-  {
-    id: 'meoh_dcm_et3n',
-    name: '12% MeOH / DCM + 1% Et₃N',
-    shortLabel: '12% MeOH/DCM + Et₃N',
-    ratio: '12:87:1 v/v/v MeOH / DCM / Et₃N',
-    chamberPrep50mL: '6.0 mL MeOH + 43.5 mL DCM + 0.5 mL Et₃N',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'basic_mod',
-    strength: 0.84,
-    alcoholPct: 12,
-    baseModifier: '1% Et₃N',
-    polarityClass: 'Basic Polar',
-    bestFor: '12% MeOH/DCM with silanol deactivation by Et₃N — basic amines, amidines & N-rich heterocycles',
-  },
-  {
-    id: 'etoac_hex_30_acoh',
-    name: '30% EtOAc / Hexanes + 1% AcOH',
-    shortLabel: '30% EtOAc/Hex + AcOH',
-    ratio: '30:69:1 v/v/v EtOAc / Hexanes / AcOH',
-    chamberPrep50mL: '15.0 mL EtOAc + 34.5 mL Hexanes + 0.5 mL AcOH',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'acid_mod',
-    strength: 0.33,
-    alcoholPct: 0,
-    acidModifier: '1% AcOH',
-    polarityClass: 'Acidic Polar',
-    bestFor: 'Nonpolar-to-medium carboxylic acids (benzoic, phenylacetic, Boc-amino acids) without front run-out',
-  },
-  {
-    id: 'etoac_hex_60_acoh',
-    name: '60% EtOAc / Hexanes + 1% AcOH',
-    shortLabel: '60% EtOAc/Hex + AcOH',
-    ratio: '60:39:1 v/v/v EtOAc / Hexanes / AcOH',
-    chamberPrep50mL: '30.0 mL EtOAc + 19.5 mL Hexanes + 0.5 mL AcOH',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'acid_mod',
-    strength: 0.51,
-    alcoholPct: 0,
-    acidModifier: '1% AcOH',
-    polarityClass: 'Acidic Polar',
-    bestFor: 'Medium-polarity carboxylic acids & carboxylate reaction wells without MeOH esterification risk',
-  },
-  {
-    id: 'meoh_dcm_3_acoh',
-    name: '3% MeOH / DCM + 1% AcOH',
-    shortLabel: '3% MeOH/DCM + AcOH',
-    ratio: '3:96:1 v/v/v MeOH / DCM / AcOH',
-    chamberPrep50mL: '1.5 mL MeOH + 48.0 mL DCM + 0.5 mL AcOH',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'acid_mod',
-    strength: 0.64,
-    alcoholPct: 3,
-    acidModifier: '1% AcOH',
-    polarityClass: 'Acidic Polar',
-    bestFor: 'Polar carboxylic acids where 8% MeOH / DCM elutes too high',
-  },
-  {
-    id: 'meoh_dcm_acoh',
-    name: '8% MeOH / DCM + 1% AcOH',
-    shortLabel: '8% MeOH/DCM + AcOH',
-    ratio: '8:91:1 v/v/v MeOH / DCM / AcOH',
-    chamberPrep50mL: '4.0 mL MeOH + 45.5 mL DCM + 0.5 mL AcOH',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'primary',
-    family: 'acid_mod',
-    strength: 0.78,
-    alcoholPct: 8,
-    acidModifier: '1% AcOH',
-    polarityClass: 'Acidic Polar',
-    bestFor: 'Carboxylic acids & acidic heterocycles to prevent silica tailing',
-  },
+export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] =
+  CORE_ELUENT_SPECS.map(composeSolventSystem);
 
-  // =========================================================================
-  // OTHER AVAILABLE COMPLEMENTARY SYSTEMS (Acetone/Hex, MeOH/EtOAc, MeOH/Toluene, EtOAc/DCM, Et2O/Pentane, C18 RP)
-  // =========================================================================
-  {
-    id: 'acetone_hex_25',
-    name: '25% Acetone / Hexanes',
-    shortLabel: '25% Acetone/Hex',
-    ratio: '1:3 v/v Acetone / Hexanes',
-    chamberPrep50mL: '12.5 mL Acetone + 37.5 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'acetone_hex',
-    strength: 0.34,
-    alcoholPct: 0,
-    polarityClass: 'Low-Med Polarity',
-    bestFor: 'Orthogonal H-bond acceptor selectivity when EtOAc/Hex spots co-elute',
-  },
-  {
-    id: 'acetone_hex_50',
-    name: '50% Acetone / Hexanes',
-    shortLabel: '50% Acetone/Hex',
-    ratio: '1:1 v/v Acetone / Hexanes',
-    chamberPrep50mL: '25.0 mL Acetone + 25.0 mL Hexanes',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'acetone_hex',
-    strength: 0.56,
-    alcoholPct: 0,
-    polarityClass: 'Medium Polarity',
-    bestFor: 'Polar alcohols, amides & heterocycles — often sharper than EtOAc/Hex',
-  },
-  {
-    id: 'meoh_etoac_5',
-    name: '5% MeOH / EtOAc',
-    shortLabel: '5% MeOH/EtOAc',
-    ratio: '1:19 v/v MeOH / EtOAc',
-    chamberPrep50mL: '2.5 mL MeOH + 47.5 mL EtOAc',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'meoh_etoac',
-    strength: 0.77,
-    alcoholPct: 5,
-    polarityClass: 'Polar',
-    bestFor: 'DCM-free polar eluent for multi-H-bond acceptors, nucleosides & azoles',
-  },
-  {
-    id: 'meoh_etoac_10',
-    name: '10% MeOH / EtOAc',
-    shortLabel: '10% MeOH/EtOAc',
-    ratio: '1:9 v/v MeOH / EtOAc',
-    chamberPrep50mL: '5.0 mL MeOH + 45.0 mL EtOAc',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'meoh_etoac',
-    strength: 0.87,
-    alcoholPct: 10,
-    polarityClass: 'Polar',
-    bestFor: 'Very polar neutral polyols/bis-amides without chlorinated solvents',
-  },
-  {
-    id: 'meoh_toluene_5',
-    name: '5% MeOH / Toluene',
-    shortLabel: '5% MeOH/Toluene',
-    ratio: '1:19 v/v MeOH / Toluene',
-    chamberPrep50mL: '2.5 mL MeOH + 47.5 mL Toluene',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'meoh_toluene',
-    strength: 0.54,
-    alcoholPct: 5,
-    polarityClass: 'Medium Polarity',
-    bestFor: 'Aromatic π-π selectivity — separates indoles, benzimidazoles & regioisomers',
-  },
-  {
-    id: 'meoh_toluene_10',
-    name: '10% MeOH / Toluene',
-    shortLabel: '10% MeOH/Toluene',
-    ratio: '1:9 v/v MeOH / Toluene',
-    chamberPrep50mL: '5.0 mL MeOH + 45.0 mL Toluene',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'meoh_toluene',
-    strength: 0.68,
-    alcoholPct: 10,
-    polarityClass: 'Polar',
-    bestFor: 'Polar aromatic heterocycles that streak or overlap in MeOH/DCM',
-  },
-  {
-    id: 'etoac_dcm_20',
-    name: '20% EtOAc / DCM',
-    shortLabel: '20% EtOAc/DCM',
-    ratio: '1:4 v/v EtOAc / DCM',
-    chamberPrep50mL: '10.0 mL EtOAc + 40.0 mL DCM',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'etoac_dcm',
-    strength: 0.38,
-    alcoholPct: 0,
-    polarityClass: 'Low-Med Polarity',
-    bestFor: 'Aprotic medium polarity for poorly hexane-soluble heterocycles',
-  },
-  {
-    id: 'et2o_pentane_40',
-    name: '40% Et₂O / Pentane',
-    shortLabel: '40% Et₂O/Pentane',
-    ratio: '2:3 v/v Et₂O / Pentane',
-    chamberPrep50mL: '20.0 mL Et₂O + 30.0 mL Pentane',
-    stationaryPhase: 'SiO2',
-    preferenceTier: 'secondary',
-    family: 'ether_pentane',
-    strength: 0.24,
-    alcoholPct: 0,
-    polarityClass: 'Non-Polar',
-    bestFor: 'Volatile nonpolar products, aldehydes, enones & low-MW intermediates',
-  },
-  {
-    id: 'c18_mecn_15',
-    name: '15% MeCN / H₂O (C18 RP)',
-    shortLabel: '15% MeCN/H₂O (C18)',
-    ratio: '3:17 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep50mL: '7.5 mL MeCN + 42.5 mL H₂O (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.15,
-    alcoholPct: 0,
-    organicPct: 15,
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'Very polar water-soluble products, guanidines & zwitterions on C18',
-  },
-  {
-    id: 'c18_mecn_30',
-    name: '30% MeCN / H₂O (C18 RP)',
-    shortLabel: '30% MeCN/H₂O (C18)',
-    ratio: '3:7 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep50mL: '15.0 mL MeCN + 35.0 mL H₂O (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.30,
-    alcoholPct: 0,
-    organicPct: 30,
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'Highly polar water-soluble products, guanidines & zwitterions pinned on SiO₂',
-  },
-  {
-    id: 'c18_mecn_45_tfa',
-    name: '45% MeCN / H₂O + 0.1% TFA (C18 RP)',
-    shortLabel: '45% MeCN/H₂O + TFA (C18)',
-    ratio: '45:55:0.1 MeCN / H₂O / TFA on C18',
-    chamberPrep50mL: '22.5 mL MeCN + 27.5 mL H₂O + 50.0 µL TFA (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.48,
-    alcoholPct: 0,
-    organicPct: 45,
-    acidModifier: '0.1% TFA',
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'Sharp LC-MS-matched C18 spots for amines, heterocycles & medium-polarity acids',
-  },
-  {
-    id: 'c18_mecn_60',
-    name: '60% MeCN / H₂O (C18 RP)',
-    shortLabel: '60% MeCN/H₂O (C18)',
-    ratio: '3:2 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep50mL: '30.0 mL MeCN + 20.0 mL H₂O (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.60,
-    alcoholPct: 0,
-    organicPct: 60,
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'General med-chem reverse-phase separation orthogonal to normal-phase SiO₂',
-  },
-  {
-    id: 'c18_mecn_85',
-    name: '85% MeCN / H₂O (C18 RP)',
-    shortLabel: '85% MeCN/H₂O (C18)',
-    ratio: '17:3 v/v MeCN / H₂O on C18 Silica',
-    chamberPrep50mL: '42.5 mL MeCN + 7.5 mL H₂O (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.85,
-    alcoholPct: 0,
-    organicPct: 85,
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'Lipophilic products (cLogP > 3) verified by orthogonal reverse-phase C18',
-  },
-  {
-    id: 'c18_meoh_50_tfa',
-    name: '50% MeOH / H₂O + 0.1% TFA (C18 RP)',
-    shortLabel: '50% MeOH/H₂O + TFA (C18)',
-    ratio: '50:50:0.1 MeOH / H₂O / TFA on C18',
-    chamberPrep50mL: '25.0 mL MeOH + 25.0 mL H₂O + 50.0 µL TFA (C18 plate)',
-    stationaryPhase: 'C18',
-    preferenceTier: 'secondary',
-    family: 'c18_rp',
-    strength: 0.45,
-    alcoholPct: 50,
-    organicPct: 50,
-    acidModifier: '0.1% TFA',
-    polarityClass: 'Reverse Phase (C18)',
-    bestFor: 'Sharp LC-MS-matched C18 spots for basic amines, guanidines & carboxylic acids',
-  },
+const ALL_DYNAMIC_FALLBACK_SYSTEMS: TlcSolventSystemDef[] = [
+  ...generateExtendedDynamicSpecs({
+    hasStrongWellAcid: true,
+    needsBasicMod: true,
+    needsAcidMod: true,
+    aromaticHeavyPlate: true,
+  }),
+  ...generatePrismaTernarySpecs({
+    targetStrengths: [0.3, 0.5, 0.72],
+    aromaticHeavyPlate: true,
+    hasStrongWellAcid: false,
+    maxAcidStress: 0,
+    needsBasicMod: false,
+    needsAcidMod: false,
+  }),
+].map(composeSolventSystem);
+
+const CORE_SYSTEM_IDS = new Set(TLC_SOLVENT_LIBRARY.map((s) => s.id));
+export const ALL_KNOWN_SOLVENT_SYSTEMS: TlcSolventSystemDef[] = [
+  ...TLC_SOLVENT_LIBRARY,
+  ...ALL_DYNAMIC_FALLBACK_SYSTEMS.filter((s) => !CORE_SYSTEM_IDS.has(s.id)),
 ];
+
+export function findSolventSystemById(id: string): TlcSolventSystemDef | undefined {
+  return ALL_KNOWN_SOLVENT_SYSTEMS.find((s) => s.id === id);
+}
+
+export interface TlcMolLser {
+  E: number; // Excess molar refraction / pi-polarizability proxy
+  S: number; // Dipolarity / polarizability proxy
+  A: number; // Solute H-bond acidity (HBD)
+  B: number; // Solute H-bond basicity (electronically attenuated HBA)
+  displacementN: number; // Snyder-Soczewinski displacement slope n_i (~0.78..1.34)
+}
 
 export interface TlcMolProfile {
   smiles: string;
+  exactmw: number;
+  heavyAtomCount?: number;
   tpsa: number;
   clogP: number;
   hbd: number;
@@ -565,10 +120,27 @@ export interface TlcMolProfile {
   aromaticRings: number;
   aliphAmineCount: number;
   azoleCount: number;
+  basicAzoleNCount?: number; // [nX2r5] sp2 basic nitrogen (excludes non-basic pyrrole/indole NH)
+  anilineCount?: number; // aromatic amine Ar-NH2 / Ar-NHR (protonates in strong acid wells)
+  imineCount?: number; // acyclic C=N basic nitrogen
   pyridineCount: number;
   carboxylicAcidCount: number;
+  primaryAmideCount: number;
+  secondaryAmideCount: number;
+  ureaCount: number;
+  sulfonamideCount: number;
+  phenolCount: number;
+  boronicCount: number;
+  phosphonateCount: number;
+  heavyHalogenCount: number; // Cl, Br, I
+  cf3Count: number;
+  nitroCount?: number;
+  cyanoCount?: number;
+  zwitterionOrQuatCount: number;
   /** has a chromophore that shows under UV254/366 (aromatic ring or conjugated C=C/C=O/C=N) */
   uvActive: boolean;
+  /** Solute LSER (E, S, A, B) & Snyder-Soczewinski displacement slope n_i */
+  lser?: TlcMolLser;
 }
 
 export interface WellTlcContext {
@@ -576,6 +148,20 @@ export interface WellTlcContext {
   hasBaseAdditive?: boolean;
   hasSaltCounterion?: boolean;
   additiveLabel?: string;
+  /** Total acid equivalents loaded in well (additive + salt counterions) */
+  acidLoadEq?: number;
+  /** Residual unconsumed free acid equivalents from well equilibrium */
+  freeAcidEq?: number;
+  /** Strength & counterion volatility class for spot-on-silica neutralization */
+  acidStrength?: 'strong_nonvolatile' | 'strong_volatile' | 'weak';
+  /** Approximate DMSO-scale pH from acid-base solver */
+  wellPh?: number;
+  /** Total base additive equivalents loaded */
+  baseLoadEq?: number;
+  /** Residual unconsumed free base equivalents */
+  freeBaseEq?: number;
+  /** Base strength class */
+  baseStrength?: 'strong' | 'weak';
 }
 
 export interface SimulatedSpot {
@@ -632,6 +218,169 @@ export interface PlateSolventGroup {
 
 export type SolventPoolMode = 'prefer_primary' | 'primary_only' | 'balanced';
 
+export interface TlcCalibrationSpotPair {
+  wellIndex: number;
+  wellCoord: string;
+  speciesLabel: string;
+  speciesKind: 'substrate' | 'product';
+  observedRf: number;
+  predictedRfBefore: number;
+  predictedRfAfter: number;
+  residualRf: number; // observedRf - predictedRfBefore
+  residualDemand: number; // inferredDemand - predictedDemand
+  weight: number;
+}
+
+export interface CalibratedLaneComparison {
+  wellIndex: number;
+  wellCoord: string;
+  isBlank: boolean;
+  frontOccupied?: boolean;
+  originOccupied?: boolean;
+  frontExcess?: number;
+  originExcess?: number;
+  measuredSpots: Array<{
+    rf: number;
+    strength: number;
+    matchedLabel?: string;
+    matchedKind?: 'substrate' | 'product';
+    matchedPredRfBefore?: number;
+    matchedPredRfAfter?: number;
+  }>;
+  predictedSpots: Array<{
+    label: string;
+    kind: 'substrate' | 'product';
+    tier?: PredictedSpecies['tier'];
+    rfBefore: number;
+    rfAfter: number;
+    found: boolean;
+    boundaryStatus?: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing';
+    matchedObsRf?: number;
+  }>;
+}
+
+export interface CalibratedPlateSummary {
+  setUid: string;
+  setName: string;
+  plateIndex: number;
+  matchedSystemId: string;
+  matchedSystemName: string;
+  stationaryPhase: TlcStationaryPhasePreference;
+  family: SolventFamily;
+  matchSource: 'auto' | 'manual';
+  laneCountWithSpots: number;
+  pairedCount: number;
+  frontCensoredCount?: number;
+  baselineCensoredCount?: number;
+  meanRfResidual: number;
+  rmseBefore: number;
+  rmseAfter: number;
+  midplateRfShift: number;
+  demandShift: number;
+  pairs: TlcCalibrationSpotPair[];
+  lanes: CalibratedLaneComparison[];
+}
+
+export interface TlcCalibrationFeatureWeights {
+  tpsa?: number;
+  hbd?: number;
+  aromaticRings?: number;
+  basicN?: number;
+  clogP?: number;
+}
+
+export interface TlcCalibrationPhaseFit {
+  globalDemandShift: number; // clamped [-0.22, +0.22]
+  demandSlope?: number; // clamped [0.82, 1.25], defaults to 1.0
+  familyDemandShifts: Partial<Record<SolventFamily, number>>; // clamped [-0.12, +0.12]
+  featureWeights?: TlcCalibrationFeatureWeights; // L2-regularized Ridge descriptor offsets
+  midplateRfShift: number; // equivalent delta-Rf at Rf = 0.50
+  calibratedSigma: number; // blended around RF_SIGMA = 0.12
+  pairedSpotCount: number;
+  matchedLaneCount: number;
+  frontCensoredCount?: number;
+  baselineCensoredCount?: number;
+  meanRfBias: number;
+  rmseBefore: number;
+  rmseAfter: number;
+}
+
+export interface TlcCalibrationModel {
+  byPhase: Partial<Record<TlcStationaryPhasePreference, TlcCalibrationPhaseFit>>;
+  plates: CalibratedPlateSummary[];
+  unmatchedSets: Array<{
+    key: string;
+    uid: string;
+    name: string;
+    plateIndex: number;
+    laneCountWithSpots: number;
+  }>;
+}
+
+export interface CalibrationAppliedSummary {
+  active: boolean;
+  stationaryPhase: TlcStationaryPhasePreference;
+  pairedSpotCount: number;
+  matchedLaneCount: number;
+  matchedPlateCount: number;
+  frontCensoredCount?: number;
+  baselineCensoredCount?: number;
+  globalDemandShift: number;
+  demandSlope?: number;
+  hasFeatureWeights?: boolean;
+  midplateRfShift: number;
+  calibratedSigma: number;
+  rmseBefore: number;
+  rmseAfter: number;
+}
+
+export interface FollowUpFailureSummary {
+  measuredWellCount: number;
+  resolvedWellCount: number;
+  frontCrowdedWells: number[];
+  baselinePinnedWells: number[];
+  coelutedWells: number[];
+}
+
+export interface FollowUpSolventOption {
+  system: TlcSolventSystemDef;
+  rescuedWellIndices: number[];
+  rescuedWellCoords: string[];
+  rescuedFrontCount: number;
+  rescuedBaselineCount: number;
+  rescuedCoelutedCount: number;
+  beforeRfRange: [number, number] | null;
+  afterRfRange: [number, number] | null;
+  reason: string;
+}
+
+export interface PlateFollowUpPlan {
+  plateIndex: number;
+  summary: FollowUpFailureSummary;
+  recommendations: FollowUpSolventOption[];
+}
+
+export interface EmpiricalPlateProfile {
+  targetStrengthMin: number;
+  targetStrengthMax: number;
+  meanAromaticRings: number;
+  meanHbd: number;
+  maxAcidStress: number;
+  acidLabel?: string;
+  recommendedMinBaseCap: number;
+  tolueneRecommended: boolean;
+  topTolueneCandidate?: {
+    id: string;
+    name: string;
+    meanScore: number;
+    coveragePct: number;
+    aromaticMix: number;
+  };
+  synthesizedCandidateCount: number;
+  synthesizedInTopSetCount: number;
+  prismaCandidateCount?: number;
+}
+
 export interface PlateSolventPlanResult {
   plateIndex: number;
   stationaryPhase: TlcStationaryPhasePreference;
@@ -646,6 +395,9 @@ export interface PlateSolventPlanResult {
   otherGroups: PlateSolventGroup[];
   wellPredictions: Record<number, WellPredictionResult>;
   summaryNotes: string[];
+  calibrationApplied?: CalibrationAppliedSummary;
+  followUpPlan?: PlateFollowUpPlan;
+  empiricalProfile?: EmpiricalPlateProfile;
 }
 
 export interface PlateSolventPlanOptions {
@@ -658,11 +410,35 @@ export interface PlateSolventPlanOptions {
   includeSpeculative?: boolean;
   /** weight of Low-confidence products relative to High/Medium (0..1, default 0.2); only matters when they are included */
   lowTierWeight?: number;
+  calibration?: TlcCalibrationModel;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
 }
 
-const TLCMOTIF_SMARTS: Array<[keyof Pick<TlcMolProfile, 'aliphAmineCount' | 'azoleCount' | 'pyridineCount' | 'carboxylicAcidCount'>, string]> = [
+type MotifCountKey = keyof Pick<
+  TlcMolProfile,
+  | 'aliphAmineCount'
+  | 'azoleCount'
+  | 'basicAzoleNCount'
+  | 'anilineCount'
+  | 'imineCount'
+  | 'pyridineCount'
+  | 'carboxylicAcidCount'
+  | 'primaryAmideCount'
+  | 'secondaryAmideCount'
+  | 'ureaCount'
+  | 'sulfonamideCount'
+  | 'phenolCount'
+  | 'boronicCount'
+  | 'phosphonateCount'
+  | 'heavyHalogenCount'
+  | 'cf3Count'
+  | 'nitroCount'
+  | 'cyanoCount'
+  | 'zwitterionOrQuatCount'
+>;
+
+const TLCMOTIF_SMARTS: Array<[MotifCountKey, string]> = [
   [
     'aliphAmineCount',
     // basic N: not nitro / N-oxide / N-N / N-O, not attached to an aromatic ring, acyl, sulfonyl or a C=C (enamine);
@@ -670,12 +446,57 @@ const TLCMOTIF_SMARTS: Array<[keyof Pick<TlcMolProfile, 'aliphAmineCount' | 'azo
     '[$([NX3;H2,H1,H0;+0;$(N-[#6;X4]);!$(N-C=[O,S,N]);!$(N-c);!$(N-S=O);!$(N-[#7,#8]);!$(N-[CX3]=[CX3])]),$([NX3;H2,H1,H0;+0;!$(N-C=O);!$(N-[#8])]-[CX3]=[NX2]),$([NX3;H2;+0;$(N-[NX3;!$(N-C=[O,S])]);!$(N-C=[O,S,N]);!$(N-N=*)])]',
   ],
   ['azoleCount', '[nX2r5,nX3H1r5]'],
+  ['basicAzoleNCount', '[nX2r5]'],
+  ['anilineCount', '[NX3;H2,H1,H0;+0;$(N-c);!$(N-C=[O,S,N]);!$(N-S=O);!$(N-[#7,#8]);!$(N=[*])]'],
+  ['imineCount', '[NX2;$(N=[CX3]);!$(N-O);!$(N-N);!$([n])]'],
   ['pyridineCount', '[nX2r6]'],
   ['carboxylicAcidCount', '[CX3](=[OX1])[OX2H1]'],
+  ['primaryAmideCount', '[CX3;$([C](=[OX1])([NX3;H2;+0])[#6])]'],
+  ['secondaryAmideCount', '[CX3;$([C](=[OX1])([NX3;H1;+0])[#6])]'],
+  ['ureaCount', '[CX3;$([C](=[OX1])([NX3])[NX3])]'],
+  ['sulfonamideCount', '[SX4;$([S](=[OX1])(=[OX1])[NX3;H2,H1;+0])]'],
+  ['phenolCount', '[OX2H1;$([O]c)]'],
+  ['boronicCount', '[BX3;$([B]([OX2H1])[OX2])]'],
+  ['phosphonateCount', '[PX4;$([P](=[OX1])([OX2])[OX2])]'],
+  ['heavyHalogenCount', '[Cl,Br,I]'],
+  ['cf3Count', '[CX4;$(C(F)(F)F)]'],
+  ['nitroCount', '[$([NX3](=O)=O),$([NX3+](=O)[O-])]'],
+  ['cyanoCount', '[CX2]#[NX1]'],
+  ['zwitterionOrQuatCount', '[NX4+]'],
 ];
 
 const CONJUGATED_SMARTS =
   '[$([CX3]=[CX3]-[CX3]=[CX3,OX1,NX2]),$([CX3]=[CX3]-[CX2]#[NX1]),$([CX3]=[CX3]-[NX2]=[#6,#7]),$([CX3]=[NX2]-[CX3]=[CX3,OX1,NX2]),$([NX2]=[NX2])]';
+
+/** Standardized 5D descriptor vector used by Ridge self-calibration and prediction */
+export function computeCalibrationFeatureVector(profile: TlcMolProfile): [number, number, number, number, number] {
+  const basicN =
+    profile.aliphAmineCount +
+    profile.pyridineCount +
+    (profile.basicAzoleNCount ?? profile.azoleCount * 0.5);
+  return [
+    (profile.tpsa - 55) / 35,
+    (profile.hbd - 1.2) / 1.2,
+    (profile.aromaticRings - 1.5) / 1.2,
+    (basicN - 0.8) / 1.0,
+    (profile.clogP - 2.0) / 1.5,
+  ];
+}
+
+export function computeFeatureDemandDelta(
+  profile: TlcMolProfile,
+  weights?: TlcCalibrationFeatureWeights
+): number {
+  if (!weights) return 0;
+  const [fTpsa, fHbd, fArom, fBasicN, fClogP] = computeCalibrationFeatureVector(profile);
+  const raw =
+    (weights.tpsa ?? 0) * fTpsa +
+    (weights.hbd ?? 0) * fHbd +
+    (weights.aromaticRings ?? 0) * fArom +
+    (weights.basicN ?? 0) * fBasicN +
+    (weights.clogP ?? 0) * fClogP;
+  return Math.max(-0.14, Math.min(0.14, raw));
+}
 
 let tlcQueryCache: WeakMap<object, Map<string, any>> = new WeakMap();
 
@@ -706,6 +527,7 @@ export function profileMoleculeForTlc(
 
   const fallback: TlcMolProfile = {
     smiles: clean,
+    exactmw: 180,
     tpsa: 35,
     clogP: 1.5,
     hbd: 1,
@@ -713,9 +535,25 @@ export function profileMoleculeForTlc(
     aromaticRings: 1,
     aliphAmineCount: 0,
     azoleCount: 0,
+    basicAzoleNCount: 0,
+    anilineCount: 0,
+    imineCount: 0,
     pyridineCount: 0,
     carboxylicAcidCount: 0,
+    primaryAmideCount: 0,
+    secondaryAmideCount: 0,
+    ureaCount: 0,
+    sulfonamideCount: 0,
+    phenolCount: 0,
+    boronicCount: 0,
+    phosphonateCount: 0,
+    heavyHalogenCount: 0,
+    cf3Count: 0,
+    nitroCount: 0,
+    cyanoCount: 0,
+    zwitterionOrQuatCount: 0,
     uvActive: true,
+    lser: { E: 0.7, S: 0.65, A: 0.42, B: 0.65, displacementN: 0.94 },
   };
   if (!rdkit || !clean) return fallback;
 
@@ -725,11 +563,26 @@ export function profileMoleculeForTlc(
     if (!mol || !mol.is_valid()) return fallback;
     const desc = JSON.parse(mol.get_descriptors());
 
-    const counts: Record<string, number> = {
+    const counts: Record<MotifCountKey, number> = {
       aliphAmineCount: 0,
       azoleCount: 0,
+      basicAzoleNCount: 0,
+      anilineCount: 0,
+      imineCount: 0,
       pyridineCount: 0,
       carboxylicAcidCount: 0,
+      primaryAmideCount: 0,
+      secondaryAmideCount: 0,
+      ureaCount: 0,
+      sulfonamideCount: 0,
+      phenolCount: 0,
+      boronicCount: 0,
+      phosphonateCount: 0,
+      heavyHalogenCount: 0,
+      cf3Count: 0,
+      nitroCount: 0,
+      cyanoCount: 0,
+      zwitterionOrQuatCount: 0,
     };
     for (const [k, sma] of TLCMOTIF_SMARTS) {
       const q = getTlcQuery(rdkit, k, sma);
@@ -752,18 +605,101 @@ export function profileMoleculeForTlc(
       } catch {}
     }
 
+    const exactmw = Number(desc.exactmw) || Number(desc.amw) || 0;
+    const heavyAtomCount =
+      Number(desc.NumHeavyAtoms) || Math.max(4, Math.round(exactmw / 13.5));
+    const tpsa = Number(desc.tpsa) || 0;
+    const hbd = Number(desc.NumHBD) || 0;
+    const hba = Number(desc.NumHBA) || 0;
+    const aromaticRings = Number(desc.NumAromaticRings) || 0;
+
+    // Abraham LSER solute vector with inductive EWG attenuation (-CF3, halogens, -NO2, -CN)
+    const inductiveAtten = Math.max(
+      0.62,
+      1 -
+        counts.cf3Count * 0.14 -
+        counts.heavyHalogenCount * 0.045 -
+        counts.nitroCount * 0.10 -
+        counts.cyanoCount * 0.07
+    );
+    const lserE = Math.round(
+      Math.min(2.6, aromaticRings * 0.65 + counts.heavyHalogenCount * 0.22 + Math.max(0, heavyAtomCount - 12) * 0.03) *
+        1000
+    ) / 1000;
+    const lserS = Math.round(
+      Math.min(2.8, tpsa * 0.014 + counts.nitroCount * 0.35 + counts.cyanoCount * 0.28 + aromaticRings * 0.15) *
+        1000
+    ) / 1000;
+    const lserA = Math.round(
+      Math.min(2.4, hbd * 0.42 + counts.phenolCount * 0.22 + counts.carboxylicAcidCount * 0.25 + counts.boronicCount * 0.20) *
+        1000
+    ) / 1000;
+    const lserB = Math.round(
+      Math.min(
+        2.8,
+        (hba * 0.32 + counts.aliphAmineCount * 0.35 + counts.basicAzoleNCount * 0.20 + counts.pyridineCount * 0.22) *
+          inductiveAtten
+      ) * 1000
+    ) / 1000;
+
+    // Snyder-Soczewinski displacement slope n_i = A_s / n_B
+    const footprintPatches =
+      (hbd > 0 ? 1 : 0) +
+      (hba >= 2 ? 1 : 0) +
+      Math.min(2, aromaticRings * 0.5) +
+      Math.min(
+        1.5,
+        (counts.primaryAmideCount +
+          counts.secondaryAmideCount +
+          counts.ureaCount +
+          counts.sulfonamideCount +
+          counts.carboxylicAcidCount +
+          counts.basicAzoleNCount +
+          counts.pyridineCount) *
+          0.45
+      );
+    const rawDispN =
+      1.0 +
+      Math.max(-0.10, Math.min(0.22, (heavyAtomCount - 12) * 0.011)) +
+      Math.max(-0.04, Math.min(0.12, (footprintPatches - 1.8) * 0.05));
+    const displacementN = Math.round(Math.max(0.86, Math.min(1.32, rawDispN)) * 1000) / 1000;
+
     const prof: TlcMolProfile = {
       smiles: clean,
-      tpsa: Number(desc.tpsa) || 0,
+      exactmw,
+      heavyAtomCount,
+      tpsa,
       clogP: Number(desc.CrippenClogP) || 0,
-      hbd: Number(desc.NumHBD) || 0,
-      hba: Number(desc.NumHBA) || 0,
-      aromaticRings: Number(desc.NumAromaticRings) || 0,
+      hbd,
+      hba,
+      aromaticRings,
       aliphAmineCount: counts.aliphAmineCount,
       azoleCount: counts.azoleCount,
+      basicAzoleNCount: counts.basicAzoleNCount,
+      anilineCount: counts.anilineCount,
+      imineCount: counts.imineCount,
       pyridineCount: counts.pyridineCount,
       carboxylicAcidCount: counts.carboxylicAcidCount,
-      uvActive: (Number(desc.NumAromaticRings) || 0) > 0 || conjugated,
+      primaryAmideCount: counts.primaryAmideCount,
+      secondaryAmideCount: counts.secondaryAmideCount,
+      ureaCount: counts.ureaCount,
+      sulfonamideCount: counts.sulfonamideCount,
+      phenolCount: counts.phenolCount,
+      boronicCount: counts.boronicCount,
+      phosphonateCount: counts.phosphonateCount,
+      heavyHalogenCount: counts.heavyHalogenCount,
+      cf3Count: counts.cf3Count,
+      nitroCount: counts.nitroCount,
+      cyanoCount: counts.cyanoCount,
+      zwitterionOrQuatCount: counts.zwitterionOrQuatCount,
+      uvActive: aromaticRings > 0 || conjugated,
+      lser: {
+        E: lserE,
+        S: lserS,
+        A: lserA,
+        B: lserB,
+        displacementN,
+      },
     };
     cache?.set(clean, prof);
     return prof;
@@ -777,49 +713,310 @@ export function profileMoleculeForTlc(
 }
 
 /**
+ * Builds rich acid-base & salt context for a reaction well so TLC Rf and streaking models
+ * reflect actual acid loading (e.g. TsOH equivalents), counterion volatility, and well pH.
+ */
+export function buildWellTlcContext(
+  ext: {
+    substrates: Array<{ smiles: string; name?: string; iupac?: string; equivalence?: number }>;
+    condition: WellConditionConfig;
+  },
+  pred?: WellPredictionResult | null
+): WellTlcContext {
+  const saltPattern =
+    /\.(Cl|Br|I|F)\b|FC\(F\)\(F\)C\(=O\)O|S\(=O\)\(=O\)O|hydrochloride|trifluoroacetate|tosylate|mesylate/i;
+  const nonVolatileSaltPattern = /S\(=O\)\(=O\)O|tosylate|mesylate/i;
+
+  let hasSaltCounterion = false;
+  let hasNonVolatileSalt = false;
+  let inferredSaltEq = 0;
+  for (const s of ext.substrates || []) {
+    const smi = s.smiles || '';
+    const isSalt =
+      (smi.includes('.') && saltPattern.test(smi)) ||
+      saltPattern.test(s.name || '') ||
+      saltPattern.test(s.iupac || '');
+    if (isSalt) {
+      hasSaltCounterion = true;
+      inferredSaltEq += Math.max(0.25, Number(s.equivalence) || 1.0);
+      if (nonVolatileSaltPattern.test(smi) || nonVolatileSaltPattern.test(s.name || '') || nonVolatileSaltPattern.test(s.iupac || '')) {
+        hasNonVolatileSalt = true;
+      }
+    }
+  }
+
+  const addName = ext.condition.additiveName || '';
+  const addEquiv = Math.max(0, Number(ext.condition.additiveEquiv) || 0);
+  const addPka = Number(ext.condition.additivePka);
+
+  const isStrongNonVolatileAcidName =
+    /\b(p?-?TsOH|PTSA|TfOH|MsOH|CSA|PPTS|H2SO4|H3PO4|KHSO4|NaHSO4)\b|toluenesulfon|benzenesulfon|tosyl|mesyl|camphorsulfon/i.test(
+      addName
+    );
+  const isStrongVolatileAcidName = /\b(TFA|HCl|HBr|HI|trifluoroacetic)\b/i.test(addName);
+  const isWeakAcidName = /\b(AcOH|HOAc|HCOOH|acetic|formic|citric|benzoic)\b/i.test(addName);
+
+  const hasAcidAdditive =
+    ext.condition.medium === 'acid' ||
+    pred?.acidBase?.effectiveMedium === 'free_acid' ||
+    (pred?.acidBase?.effectiveMedium === 'buffered' &&
+      (isStrongNonVolatileAcidName || isStrongVolatileAcidName || isWeakAcidName));
+
+  const isStrongBaseName = /\b(DBU|TBD|MTBD|BTMG|K2CO3|Cs2CO3|NaOH|KOH|KOtBu|NaOtBu|LiOH|K3PO4|NaH|LDA|LiHMDS|NaHMDS)\b/i.test(
+    addName
+  );
+  const isWeakBaseName = /\b(Et3N|TEA|DIPEA|Pyridine|DMAP|DABCO|NaHCO3|NaOAc)\b/i.test(addName);
+  const hasBaseAdditive =
+    ext.condition.medium === 'base' ||
+    pred?.acidBase?.effectiveMedium === 'basic' ||
+    (pred?.acidBase?.effectiveMedium === 'buffered' && (isStrongBaseName || isWeakBaseName));
+
+  let acidStrength: WellTlcContext['acidStrength'];
+  if (hasAcidAdditive || hasSaltCounterion) {
+    if (isStrongNonVolatileAcidName || hasNonVolatileSalt) {
+      acidStrength = 'strong_nonvolatile';
+    } else if (isStrongVolatileAcidName || hasSaltCounterion) {
+      acidStrength = 'strong_volatile';
+    } else if (isWeakAcidName) {
+      acidStrength = 'weak';
+    } else if (Number.isFinite(addPka) && addPka <= 2.5) {
+      acidStrength = 'strong_nonvolatile';
+    } else {
+      acidStrength = 'weak';
+    }
+  }
+
+  const acidLoadEq =
+    pred?.acidBase?.totalAddedAcidEq != null && pred.acidBase.totalAddedAcidEq > 0
+      ? pred.acidBase.totalAddedAcidEq
+      : (hasAcidAdditive ? (addEquiv > 0 ? addEquiv : 0.25) : 0) + (hasSaltCounterion ? inferredSaltEq : 0);
+
+  const freeAcidEq =
+    pred?.acidBase?.freeAcidEq != null
+      ? pred.acidBase.freeAcidEq
+      : acidLoadEq > 0
+      ? acidLoadEq * 0.4
+      : 0;
+
+  const baseLoadEq =
+    pred?.acidBase?.totalAddedBaseEq != null && pred.acidBase.totalAddedBaseEq > 0
+      ? pred.acidBase.totalAddedBaseEq
+      : hasBaseAdditive
+      ? addEquiv > 0
+        ? addEquiv
+        : 0.25
+      : 0;
+
+  const freeBaseEq =
+    pred?.acidBase?.freeBaseEq != null
+      ? pred.acidBase.freeBaseEq
+      : baseLoadEq > 0
+      ? baseLoadEq * 0.5
+      : 0;
+
+  const baseStrength: WellTlcContext['baseStrength'] = hasBaseAdditive
+    ? isStrongBaseName || (Number.isFinite(addPka) && addPka >= 11)
+      ? 'strong'
+      : 'weak'
+    : undefined;
+
+  return {
+    hasAcidAdditive,
+    hasBaseAdditive,
+    hasSaltCounterion,
+    additiveLabel: addName && addName !== 'None (Neutral)' ? addName : undefined,
+    acidLoadEq: acidLoadEq > 0 ? Math.round(acidLoadEq * 1000) / 1000 : 0,
+    freeAcidEq: freeAcidEq > 0 ? Math.round(freeAcidEq * 1000) / 1000 : 0,
+    acidStrength,
+    wellPh: pred?.acidBase?.effectivePhDmso,
+    baseLoadEq: baseLoadEq > 0 ? Math.round(baseLoadEq * 1000) / 1000 : 0,
+    freeBaseEq: freeBaseEq > 0 ? Math.round(freeBaseEq * 1000) / 1000 : 0,
+    baseStrength,
+  };
+}
+
+function resolveWellAcidStress(profile: TlcMolProfile, wellCtx?: WellTlcContext): {
+  hasAcidEffect: boolean;
+  acidStrength: 'strong_nonvolatile' | 'strong_volatile' | 'weak';
+  acidLoad: number;
+  acidSeverity: number;
+  effBasicCount: number;
+  acidStress: number;
+  label: string;
+} {
+  if (!wellCtx || (!wellCtx.hasAcidAdditive && !wellCtx.hasSaltCounterion)) {
+    return {
+      hasAcidEffect: false,
+      acidStrength: 'weak',
+      acidLoad: 0,
+      acidSeverity: 0,
+      effBasicCount: 0,
+      acidStress: 0,
+      label: '',
+    };
+  }
+
+  const label = wellCtx.additiveLabel || (wellCtx.hasSaltCounterion ? 'Salt counterion' : 'Acid');
+  let acidStrength = wellCtx.acidStrength;
+  if (!acidStrength) {
+    if (
+      /\b(p?-?TsOH|PTSA|TfOH|MsOH|CSA|PPTS|H2SO4|H3PO4|KHSO4|NaHSO4)\b|toluenesulfon|benzenesulfon|tosyl|mesyl|camphorsulfon/i.test(
+        label
+      )
+    ) {
+      acidStrength = 'strong_nonvolatile';
+    } else if (/\b(TFA|HCl|HBr|HI|trifluoroacetic)\b/i.test(label) || wellCtx.hasSaltCounterion) {
+      acidStrength = 'strong_volatile';
+    } else {
+      acidStrength = 'weak';
+    }
+  }
+
+  const acidLoad = Math.max(0, wellCtx.acidLoadEq ?? 0.25);
+  const freeAcid = Math.max(0, wellCtx.freeAcidEq ?? acidLoad * 0.4);
+  const acidSeverity = acidStrength === 'strong_nonvolatile' ? 1.0 : acidStrength === 'strong_volatile' ? 0.72 : 0.35;
+
+  const basicAzole = profile.basicAzoleNCount ?? profile.azoleCount * 0.5;
+  const aniline = profile.anilineCount ?? 0;
+  const imine = profile.imineCount ?? 0;
+  const medBasicSites = profile.pyridineCount + basicAzole + aniline + 0.55 * imine;
+  const strongBasicSites = profile.aliphAmineCount;
+  const effBasicCount =
+    acidStrength === 'weak'
+      ? strongBasicSites + 0.25 * medBasicSites
+      : strongBasicSites + 0.80 * medBasicSites;
+
+  if (effBasicCount <= 0 || acidLoad <= 0) {
+    return {
+      hasAcidEffect: false,
+      acidStrength,
+      acidLoad,
+      acidSeverity,
+      effBasicCount: 0,
+      acidStress: 0,
+      label,
+    };
+  }
+
+  // Note: when imidazoles/benzimidazoles (pKa_BH+ ~7 in DMSO) absorb added TsOH to form BH+ TsO- salts,
+  // effectivePhDmso sits near ~7.0-8.2 with freeAcidEq=0 — the acid is NOT neutralized, it is bound as
+  // imidazolium tosylate salt! Only attenuate when an external or much stronger base pushes well pH high.
+  let pHFactor = 1.0;
+  if (wellCtx.wellPh != null) {
+    const isStrongAliph = strongBasicSites > 0;
+    if (isStrongAliph) {
+      if (wellCtx.hasBaseAdditive && (wellCtx.freeBaseEq ?? 0) > 0.08 && wellCtx.wellPh > 11.5) {
+        pHFactor = Math.max(0.15, 1 / (1 + Math.pow(10, (wellCtx.wellPh - 12.2) * 0.7)));
+      }
+    } else if (wellCtx.wellPh >= 8.6) {
+      const midPh = wellCtx.hasBaseAdditive && (wellCtx.freeBaseEq ?? 0) > 0.05 ? 9.0 : 10.2;
+      pHFactor = Math.max(0.15, Math.min(1.05, 1 / (1 + Math.pow(10, (wellCtx.wellPh - midPh) * 0.7))));
+    }
+  }
+
+  const rawEqStress = Math.min(1.6, 0.34 + 0.68 * acidLoad + 0.25 * freeAcid);
+  const acidStress =
+    acidSeverity * rawEqStress * pHFactor * Math.min(1.12, 0.72 + 0.16 * effBasicCount);
+
+  return {
+    hasAcidEffect: acidStress > 0.04,
+    acidStrength,
+    acidLoad,
+    acidSeverity,
+    effBasicCount,
+    acidStress,
+    label,
+  };
+}
+
+/**
  * Predicts TLC Rf (0.02..0.96) and streaking risk on Normal-Phase SiO2, Al2O3 (Neutral/Basic), or Reverse-Phase C18.
  */
 export function predictTlcRf(
   profile: TlcMolProfile,
   system: TlcSolventSystemDef,
   wellCtx?: WellTlcContext,
-  stationaryPhasePref: TlcStationaryPhasePreference = 'auto'
+  stationaryPhasePref: TlcStationaryPhasePreference = 'auto',
+  demandShift: number = 0,
+  demandSlope: number = 1.0,
+  featureWeights?: TlcCalibrationFeatureWeights
 ): { rf: number; tailing: boolean; tailingReason?: string; mildStreak?: boolean } {
+  const primAmide = profile.primaryAmideCount || 0;
+  const secAmide = profile.secondaryAmideCount || 0;
+  const urea = profile.ureaCount || 0;
+  const sulfonamide = profile.sulfonamideCount || 0;
+  const phenol = profile.phenolCount || 0;
+  const boronic = profile.boronicCount || 0;
+  const phosphonate = profile.phosphonateCount || 0;
+  const heavyHalogen = profile.heavyHalogenCount || 0;
+  const cf3 = profile.cf3Count || 0;
+  const nitro = profile.nitroCount || 0;
+  const cyano = profile.cyanoCount || 0;
+  const quat = profile.zwitterionOrQuatCount || 0;
+  const exactmw = profile.exactmw || 0;
+  const featureDelta = computeFeatureDemandDelta(profile, featureWeights);
+  const wellAcid = resolveWellAcidStress(profile, wellCtx);
+
   // -------------------------------------------------------------------------
   // CASE A: REVERSE-PHASE C18 TLC (Polarity & elution order inverted!)
   // -------------------------------------------------------------------------
   if (system.stationaryPhase === 'C18') {
-    const orgFrac = (system.organicPct ?? system.strength * 100) / 100;
-    const isMeCN = system.id.includes('mecn');
+    const desc = system.descriptors;
+    const orgFrac = (system.organicPct ?? desc?.organicPct ?? system.strength * 100) / 100;
+    const isMeCN = system.composition
+      ? system.composition.strongSolvent === 'MeCN'
+      : system.id.includes('mecn');
     const isAcidic = Boolean(system.acidModifier);
 
     // Lipophilicity increases C18 binding; TPSA/HBD/ionizable groups decrease C18 binding
-    const polarRelease =
+    let polarRelease =
       Math.min(0.45, profile.tpsa * 0.0042) +
       profile.hbd * 0.055 +
       profile.aliphAmineCount * (isAcidic ? 0.24 : 0.14) +
       profile.azoleCount * 0.07 +
-      profile.carboxylicAcidCount * (isAcidic ? 0.04 : 0.14);
+      profile.carboxylicAcidCount * (isAcidic ? 0.04 : 0.14) +
+      primAmide * 0.055 +
+      urea * 0.065 +
+      sulfonamide * 0.045 +
+      boronic * 0.09 +
+      phosphonate * 0.08 +
+      quat * 0.28;
 
+    // Protonated basic sites from acid/salt reaction wells elute earlier on C18
+    if (wellAcid.hasAcidEffect) {
+      polarRelease += Math.min(0.16, 0.04 + 0.08 * wellAcid.acidStress);
+    }
+
+    const mwLipo = exactmw > 420 ? Math.min(0.08, (exactmw - 420) * 0.00022) : 0;
     const lipoRetention =
       0.16 +
       Math.max(-0.2, profile.clogP * 0.21) +
-      profile.aromaticRings * 0.055 -
-      polarRelease;
+      profile.aromaticRings * 0.055 +
+      mwLipo +
+      heavyHalogen * 0.018 +
+      cf3 * 0.03 -
+      polarRelease +
+      demandShift +
+      featureDelta;
 
     const rpEluentPower = orgFrac * (isMeCN ? 1.08 : 0.94) + (isAcidic ? 0.05 : 0);
 
     let tailing = false;
     let tailingReason: string | undefined;
+    let mildStreak = false;
     if (!isAcidic && profile.aliphAmineCount >= 1) {
       tailing = true;
       tailingReason = 'Basic amine can tail on C18 without 0.1% TFA modifier';
+    } else if (!isAcidic && wellAcid.hasAcidEffect && wellAcid.acidStress >= 0.45) {
+      mildStreak = true;
+      tailingReason = `${wellAcid.label} protonated salt can split/streak on unbuffered C18 — use 0.1% TFA modifier`;
     }
 
-    const z = Math.max(-10, Math.min(10, 4.8 * (rpEluentPower - lipoRetention)));
+    const effDispN = profile.lser?.displacementN ?? 1.0;
+    const z = Math.max(-10, Math.min(10, 4.8 * demandSlope * (0.6 + 0.4 * effDispN) * (rpEluentPower - lipoRetention)));
     const rawRf = 1 / (1 + Math.exp(-z));
     const rf = Math.round(Math.max(0.02, Math.min(0.96, rawRf)) * 100) / 100;
-    return { rf, tailing, tailingReason };
+    return { rf, tailing, tailingReason, mildStreak };
   }
 
   // -------------------------------------------------------------------------
@@ -830,31 +1027,85 @@ export function predictTlcRf(
   const isAlumina = isNeutralAlumina || isBasicAlumina;
 
   const lipophilicityOffset = Math.max(-0.14, Math.min(0.22, (profile.clogP - 1.4) * 0.04));
+  // Heavy halogens & -CF3 reduce adjacent heteroatom H-bond basicity; keep -NO2/-CN dipole neutral
+  const halogenCf3Relief = Math.min(0.09, cf3 * 0.036 + heavyHalogen * 0.016);
+  // Larger MW (> 450 Da) adds modest nonspecific silica adsorption unless already very lipophilic
+  const mwAdsorption = exactmw > 450 ? Math.min(0.055, (exactmw - 450) * 0.00016) : 0;
+
+  const aniline = profile.anilineCount || 0;
+  const basicAzoleN = profile.basicAzoleNCount ?? profile.azoleCount * 0.5;
+  const azoleNH = Math.max(0, profile.azoleCount - basicAzoleN);
+  // Tautomeric NH + basic =N- azoles (imidazole, benzimidazole, pyrazole, triazole) form strong silanol/intermolecular H-bond chains
+  const nhBasicAzole = Math.min(basicAzoleN, azoleNH);
+
+  // Functional-group specific silica/alumina affinities beyond bulk TPSA/HBD
+  const functionalGroupDemand =
+    Math.min(0.18, primAmide * 0.075) +
+    Math.min(0.11, secAmide * 0.035) +
+    Math.min(0.22, urea * 0.095) +
+    Math.min(0.16, sulfonamide * 0.06) +
+    Math.min(0.12, phenol * 0.045) +
+    Math.min(0.11, aniline * (isBasicAlumina ? 0.025 : 0.045)) +
+    Math.min(0.18, phosphonate * 0.075) +
+    mwAdsorption -
+    halogenCf3Relief;
 
   let demand =
     (isBasicAlumina ? 0.02 : isNeutralAlumina ? 0.03 : 0.04) +
     Math.min(0.55, profile.tpsa * (isAlumina ? 0.0041 : 0.0044)) +
     profile.hbd * (isBasicAlumina ? 0.068 : 0.062) +
     Math.max(0, profile.hba - 1) * (isAlumina ? 0.021 : 0.018) +
-    Math.min(0.28, profile.azoleCount * (isBasicAlumina ? 0.038 : 0.055)) +
-    profile.pyridineCount * (isBasicAlumina ? 0.028 : 0.055) -
-    lipophilicityOffset;
+    Math.min(0.22, profile.azoleCount * (isBasicAlumina ? 0.032 : 0.040)) +
+    Math.min(0.14, basicAzoleN * (isBasicAlumina ? 0.015 : isNeutralAlumina ? 0.028 : 0.045)) +
+    Math.min(0.18, nhBasicAzole * (isBasicAlumina ? 0.035 : isNeutralAlumina ? 0.060 : 0.095)) +
+    profile.pyridineCount * (isBasicAlumina ? 0.028 : 0.055) +
+    functionalGroupDemand -
+    lipophilicityOffset +
+    demandShift +
+    featureDelta;
 
-  // Solvent-family orthogonal selectivity adjustments
-  if (system.family === 'meoh_toluene') {
+  // Continuous empirical mixture selectivity adjustments (derived from Kamlet-Taft alpha/beta/pi*, LSER & aromaticMix)
+  const desc = system.descriptors;
+  const aromMix = desc?.aromaticMix ?? (system.family === 'meoh_toluene' ? 0.92 : 0);
+  if (aromMix > 0.15) {
     // Aromatic pi-pi competition reduces retention of aromatic rings relative to aliphatic H-bonders
-    demand -= Math.min(0.11, profile.aromaticRings * 0.032);
-  } else if (system.family === 'acetone_hex') {
-    // Acetone carbonyl competes selectively against HBD & alcohols relative to EtOAc
-    demand -= Math.min(0.08, profile.hbd * 0.028);
-  } else if (system.family === 'meoh_etoac') {
-    demand -= Math.min(0.07, profile.hbd * 0.022 + profile.hba * 0.008);
-  } else if (system.family === 'etoac_dcm') {
+    const aromScale = Math.min(1.05, aromMix / 0.9);
+    demand -= Math.min(0.115, profile.aromaticRings * 0.032 * aromScale);
+  }
+  if (system.family === 'acetone_hex' || system.composition?.strongSolvent === 'Acetone') {
+    // Acetone carbonyl competes selectively against HBD, phenols, primary amides & ureas relative to EtOAc
+    const betaScale = desc ? Math.min(1.12, 0.55 + desc.betaMix * 1.35) : 1.0;
+    demand -= Math.min(0.105, (profile.hbd * 0.028 + (primAmide + urea + phenol) * 0.02) * betaScale);
+  } else if (system.family === 'mtbe_hex' || system.composition?.strongSolvent === 'MTBE') {
+    // Pure ether HBA (beta=0.49, low pi*=0.27): lifts HBD solutes selectively while retaining non-HBD dipolar aromatics slightly tighter than EtOAc
+    const betaScale = desc ? Math.min(1.15, 0.6 + desc.betaMix * 1.25) : 1.0;
+    const hbdLift = Math.min(0.085, ((profile.lser?.A ?? profile.hbd * 0.42) * 0.065 + (phenol + primAmide) * 0.015) * betaScale);
+    const dipolarHold = profile.hbd === 0 ? Math.min(0.03, (profile.lser?.S ?? 0) * 0.015) : 0;
+    demand -= hbdLift - dipolarHold;
+  } else if (system.family === 'meoh_etoac' || (desc && desc.alcoholPct > 0 && desc.betaMix >= 0.44)) {
+    demand -= Math.min(0.08, profile.hbd * 0.022 + profile.hba * 0.008 + (primAmide + urea) * 0.018);
+  } else if (
+    system.family === 'etoac_dcm' ||
+    (desc && desc.piStarMix >= 0.72 && desc.alcoholPct === 0 && desc.aromaticMix === 0)
+  ) {
     demand -= Math.min(0.06, profile.aromaticRings * 0.02);
+  } else if ((system.family === 'meoh_dcm' || (desc && desc.alphaMix >= 0.22)) && (urea > 0 || primAmide > 0)) {
+    // MeOH/DCM disrupts amide/urea H-bond dimers noticeably better than neat EtOAc
+    const dimerScale = desc ? Math.min(1.15, Math.max(0.65, desc.alphaMix / 0.35)) : 1.0;
+    demand -= Math.min(0.065, (urea * 0.035 + primAmide * 0.025) * dimerScale);
+  }
+
+  // PRISMA ternary & continuous Abraham LSER cross-selectivity:
+  // blends dipolar pi* (split non-HBD carbonyl/aromatic dipoles) + beta HBA competition against LSER A/B/S
+  if (system.family === 'prisma_ternary' && desc && profile.lser) {
+    const dipolarPull = Math.max(0, desc.piStarMix - 0.32) * (profile.lser.S * 0.032 + profile.lser.E * 0.018);
+    const hbdPull = Math.max(0, desc.betaMix - 0.16) * profile.lser.A * 0.038;
+    demand -= Math.max(-0.04, Math.min(0.08, dipolarPull + hbdPull));
   }
 
   let tailing = false;
   let tailingReason: string | undefined;
+  let mildStreak = false;
 
   if (isAlumina) {
     // Alumina lacks acidic Si-OH groups, freeing basic amines/guanidines/pyridines without Et3N
@@ -870,19 +1121,26 @@ export function predictTlcRf(
       }
     }
 
-    // Well acid/salt effects: Basic Al2O3 neutralizes trace acid/salt in situ; Neutral Al2O3 gives mild protonation tailing only for strong basic amines
-    if (
-      isNeutralAlumina &&
-      (wellCtx?.hasAcidAdditive || wellCtx?.hasSaltCounterion) &&
-      (profile.aliphAmineCount > 0 || profile.pyridineCount > 0) &&
-      !system.baseModifier
-    ) {
-      demand += 0.06;
-      if (profile.aliphAmineCount > 0) {
-        tailing = true;
-        tailingReason = wellCtx?.additiveLabel
-          ? `${wellCtx.additiveLabel}/salt in well can protonate amine on Neutral Al₂O₃ — try Basic Al₂O₃ or SiO₂ + Et₃N`
-          : 'Acid/salt in well can protonate amine on Neutral Al₂O₃ — try Basic Al₂O₃ or SiO₂ + Et₃N';
+    // Well acid/salt effects: Basic Al2O3 neutralizes acid/salt at the origin up to ~1.25 eq;
+    // Neutral Al2O3 gives protonation retention & tailing under strong or stoichiometric acid loads.
+    if (wellAcid.hasAcidEffect) {
+      if (isBasicAlumina) {
+        const cap = wellAcid.acidStrength === 'strong_nonvolatile' ? 1.25 : 1.55;
+        const overload = Math.max(0, wellAcid.acidStress - cap);
+        if (overload > 0) {
+          demand += Math.min(0.10, 0.03 + overload * 0.14);
+          mildStreak = true;
+          tailingReason = `High ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) loading may leave slight residual drag on Basic Al₂O₃`;
+        }
+      } else {
+        demand += Math.min(0.18, 0.04 + 0.10 * wellAcid.acidStress);
+        if (profile.aliphAmineCount > 0 || wellAcid.acidStress >= 0.60) {
+          tailing = true;
+          tailingReason = `${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) in well protonates N-base on Neutral Al₂O₃ — try Basic Al₂O₃ or 2M NH₃/MeOH`;
+        } else {
+          mildStreak = true;
+          tailingReason = `Trace ${wellAcid.label} protonation on Neutral Al₂O₃ — Basic Al₂O₃ buffers cleaner`;
+        }
       }
     }
 
@@ -913,53 +1171,188 @@ export function predictTlcRf(
       tailingReason = 'Multi-azole H-bonding may streak in aprotic solvent';
     }
 
-    // Reaction-well acid additives or salt counterions protonate basic N-sites unless buffered by base modifier
-    if (
-      (wellCtx?.hasAcidAdditive || wellCtx?.hasSaltCounterion) &&
-      (profile.aliphAmineCount > 0 || profile.pyridineCount > 0 || profile.azoleCount > 0) &&
-      !system.baseModifier
-    ) {
-      demand += profile.aliphAmineCount > 0 ? 0.12 : 0.10;
-      tailing = true;
-      if (!tailingReason) {
-        tailingReason = wellCtx?.additiveLabel
-          ? `${wellCtx.additiveLabel}/salt in well protonates N-base — add Et₃N or NH₃-MeOH`
-          : 'Acid/salt additive in well protonates N-base — add Et₃N or NH₃-MeOH';
+    // Reaction-well acid additives or salt counterions protonate basic N-sites;
+    // 1% Et3N (~72 mM, partly consumed by Si-OH silanols) has finite capacity and cannot fully neutralize
+    // stoichiometric strong non-volatile acids (TsOH, MsOH, TfOH) on basic/poly-basic spots.
+    if (wellAcid.hasAcidEffect) {
+      const isNh3 = desc ? desc.modifierKind === 'base_nh3' : Boolean(system.baseModifier?.includes('NH₃'));
+      const isEt3n = desc ? desc.modifierKind === 'base_et3n' : Boolean(system.baseModifier && !isNh3);
+      const modCap = desc?.modifierCapacity;
+
+      if (!system.baseModifier) {
+        demand += Math.min(0.46, 0.12 + 0.24 * wellAcid.acidStress);
+        if (system.acidModifier) demand += 0.04;
+        tailing = true;
+        if (!tailingReason) {
+          tailingReason =
+            wellAcid.acidLoad >= 0.4 && wellAcid.acidStrength === 'strong_nonvolatile'
+              ? `${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) protonates basic N-sites into non-volatile salts — use 2M NH₃/MeOH, Basic Al₂O₃, or pre-neutralize`
+              : `${wellAcid.label}/salt in well protonates N-base — add Et₃N or NH₃-MeOH`;
+        }
+      } else if (isEt3n) {
+        const baseCap = modCap && modCap > 0 ? modCap : 0.46;
+        const et3nCap =
+          wellAcid.acidStrength === 'strong_nonvolatile'
+            ? baseCap
+            : wellAcid.acidStrength === 'strong_volatile'
+            ? baseCap * (0.65 / 0.46)
+            : baseCap * (1.10 / 0.46);
+        const preCapCoeff =
+          wellAcid.acidStrength === 'strong_nonvolatile'
+            ? 0.24
+            : wellAcid.acidStrength === 'strong_volatile'
+            ? 0.14
+            : 0;
+        const preCapDrag = preCapCoeff > 0 ? Math.min(0.14, wellAcid.acidStress * preCapCoeff) : 0;
+        const overload = Math.max(0, wellAcid.acidStress - et3nCap);
+        demand += preCapDrag;
+        if (overload > 0) {
+          demand += Math.min(0.24, 0.04 + overload * 0.28);
+          if (overload >= 0.12) {
+            tailing = true;
+            if (!tailingReason) {
+              tailingReason = `1% Et₃N may not fully neutralize ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) & silica Si–OH — try 2M NH₃/MeOH, Basic Al₂O₃, or pre-neutralize`;
+            }
+          } else {
+            mildStreak = true;
+            if (!tailingReason) {
+              tailingReason = `Residual ${wellAcid.label} salt may streak in 1% Et₃N — 2M NH₃/MeOH or Basic Al₂O₃ neutralizes cleaner`;
+            }
+          }
+        } else if (wellAcid.acidStrength === 'strong_nonvolatile' && wellAcid.acidStress >= 0.40) {
+          mildStreak = true;
+          if (!tailingReason) {
+            tailingReason = `Catalytic ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) salt can leave slight baseline drag in 1% Et₃N — 2M NH₃/MeOH runs sharper`;
+          }
+        }
+      } else if (isNh3) {
+        const baseCap = modCap && modCap > 0 ? modCap : 0.95;
+        const nh3Cap =
+          wellAcid.acidStrength === 'strong_nonvolatile' ? baseCap : baseCap * (1.25 / 0.95);
+        const preCapDrag =
+          wellAcid.acidStrength === 'strong_nonvolatile' ? Math.min(0.05, wellAcid.acidStress * 0.04) : 0;
+        const overload = Math.max(0, wellAcid.acidStress - nh3Cap);
+        demand += preCapDrag;
+        if (overload > 0) {
+          demand += Math.min(0.14, 0.025 + overload * 0.18);
+          if (overload >= 0.35) {
+            tailing = true;
+            if (!tailingReason) {
+              tailingReason =
+                baseCap < 1.2
+                  ? `Excess ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) can overload ${system.baseModifier || '2% (2M NH₃/MeOH)'} — use 4% (2M NH₃/MeOH), Basic Al₂O₃, or pre-neutralize`
+                  : `Excess ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) can overload ${system.baseModifier || '4% NH₃/MeOH'} — use Basic Al₂O₃ or pre-neutralize`;
+            }
+          } else {
+            mildStreak = true;
+            if (!tailingReason) {
+              tailingReason = `High ${wellAcid.label} (${wellAcid.acidLoad.toFixed(1)} eq) loading may leave slight residual drag even in ${system.baseModifier || '2M NH₃/MeOH'}`;
+            }
+          }
+        }
       }
     }
 
-    // Carboxylic acids dimerize & streak unless AcOH modifier is present
+    // Carboxylic acids dimerize & streak unless AcOH modifier is present;
+    // excess strong non-volatile base (KOH, DBU, Cs2CO3 >= 1.2 eq) can overwhelm 1% AcOH too.
     if (profile.carboxylicAcidCount > 0) {
+      const baseLoad = Math.max(0, wellCtx?.baseLoadEq ?? (wellCtx?.hasBaseAdditive ? 0.3 : 0));
+      const baseSeverity = wellCtx?.baseStrength === 'strong' ? 1.0 : 0.45;
       if (system.acidModifier) {
         demand += Math.min(0.18, profile.carboxylicAcidCount * 0.08);
+        if (wellCtx?.hasBaseAdditive && baseLoad * baseSeverity >= 0.95) {
+          const baseOverload = Math.min(0.14, (baseLoad * baseSeverity - 0.95) * 0.10 + 0.04);
+          demand += baseOverload;
+          mildStreak = true;
+          if (!tailingReason) {
+            tailingReason = `1% AcOH may not fully acidify excess ${wellCtx.additiveLabel || 'base'} (${baseLoad.toFixed(1)} eq) — pre-acidify or use C18`;
+          }
+        }
       } else {
         demand += Math.min(0.55, 0.28 + profile.carboxylicAcidCount * 0.15);
         if (wellCtx?.hasBaseAdditive) {
-          demand += 0.12;
+          demand += Math.min(0.22, 0.08 + 0.10 * baseLoad * baseSeverity);
         }
         tailing = true;
         tailingReason = wellCtx?.hasBaseAdditive
-          ? 'Base additive in well deprotonates carboxylic acid — add AcOH modifier'
+          ? `${wellCtx.additiveLabel || 'Base'} (${baseLoad.toFixed(1)} eq) in well deprotonates carboxylic acid — add AcOH modifier`
           : 'Carboxylic acid tails without AcOH';
+      }
+    }
+
+    // Free boronic acids (-B(OH)2 / hemiesters) smear on unmodified silica without MeOH + AcOH
+    if (boronic > 0) {
+      if (system.acidModifier || system.alcoholPct >= 7) {
+        demand += Math.min(0.20, boronic * 0.11);
+      } else {
+        demand += Math.min(0.38, 0.18 + boronic * 0.15);
+        tailing = true;
+        if (!tailingReason) {
+          tailingReason = 'Free boronic acid can streak on SiO₂ — add MeOH/AcOH or use C18';
+        }
       }
     }
   }
 
-  // Protic MeOH competes strongly against normal-phase H-bonding
+  // Quaternary ammonium / permanently charged N stays near baseline on normal-phase plates
+  if (quat > 0) {
+    demand += Math.min(0.85, 0.58 + quat * 0.24);
+    if (!(system.alcoholPct >= 10 && system.baseModifier)) {
+      tailing = true;
+      if (!tailingReason) {
+        tailingReason = 'Quaternary/charged N pins on normal phase — use 12% MeOH/DCM + NH₃ or C18';
+      }
+    }
+  }
+
+  // Protic MeOH competes strongly against normal-phase H-bonding (including primary amides & ureas)
+  const proticSites = profile.hbd + basicAzoleN * 0.20 + primAmide * 0.45 + urea * 0.6;
   const proticBoost =
     system.alcoholPct > 0
-      ? Math.min(0.18, system.alcoholPct * 0.0115 * Math.max(0.4, (profile.hbd + profile.azoleCount * 0.5) * 0.5))
+      ? Math.min(0.18, system.alcoholPct * 0.0105 * Math.max(0.4, proticSites * 0.45))
       : 0;
 
   const effectiveStrength = system.strength + proticBoost;
-  const z = Math.max(-12, Math.min(12, 6.2 * (effectiveStrength - demand)));
-  const rawRf = 1 / (1 + Math.exp(-z));
-  const rf = Math.round(Math.max(0.02, Math.min(0.96, rawRf)) * 100) / 100;
+  const rawDispN = profile.lser?.displacementN ?? 1.0;
+  // Compact non-polar solutes (no HBD, TPSA < 12, HBA <= 1 like benzyl bromide/aryl halides) partition negligibly
+  // into polar eluents and run straight with the solvent front instead of being flattened down to ~0.94.
+  const isApolarMobile = profile.tpsa < 12 && profile.hbd === 0 && profile.hba <= 1;
+  const effDispN =
+    effectiveStrength > demand
+      ? isApolarMobile && effectiveStrength >= 0.35
+        ? Math.max(1.18, rawDispN)
+        : Math.max(1.0, rawDispN)
+      : rawDispN;
+  const z = Math.max(-12, Math.min(12, 6.2 * demandSlope * effDispN * (effectiveStrength - demand)));
+  let rawRf = 1 / (1 + Math.exp(-z));
+
+  // Geiss secondary solvent-front (beta-front) demixing compression on dry SiO2 plates:
+  // applies ONLY to H-bonding/amine/acid polar solutes (demand >= 0.32) that depend on adsorbed MeOH to move,
+  // never artificially dragging non-HBD lipophilic azoles/ketones down out of the front band.
+  if (!isAlumina && desc?.betaFrontCeiling !== undefined) {
+    const isAlcoholDependent =
+      demand >= 0.32 &&
+      (profile.hbd >= 1 ||
+        profile.aliphAmineCount >= 1 ||
+        primAmide >= 1 ||
+        urea >= 1 ||
+        profile.carboxylicAcidCount >= 1);
+    const betaCap = desc.betaFrontCeiling;
+    const knee = betaCap - 0.06;
+    if (isAlcoholDependent && rawRf > knee) {
+      const excess = rawRf - knee;
+      const headroom = Math.max(0.04, betaCap - knee);
+      rawRf = knee + headroom * (excess / (excess + headroom * 0.45));
+    }
+  }
+
+  const rf = Math.round(Math.max(0.02, Math.min(0.99, rawRf)) * 100) / 100;
 
   // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
   // tiny tie-break only (NH₃ listed first when equal); the real answer is the "or" alternative shown on the card.
-  const mildStreak =
-    !tailing && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N');
+  if (!tailing && !mildStreak && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N')) {
+    mildStreak = true;
+  }
 
   return { rf, tailing, tailingReason, mildStreak };
 }
@@ -988,7 +1381,7 @@ function windowScore(rf: number): number {
 
 // Rf predictions are hand-tuned guesses (error roughly +-0.12), so separation is scored as the
 // probability that two spots really are apart, not as a point estimate of the gap.
-const RF_SIGMA = 0.12;
+export const RF_SIGMA = 0.12;
 const RF_MIN_VISIBLE_GAP = 0.03;
 
 function erf(x: number): number {
@@ -1003,8 +1396,8 @@ function erf(x: number): number {
   return sign * y;
 }
 
-function deltaScore(deltaRf: number): number {
-  const z = (Math.abs(deltaRf) - RF_MIN_VISIBLE_GAP) / (RF_SIGMA * Math.SQRT2);
+function deltaScore(deltaRf: number, sigma: number = RF_SIGMA): number {
+  const z = (Math.abs(deltaRf) - RF_MIN_VISIBLE_GAP) / (sigma * Math.SQRT2);
   const p = 0.5 * (1 + erf(z));
   return Math.max(0.03, Math.min(1, p));
 }
@@ -1032,13 +1425,44 @@ interface WellCandidateData {
   }>;
 }
 
+function calibrationPhaseKeyForSystem(
+  system: TlcSolventSystemDef,
+  stationaryPhasePref: TlcStationaryPhasePreference
+): TlcStationaryPhasePreference {
+  if (system.stationaryPhase === 'C18') return 'C18';
+  if (stationaryPhasePref === 'Al2O3_neutral') return 'Al2O3_neutral';
+  if (stationaryPhasePref === 'Al2O3_basic') return 'Al2O3_basic';
+  return 'SiO2';
+}
+
+function resolveCalibrationOffsets(
+  calibration: TlcCalibrationModel | undefined,
+  system: TlcSolventSystemDef,
+  stationaryPhasePref: TlcStationaryPhasePreference
+): { demandShift: number; demandSlope: number; sigma: number; featureWeights?: TlcCalibrationFeatureWeights } {
+  if (!calibration) return { demandShift: 0, demandSlope: 1.0, sigma: RF_SIGMA };
+  const pKey = calibrationPhaseKeyForSystem(system, stationaryPhasePref);
+  const fit = calibration.byPhase[pKey];
+  const evidence = (fit?.pairedSpotCount ?? 0) + (fit?.frontCensoredCount ?? 0) + (fit?.baselineCensoredCount ?? 0);
+  if (!fit || evidence === 0) return { demandShift: 0, demandSlope: 1.0, sigma: RF_SIGMA };
+  const famShift = fit.familyDemandShifts[system.family] ?? 0;
+  return {
+    demandShift: fit.globalDemandShift + famShift,
+    demandSlope: fit.demandSlope ?? 1.0,
+    sigma: fit.calibratedSigma || RF_SIGMA,
+    featureWeights: fit.featureWeights,
+  };
+}
+
 function evaluateWellInSolvent(
   well: WellCandidateData,
   system: TlcSolventSystemDef,
-  stationaryPhasePref: TlcStationaryPhasePreference = 'auto'
+  stationaryPhasePref: TlcStationaryPhasePreference = 'auto',
+  calibration?: TlcCalibrationModel
 ): { score: number; deltaRf: number; bestProductRf: number | null; spots: SimulatedSpot[] } {
+  const { demandShift, demandSlope, sigma, featureWeights } = resolveCalibrationOffsets(calibration, system, stationaryPhasePref);
   const subSpots: SimulatedSpot[] = well.substrates.map((s) => {
-    const pred = predictTlcRf(s.profile, system, well.wellCtx, stationaryPhasePref);
+    const pred = predictTlcRf(s.profile, system, well.wellCtx, stationaryPhasePref, demandShift, demandSlope, featureWeights);
     return {
       kind: 'substrate',
       label: s.name || s.code,
@@ -1049,11 +1473,12 @@ function evaluateWellInSolvent(
       tailing: pred.tailing,
       tailingReason: pred.tailingReason,
       uvActive: s.profile.uvActive,
+      mildStreak: pred.mildStreak,
     };
   });
 
   const prodSpots: SimulatedSpot[] = well.products.map((p, idx) => {
-    const pred = predictTlcRf(p.profile, system, well.wellCtx, stationaryPhasePref);
+    const pred = predictTlcRf(p.profile, system, well.wellCtx, stationaryPhasePref, demandShift, demandSlope, featureWeights);
     return {
       kind: 'product',
       label: p.label || `Product #${idx + 1}`,
@@ -1137,10 +1562,18 @@ function evaluateWellInSolvent(
     const subTailPenalty = subSpots.some((s) => s.tailing) ? 0.88 : 1.0;
     const visFactor = pSpot.uvActive === false ? STAIN_ONLY_FACTOR : 1.0;
     const decompFactor = pSpot.mayDecompose ? DECOMPOSE_FACTOR : 1.0;
-    const mildStreakFactor = pSpot.mildStreak ? 0.98 : 1.0;
+    const hasMildWellOverload = pSpot.mildStreak && Boolean(pSpot.tailingReason);
+    const hasSubMildWellOverload = subSpots.some((s) => s.mildStreak && Boolean(s.tailingReason));
+    const mildStreakFactor = hasMildWellOverload
+      ? 0.90
+      : hasSubMildWellOverload
+      ? 0.95
+      : pSpot.mildStreak
+      ? 0.98
+      : 1.0;
     const qual =
       windowScore(pSpot.rf) *
-      deltaScore(minSubDelta) *
+      deltaScore(minSubDelta, sigma) *
       tailFactor *
       subTailPenalty *
       crowdFactor *
@@ -1450,35 +1883,10 @@ export async function optimizePlateTlcSolvents(
     const importanceWeight = hasHighOrMed ? 1.0 : products.length > 0 ? 0.9 : 0.5;
     void topScore;
 
-    const saltPattern = /\.(Cl|Br|I|F)\b|FC\(F\)\(F\)C\(=O\)O|S\(=O\)\(=O\)O|hydrochloride|trifluoroacetate|tosylate|mesylate/i;
-    // A salt shows up as a separate fragment in the SMILES; a sulfonate ester or sulfonamide inside one
-    // molecule is not a counterion.
-    const hasSaltCounterion = validSubs.some(
-      (s) =>
-        (s.smiles.includes('.') && saltPattern.test(s.smiles)) ||
-        saltPattern.test(s.name || '') ||
-        saltPattern.test(s.iupac || '')
-    );
-    const hasAcidAdditive =
-      ext.condition.medium === 'acid' ||
-      pred?.acidBase?.effectiveMedium === 'free_acid' ||
-      (pred?.acidBase?.effectiveMedium === 'buffered' &&
-        /\b(TsOH|TFA|HCl|TfOH|MsOH|AcOH|PPTS|CSA|HCOOH)\b/i.test(ext.condition.additiveName || ''));
-    const hasBaseAdditive =
-      ext.condition.medium === 'base' ||
-      pred?.acidBase?.effectiveMedium === 'basic' ||
-      (pred?.acidBase?.effectiveMedium === 'buffered' &&
-        /\b(DBU|TBD|MTBD|BTMG|K2CO3|Cs2CO3|NaOH|KOH|KOtBu|Et3N|DIPEA)\b/i.test(ext.condition.additiveName || ''));
-    const wellCtx: WellTlcContext = {
-      hasAcidAdditive,
-      hasBaseAdditive,
-      hasSaltCounterion,
-      additiveLabel: ext.condition.additiveName && ext.condition.additiveName !== 'None (Neutral)'
-        ? ext.condition.additiveName
-        : undefined,
-    };
+    const wellCtx = buildWellTlcContext(ext, pred);
 
     const allProfiles = [...subsProfiles.map((s) => s.profile), ...products.map((p) => p.profile)];
+    const hasStrongWellAcid = Boolean(wellCtx.hasAcidAdditive || wellCtx.hasSaltCounterion);
     const needsBasicMod =
       stationaryPhasePref === 'Al2O3_basic' || stationaryPhasePref === 'Al2O3_neutral'
         ? false
@@ -1486,7 +1894,11 @@ export async function optimizePlateTlcSolvents(
             (prof) =>
               prof.aliphAmineCount > 0 ||
               prof.azoleCount >= 3 ||
-              ((hasAcidAdditive || hasSaltCounterion) && (prof.pyridineCount > 0 || prof.azoleCount > 0))
+              (hasStrongWellAcid &&
+                (prof.pyridineCount > 0 ||
+                  (prof.basicAzoleNCount ?? prof.azoleCount) > 0 ||
+                  (prof.anilineCount ?? 0) > 0 ||
+                  (prof.imineCount ?? 0) > 0))
           );
     const needsAcidMod =
       stationaryPhasePref === 'Al2O3_basic' || stationaryPhasePref === 'Al2O3_neutral'
@@ -1509,16 +1921,17 @@ export async function optimizePlateTlcSolvents(
     await yieldIfFrameExceeded();
   }
 
-  // 2. Filter solvent library to requested stationary phase & score across every active well
-  const phaseFilteredLibrary = TLC_SOLVENT_LIBRARY.filter((sys) => {
+  // 2. Compose plate-tailored dynamic candidates alongside core library & score across every active well
+  const phaseFilter = (sys: TlcSolventSystemDef): boolean => {
     if (stationaryPhasePref === 'SiO2') return sys.stationaryPhase === 'SiO2';
     if (stationaryPhasePref === 'C18') return sys.stationaryPhase === 'C18';
     if (stationaryPhasePref === 'Al2O3_neutral' || stationaryPhasePref === 'Al2O3_basic') {
-      // Alumina uses neat normal-phase organic blends without AcOH or NH3/Et3N modifiers
       return sys.stationaryPhase === 'SiO2' && !sys.acidModifier && !sys.baseModifier;
     }
     return true;
-  });
+  };
+
+  const phaseFilteredLibrary = TLC_SOLVENT_LIBRARY.filter(phaseFilter);
 
   const activeWells = activeIndices
     .map((w) => wellDataByIdx.get(w))
@@ -1526,22 +1939,178 @@ export async function optimizePlateTlcSolvents(
 
   const plateNeedsBasicMod = activeWells.some((w) => w.needsBasicMod);
   const plateNeedsAcidMod = activeWells.some((w) => w.needsAcidMod);
+  const hasStrongWellAcid = activeWells.some(
+    (w) => w.wellCtx.acidStrength === 'strong_nonvolatile' && (w.wellCtx.acidLoadEq ?? 0) >= 0.30
+  );
+
+  // Empirical plate descriptor aggregation: aromaticity, HBD, acid stress, and ideal target strengths
+  let totalArom = 0;
+  let totalHbd = 0;
+  let molCount = 0;
+  let maxAcidStress = 0;
+  let maxAcidLabel: string | undefined;
+  const wellBestStrengths: number[] = [];
+
+  for (const w of activeWells) {
+    const allProfs = [...w.substrates.map((s) => s.profile), ...w.products.map((p) => p.profile)];
+    for (const prof of allProfs) {
+      totalArom += prof.aromaticRings;
+      totalHbd += prof.hbd;
+      molCount++;
+      const stress = resolveWellAcidStress(prof, w.wellCtx);
+      if (stress.hasAcidEffect && stress.acidStress > maxAcidStress) {
+        maxAcidStress = stress.acidStress;
+        maxAcidLabel = stress.label;
+      }
+    }
+    // Estimate ideal eluent strength for this well across baseline SiO2 library
+    let wBestSc = -1;
+    let wBestStr = 0.50;
+    for (const cs of phaseFilteredLibrary) {
+      if (cs.stationaryPhase !== 'SiO2') continue;
+      const sc = evaluateWellInSolvent(w, cs, stationaryPhasePref, options.calibration).score;
+      if (sc > wBestSc) {
+        wBestSc = sc;
+        wBestStr = cs.strength;
+      }
+    }
+    wellBestStrengths.push(wBestStr);
+  }
+
+  const meanAromaticRings = molCount > 0 ? Math.round((totalArom / molCount) * 100) / 100 : 0;
+  const meanHbd = molCount > 0 ? Math.round((totalHbd / molCount) * 100) / 100 : 0;
+  const aromaticHeavyPlate = meanAromaticRings >= 1.5;
+
+  wellBestStrengths.sort((a, b) => a - b);
+  const qIdx = (q: number) =>
+    wellBestStrengths.length > 0
+      ? wellBestStrengths[Math.min(wellBestStrengths.length - 1, Math.floor(q * (wellBestStrengths.length - 1)))]
+      : 0.5;
+  const rawTargets = [qIdx(0.15), qIdx(0.5), qIdx(0.85)];
+  const targetStrengths = Array.from(new Set(rawTargets.map((v) => Math.round(v * 20) / 20)));
+  const targetStrengthMin = wellBestStrengths.length > 0 ? wellBestStrengths[0] : 0.25;
+  const targetStrengthMax = wellBestStrengths.length > 0 ? wellBestStrengths[wellBestStrengths.length - 1] : 0.75;
+
+  const coreIds = new Set(phaseFilteredLibrary.map((s) => s.id));
+  const compKey = (c?: {
+    strongSolvent: string;
+    weakSolvent: string;
+    ternaryCoSolvent?: { solvent: string; pct: number };
+    strongPct: number;
+    modifierId: string;
+  }) =>
+    c
+      ? `${c.strongSolvent}:${c.ternaryCoSolvent?.solvent ?? ''}:${c.ternaryCoSolvent?.pct ?? 0}:${c.weakSolvent}:${c.strongPct}:${c.modifierId}`
+      : '';
+  const seenCompKeys = new Set(phaseFilteredLibrary.map((s) => compKey(s.composition)).filter(Boolean));
+
+  const synthInput = {
+    targetStrengths,
+    aromaticHeavyPlate,
+    hasStrongWellAcid,
+    maxAcidStress,
+    needsBasicMod: plateNeedsBasicMod,
+    needsAcidMod: plateNeedsAcidMod,
+  };
+
+  const synthesizedSpecs =
+    stationaryPhasePref === 'C18' ? [] : synthesizePlateTailoredSpecs(synthInput);
+
+  const prismaSpecs =
+    stationaryPhasePref === 'C18' ? [] : generatePrismaTernarySpecs(synthInput);
+
+  const extendedSpecs = generateExtendedDynamicSpecs({
+    hasStrongWellAcid,
+    needsBasicMod: plateNeedsBasicMod,
+    needsAcidMod: plateNeedsAcidMod,
+    aromaticHeavyPlate,
+  });
+
+  const dynamicSystems: TlcSolventSystemDef[] = [];
+  for (const spec of [...synthesizedSpecs, ...prismaSpecs, ...extendedSpecs]) {
+    if (coreIds.has(spec.id)) continue;
+    const ck = `${spec.strongSolvent}:${spec.ternaryCoSolvent?.solvent ?? ''}:${spec.ternaryCoSolvent?.pct ?? 0}:${spec.weakSolvent}:${spec.strongPct}:${spec.modifierId}`;
+    if (seenCompKeys.has(ck)) continue;
+    if (!validateEluentCompatibility(spec, stationaryPhasePref).valid) continue;
+    const composed = composeSolventSystem(spec);
+    if (!phaseFilter(composed)) continue;
+    seenCompKeys.add(ck);
+    dynamicSystems.push(composed);
+  }
+
+  const allCandidateSystems = [...phaseFilteredLibrary, ...dynamicSystems];
 
   const evalMatrix = new Map<string, Map<number, ReturnType<typeof evaluateWellInSolvent>>>();
-  for (const sys of phaseFilteredLibrary) {
+  for (const sys of allCandidateSystems) {
     const m = new Map<number, ReturnType<typeof evaluateWellInSolvent>>();
     for (const w of activeWells) {
-      m.set(w.wellIndex, evaluateWellInSolvent(w, sys, stationaryPhasePref));
+      m.set(w.wellIndex, evaluateWellInSolvent(w, sys, stationaryPhasePref, options.calibration));
     }
     evalMatrix.set(sys.id, m);
     await yieldIfFrameExceeded();
   }
 
-  // 3. Filter candidate search pool by poolMode (unless explicit C18 plate where all systems are reverse-phase), then run exact complementary set cover
-  const searchPool =
+  // 3. Filter candidate search pool by poolMode and enrich with top plate-tailored dynamic candidates
+  const corePool =
     stationaryPhasePref !== 'C18' && poolMode === 'primary_only'
       ? phaseFilteredLibrary.filter((s) => s.preferenceTier === 'primary')
       : phaseFilteredLibrary;
+
+  const eligibleDynamic =
+    stationaryPhasePref !== 'C18' && poolMode === 'primary_only'
+      ? dynamicSystems.filter((s) => s.preferenceTier === 'primary')
+      : dynamicSystems;
+
+  const coreBestByWell = new Map<number, number>();
+  for (const w of activeWells) {
+    let best = 0;
+    for (const cs of corePool) {
+      const sc = evalMatrix.get(cs.id)?.get(w.wellIndex)?.score ?? 0;
+      if (sc > best) best = sc;
+    }
+    coreBestByWell.set(w.wellIndex, best);
+  }
+
+  const rankedDynamic = eligibleDynamic
+    .map((sys) => {
+      const sysMap = evalMatrix.get(sys.id)!;
+      let gainSum = 0;
+      let improvedCount = 0;
+      let totalScore = 0;
+      for (const w of activeWells) {
+        const sc = sysMap.get(w.wellIndex)!.score;
+        totalScore += sc;
+        const coreBest = coreBestByWell.get(w.wellIndex) ?? 0;
+        if (sc > coreBest + 0.015) {
+          improvedCount++;
+          gainSum += sc - coreBest;
+        }
+      }
+      const meanScore = activeWells.length > 0 ? totalScore / activeWells.length : 0;
+      return { sys, improvedCount, gainSum, meanScore };
+    })
+    .filter((d) => d.improvedCount > 0 || d.meanScore >= 0.48 || Boolean(d.sys.isSynthesized && d.meanScore >= 0.42))
+    .sort((a, b) => b.gainSum * 3 + b.meanScore - (a.gainSum * 3 + a.meanScore));
+
+  const maxDynAdd = requestedK >= 4 ? 6 : 8;
+  const pickedDynamic = rankedDynamic.slice(0, maxDynAdd).map((d) => d.sys);
+  let searchPool = [...corePool, ...pickedDynamic];
+
+  // Keep combinatorial search fast when poolMode exposes full library + dynamic specs at K=4
+  if (requestedK >= 4 && searchPool.length > 36 && activeWells.length > 0) {
+    const activePool = searchPool.filter((sys) => {
+      const sysMap = evalMatrix.get(sys.id)!;
+      let maxSc = 0;
+      for (const w of activeWells) {
+        const sc = sysMap.get(w.wellIndex)!.score;
+        if (sc > maxSc) maxSc = sc;
+      }
+      return maxSc >= 0.30;
+    });
+    if (activePool.length >= requestedK) {
+      searchPool = activePool.slice(0, 38);
+    }
+  }
 
   const numActive = activeWells.length;
   const importanceArr = new Float64Array(numActive);
@@ -1724,10 +2293,17 @@ export async function optimizePlateTlcSolvents(
     const full = resolvedCountFor(chosenSystems);
     let weakest = -1;
     let weakestLoss = Infinity;
+    let weakestMean = Infinity;
     for (let i = 0; i < chosenSystems.length; i++) {
+      const sys = chosenSystems[i];
       const loss = full - resolvedCountFor(chosenSystems.filter((_, j) => j !== i));
-      if (loss < weakestLoss) {
+      const sMap = evalMatrix.get(sys.id)!;
+      let scSum = 0;
+      for (const w of activeWells) scSum += sMap.get(w.wellIndex)!.score;
+      const meanSc = activeWells.length > 0 ? scSum / activeWells.length : 0;
+      if (loss < weakestLoss || (loss === weakestLoss && meanSc < weakestMean)) {
         weakestLoss = loss;
+        weakestMean = meanSc;
         weakest = i;
       }
     }
@@ -1776,7 +2352,7 @@ export async function optimizePlateTlcSolvents(
     const kind = baseKind(rec.system);
     if (!kind || rec.assignedWellIndices.length === 0) continue;
     const need = Math.ceil(rec.assignedWellIndices.length * 0.9);
-    const alts = phaseFilteredLibrary
+    const alts = allCandidateSystems
       .filter((c) => c.stationaryPhase === rec.system.stationaryPhase && !recIds.has(c.id))
       .filter((c) => {
         const k = baseKind(c);
@@ -1791,10 +2367,11 @@ export async function optimizePlateTlcSolvents(
     if (alts.length > 0) rec.alternatives = alts.slice(0, 1).map((x) => x.c);
   }
 
-  // Ensure every system in this stationary phase not in final recommendedSystems is still available for plate simulation & inspection
+  // Expose every core system in this stationary phase plus high-performing dynamic candidates for plate inspection
   const chosenFinalIds = new Set(recommendedSystems.map((r) => r.system.id));
   const emptyOwnerMap = new Map<number, string>();
-  const otherSystems = phaseFilteredLibrary
+  const exposedSystems = [...phaseFilteredLibrary, ...pickedDynamic];
+  const otherSystems = exposedSystems
     .filter((sys) => !chosenFinalIds.has(sys.id))
     .map((sys) =>
       buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, emptyOwnerMap)
@@ -1884,12 +2461,328 @@ export async function optimizePlateTlcSolvents(
   } else if (hasEt3n) {
     summaryNotes.push('Includes 1% Et₃N mobile phase to release basic amines/azoles from baseline.');
   }
+  const hasStrongAcidBasicWells = activeWells.some(
+    (w) =>
+      w.needsBasicMod &&
+      w.wellCtx.acidStrength === 'strong_nonvolatile' &&
+      (w.wellCtx.acidLoadEq ?? 0) >= 0.35
+  );
+  if (hasStrongAcidBasicWells && stationaryPhasePref !== 'Al2O3_basic') {
+    summaryNotes.push(
+      'Strong non-volatile acid (e.g. TsOH) wells protonate basic N-heterocycles/anilines into tosylate salts; 1% Et₃N (~72 mM) may be overwhelmed by acid + silica Si–OH — prefer 2M NH₃/MeOH, Basic Al₂O₃, or pre-neutralize aliquots.'
+    );
+  }
   if (stationaryPhasePref === 'auto' && recommendedSystems.some((s) => s.system.stationaryPhase === 'C18')) {
     summaryNotes.push('Includes C18 Reverse-Phase TLC to rescue ultra-polar/ionizable wells orthogonal to SiO₂.');
   }
   if (recommendedSystems.some((s) => s.system.acidModifier && s.system.stationaryPhase === 'SiO2')) {
     summaryNotes.push('Includes 1% AcOH mobile phase to sharpen carboxylic acid spots.');
   }
+
+  if (recommendedSystems.some((s) => s.system.family === 'prisma_ternary')) {
+    summaryNotes.push('Includes Nyiredy PRISMA ternary eluent to break co-eluting regioisomer/HBA overlaps.');
+  }
+
+  const primaryPhaseKey: TlcStationaryPhasePreference =
+    stationaryPhasePref === 'C18'
+      ? 'C18'
+      : stationaryPhasePref === 'Al2O3_neutral'
+      ? 'Al2O3_neutral'
+      : stationaryPhasePref === 'Al2O3_basic'
+      ? 'Al2O3_basic'
+      : 'SiO2';
+  const activePhaseFit = options.calibration?.byPhase[primaryPhaseKey];
+  const matchedPhasePlates = (options.calibration?.plates || []).filter(
+    (p) => p.stationaryPhase === primaryPhaseKey && (p.pairedCount > 0 || (p.frontCensoredCount ?? 0) > 0 || (p.baselineCensoredCount ?? 0) > 0)
+  );
+  const totalEvidence =
+    (activePhaseFit?.pairedSpotCount ?? 0) +
+    (activePhaseFit?.frontCensoredCount ?? 0) +
+    (activePhaseFit?.baselineCensoredCount ?? 0);
+  const calibrationApplied: CalibrationAppliedSummary | undefined =
+    activePhaseFit && totalEvidence > 0
+      ? {
+          active: true,
+          stationaryPhase: primaryPhaseKey,
+          pairedSpotCount: activePhaseFit.pairedSpotCount,
+          matchedLaneCount: activePhaseFit.matchedLaneCount,
+          matchedPlateCount: matchedPhasePlates.length,
+          frontCensoredCount: activePhaseFit.frontCensoredCount ?? 0,
+          baselineCensoredCount: activePhaseFit.baselineCensoredCount ?? 0,
+          globalDemandShift: activePhaseFit.globalDemandShift,
+          demandSlope: activePhaseFit.demandSlope ?? 1.0,
+          hasFeatureWeights: Boolean(activePhaseFit.featureWeights),
+          midplateRfShift: activePhaseFit.midplateRfShift,
+          calibratedSigma: activePhaseFit.calibratedSigma,
+          rmseBefore: activePhaseFit.rmseBefore,
+          rmseAfter: activePhaseFit.rmseAfter,
+        }
+      : undefined;
+
+  if (calibrationApplied) {
+    const dir = calibrationApplied.midplateRfShift >= 0 ? '+' : '';
+    const censNote =
+      (calibrationApplied.frontCensoredCount ?? 0) + (calibrationApplied.baselineCensoredCount ?? 0) > 0
+        ? ` + ${(calibrationApplied.frontCensoredCount ?? 0)} front / ${(calibrationApplied.baselineCensoredCount ?? 0)} baseline bounds`
+        : '';
+    const ridgeNote = calibrationApplied.hasFeatureWeights ? ' · L2 Ridge descriptor weights' : '';
+    summaryNotes.push(
+      `Self-calibrated (${primaryPhaseKey}) from ${calibrationApplied.matchedPlateCount} measured plate${calibrationApplied.matchedPlateCount > 1 ? 's' : ''} (${calibrationApplied.pairedSpotCount} paired spots${censNote} · mid-plate Rf shift ${dir}${calibrationApplied.midplateRfShift.toFixed(2)}${ridgeNote} · RMSE ±${calibrationApplied.rmseBefore.toFixed(2)} → ±${calibrationApplied.rmseAfter.toFixed(2)}).`
+    );
+  }
+
+  // 5. Follow-up / Rescue Solvent Recommender driven directly by already-measured plate outcomes
+  let followUpPlan: PlateFollowUpPlan | undefined;
+  const relevantMeasuredPlates = (options.calibration?.plates || []).filter(
+    (p) =>
+      p.plateIndex === plateIndex &&
+      (stationaryPhasePref === 'auto' ? true : p.stationaryPhase === primaryPhaseKey)
+  );
+
+  if (relevantMeasuredPlates.length > 0 && activeWells.length > 0) {
+    const testedSystemIds = new Set(relevantMeasuredPlates.map((p) => p.matchedSystemId));
+    const frontCeilingByWell = new Map<number, number>(); // weakest strength that still caused front saturation
+    const baseFloorByWell = new Map<number, number>(); // strongest unmodified strength that remained baseline-pinned
+    const measuredResolvedWells = new Set<number>();
+    const frontCrowdedSet = new Set<number>();
+    const baselinePinnedSet = new Set<number>();
+    const coelutedSet = new Set<number>();
+    const beforeRfValuesByWell = new Map<number, number[]>();
+
+    for (const w of activeWells) {
+      const wi = w.wellIndex;
+      let resolvedOnAny = false;
+      let sawFront = false;
+      let sawBaseline = false;
+      let sawCoelution = false;
+      const rfVals: number[] = [];
+
+      for (const mp of relevantMeasuredPlates) {
+        const lane = mp.lanes?.[wi];
+        const sysDef =
+          allCandidateSystems.find((s) => s.id === mp.matchedSystemId) ||
+          findSolventSystemById(mp.matchedSystemId);
+        if (!lane || lane.isBlank || !sysDef) continue;
+
+        const hasFrontPred = lane.predictedSpots.some(
+          (p) => p.boundaryStatus === 'front_saturated' || p.rfAfter >= 0.85
+        );
+        const hasFrontMeas = lane.measuredSpots.some((m) => m.rf >= 0.86);
+        const isFrontPlate =
+          hasFrontPred ||
+          hasFrontMeas ||
+          (Boolean(lane.frontOccupied) && lane.predictedSpots.some((p) => p.rfAfter >= 0.72));
+
+        const hasBasePred = lane.predictedSpots.some(
+          (p) => p.boundaryStatus === 'baseline_pinned' || p.rfAfter <= 0.08
+        );
+        const hasBaseMeas = lane.measuredSpots.some((m) => m.rf <= 0.07);
+        const isBasePlate =
+          hasBasePred ||
+          hasBaseMeas ||
+          (Boolean(lane.originOccupied) && lane.predictedSpots.some((p) => p.rfAfter <= 0.25));
+
+        for (const p of lane.predictedSpots) {
+          rfVals.push(p.boundaryStatus === 'front_saturated' ? 0.95 : p.boundaryStatus === 'baseline_pinned' ? 0.04 : p.rfAfter);
+        }
+
+        if (isFrontPlate) {
+          sawFront = true;
+          const prevC = frontCeilingByWell.get(wi);
+          if (prevC === undefined || sysDef.strength < prevC) frontCeilingByWell.set(wi, sysDef.strength);
+        }
+        if (isBasePlate) {
+          sawBaseline = true;
+          const prevF = baseFloorByWell.get(wi);
+          if (prevF === undefined || sysDef.strength > prevF) baseFloorByWell.set(wi, sysDef.strength);
+        }
+
+        // Did this measured plate cleanly resolve a product vs SM inside 0.10..0.85?
+        const interiorMeas = lane.measuredSpots.filter((m) => m.rf >= 0.10 && m.rf <= 0.86);
+        const interiorFoundProd = lane.predictedSpots.some(
+          (p) => p.kind === 'product' && p.found && p.rfAfter >= 0.12 && p.rfAfter <= 0.85
+        );
+        const modelOkHere = (evalMatrix.get(sysDef.id)?.get(wi)?.score ?? 0) >= 0.55;
+        if (
+          !isFrontPlate &&
+          !isBasePlate &&
+          ((interiorFoundProd && interiorMeas.length >= 2) || (modelOkHere && interiorMeas.length >= 1))
+        ) {
+          resolvedOnAny = true;
+        } else if (!isFrontPlate && !isBasePlate && lane.measuredSpots.length > 0) {
+          sawCoelution = true;
+        }
+      }
+
+      if (rfVals.length > 0) beforeRfValuesByWell.set(wi, rfVals);
+      if (resolvedOnAny) {
+        measuredResolvedWells.add(wi);
+      } else {
+        if (sawFront) frontCrowdedSet.add(wi);
+        if (sawBaseline) baselinePinnedSet.add(wi);
+        if (!sawFront && !sawBaseline && (sawCoelution || rfVals.length > 0)) coelutedSet.add(wi);
+      }
+    }
+
+    const unresolvedTargets = activeWells
+      .map((w) => w.wellIndex)
+      .filter((wi) => frontCrowdedSet.has(wi) || baselinePinnedSet.has(wi) || coelutedSet.has(wi));
+
+    const recommendations: FollowUpSolventOption[] = [];
+    if (unresolvedTargets.length > 0) {
+      const remaining = new Set<number>(unresolvedTargets);
+      const pickedIds = new Set<string>();
+      const maxFollowUps = Math.min(3, requestedK);
+
+      for (let step = 0; step < maxFollowUps && remaining.size > 0; step++) {
+        let bestOpt: FollowUpSolventOption | null = null;
+        let bestGain = 0;
+
+        for (const sys of searchPool) {
+          if (testedSystemIds.has(sys.id) || pickedIds.has(sys.id)) continue;
+          const sysMap = evalMatrix.get(sys.id);
+          if (!sysMap) continue;
+
+          const rescued: number[] = [];
+          let rFront = 0;
+          let rBase = 0;
+          let rCoel = 0;
+          let weightedGain = 0;
+          const beforeRfs: number[] = [];
+          const afterRfs: number[] = [];
+
+          for (const wi of remaining) {
+            // Respect empirical boundary exclusions from failed measured plates
+            const fCeil = frontCeilingByWell.get(wi);
+            if (frontCrowdedSet.has(wi) && fCeil !== undefined && sys.stationaryPhase === 'SiO2' && sys.strength >= fCeil - 0.025) {
+              continue;
+            }
+            const bFloor = baseFloorByWell.get(wi);
+            if (baselinePinnedSet.has(wi) && bFloor !== undefined && sys.stationaryPhase === 'SiO2' && sys.strength <= bFloor + 0.025 && !sys.baseModifier && !sys.acidModifier) {
+              continue;
+            }
+
+            const evalRes = sysMap.get(wi);
+            if (!evalRes || evalRes.score < 0.55) continue;
+
+            // Ensure spots in this candidate follow-up solvent actually sit inside 0.12..0.84 (not re-saturating!)
+            const prodSpotsHere = evalRes.spots.filter((sp) => sp.kind === 'product');
+            const anyInWindow =
+              prodSpotsHere.length > 0
+                ? prodSpotsHere.some((sp) => sp.rf >= 0.12 && sp.rf <= 0.84)
+                : evalRes.spots.some((sp) => sp.rf >= 0.12 && sp.rf <= 0.84);
+            if (!anyInWindow) continue;
+
+            rescued.push(wi);
+            if (frontCrowdedSet.has(wi)) rFront++;
+            else if (baselinePinnedSet.has(wi)) rBase++;
+            else rCoel++;
+
+            weightedGain += evalRes.score;
+            const prevRfs = beforeRfValuesByWell.get(wi);
+            if (prevRfs) beforeRfs.push(...prevRfs);
+            for (const sp of evalRes.spots) afterRfs.push(sp.rf);
+          }
+
+          if (rescued.length === 0) continue;
+          const tierBonus = sys.preferenceTier === 'primary' ? 0.25 : 0;
+          const scoreRank = weightedGain + tierBonus;
+          if (scoreRank > bestGain) {
+            bestGain = scoreRank;
+            const bMin = beforeRfs.length > 0 ? Math.min(...beforeRfs) : null;
+            const bMax = beforeRfs.length > 0 ? Math.max(...beforeRfs) : null;
+            const aMin = afterRfs.length > 0 ? Math.min(...afterRfs) : null;
+            const aMax = afterRfs.length > 0 ? Math.max(...afterRfs) : null;
+            const parts: string[] = [];
+            if (rFront > 0) parts.push(`${rFront} front-crowded`);
+            if (rBase > 0) parts.push(`${rBase} baseline-pinned`);
+            if (rCoel > 0) parts.push(`${rCoel} unresolved`);
+            const rangeTxt =
+              bMin !== null && bMax !== null && aMin !== null && aMax !== null
+                ? ` · moves predicted spots from Rf ${bMin.toFixed(2)}–${bMax.toFixed(2)} → ${aMin.toFixed(2)}–${aMax.toFixed(2)}`
+                : '';
+            bestOpt = {
+              system: sys,
+              rescuedWellIndices: rescued,
+              rescuedWellCoords: rescued.map((idx) => wellLabel(idx)),
+              rescuedFrontCount: rFront,
+              rescuedBaselineCount: rBase,
+              rescuedCoelutedCount: rCoel,
+              beforeRfRange: bMin !== null && bMax !== null ? [bMin, bMax] : null,
+              afterRfRange: aMin !== null && aMax !== null ? [aMin, aMax] : null,
+              reason: `Rescues ${rescued.length} well${rescued.length > 1 ? 's' : ''} (${parts.join(', ')})${rangeTxt}`,
+            };
+          }
+        }
+
+        if (!bestOpt) break;
+        recommendations.push(bestOpt);
+        pickedIds.add(bestOpt.system.id);
+        for (const wi of bestOpt.rescuedWellIndices) remaining.delete(wi);
+      }
+    }
+
+    followUpPlan = {
+      plateIndex,
+      summary: {
+        measuredWellCount: activeWells.length,
+        resolvedWellCount: measuredResolvedWells.size,
+        frontCrowdedWells: Array.from(frontCrowdedSet).sort((a, b) => a - b),
+        baselinePinnedWells: Array.from(baselinePinnedSet).sort((a, b) => a - b),
+        coelutedWells: Array.from(coelutedSet).sort((a, b) => a - b),
+      },
+      recommendations,
+    };
+  }
+
+  // Compute empirical plate diagnostics summary so UI can transparently surface how solvent physics scored
+  const tolueneEvaluated = allCandidateSystems
+    .filter((s) => (s.descriptors?.aromaticMix ?? 0) >= 0.25)
+    .map((s) => {
+      const sysMap = evalMatrix.get(s.id);
+      let sSum = 0;
+      let res = 0;
+      for (const w of activeWells) {
+        const sc = sysMap?.get(w.wellIndex)?.score ?? 0;
+        sSum += sc;
+        if (sc >= 0.55) res++;
+      }
+      const meanScore = activeWells.length > 0 ? Math.round((sSum / activeWells.length) * 100) / 100 : 0;
+      const coveragePct = activeWells.length > 0 ? Math.round((res / activeWells.length) * 100) : 0;
+      return {
+        id: s.id,
+        name: s.name,
+        meanScore,
+        coveragePct,
+        aromaticMix: s.descriptors?.aromaticMix ?? 0,
+      };
+    })
+    .sort((a, b) => (b.coveragePct !== a.coveragePct ? b.coveragePct - a.coveragePct : b.meanScore - a.meanScore));
+
+  const topTol = tolueneEvaluated[0];
+  const bestRecMean =
+    recommendedSystems.length > 0
+      ? Math.max(...recommendedSystems.map((r) => r.meanResolutionScore))
+      : 0;
+  const empiricalProfile: EmpiricalPlateProfile = {
+    targetStrengthMin: Math.round(targetStrengthMin * 100) / 100,
+    targetStrengthMax: Math.round(targetStrengthMax * 100) / 100,
+    meanAromaticRings,
+    meanHbd,
+    maxAcidStress: Math.round(maxAcidStress * 100) / 100,
+    acidLabel: maxAcidLabel,
+    recommendedMinBaseCap: hasStrongWellAcid && maxAcidStress >= 0.90 ? 1.35 : hasStrongWellAcid || plateNeedsBasicMod ? 0.95 : 0,
+    tolueneRecommended: Boolean(
+      aromaticHeavyPlate &&
+        topTol &&
+        topTol.coveragePct >= totalCoveragePct - 2 &&
+        topTol.meanScore >= bestRecMean - 0.01
+    ),
+    topTolueneCandidate: topTol,
+    synthesizedCandidateCount: dynamicSystems.filter((s) => s.isSynthesized).length,
+    synthesizedInTopSetCount: recommendedSystems.filter((r) => r.system.isSynthesized).length,
+    prismaCandidateCount: dynamicSystems.filter((s) => s.family === 'prisma_ternary').length,
+  };
 
   return {
     plateIndex,
@@ -1904,5 +2797,8 @@ export async function optimizePlateTlcSolvents(
     otherGroups,
     wellPredictions,
     summaryNotes,
+    calibrationApplied,
+    followUpPlan,
+    empiricalProfile,
   };
 }

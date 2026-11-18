@@ -8,7 +8,9 @@ import {
   TlcProfileOptions,
   TlcDensitogramData,
   TlcSet,
+  ProfileHistogramStats,
 } from '../types';
+export type { ProfileHistogramStats };
 import { parseDelimited } from './importers/tableReader';
 import { csvText } from './exporters/csv';
 import { getTlcPlateSlice } from './tlcPlateSlice';
@@ -349,12 +351,254 @@ export interface FrontDetectionResult {
 }
 
 const MIN_FRONT_SNR = 4.5;
+const RIDGE_ONLY_FACTOR = 0.75;
+
+/**
+ * Computes a 256-bin grayscale intensity histogram over interior regions of one or more TLC
+ * profiles (ideal for uniform Merck TLC Explorer illumination). Measures the clean silica
+ * background mode, one-sided quiet background noise sigma (uncontaminated by spots), usable
+ * contrast span, highlight/shadow clipping fractions, and bimodal Otsu wet-vs-dry separation.
+ */
+export function analyzeProfileHistogram(
+  profiles: number[][],
+  sign: number = -1,
+  loFrac: number = 0.06,
+  hiFrac: number = 0.94
+): ProfileHistogramStats {
+  const bins = new Uint32Array(256);
+  let total = 0;
+
+  for (const p of profiles) {
+    const len = p?.length || 0;
+    if (len < 6) continue;
+    const s = Math.max(0, Math.floor(len * loFrac));
+    const e = Math.min(len, Math.ceil(len * hiFrac));
+    for (let i = s; i < e; i++) {
+      const v = Math.max(0, Math.min(255, Math.round(p[i])));
+      bins[v]++;
+      total++;
+    }
+  }
+
+  if (total < 8) {
+    return {
+      bgMode: sign < 0 ? 200 : 20,
+      bgSigma: 2.0,
+      contrastSpan: 100,
+      sigTail: sign < 0 ? 100 : 120,
+      clipLowFrac: 0,
+      clipHighFrac: 0,
+      otsuThresh: 0,
+      otsuEta: 0,
+      sampleCount: total,
+    };
+  }
+
+  const clipLowFrac = (bins[0] + bins[1] + bins[2]) / total;
+  const clipHighFrac = (bins[253] + bins[254] + bins[255]) / total;
+
+  const cdfAt = (q: number): number => {
+    const target = Math.max(1, Math.min(total, Math.round(q * total)));
+    let acc = 0;
+    for (let v = 0; v < 256; v++) {
+      acc += bins[v];
+      if (acc >= target) return v;
+    }
+    return 255;
+  };
+
+  // 5-bin triangular smoothing prevents single-bin quantization spikes from shifting the mode
+  const sm = new Float64Array(256);
+  const wKer = [1, 2, 3, 2, 1];
+  for (let v = 0; v < 256; v++) {
+    let ws = 0;
+    let wt = 0;
+    for (let k = -2; k <= 2; k++) {
+      const idx = v + k;
+      if (idx >= 0 && idx < 256) {
+        const w = wKer[k + 2];
+        ws += bins[idx] * w;
+        wt += w;
+      }
+    }
+    sm[v] = wt > 0 ? ws / wt : 0;
+  }
+
+  const p02 = cdfAt(0.02);
+  const p30 = cdfAt(0.30);
+  const p70 = cdfAt(0.70);
+  const p98 = cdfAt(0.98);
+
+  // Locate clean silica background mode on the background-dominant quantile band
+  const mLo = sign < 0 ? Math.max(4, p30) : Math.max(3, p02);
+  const mHi = sign < 0 ? Math.min(252, p98) : Math.min(251, p70);
+  let bgMode = sign < 0 ? p70 : p30;
+  let maxPeak = -1;
+  for (let v = mLo; v <= mHi; v++) {
+    if (sm[v] > maxPeak) {
+      maxPeak = sm[v];
+      bgMode = v;
+    }
+  }
+  if (maxPeak <= 0) {
+    for (let v = 0; v < 256; v++) {
+      if (sm[v] > maxPeak) {
+        maxPeak = sm[v];
+        bgMode = v;
+      }
+    }
+  }
+
+  // Estimate silica noise sigma strictly on the non-spot (quiet) side of bgMode within ±16 bins
+  // so spots, smears, and distant wet/dry shifts do not inflate background noise.
+  let quietCount = 0;
+  if (sign < 0) {
+    const qHi = Math.min(253, bgMode + 16);
+    for (let v = bgMode; v <= qHi; v++) quietCount += bins[v];
+  } else {
+    const qLo = Math.max(2, bgMode - 16);
+    for (let v = qLo; v <= bgMode; v++) quietCount += bins[v];
+  }
+
+  let bgSigma = 1.5;
+  if (quietCount >= 6) {
+    const target = 0.6827 * quietCount;
+    let acc = 0;
+    let prevAcc = 0;
+    let foundD = 0;
+    for (let d = 0; d <= 16; d++) {
+      const v = sign < 0 ? bgMode + d : bgMode - d;
+      if (v < 2 || v > 253) break;
+      prevAcc = acc;
+      acc += bins[v];
+      if (acc >= target) {
+        const binW = Math.max(1, bins[v]);
+        const frac = (target - prevAcc) / binW;
+        foundD = d === 0 ? frac : d - 0.5 + frac;
+        break;
+      }
+      foundD = d;
+    }
+    bgSigma = Math.max(0.4, Math.min(20.0, foundD));
+  } else {
+    // Fallback symmetric local MAD around bgMode when clipped at 0 or 255
+    let symCount = 0;
+    for (let d = 0; d <= 16; d++) {
+      const vL = bgMode - d;
+      const vR = bgMode + d;
+      if (vL >= 0) symCount += bins[vL];
+      if (d > 0 && vR <= 255) symCount += bins[vR];
+    }
+    if (symCount >= 6) {
+      const target = 0.6827 * symCount;
+      let acc = 0;
+      let foundD = 0.8;
+      for (let d = 0; d <= 16; d++) {
+        if (d === 0) acc += bins[bgMode];
+        else {
+          if (bgMode - d >= 0) acc += bins[bgMode - d];
+          if (bgMode + d <= 255) acc += bins[bgMode + d];
+        }
+        if (acc >= target) {
+          foundD = Math.max(0.4, d);
+          break;
+        }
+      }
+      bgSigma = Math.min(20.0, foundD);
+    }
+  }
+
+  const sigTail = sign < 0 ? p02 : p98;
+  const contrastSpan = Math.max(0, sign < 0 ? bgMode - sigTail : sigTail - bgMode);
+
+  // 1D Otsu between-class variance split (bimodality strength eta in [0, 1])
+  let sumAll = 0;
+  let sumSqAll = 0;
+  for (let v = 0; v < 256; v++) {
+    sumAll += v * bins[v];
+    sumSqAll += v * v * bins[v];
+  }
+  const meanAll = sumAll / total;
+  const totalVar = Math.max(0, sumSqAll / total - meanAll * meanAll);
+
+  let wB = 0;
+  let sumB = 0;
+  let maxBetween = 0;
+  let otsuThresh = Math.round(meanAll);
+  for (let t = 0; t < 255; t++) {
+    wB += bins[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * bins[t];
+    const mB = sumB / wB;
+    const mF = (sumAll - sumB) / wF;
+    const between = (wB / total) * (wF / total) * (mB - mF) * (mB - mF);
+    if (between > maxBetween) {
+      maxBetween = between;
+      otsuThresh = t;
+    }
+  }
+  const otsuEta = totalVar > 1e-6 ? Math.min(1, maxBetween / totalVar) : 0;
+
+  return {
+    bgMode,
+    bgSigma,
+    contrastSpan,
+    sigTail,
+    clipLowFrac,
+    clipHighFrac,
+    otsuThresh,
+    otsuEta,
+    sampleCount: total,
+  };
+}
+
+/**
+ * Returns cached interior channel histogram statistics across all lanes of a TLC set.
+ */
+export function getChannelHistogram(
+  set: TlcSet,
+  key: TlcChannelKey,
+  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): ProfileHistogramStats | undefined {
+  if (!set.cfg?.lanes?.length || !set.imgs?.[key]) return undefined;
+  const sig = autoCacheSignature(set);
+  if ((set as any)._autoCacheSig !== sig) {
+    set.frontAuto = {};
+    set.originAuto = {};
+    set.originAutoByLane = {};
+    set.autoConf = {};
+    (set as any)._histCache = {};
+    (set as any)._autoCacheSig = sig;
+  }
+  const cache: Record<string, ProfileHistogramStats> = ((set as any)._histCache =
+    (set as any)._histCache || {});
+  if (cache[key]) return cache[key];
+
+  const profiles = set.cfg.lanes
+    .map((l) => getProfile(set, key, l))
+    .filter((p) => p && p.length >= 10);
+  if (!profiles.length) return undefined;
+
+  const stats = analyzeProfileHistogram(profiles, TLC_SIGNAL[key]?.sign ?? -1, 0.06, 0.94);
+  cache[key] = stats;
+  return stats;
+}
 
 // Detect solvent front from thin meniscus line (sharp local ridge) and/or persistent wet-vs-dry background step
 // across 50%-96% of the lane. Returns { pos: 0, score: 0 } when no reliable front signal is found.
-export function detectFrontDetailed(profile: number[], sign: number = 1): FrontDetectionResult {
+export function detectFrontDetailed(
+  profile: number[],
+  sign: number = 1,
+  hist?: ProfileHistogramStats
+): FrontDetectionResult {
   const n = profile.length;
   if (n < 20) return { pos: 0, score: 0 };
+
+  const h = hist ?? analyzeProfileHistogram([profile], sign, 0.10, 0.95);
+  const minStepAmp = h.sampleCount >= 16 ? Math.max(0.8, Math.min(1.5, 1.4 * h.bgSigma)) : 1.5;
+  const minFeatFloor = h.sampleCount >= 16 ? Math.max(2.2, Math.min(5.0, 3.2 * h.bgSigma)) : 5.0;
 
   const s = movingAvg(profile, 3);
   const lo = Math.max(4, Math.floor(n * 0.50));
@@ -380,12 +624,14 @@ export function detectFrontDetailed(profile: number[], sign: number = 1): FrontD
     d2Arr[d2Count++] = Math.abs(s[i + 1] - 2 * s[i] + s[i - 1]);
   }
   // For 3-pt moving avg s, std(s[i+1] - 2s[i] + s[i-1]) = (2 / sqrt(3)) * sigma_s
-  const sigmaS = Math.max(0.8, 1.4826 * medianSortedBuf(d2Arr, d2Count) * 0.866);
+  const sigmaMin = h.sampleCount >= 16 ? Math.max(0.5, Math.min(0.8, h.bgSigma)) : 0.8;
+  const sigmaS = Math.max(sigmaMin, 1.4826 * medianSortedBuf(d2Arr, d2Count) * 0.866);
 
   const buf = new Float64Array(36);
   const feats = new Float64Array(count);
   let bestIdx = lo;
   let bestFeat = 0;
+  let bestRank = 0;
   // Wet->dry background step moves brighter (+1) in UV254/White (sign=-1) and darker (-1) in UV366 (sign=+1)
   const dirSign = -Math.sign(sign || 1);
 
@@ -446,7 +692,11 @@ export function detectFrontDetailed(profile: number[], sign: number = 1): FrontD
 
     const feat = ridgeAmp + 0.65 * stepAmp;
     feats[i - lo] = feat;
-    if (feat > bestFeat) {
+    // A pencil line (or ink/scratch) is a thin ridge with no wet-vs-dry background change across it;
+    // the real front has both. Down-weight ridge-only candidates when ranking against step-backed fronts.
+    const rank = stepAmp >= minStepAmp ? feat : feat * RIDGE_ONLY_FACTOR;
+    if (rank > bestRank) {
+      bestRank = rank;
       bestFeat = feat;
       bestIdx = i;
     }
@@ -457,9 +707,9 @@ export function detectFrontDetailed(profile: number[], sign: number = 1): FrontD
   for (let j = 0; j < count; j++) featsSorted[j] = Math.abs(feats[j] - medFeat);
   const madFeat = 1.4826 * medianSortedBuf(featsSorted, count);
 
-  const noiseFloor = Math.max(sigmaS, madFeat, 1.6);
+  const noiseFloor = Math.max(sigmaS, madFeat, Math.min(1.6, Math.max(0.5, h.bgSigma)));
   const snr = bestFeat / noiseFloor;
-  if (snr < MIN_FRONT_SNR || bestFeat < 5.0) {
+  if (snr < MIN_FRONT_SNR || bestFeat < minFeatFloor) {
     return { pos: 0, score: 0 };
   }
   return { pos: bestIdx, score: snr };
@@ -595,7 +845,9 @@ interface OriginCandidate extends FrontDetectionResult {
 function detectOriginCandidates(
   profile: number[],
   sign: number = -1,
-  maxPeaks: number = 3
+  maxPeaks: number = 3,
+  relaxed: boolean = false,
+  histBgSigma?: number
 ): OriginCandidate[] {
   const n = profile.length;
   if (n < 20) return [];
@@ -643,12 +895,21 @@ function detectOriginCandidates(
   const medFeat = medianSortedBuf(featsSorted, count);
   for (let j = 0; j < count; j++) featsSorted[j] = Math.abs(feats[j] - medFeat);
   const madFeat = 1.4826 * medianSortedBuf(featsSorted, count);
-  const noiseFloor = Math.max(sigmaS, madFeat, 1.0);
+  const noiseFloor = Math.max(sigmaS, madFeat, histBgSigma != null ? Math.min(1.0, Math.max(0.55, histBgSigma)) : 1.0);
+
+  const minCandFeat = relaxed
+    ? histBgSigma != null
+      ? Math.max(1.2, Math.min(1.8, 2.0 * histBgSigma))
+      : 1.6
+    : histBgSigma != null
+    ? Math.max(1.8, Math.min(3.5, 2.4 * histBgSigma))
+    : 3.0;
+  const minCandSnr = relaxed ? 2.2 : MIN_ORIGIN_SNR;
 
   const localPeaks: Array<{ idx: number; feat: number }> = [];
   for (let i = lo; i <= hi; i++) {
     const f = feats[i - lo];
-    if (f < 3.0 || f / noiseFloor < MIN_ORIGIN_SNR) continue;
+    if (f < minCandFeat || f / noiseFloor < minCandSnr) continue;
     const prev = i > lo ? feats[i - 1 - lo] : 0;
     const next = i < hi ? feats[i + 1 - lo] : 0;
     if (f >= prev && f >= next) {
@@ -671,8 +932,13 @@ function detectOriginCandidates(
 
 // Detect spot origin from compact deposit peak in lower 3%-25% of the lane with bilateral silica contrast,
 // rejecting monotonic dark plate borders and empty-lane noise.
-export function detectOriginDetailed(profile: number[], sign: number = -1): FrontDetectionResult {
-  const best = detectOriginCandidates(profile, sign, 1)[0];
+export function detectOriginDetailed(
+  profile: number[],
+  sign: number = -1,
+  hist?: ProfileHistogramStats
+): FrontDetectionResult {
+  const h = hist ?? analyzeProfileHistogram([profile], sign, 0.06, 0.90);
+  const best = detectOriginCandidates(profile, sign, 1, false, h.sampleCount >= 16 ? h.bgSigma : undefined)[0];
   return best ? { pos: best.pos, score: best.score } : { pos: 0, score: 0 };
 }
 
@@ -683,20 +949,143 @@ export function detectOrigin(profile: number[], sign: number = -1): number {
 
 export const tlcHalf = (lane: TlcLane): number => (lane.id < 27 ? 0 : 1);
 
-// Find spots in a lane profile using rolling percentile baseline subtraction and chromatographic prominence consolidation
+export interface LaneBoundaryOccupancy {
+  originOccupied: boolean;
+  frontOccupied: boolean;
+  originExcess: number; // 0..1 normalized excess above plate baseline
+  frontExcess: number; // 0..1 normalized excess above plate meniscus
+}
+
+/**
+ * Compares each lane's origin zone (Rf -0.01..0.055) and solvent-front zone (Rf 0.91..1.01)
+ * against the quietest 25% of lanes on the same plate so compounds that sit on the baseline
+ * or co-migrate into the solvent front are accounted for without mistaking uniform plate borders for spots.
+ */
+export function analyzeLaneBoundaryOccupancy(
+  laneProfiles: Array<{ laneId: number; profile: number[]; origin: number; front: number; sign: number }>
+): Map<number, LaneBoundaryOccupancy> {
+  const out = new Map<number, LaneBoundaryOccupancy>();
+  if (laneProfiles.length === 0) return out;
+
+  interface RawBoundaryStat {
+    laneId: number;
+    originSig: number;
+    frontSig: number;
+    dynRange: number;
+  }
+  const stats: RawBoundaryStat[] = [];
+
+  for (const item of laneProfiles) {
+    const prof = item.profile;
+    const n = prof.length;
+    const span = item.front - item.origin;
+    if (n < 20 || span < 20) continue;
+
+    // Reference interior silica background (median of upper/lower quartiles in Rf 0.15..0.85)
+    const intLo = Math.max(0, Math.round(item.origin + 0.12 * span));
+    const intHi = Math.min(n - 1, Math.round(item.origin + 0.88 * span));
+    const interior = prof.slice(intLo, intHi + 1);
+    if (interior.length < 10) continue;
+    const bgLevel = pctile(interior, item.sign < 0 ? 0.85 : 0.15);
+    const quietSpan = Math.max(12, Math.abs(pctile(interior, 0.95) - pctile(interior, 0.05)));
+
+    // Origin core window: [-0.015 .. +0.055] Rf
+    const oStart = Math.max(0, Math.round(item.origin - Math.max(3, 0.015 * span)));
+    const oEnd = Math.min(n - 1, Math.round(item.origin + Math.max(5, 0.055 * span)));
+    let originPeak = 0;
+    for (let i = oStart; i <= oEnd; i++) {
+      const val = item.sign < 0 ? bgLevel - prof[i] : prof[i] - bgLevel;
+      if (val > originPeak) originPeak = val;
+    }
+
+    // Solvent-front window: [0.91 .. 1.005] Rf (strictly inside/on meniscus, stopping before exterior dark border)
+    const fStart = Math.max(0, Math.round(item.origin + 0.91 * span));
+    const fEnd = Math.min(n - 1, Math.round(item.front + Math.max(2, 0.008 * span)));
+    let frontPeak = 0;
+    let frontSum = 0;
+    let frontCnt = 0;
+    for (let i = fStart; i <= fEnd; i++) {
+      const val = Math.max(0, item.sign < 0 ? bgLevel - prof[i] : prof[i] - bgLevel);
+      if (val > frontPeak) frontPeak = val;
+      frontSum += val;
+      frontCnt++;
+    }
+    const frontScore = 0.65 * frontPeak + 0.35 * (frontCnt > 0 ? frontSum / frontCnt : 0);
+
+    stats.push({
+      laneId: item.laneId,
+      originSig: Math.max(0, originPeak),
+      frontSig: Math.max(0, frontScore),
+      dynRange: quietSpan,
+    });
+  }
+
+  if (stats.length === 0) return out;
+
+  // Baseline meniscus / blank-well origin mark estimated from quietest 25% of lanes (if >= 4 lanes)
+  const originVals = stats.map((s) => s.originSig);
+  const frontVals = stats.map((s) => s.frontSig);
+  const refOrigin = stats.length >= 4 ? pctile(originVals, 0.25) : 0;
+  const refFront = stats.length >= 4 ? pctile(frontVals, 0.25) : 0;
+  const refNoise = stats.length >= 4 ? Math.max(6, pctile(frontVals, 0.35) - pctile(frontVals, 0.15)) : 8;
+
+  for (const s of stats) {
+    const oEx = Math.max(0, s.originSig - refOrigin);
+    const fEx = Math.max(0, s.frontSig - refFront);
+    const oThr = Math.max(12, 0.09 * s.dynRange, 1.8 * refNoise);
+    const fThr = Math.max(10, 0.08 * s.dynRange, 1.8 * refNoise);
+    out.set(s.laneId, {
+      originOccupied: oEx >= oThr,
+      frontOccupied: fEx >= fThr,
+      originExcess: Math.min(1, +(oEx / Math.max(35, s.dynRange)).toFixed(3)),
+      frontExcess: Math.min(1, +(fEx / Math.max(35, s.dynRange)).toFixed(3)),
+    });
+  }
+  return out;
+}
+
+// Find spots in a lane profile using interior-clamped rolling percentile baseline, artifact guards, and prominence consolidation
 export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const n = profile.length;
   if (n < 10) return [];
-  const sm1 = movingAvg(profile, 7);
+  const r = o.radius || 24;
+  const span = Math.max(1, o.front - o.origin);
+  const minProm = o.minProminence ?? 0.28;
+
+  // Clamp outer plate bezels (< origin or > front) when smoothing chromatographic zone [origin, front]
+  // so dark glass borders or outside background steps never bleed into near-origin or near-front peaks.
+  const chromLo = Math.max(0, Math.round(o.origin));
+  const chromHi = Math.min(n - 1, Math.round(o.front));
+  const useChromClamp = chromHi - chromLo >= 20;
+  const boundedProf = useChromClamp
+    ? profile.map((v, i) => (i < chromLo ? profile[chromLo] : i > chromHi ? profile[chromHi] : v))
+    : profile;
+
+  const smWin = span < 450 ? 5 : 7;
+  const sm1 = movingAvg(boundedProf, smWin);
+
+  // Restrict rolling baseline estimation strictly to chromatographic interior [origin + 3, front]
+  // so dark outer plate borders (< origin or > front) do not drag the baseline down near Rf ~0.04 or Rf ~0.95.
+  const baseLo = Math.max(0, Math.round(o.origin + Math.max(3, Math.min(8, r * 0.18))));
+  const baseHi = Math.min(n - 1, Math.round(o.front));
+  const useRestrictedBase = baseHi - baseLo >= 16;
+
   const step = 5;
   const win = 100;
   const base = new Array(n);
   const q = o.sign < 0 ? 0.9 : 0.1;
   const pts: [number, number][] = [];
 
+  const effStart = useRestrictedBase ? baseLo : 0;
+  const effEnd = useRestrictedBase ? baseHi : n - 1;
+
   for (let i = 0; i < n; i += step) {
-    const chunk = sm1.slice(Math.max(0, i - win), Math.min(n, i + win + 1));
-    pts.push([i, pctile(chunk, q)]);
+    const cStart = Math.max(effStart, i - win);
+    const cEnd = Math.min(effEnd, i + win);
+    const sliceLo = cStart <= cEnd ? cStart : effStart;
+    const sliceHi = cStart <= cEnd ? cEnd : effEnd;
+    const chunk = sm1.slice(sliceLo, sliceHi + 1);
+    pts.push([i, chunk.length > 0 ? pctile(chunk, q) : sm1[Math.min(n - 1, Math.max(0, i))]]);
   }
   pts.push([n - 1, pts[pts.length - 1][1]]);
 
@@ -707,49 +1096,67 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     base[i] = x1 === x0 ? y0 : y0 + ((y1 - y0) * (i - x0)) / (x1 - x0);
   }
 
-  // Raw baseline-subtracted signal
-  const rawDiff = sm1.map((v, i) => (o.sign < 0 ? base[i] - v : v - base[i]));
-
-  const r = o.radius || 24;
-  const span = Math.max(1, o.front - o.origin);
-  const minProm = o.minProminence ?? 0.28;
+  // Raw baseline-subtracted signal (zero outside [origin - 2, front] so outer steps don't bleed in)
+  const rawDiff = sm1.map((v, i) => {
+    if (useChromClamp && (i < chromLo - 1 || i > chromHi)) return 0;
+    return o.sign < 0 ? base[i] - v : v - base[i];
+  });
 
   // Continuous sensitivity: t = 0 (most sensitive, slider 8%) .. 1 (most merging, slider 70%).
-  // Every knob below scales smoothly with it, so each slider step changes the result.
+  // Scale smoothing width gently with lane span and keep sensitivity high enough that peaks
+  // visible in the 7px densitogram are not flattened before basin consolidation.
   const t = Math.min(1, Math.max(0, (minProm - 0.08) / 0.62));
-  const smoothHalf = Math.round(3 + 8 * t);
+  const spanScale = Math.min(1, Math.max(0.52, span / 520));
+  const smoothHalf = Math.max(1, Math.round((1.0 + 5.2 * t) * spanScale));
   const d = movingAvg(rawDiff, smoothHalf * 2 + 1);
 
-  // Origin buffer: allow detecting polar products from Rf ~0.04 upwards
-  const originBuffer = Math.max(4, Math.min(10, Math.round(r * 0.25)));
+  // Origin buffer: allow detecting resolved polar products from Rf ~0.025 upwards
+  const originBuffer = Math.max(3, Math.min(8, Math.round(r * 0.18)));
   const start = Math.round(o.origin + originBuffer);
 
-  // Front buffer: allow detecting fast-eluting nonpolar spots up to Rf ~0.975 while excluding the solvent front boundary
-  const end = Math.round(o.origin + Math.min(span - 3, 0.975 * span));
+  // Front buffer: extend reach up to Rf ~0.988 so fast nonpolar spots right before the solvent front are still detected
+  const end = Math.round(o.origin + Math.min(span - 2, 0.988 * span));
 
   if (end <= start) return [];
 
-  // Compute baseline noise specifically within the chromatographic migration window (chrom)
+  // Compute baseline noise & physical signal range specifically within the chromatographic migration window (chrom)
   const chrom = d.slice(Math.max(start, 0), Math.min(n, end));
   const dmax = chrom.length > 0 ? Math.max(...chrom, 1e-9) : Math.max(...d, 1e-9);
   const med = chrom.length > 0 ? pctile(chrom, 0.5) : pctile(d, 0.5);
-  const noise = chrom.length > 0
+  const rawMadNoise = chrom.length > 0
     ? 1.4826 * pctile(chrom.map((v) => Math.abs(v - med)), 0.5)
     : 1.4826 * pctile(d.map((v) => Math.abs(v - med)), 0.5);
 
+  const profSlice = profile.slice(Math.max(0, start), Math.min(n, end));
+  const dynSpan = profSlice.length > 4
+    ? Math.abs(pctile(profSlice, 0.98) - pctile(profSlice, 0.02))
+    : 100;
+  const h = o.plateHistogram ?? analyzeProfileHistogram([profSlice], o.sign, 0, 1);
+  // Prevent busy lanes (spots covering 35-60% of the lane) from inflating MAD noise into tens of counts;
+  // quiet-side histogram bgSigma directly measures background noise uncontaminated by spots.
+  const noise = h.sampleCount >= 16
+    ? Math.min(rawMadNoise, Math.max(0.5, 1.35 * h.bgSigma))
+    : rawMadNoise;
+  // Histogram-calibrated physical minimum floor:
+  // - Adapts to quiet-side silica noise (2.8 * bgSigma) & plate dynamic range (0.016 * contrastSpan)
+  // - Lets faint spots on clean, low-exposure Merck TLC Explorer plates resolve down to ~2.0 units
+  // - Prevents blank-well camera noise from triggering when plate contrast is high
+  const histFloor = h.sampleCount >= 8 ? Math.max(2.0, 2.8 * h.bgSigma, 0.016 * h.contrastSpan) : 4.5;
+  const minAbsFloor = Math.max(histFloor, 0.018 * dynSpan);
+
   // Robust chromatographic signal threshold
-  const thr = Math.max(2.4 * noise, 0.035 * dmax);
+  const thr = Math.max(2.6 * noise, 0.035 * dmax, minAbsFloor);
 
   // 1. Initial Candidate Peaks via local maximum search
-  // halfWin scales dynamically with minProminence to avoid fracturing broad spots
-  const halfWin = Math.max(4, Math.round(r * (0.2 + 0.55 * t)));
+  const halfWin = Math.max(3, Math.round(r * (0.14 + 0.38 * t)));
 
   const candidates: Array<{ pos: number; val: number; extentStart: number; extentEnd: number }> = [];
 
   for (let i = Math.max(start, 1); i < Math.min(end, n - 1); i++) {
     if (d[i] < thr) continue;
+    if (d[i] < d[i - 1] || d[i] < d[i + 1]) continue;
     let top = true;
-    for (let k = Math.max(0, i - halfWin); k <= Math.min(n - 1, i + halfWin); k++) {
+    for (let k = Math.max(start, i - halfWin); k <= Math.min(end, i + halfWin); k++) {
       if (d[k] > d[i] || (d[k] === d[i] && k < i)) {
         top = false;
         break;
@@ -765,29 +1172,122 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     }
   }
 
-  // Filter out candidates that are just the upper rim or monotonic tail of an uneluted origin dot:
-  // a genuine low-Rf spot close to the origin has a clear chromatographic valley separating it from o.origin.
+  // Failsafe Artifact Rejection Filters:
+  // (a) Reject single-pixel dust specks (< 3 raw px persistence + smoothed support check)
+  // (b) Near-origin: require clear chromatographic valley from o.origin (not an uneluted/tailing origin dot)
+  // (c) Near-front (Rf >= 0.88): reject monotonic ramps climbing into dark plate borders past o.front,
+  //     and require a genuine left chromatographic valley separating the spot from baseline noise
+  // (d) Interior: require bilateral local prominence on both sides so gentle illumination gradients don't trigger
   const nearOriginLimit = o.origin + Math.max(Math.round(0.055 * span), Math.round(r * 1.15));
-  const originCoreStart = Math.max(0, Math.round(o.origin - r * 0.35));
+  const originCoreStart = Math.max(0, Math.round(o.origin - 1));
+  const nearFrontLimit = o.origin + Math.min(Math.round(0.90 * span), span - Math.max(6, Math.round(r * 0.45)));
+  const frontCoreEnd = Math.min(n - 1, Math.round(o.front + Math.max(6, r * 0.35)));
+  const flankRadius = Math.max(halfWin * 2, Math.round(0.10 * span));
+
   const filteredCandidates = candidates.filter((p) => {
-    if (p.pos >= nearOriginLimit) return true;
-    const originCoreEnd = Math.min(p.pos - 1, Math.round(o.origin + originBuffer));
-    if (originCoreEnd < originCoreStart) return true;
-    let originPeak = -Infinity;
-    let originPeakIdx = originCoreStart;
-    for (let k = originCoreStart; k <= originCoreEnd; k++) {
-      if (d[k] > originPeak) {
-        originPeak = d[k];
-        originPeakIdx = k;
+    // (a1) Raw pixel persistence check: a genuine chromatographic band spans >= 3 raw pixels,
+    //      whereas dead pixels or dust specks are only 1-2 pixels wide even at extreme amplitude.
+    const rWinLo = Math.max(Math.round(o.origin + 1), p.pos - 6);
+    const rWinHi = Math.min(Math.round(o.front), p.pos + 6);
+    let rawMaxDev = 0;
+    for (let k = rWinLo; k <= rWinHi; k++) {
+      const dev = o.sign < 0 ? base[k] - profile[k] : profile[k] - base[k];
+      if (dev > rawMaxDev) rawMaxDev = dev;
+    }
+    const rawCut = Math.max(minAbsFloor * 0.65, 0.30 * rawMaxDev);
+    let rawSupport = 0;
+    for (let k = rWinLo; k <= rWinHi; k++) {
+      const dev = o.sign < 0 ? base[k] - profile[k] : profile[k] - base[k];
+      if (dev >= rawCut) rawSupport++;
+    }
+    if (rawSupport < 3) return false;
+
+    // (a2) Smoothed half-height width check
+    const halfHeight = med + 0.45 * (p.val - med);
+    let supportPx = 0;
+    for (let k = Math.max(start, p.pos - 4); k <= Math.min(end, p.pos + 4); k++) {
+      if (d[k] >= halfHeight) supportPx++;
+    }
+    if (supportPx < 3 && p.val < Math.max(12, 5 * noise)) return false;
+
+    // (b) Near-origin guard
+    if (p.pos < nearOriginLimit) {
+      const originCoreEnd = Math.min(p.pos - 1, Math.round(o.origin + originBuffer));
+      if (originCoreEnd >= originCoreStart) {
+        let originPeak = -Infinity;
+        let originPeakIdx = originCoreStart;
+        for (let k = originCoreStart; k <= originCoreEnd; k++) {
+          if (d[k] > originPeak) {
+            originPeak = d[k];
+            originPeakIdx = k;
+          }
+        }
+        if (originPeak >= Math.max(thr, 0.45 * p.val)) {
+          let valleyMin = Infinity;
+          for (let k = originPeakIdx; k <= p.pos; k++) {
+            if (d[k] < valleyMin) valleyMin = d[k];
+          }
+          const valleyDrop = p.val - valleyMin;
+          const minOriginDrop = 0.14 + 0.22 * t;
+          if (valleyDrop < Math.max(minOriginDrop * p.val, 2.5 * noise)) return false;
+        }
       }
     }
-    if (originPeak < Math.max(thr, 0.45 * p.val)) return true;
-    let valleyMin = Infinity;
-    for (let k = originPeakIdx; k <= p.pos; k++) {
-      if (d[k] < valleyMin) valleyMin = d[k];
+
+    // (c) Near-front guard against exterior plate border artifacts & baseline drift
+    if (p.pos >= nearFrontLimit) {
+      // Check left chromatographic valley
+      const lStart = Math.max(start, p.pos - flankRadius);
+      let leftMin = Infinity;
+      for (let k = lStart; k < p.pos; k++) {
+        if (d[k] < leftMin) leftMin = d[k];
+      }
+      const leftDrop = p.val - leftMin;
+      const minFrontDrop = 0.15 + 0.24 * t;
+      if (leftDrop < Math.max(minFrontDrop * p.val, 2.6 * noise, minAbsFloor * 0.7)) {
+        return false;
+      }
+
+      // Check raw profile at front edge: only reject if a dark glass border continues monotonically from p.pos past o.front without dipping back toward baseline
+      const outStart = Math.min(n - 1, Math.round(o.front + 2));
+      if (frontCoreEnd > outStart && p.pos > o.origin + 0.93 * span) {
+        const refBase = base[chromHi];
+        let minInsideDev = Infinity;
+        for (let k = p.pos; k <= chromHi; k++) {
+          const dev = o.sign < 0 ? refBase - profile[k] : profile[k] - refBase;
+          if (dev < minInsideDev) minInsideDev = dev;
+        }
+        let outMaxDev = -Infinity;
+        for (let k = outStart; k <= frontCoreEnd; k++) {
+          const dev = o.sign < 0 ? refBase - profile[k] : profile[k] - refBase;
+          if (dev > outMaxDev) outMaxDev = dev;
+        }
+        if (outMaxDev > p.val * 1.15 && p.val - minInsideDev < Math.max(0.25 * p.val, 2 * noise)) {
+          return false;
+        }
+      }
+      return true;
     }
-    const valleyDrop = p.val - valleyMin;
-    return valleyDrop >= Math.max(0.35 * p.val, 2.5 * noise);
+
+    // (d) Interior bilateral prominence check: avoid gentle illumination gradients
+    if (p.pos >= nearOriginLimit) {
+      const lStart = Math.max(start, p.pos - flankRadius);
+      const rEnd = Math.min(end, p.pos + flankRadius);
+      let lMin = Infinity;
+      let rMin = Infinity;
+      for (let k = lStart; k < p.pos; k++) {
+        if (d[k] < lMin) lMin = d[k];
+      }
+      for (let k = p.pos + 1; k <= rEnd; k++) {
+        if (d[k] < rMin) rMin = d[k];
+      }
+      const bilatProm = Math.min(p.val - lMin, p.val - rMin);
+      if (bilatProm < Math.max(2.0 * noise, minAbsFloor * 0.45)) {
+        return false;
+      }
+    }
+
+    return true;
   });
 
   if (filteredCandidates.length === 0) return [];
@@ -822,14 +1322,20 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       const dropRatio = lowerVal > 0 ? valleyDrop / lowerVal : 0;
 
       // Two adjacent peaks are one spot when the valley between them is shallow.
-      // mergeDrop grows continuously with the slider (8% -> 0.19, 28% -> 0.35, 55% -> 0.57, 70% -> 0.69);
-      // peaks that are also physically close (distance scales with the slider) merge a little more readily.
-      const mergeDrop = Math.min(0.92, 0.12 + 0.82 * minProm);
+      // mergeDrop scales continuously with the slider (8% -> 0.13, 12% -> 0.17, 28% -> 0.31, 55% -> 0.56);
+      // well-separated peaks (>= 0.075 Rf apart) with distinct height asymmetry (a genuine secondary band
+      // beside a dominant band rather than ripples on one flat dome) stay resolved in Sensitive/Standard modes.
+      const baseMergeDrop = Math.min(0.92, 0.06 + 0.90 * minProm);
+      const higherVal = Math.max(p1.val, p2.val, 1e-6);
+      const sep = Math.min(1, Math.max(0, (dist / span - 0.065) / 0.015));
+      const asym = Math.min(1, Math.max(0, (1 - lowerVal / higherVal) / 0.22));
+      const distDiscount = 1 - 0.85 * sep * asym * Math.max(0, 1 - t / 0.75);
+      const mergeDrop = baseMergeDrop * distDiscount;
       const closeDist = Math.max(10, Math.round(span * (0.01 + 0.10 * t)));
       const shouldMerge =
         dropRatio < mergeDrop ||
-        (dist < closeDist && dropRatio < Math.min(0.95, mergeDrop + 0.15)) ||
-        valleyDrop < 2.5 * noise;
+        (dist < closeDist && dropRatio < Math.min(0.95, baseMergeDrop + 0.15)) ||
+        valleyDrop < Math.max(2.5 * noise, 0.45 * minAbsFloor);
 
       if (shouldMerge) {
         if (dropRatio < minValleyRatio) {
@@ -889,6 +1395,174 @@ export function getEffectiveLaneSpots(lane: TlcLane, autoSpots: TlcSpot[]): TlcS
     return lane.customSpots;
   }
   return autoSpots;
+}
+
+export const ALL_TLC_CHANNELS: TlcChannelKey[] = ['UV254', 'UV366', 'White'];
+
+/**
+ * Returns loaded TLC channels in canonical order (UV254, UV366, White).
+ */
+export function getLoadedTlcChannels(
+  imgs?: Record<string, any> | null,
+  requireBitmap: boolean = false
+): TlcChannelKey[] {
+  if (!imgs) return [];
+  return ALL_TLC_CHANNELS.filter((k) => (requireBitmap ? Boolean(imgs[k]?.bmp) : Boolean(imgs[k])));
+}
+
+/**
+ * Returns true when at least two TLC channels are loaded so a multi-channel composite can be formed.
+ */
+export function hasCompositeChannels(
+  imgs?: Record<string, any> | null,
+  requireBitmap: boolean = false
+): boolean {
+  return getLoadedTlcChannels(imgs, requireBitmap).length >= 2;
+}
+
+/**
+ * Merges spot lists across multiple channels, deduplicating co-eluting peaks within rfMergeTolerance
+ * while preserving channel provenance on each spot.
+ */
+export function mergeMultiChannelSpots(
+  channelSpots: Partial<Record<TlcChannelKey, TlcSpot[]>>,
+  rfMergeTolerance: number = 0.035
+): TlcSpot[] {
+  const merged: TlcSpot[] = [];
+
+  for (const ch of ALL_TLC_CHANNELS) {
+    const spots = channelSpots[ch];
+    if (!spots || spots.length === 0) continue;
+
+    for (const sp of spots) {
+      const incomingChannels = sp.channels && sp.channels.length ? sp.channels : [ch];
+      // Pick closest matching Rf within tolerance (never collapse two already-resolved spots from the same channel)
+      let bestMatch: TlcSpot | null = null;
+      let bestDelta = Infinity;
+      for (const m of merged) {
+        if (m.channels && incomingChannels.some((ic) => m.channels!.includes(ic))) continue;
+        const d = Math.abs(m.rf - sp.rf);
+        if (d < rfMergeTolerance && d < bestDelta) {
+          bestDelta = d;
+          bestMatch = m;
+        }
+      }
+      if (!bestMatch) {
+        merged.push({
+          ...sp,
+          channels: [...incomingChannels],
+        });
+      } else {
+        const mergedChannels = bestMatch.channels ? [...bestMatch.channels] : [];
+        for (const c of incomingChannels) {
+          if (!mergedChannels.includes(c)) mergedChannels.push(c);
+        }
+        bestMatch.channels = mergedChannels;
+        if (sp.strength > bestMatch.strength) {
+          bestMatch.strength = sp.strength;
+          bestMatch.pos = sp.pos;
+          bestMatch.rf = sp.rf;
+          if (sp.areaPct != null) bestMatch.areaPct = sp.areaPct;
+          if (sp.rfRaw != null) bestMatch.rfRaw = sp.rfRaw;
+        }
+      }
+    }
+  }
+
+  merged.sort((a, b) => a.rf - b.rf || a.pos - b.pos);
+  return merged;
+}
+
+export interface MultiChannelSpotsOptions {
+  profiles: Partial<Record<TlcChannelKey, number[]>>;
+  origin: number;
+  front: number;
+  radius?: number;
+  minProminence?: number;
+  minDistance?: number;
+  rfMergeTolerance?: number;
+  histograms?: Partial<Record<TlcChannelKey, ProfileHistogramStats>>;
+}
+
+/**
+ * Detects spots across all provided channels (UV254, UV366, White) using a shared origin & front
+ * and merges co-eluting peaks while keeping channel-unique spots from all three channels.
+ */
+export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpot[] {
+  const {
+    profiles,
+    origin,
+    front,
+    radius = 24,
+    minProminence,
+    minDistance,
+    rfMergeTolerance = 0.035,
+    histograms,
+  } = options;
+
+  const perChannel: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
+  for (const ch of ALL_TLC_CHANNELS) {
+    const prof = profiles[ch];
+    if (!prof || prof.length < 10) continue;
+    perChannel[ch] = findSpots(prof, {
+      sign: TLC_SIGNAL[ch].sign,
+      origin,
+      front,
+      radius,
+      minProminence,
+      minDistance,
+      plateHistogram: histograms?.[ch],
+    });
+  }
+
+  return mergeMultiChannelSpots(perChannel, rfMergeTolerance);
+}
+
+/**
+ * Convenience wrapper extracting multi-channel spots for a TLC lane across all loaded channels,
+ * respecting custom/manual lane spot overrides.
+ */
+export function getLaneMultiChannelSpots(
+  set: TlcSet,
+  lane: TlcLane,
+  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[],
+  options: {
+    origin?: number;
+    front?: number;
+    minProminence?: number;
+    minDistance?: number;
+    rfMergeTolerance?: number;
+  } = {}
+): TlcSpot[] {
+  if (lane.customSpots !== undefined && Array.isArray(lane.customSpots)) {
+    return lane.customSpots;
+  }
+  const channels = getLoadedTlcChannels(set.imgs, false);
+  if (!channels.length) return [];
+
+  const oVal = options.origin ?? tlcOrigin(set, lane, getProfile);
+  const fVal = options.front ?? tlcFront(set, lane, getProfile);
+  const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+  const histograms: Partial<Record<TlcChannelKey, ProfileHistogramStats>> = {};
+  for (const ch of channels) {
+    const p = getProfile(set, ch, lane);
+    if (p && p.length >= 10) {
+      profiles[ch] = p;
+      const chHist = getChannelHistogram(set, ch, getProfile);
+      if (chHist) histograms[ch] = chHist;
+    }
+  }
+
+  return findMultiChannelSpots({
+    profiles,
+    origin: oVal,
+    front: fVal,
+    radius: lane.spotRadius || 24,
+    minProminence: options.minProminence ?? set.spotProminence,
+    minDistance: options.minDistance,
+    rfMergeTolerance: options.rfMergeTolerance,
+    histograms,
+  });
 }
 
 // Complete 1D Densitometry extraction: returns profile curve, rolling baseline, baseline-subtracted signal & spots
@@ -1144,6 +1818,86 @@ function measureFrontContinuity(
   return { frac, allThirds };
 }
 
+function detectOtsuWetDryFront(
+  medProfile: number[],
+  profiles: number[][],
+  sign: number,
+  upperHist: ProfileHistogramStats,
+  laneLen: number
+): FrontDetectionResult {
+  const n = medProfile.length;
+  if (n < 20 || upperHist.otsuEta < 0.50) return { pos: 0, score: 0 };
+
+  const lo = Math.max(4, Math.floor(n * 0.50));
+  const hi = Math.min(n - 4, Math.floor(n * 0.96));
+  if (hi <= lo + 8) return { pos: 0, score: 0 };
+
+  const s = movingAvg(medProfile, 5);
+  const dirSign = -Math.sign(sign || 1);
+  const thresh = upperHist.otsuThresh;
+
+  // Maximize cumulative wet-vs-dry classification agreement around otsuThresh across [lo..hi]
+  let bestPos = 0;
+  let bestObj = -Infinity;
+  const margin = Math.max(6, Math.round(n * 0.02));
+  for (let i = lo + margin; i <= hi - margin; i++) {
+    let wetOk = 0;
+    let dryOk = 0;
+    for (let k = lo; k < i; k++) {
+      if ((thresh - s[k]) * dirSign > 0) wetOk++;
+    }
+    for (let k = i; k <= hi; k++) {
+      if ((s[k] - thresh) * dirSign > 0) dryOk++;
+    }
+    const obj = wetOk + dryOk;
+    if (obj > bestObj) {
+      bestObj = obj;
+      bestPos = i;
+    }
+  }
+  const accuracy = bestObj / Math.max(1, hi - lo + 1);
+  if (bestPos <= 0 || accuracy < 0.72) return { pos: 0, score: 0 };
+
+  const wMeanBefore = windowMean(s, Math.max(lo, bestPos - Math.round(n * 0.14)), bestPos - 3);
+  const wMeanAfter = windowMean(s, bestPos + 3, Math.min(hi, bestPos + Math.round(n * 0.14)));
+  const stepGap = (wMeanAfter - wMeanBefore) * dirSign;
+  if (stepGap < Math.max(2.0, 2.5 * upperHist.bgSigma)) return { pos: 0, score: 0 };
+
+  if (profiles.length >= 6) {
+    let support = 0;
+    const thirdSup = [0, 0, 0];
+    const thirdTot = [0, 0, 0];
+    const win = Math.max(12, Math.round(laneLen * 0.08));
+    for (let li = 0; li < profiles.length; li++) {
+      const p = profiles[li];
+      const third = Math.min(2, Math.floor((li * 3) / profiles.length));
+      thirdTot[third]++;
+      const pLo = Math.max(0, bestPos - win);
+      const pHi = Math.min(p.length - 1, bestPos + win);
+      if (bestPos - 3 >= pLo && pHi >= bestPos + 3) {
+        const mB = windowMean(p, pLo, bestPos - 3);
+        const mA = windowMean(p, bestPos + 3, pHi);
+        if ((mA - mB) * dirSign >= Math.max(1.5, 0.45 * stepGap)) {
+          support++;
+          thirdSup[third]++;
+        }
+      }
+    }
+    const frac = support / profiles.length;
+    const allThirds = thirdTot.every((tot, t) => tot === 0 || thirdSup[t] / tot >= 0.55);
+    if (frac < 0.72 || !allThirds) return { pos: 0, score: 0 };
+    return {
+      pos: bestPos,
+      score: Math.min(9, (stepGap / Math.max(0.8, upperHist.bgSigma)) * (0.4 + 0.6 * frac)),
+    };
+  }
+
+  return {
+    pos: bestPos,
+    score: Math.min(8, 4.5 + upperHist.otsuEta * 3.5),
+  };
+}
+
 function detectChannelFront(profiles: number[][], sign: number, laneLen: number): FrontDetectionResult {
   if (!profiles.length) return { pos: 0, score: 0 };
 
@@ -1161,7 +1915,11 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
     }
   }
 
-  let best = detectFrontDetailed(medProfile, sign);
+  const plateHist = analyzeProfileHistogram(profiles, sign, 0.12, 0.95);
+  const upperHist = analyzeProfileHistogram(profiles, sign, 0.50, 0.95);
+  const otsuCandidate = detectOtsuWetDryFront(medProfile, profiles, sign, upperHist, laneLen);
+
+  let best = detectFrontDetailed(medProfile, sign, plateHist);
   const smoothed = profiles.length >= 6 ? profiles.map((p) => movingAvg(p, 3)) : [];
   if (profiles.length >= 6 && best.pos > 0) {
     const cont = measureFrontContinuity(smoothed, best.pos, sign, laneLen);
@@ -1176,7 +1934,7 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
   // line across the plate so high-Rf spot bands in a subset of wells cannot beat the real front.
   if (profiles.length >= 3) {
     const laneHits = profiles
-      .map((p) => detectFrontDetailed(p, sign))
+      .map((p) => detectFrontDetailed(p, sign, plateHist))
       .filter((r) => r.pos > 0);
     const minNeeded =
       profiles.length >= 6
@@ -1200,7 +1958,12 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
         const cScore = cl.map((r) => r.score).sort((a, b) => a - b);
         const medScore = cScore[cScore.length >> 1];
         const agreement = cl.length / profiles.length;
-        const aggScore = medScore * (0.25 + 0.75 * agreement) * contFactor;
+        // Histogram Otsu wet-vs-dry agreement reinforces true fronts over dry pencil marks
+        const otsuConfirm =
+          otsuCandidate.pos > 0 && Math.abs(clusterPos - otsuCandidate.pos) <= Math.max(16, laneLen * 0.04)
+            ? 1.18
+            : 1.0;
+        const aggScore = medScore * (0.25 + 0.75 * agreement) * contFactor * otsuConfirm;
         if (aggScore > bestAgg) {
           bestAgg = aggScore;
           bestCluster = cl;
@@ -1217,7 +1980,36 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
     best = detectDiffuseChannelFront(medProfile, profiles, sign);
   }
 
+  // Fallback to strong bimodal wet-vs-dry histogram transition if ridge/diffuse found nothing
+  if (best.pos === 0 && profiles.length >= 6 && upperHist.otsuEta >= 0.62 && otsuCandidate.pos > 0) {
+    best = otsuCandidate;
+  }
+
   return best;
+}
+
+// Narrow pseudo-lanes centred half way between neighbouring lanes of one half (same axis and length).
+export function gutterLanes(halfLanes: TlcLane[]): TlcLane[] {
+  const sorted = halfLanes.slice().sort((a, b) => a.id - b.id);
+  const out: TlcLane[] = [];
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    const dx = b.x0 - a.x0;
+    const dy = b.y0 - a.y0;
+    const pitch = Math.hypot(dx, dy);
+    if (!(pitch > 4) || pitch > 5 * Math.max(a.width, 1)) continue;
+    out.push({
+      ...a,
+      id: 1000 + a.id,
+      x0: a.x0 + dx / 2,
+      y0: a.y0 + dy / 2,
+      width: Math.max(6, Math.round(pitch * 0.5)),
+      zeroRf: null,
+      customSpots: undefined,
+    });
+  }
+  return out;
 }
 
 // Solvent front resolution: explicit side override -> explicit global manual override -> clearest-channel detection -> fallback 93% of lane length
@@ -1241,6 +2033,7 @@ export function tlcFront(
     set.originAuto = {};
     set.originAutoByLane = {};
     set.autoConf = {};
+    (set as any)._histCache = {};
     (set as any)._autoCacheSig = sig;
   }
 
@@ -1248,13 +2041,20 @@ export function tlcFront(
   if (set.frontAuto[h] == null && set.cfg) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
     let best: FrontDetectionResult = { pos: 0, score: 0 };
-    for (const ch of channels) {
-      const profiles = halfLanes.map((l) => getProfile(set, ch, l)).filter((p) => p.length > 0);
-      if (!profiles.length) continue;
-      const res = detectChannelFront(profiles, TLC_SIGNAL[ch]?.sign ?? 1, lane.length);
-      if (res.score > best.score && res.pos > 0) {
-        best = res;
+    // Strips of bare silica between the lanes carry no spots or smears, so a front or pencil line is
+    // far cleaner there than down the lanes; sample them first and fall back to the lane centres.
+    const gutters = gutterLanes(halfLanes);
+    const laneSets = gutters.length >= 4 ? [gutters, halfLanes] : [halfLanes];
+    for (const lanesToUse of laneSets) {
+      for (const ch of channels) {
+        const profiles = lanesToUse.map((l) => getProfile(set, ch, l)).filter((p) => p.length > 0);
+        if (!profiles.length) continue;
+        const res = detectChannelFront(profiles, TLC_SIGNAL[ch]?.sign ?? 1, lane.length);
+        if (res.score > best.score && res.pos > 0) {
+          best = res;
+        }
       }
+      if (best.pos > 0) break;
     }
     set.frontAuto[h] = best.pos > 0 ? best.pos : Math.round(lane.length * 0.93);
     set.autoConf = set.autoConf || {};
@@ -1400,7 +2200,8 @@ function detectOriginNear(
   refPos: number,
   localRadius: number,
   minFeat: number = 3.0,
-  minSnr: number = 3.2
+  minSnr: number = 3.2,
+  minBi: number = 8.0
 ): number {
   const n = profile.length;
   if (n < 20) return 0;
@@ -1430,6 +2231,7 @@ function detectOriginNear(
   let bestScore = 0;
   let bestRawFeat = 0;
   let bestBilateral = 0;
+  const biFloor = Math.max(2.0, Math.min(6.0, 0.75 * minBi));
 
   for (let i = wLo; i <= wHi; i++) {
     if (i - flankIn < 1 || i + flankIn >= n - 1) continue;
@@ -1442,7 +2244,7 @@ function detectOriginNear(
     if (dBelow > 0 && dAbove > 0) {
       const rawFeat = 0.65 * Math.min(dBelow, dAbove) + 0.35 * 0.5 * (dBelow + dAbove);
       const biMin = Math.min(dBelow, dAbove);
-      if (biMin < Math.max(6, 0.32 * rawFeat)) continue;
+      if (biMin < Math.max(biFloor, 0.32 * rawFeat)) continue;
       const distFrac = Math.abs(i - refPos) / Math.max(1, localRadius);
       // Stronger distance bias so stray smears/grain far from the baseline cannot pull missing-dot lanes
       const weight = 1 - (i > refPos ? 0.30 : 0.16) * distFrac;
@@ -1457,7 +2259,7 @@ function detectOriginNear(
   }
 
   const snr = bestRawFeat / Math.max(sigmaS, 1.0);
-  if (snr < Math.max(minSnr, 5.5) || bestRawFeat < Math.max(minFeat, 14.0) || bestBilateral < 8 || bestIdx <= 0) {
+  if (snr < Math.max(minSnr, 5.5) || bestRawFeat < minFeat || bestBilateral < minBi || bestIdx <= 0) {
     return 0;
   }
   const refined = refineOriginCoreCenter(s, bestIdx, sign);
@@ -1470,12 +2272,74 @@ function detectOriginNear(
   return refined;
 }
 
-function detectChannelOrigin(
+// Faint-origin fallback: when no dot passes normal thresholds, accept weaker features only if a
+// substantial share of lanes agree on one height (a consistent row is strong evidence on its own).
+function detectFaintOriginRow(
   laneEntries: Array<{ laneId: number; profile: number[] }>,
   sign: number,
-  laneLen: number
+  laneLen: number,
+  histBgSigma?: number
+): ChannelOriginResult {
+  const hits: Array<{ laneId: number; pos: number; score: number }> = [];
+  for (const e of laneEntries) {
+    for (const cand of detectOriginCandidates(e.profile, sign, 3, true, histBgSigma)) {
+      if (cand.pos > laneLen * 0.06) hits.push({ laneId: e.laneId, pos: cand.pos, score: cand.score });
+    }
+  }
+  const minNeeded = Math.max(3, Math.ceil(laneEntries.length * 0.4));
+  if (hits.length < minNeeded) return { pos: 0, score: 0 };
+  const tol = Math.max(10, Math.round(laneLen * 0.03));
+  let chosen: { pos: number; cl: typeof hits; agg: number } | null = null;
+  for (const anchor of hits) {
+    const byLane = new Map<number, (typeof hits)[number]>();
+    for (const r of hits) {
+      if (Math.abs(r.pos - anchor.pos) > tol) continue;
+      const prev = byLane.get(r.laneId);
+      if (!prev || r.score > prev.score) byLane.set(r.laneId, r);
+    }
+    const cl = Array.from(byLane.values());
+    if (cl.length < minNeeded) continue;
+    const sortedPos = cl.map((r) => r.pos).sort((a, b) => a - b);
+    const pos = sortedPos[sortedPos.length >> 1];
+    if (pos < laneLen * 0.06 || pos > laneLen * 0.30) continue;
+    const agg = cl.length / laneEntries.length;
+    // Prefer the better-supported row; on near ties take the outer (lower) one, which is the true origin
+    if (!chosen || agg > chosen.agg + 0.08 || (agg >= chosen.agg - 0.08 && pos < chosen.pos)) {
+      chosen = { pos, cl, agg };
+    }
+  }
+  if (!chosen) return { pos: 0, score: 0 };
+  const backbone = fitOriginQuadCurve(
+    chosen.cl.map((r) => ({ laneId: r.laneId, pos: r.pos })),
+    chosen.pos,
+    laneLen
+  );
+  const byLane: Record<number, number> = {};
+  for (const e of laneEntries) {
+    const own = chosen.cl.find((r) => r.laneId === e.laneId);
+    byLane[e.laneId] = own ? own.pos : Math.round(backbone?.[e.laneId] ?? chosen.pos);
+  }
+  const medScore = chosen.cl.map((r) => r.score).sort((a, b) => a - b)[chosen.cl.length >> 1];
+  return {
+    pos: chosen.pos,
+    // Deliberately modest so UI / multi-channel comparison still treats stronger channels as higher confidence
+    score: Math.min(6, medScore) * (0.4 + 0.6 * chosen.agg),
+    byLane,
+    validFrac: chosen.cl.length / laneEntries.length,
+    medFeat: 0,
+  };
+}
+
+export function detectChannelOrigin(
+  laneEntries: Array<{ laneId: number; profile: number[] }>,
+  sign: number,
+  laneLen: number,
+  hist?: ProfileHistogramStats
 ): ChannelOriginResult {
   if (!laneEntries.length) return { pos: 0, score: 0 };
+
+  const h = hist ?? analyzeProfileHistogram(laneEntries.map((e) => e.profile), sign, 0.06, 0.90);
+  const histBgSigma = h.sampleCount >= 16 ? h.bgSigma : undefined;
 
   let medProfile: number[];
   if (laneEntries.length === 1) {
@@ -1491,12 +2355,12 @@ function detectChannelOrigin(
     }
   }
 
-  let best: ChannelOriginResult = detectOriginDetailed(medProfile, sign);
+  let best: ChannelOriginResult = detectOriginDetailed(medProfile, sign, h);
 
   if (laneEntries.length >= 3) {
     const laneHits: Array<{ laneId: number; pos: number; score: number; feat: number }> = [];
     for (const e of laneEntries) {
-      for (const cand of detectOriginCandidates(e.profile, sign, 3)) {
+      for (const cand of detectOriginCandidates(e.profile, sign, 3, false, histBgSigma)) {
         if (cand.pos > 10) laneHits.push({ laneId: e.laneId, pos: cand.pos, score: cand.score, feat: cand.feat });
       }
     }
@@ -1562,7 +2426,13 @@ function detectChannelOrigin(
         const cScores = inCluster.map((r) => r.score).sort((a, b) => a - b);
         const medFeat = cFeats[cFeats.length >> 1] || 20;
         const medScore = cScores[cScores.length >> 1] || 10;
-        const minFeat = Math.max(14.0, 0.28 * medFeat);
+        // Histogram-scaled floor keeps low-exposure Merck Explorer dots valid without loosening high-contrast noise rejection
+        const histFeatFloor =
+          h.sampleCount >= 16
+            ? Math.min(14.0, Math.max(4.5, 3.8 * h.bgSigma, 0.12 * h.contrastSpan))
+            : 14.0;
+        const histBiFloor = Math.min(8.0, Math.max(2.5, 0.55 * histFeatFloor));
+        const minFeat = Math.max(histFeatFloor, 0.28 * medFeat);
         const minSnr = Math.max(5.5, 0.25 * medScore);
 
         // Second pass: lock spotted lanes onto their sharp origin peak within experimental spotting
@@ -1571,7 +2441,7 @@ function detectChannelOrigin(
         const sortedEntries = laneEntries.slice().sort((a, b) => a.laneId - b.laneId);
         const detected = sortedEntries.map((e) => {
           const refPos = backbone?.[e.laneId] ?? pos;
-          const p = detectOriginNear(e.profile, sign, refPos, localRadius, minFeat, minSnr);
+          const p = detectOriginNear(e.profile, sign, refPos, localRadius, minFeat, minSnr, histBiFloor);
           return { laneId: e.laneId, refPos, pos: p };
         });
 
@@ -1609,6 +2479,11 @@ function detectChannelOrigin(
     }
   }
 
+  if (best.pos <= 10 && laneEntries.length >= 6) {
+    const faint = detectFaintOriginRow(laneEntries, sign, laneLen, histBgSigma);
+    if (faint.pos > 10) best = faint;
+  }
+
   return best;
 }
 
@@ -1632,6 +2507,7 @@ export function tlcOrigin(
     set.originAuto = {};
     set.originAutoByLane = {};
     set.autoConf = {};
+    (set as any)._histCache = {};
     (set as any)._autoCacheSig = sig;
   }
 
@@ -1641,22 +2517,33 @@ export function tlcOrigin(
   if (set.originAuto[h] == null) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
     let best: ChannelOriginResult = { pos: 0, score: 0 };
+    let bestClipped = false;
     for (const ch of channels) {
+      const chSign = TLC_SIGNAL[ch]?.sign ?? -1;
       const entries = halfLanes
         .map((l) => ({ laneId: l.id, profile: getProfile(set, ch, l) }))
         .filter((e) => e.profile.length > 0);
       if (!entries.length) continue;
-      const res = detectChannelOrigin(entries, TLC_SIGNAL[ch]?.sign ?? -1, lane.length);
+      const chHist =
+        getChannelHistogram(set, ch, getProfile) ??
+        analyzeProfileHistogram(entries.map((e) => e.profile), chSign, 0.06, 0.90);
+      const resClipped = chSign < 0 ? chHist.clipHighFrac > 0.25 : chHist.clipLowFrac > 0.25;
+      const res = detectChannelOrigin(entries, chSign, lane.length, chHist);
       if (res.pos <= 10) continue;
       const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
       if (!bestSolid) {
-        if (res.score > best.score) best = res;
+        if (res.score > best.score) {
+          best = res;
+          bestClipped = resClipped;
+        }
       } else if (
-        (res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
-        (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1 &&
-        res.score > best.score * 1.25
+        (bestClipped && !resClipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
+        ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
+          (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1 &&
+          res.score > best.score * 1.25)
       ) {
         best = res;
+        bestClipped = resClipped;
       }
     }
     set.autoConf = set.autoConf || {};
@@ -2155,49 +3042,93 @@ export function extractFluorescenceOverlay(
 }
 
 /**
- * Computes false-color dual channel composite (UV254 Quenching = Amber/Red, UV366 Fluorescence = Cyan).
+ * Computes multi-channel false-color composite combining up to three TLC detection modes:
+ * - UV 254 nm quenching = Gold / Amber
+ * - UV 365 nm fluorescence = Laser Cyan
+ * - Visible (White) stain/absorbance = Rose / Magenta
  */
 export function computeFalseColorComposite(
-  uv254Data: Uint8ClampedArray,
-  uv366Data: Uint8ClampedArray,
+  uv254Data: Uint8ClampedArray | null | undefined,
+  uv366Data: Uint8ClampedArray | null | undefined,
   width: number,
   height: number,
-  gain: number = 1.4
+  gain: number = 1.4,
+  whiteData?: Uint8ClampedArray | null
 ): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(uv254Data.length);
+  const ref = uv254Data || uv366Data || whiteData;
+  const byteLen = ref ? ref.length : Math.max(0, width * height * 4);
+  const out = new Uint8ClampedArray(byteLen);
+  if (!ref || byteLen === 0) return out;
 
   // Estimate UV254 bright phosphor baseline
-  let gSum = 0;
-  for (let i = 0; i < uv254Data.length; i += 16) {
-    gSum += uv254Data[i + 1];
+  let baseG = 180;
+  if (uv254Data && uv254Data.length === byteLen) {
+    let gSum = 0;
+    let gCount = 0;
+    for (let i = 0; i < uv254Data.length; i += 16) {
+      gSum += uv254Data[i + 1];
+      gCount++;
+    }
+    baseG = Math.max(100, (gSum / Math.max(1, gCount)) * 1.05);
   }
-  const baseG = Math.max(100, (gSum / (uv254Data.length / 16)) * 1.05);
 
-  for (let i = 0; i < uv254Data.length; i += 4) {
-    // 1. Quenching signal (darkness in UV254 green channel)
-    const g254 = uv254Data[i + 1];
-    const qRaw = Math.max(0, (baseG - g254) / baseG);
-    const q = Math.min(1.0, Math.pow(qRaw, 0.9) * 1.6);
+  // Estimate Visible (White) bright silica plate baseline using upper-quartile luminance
+  // so stained bands do not depress the background reference
+  let baseW = 220;
+  if (whiteData && whiteData.length === byteLen) {
+    const pxCount = whiteData.length >> 2;
+    const stride = Math.max(1, Math.floor(pxCount / 4096));
+    const lumSamples: number[] = [];
+    for (let p = 0; p < pxCount; p += stride) {
+      const idx = p * 4;
+      lumSamples.push(0.25 * whiteData[idx] + 0.45 * whiteData[idx + 1] + 0.30 * whiteData[idx + 2]);
+    }
+    baseW = Math.max(120, pctile(lumSamples, 0.80));
+  }
 
-    // 2. Fluorescence signal (brightness in UV366)
-    const lum366 = 0.25 * uv366Data[i] + 0.35 * uv366Data[i + 1] + 0.40 * uv366Data[i + 2];
-    const fRaw = Math.max(0, (lum366 - 25) / 230);
-    const f = Math.min(1.0, Math.pow(fRaw, 0.85) * gain);
+  const whiteGainScale = gain / 1.4;
+
+  for (let i = 0; i < byteLen; i += 4) {
+    // 1. UV254 quenching signal (darkness in UV254 green channel)
+    let q = 0;
+    if (uv254Data && uv254Data.length === byteLen) {
+      const g254 = uv254Data[i + 1];
+      const qRaw = Math.max(0, (baseG - g254) / baseG);
+      q = Math.min(1.0, Math.pow(qRaw, 0.9) * 1.6);
+    }
+
+    // 2. UV366 fluorescence signal (brightness in UV366)
+    let f = 0;
+    if (uv366Data && uv366Data.length === byteLen) {
+      const lum366 = 0.25 * uv366Data[i] + 0.35 * uv366Data[i + 1] + 0.40 * uv366Data[i + 2];
+      const fRaw = Math.max(0, (lum366 - 25) / 230);
+      f = Math.min(1.0, Math.pow(fRaw, 0.85) * gain);
+    }
+
+    // 3. Visible (White) light absorbance/stain signal (darker than clean white silica)
+    let v = 0;
+    if (whiteData && whiteData.length === byteLen) {
+      const lumW = 0.25 * whiteData[i] + 0.45 * whiteData[i + 1] + 0.30 * whiteData[i + 2];
+      const wRaw = Math.max(0, (baseW - lumW) / baseW);
+      const vNorm = Math.max(0, (wRaw - 0.08) / 0.92);
+      v = Math.min(1.0, Math.pow(vNorm, 0.85) * 1.55 * whiteGainScale);
+    }
 
     // Dark matrix background: [12, 18, 30]
-    // Quenching: Gold/Amber [245, 158, 11]
-    // Fluorescence: Laser Cyan [6, 182, 212]
-    out[i] = Math.min(255, Math.round(12 + q * 233 + f * 50));
-    out[i + 1] = Math.min(255, Math.round(18 + q * 140 + f * 194));
-    out[i + 2] = Math.min(255, Math.round(30 + q * 10 + f * 225));
+    // Quenching (UV254): Gold/Amber [245, 158, 11]
+    // Fluorescence (UV366): Laser Cyan [6, 182, 212]
+    // Visible Stain (White): Rose/Magenta [250, 63, 175]
+    out[i] = Math.min(255, Math.round(12 + q * 233 + f * 50 + v * 238));
+    out[i + 1] = Math.min(255, Math.round(18 + q * 140 + f * 194 + v * 45));
+    out[i + 2] = Math.min(255, Math.round(30 + q * 10 + f * 225 + v * 145));
     out[i + 3] = 255;
   }
   return out;
 }
 
 /**
- * Renders an upright false-color composite lane canvas combining UV 254 nm quenching (gold/amber)
- * and UV 365 nm fluorescence (laser cyan).
+ * Renders an upright false-color composite lane canvas combining any 2 or all 3 loaded channels:
+ * UV 254 nm quenching (gold/amber), UV 365 nm fluorescence (laser cyan), and Visible stain (rose/magenta).
  */
 export function renderFalseColorLane(
   set: TlcSet,
@@ -2209,7 +3140,9 @@ export function renderFalseColorLane(
   if (typeof document === 'undefined') return null;
   const im254 = set.imgs?.UV254;
   const im366 = set.imgs?.UV366;
-  if (!im254?.bmp || !im366?.bmp) return null;
+  const imWhite = set.imgs?.White;
+  const loadedCount = (im254?.bmp ? 1 : 0) + (im366?.bmp ? 1 : 0) + (imWhite?.bmp ? 1 : 0);
+  if (loadedCount < 2) return null;
 
   const W = Math.max(1, Math.round(width || lane.width));
   const L = Math.max(1, Math.round(height || lane.length));
@@ -2220,22 +3153,20 @@ export function renderFalseColorLane(
   const ctx = c1.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
 
-  // 1. Render UV254 lane upright
-  const m254 = laneMatrix(lane, im254.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m254[0], m254[1], m254[2], m254[3], m254[4], m254[5]);
-  ctx.drawImage(im254.bmp, 0, 0);
-  const data254 = ctx.getImageData(0, 0, W, L);
+  const extractChannelBytes = (bmp: ImageBitmap): Uint8ClampedArray => {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, W, L);
+    const m = laneMatrix(lane, bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+    ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+    ctx.drawImage(bmp, 0, 0);
+    return ctx.getImageData(0, 0, W, L).data;
+  };
 
-  // 2. Render UV366 lane upright
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-  const m366 = laneMatrix(lane, im366.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m366[0], m366[1], m366[2], m366[3], m366[4], m366[5]);
-  ctx.drawImage(im366.bmp, 0, 0);
-  const data366 = ctx.getImageData(0, 0, W, L);
+  const data254 = im254?.bmp ? extractChannelBytes(im254.bmp) : null;
+  const data366 = im366?.bmp ? extractChannelBytes(im366.bmp) : null;
+  const dataWhite = imWhite?.bmp ? extractChannelBytes(imWhite.bmp) : null;
 
-  // 3. Compute composite pixels
-  const compositeBytes = computeFalseColorComposite(data254.data, data366.data, W, L, gain);
+  const compositeBytes = computeFalseColorComposite(data254, data366, W, L, gain, dataWhite);
   const imgData = ctx.createImageData(W, L);
   imgData.data.set(compositeBytes);
 

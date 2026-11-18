@@ -6,6 +6,8 @@ export * from './scoring';
 export * from './engine';
 export * from './plateBridge';
 export * from './tlcSolventAdvisor';
+export * from './solventSystemModel';
+export * from './tlcCalibration';
 export * from './pathwayGrouping';
 export * from './molQueries';
 export * from './lcmsTargets';

@@ -21,14 +21,14 @@ interface KnownAdditiveProfile {
 }
 
 const KNOWN_ADDITIVES: KnownAdditiveProfile[] = [
-  { pattern: /^Ac$|\bTsOH\b|toluenesulfonic|tosic/i, medium: 'acid', pka: 0.9, label: 'TsOH' },
+  { pattern: /^Ac$|\bp?-?TsOH\b|\bPTSA\b|toluenesulfon|methylbenzenesulfon|benzenesulfon|tosic|tosyl/i, medium: 'acid', pka: 0.9, label: 'TsOH' },
   { pattern: /\bTFA\b|trifluoroacetic/i, medium: 'acid', pka: 3.45, label: 'TFA' },
   { pattern: /\bHCl\b|hydrochloric/i, medium: 'acid', pka: 1.8, label: 'HCl' },
   { pattern: /\bTfOH\b|triflic/i, medium: 'acid', pka: 0.3, label: 'TfOH' },
   { pattern: /\bMsOH\b|methanesulfonic/i, medium: 'acid', pka: 1.6, label: 'MsOH' },
   { pattern: /\bH2SO4\b|sulfuric\s+acid/i, medium: 'acid', pka: 1.9, label: 'H₂SO₄' },
   { pattern: /\bH3PO4\b|phosphoric\s+acid/i, medium: 'acid', pka: 3.5, label: 'H₃PO₄' },
-  { pattern: /\bPPTS\b|pyridinium\s+p-toluenesulfonate/i, medium: 'acid', pka: 5.2, label: 'PPTS' },
+  { pattern: /\bPPTS\b|pyridinium/i, medium: 'acid', pka: 5.2, label: 'PPTS' },
   { pattern: /\bCSA\b|camphorsulfonic/i, medium: 'acid', pka: 1.2, label: 'CSA' },
   { pattern: /\bHCOOH\b|formic\s+acid/i, medium: 'acid', pka: 11.6, label: 'HCOOH' },
   { pattern: /\bAcOH\b|\bHOAc\b|acetic\s+acid/i, medium: 'acid', pka: 12.6, label: 'AcOH' },

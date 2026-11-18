@@ -26,6 +26,8 @@ import {
   extractDensitogram,
   extractWellSnapshot,
   findFirstOccupiedWell,
+  findMultiChannelSpots,
+  getChannelHistogram,
   getEffectiveLaneSpots,
   laneMatrix,
   predictWellReactions,
@@ -106,23 +108,46 @@ function resolveSpotsForSnapshot(
   if (tlcSet.imgs?.White?.bmp) available.push('White');
   if (!available.length) return [];
 
-  const traceKey: TlcChannelKey =
-    preferredChannel !== 'composite' && available.includes(preferredChannel)
-      ? preferredChannel
-      : available.includes('UV254')
-      ? 'UV254'
-      : available[0];
+  const origin = tlcOrigin(tlcSet, lane, extractLaneProfileOnce);
+  const front = tlcFront(tlcSet, lane, extractLaneProfileOnce);
+
+  if (preferredChannel === 'composite') {
+    const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+    const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+    for (const ch of available) {
+      const p = extractLaneProfileOnce(tlcSet, ch, lane);
+      if (p.length) {
+        profiles[ch] = p;
+        const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileOnce);
+        if (chHist) histograms[ch] = chHist;
+      }
+    }
+    const merged = findMultiChannelSpots({
+      profiles,
+      origin,
+      front,
+      radius: lane.spotRadius ?? undefined,
+      minProminence: tlcSet.spotProminence ?? 0.28,
+      histograms,
+    });
+    return getEffectiveLaneSpots(lane, merged);
+  }
+
+  const traceKey: TlcChannelKey = available.includes(preferredChannel)
+    ? preferredChannel
+    : available.includes('UV254')
+    ? 'UV254'
+    : available[0];
 
   const profile = extractLaneProfileOnce(tlcSet, traceKey, lane);
   if (!profile.length) return [];
-  const origin = tlcOrigin(tlcSet, lane, extractLaneProfileOnce);
-  const front = tlcFront(tlcSet, lane, extractLaneProfileOnce);
   const dens = extractDensitogram(profile, {
     sign: TLC_SIGNAL[traceKey].sign,
     origin,
     front,
     radius: lane.spotRadius ?? undefined,
     minProminence: tlcSet.spotProminence ?? 0.28,
+    plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileOnce),
   });
   return getEffectiveLaneSpots(lane, dens.spots);
 }

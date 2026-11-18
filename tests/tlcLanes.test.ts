@@ -28,6 +28,10 @@ import {
   TlcSet,
   TlcSpot,
   getEffectiveLaneSpots,
+  analyzeLaneBoundaryOccupancy,
+  findMultiChannelSpots,
+  mergeMultiChannelSpots,
+  hasCompositeChannels,
 } from '../src/engine/tlcLanes';
 import { buildRun } from '../src/engine/dilution';
 import { exampleState, dataFor } from '../src/context/runPayload';
@@ -1373,6 +1377,232 @@ describe('exportTlcAnalysisCsv and exportTlcAnalysisJson', () => {
     expect(out[13]).toBeGreaterThan(180);
     expect(out[14]).toBeGreaterThan(180);
   });
+
+  it('failsafe peak detection rejects noise, dust spikes, and dark border ramps while detecting genuine near-origin and near-front peaks', () => {
+    const n = 400;
+    const origin = 40;
+    const front = 360; // span = 320
+
+    // 1. Blank lane with ±3 camera noise + extreme 1-px dead-pixel spike at 180 + dark top plate bezel (> front + 2)
+    const noisyArtifactLane = Array.from({ length: n }, (_, i) => {
+      const noise = ((i * 19 + 7) % 7) - 3; // deterministic ±3 noise
+      if (i > front + 2) return 20; // dark glass bezel past front
+      if (i < origin - 3) return 25; // dark bottom bezel
+      return 210 + noise;
+    });
+    noisyArtifactLane[180] = 5; // severe 1-pixel dead-pixel / dust speck
+
+    const falseSpots = findSpots(noisyArtifactLane, {
+      sign: -1,
+      origin,
+      front,
+      radius: 18,
+    });
+    expect(falseSpots).toEqual([]);
+
+    // 2. Genuine extreme-boundary peaks:
+    //    - Heavy origin dot at 40 + valley + resolved polar peak at Rf ~0.047 (pos 55)
+    //    - Fast nonpolar peak right before solvent front at Rf ~0.975 (pos 352), plus dark outer plate bezel (> front + 3)
+    const boundaryPeakLane = Array.from({ length: n }, (_, i) => {
+      if (i > front + 4) return 20; // dark glass bezel past front
+      const bg = 215 + (((i * 13) % 5) - 2);
+      const originDot = 135 * Math.exp(-((i - origin) ** 2) / (2 * 3.0 * 3.0));
+      const polarSpot = 125 * Math.exp(-((i - 55) ** 2) / (2 * 2.8 * 2.8)); // Rf = (55-40)/320 = 0.047
+      const nonpolarSpot = 130 * Math.exp(-((i - 352) ** 2) / (2 * 3.0 * 3.0)); // Rf = (352-40)/320 = 0.975
+      return Math.max(15, bg - originDot - polarSpot - nonpolarSpot);
+    });
+
+    const detected = findSpots(boundaryPeakLane, {
+      sign: -1,
+      origin,
+      front,
+      radius: 18,
+    });
+    expect(detected.length).toBe(2);
+    expect(detected[0].rf).toBeCloseTo(0.047, 1);
+    expect(detected[0].rf).toBeLessThan(0.08);
+    expect(detected[1].rf).toBeCloseTo(0.975, 1);
+    expect(detected[1].rf).toBeGreaterThan(0.94);
+  });
+
+  it('analyzeLaneBoundaryOccupancy detects front-crowded and baseline-pinned sample lanes without flagging uniform plate meniscus', () => {
+    const n = 400;
+    const origin = 40;
+    const front = 360;
+    const lanesInput = Array.from({ length: 8 }, (_, laneId) => {
+      const profile = Array.from({ length: n }, (__, i) => {
+        // Uniform background + uniform thin dark meniscus + uniform faint origin line across all lanes
+        const meniscus = 24 * Math.exp(-((i - front) ** 2) / (2 * 2.0 * 2.0));
+        const originLine = 22 * Math.exp(-((i - origin) ** 2) / (2 * 2.5 * 2.5));
+        let extra = 0;
+        if (laneId === 6) {
+          // Compound pushed into the solvent front band (Rf 0.93..0.99)
+          extra = 120 * Math.exp(-((i - 352) ** 2) / (2 * 8 * 8));
+        } else if (laneId === 7) {
+          // Compound pinned/streaked on baseline (Rf 0..0.04)
+          extra = 135 * Math.exp(-((i - 43) ** 2) / (2 * 7 * 7));
+        }
+        return Math.max(15, 220 - meniscus - originLine - extra);
+      });
+      return { laneId, profile, origin, front, sign: -1 };
+    });
+
+    const occ = analyzeLaneBoundaryOccupancy(lanesInput);
+    for (let id = 0; id < 6; id++) {
+      expect(occ.get(id)?.frontOccupied).toBe(false);
+      expect(occ.get(id)?.originOccupied).toBe(false);
+    }
+    expect(occ.get(6)?.frontOccupied).toBe(true);
+    expect(occ.get(6)?.originOccupied).toBe(false);
+    expect(occ.get(7)?.originOccupied).toBe(true);
+    expect(occ.get(7)?.frontOccupied).toBe(false);
+  });
+
+  it('computes 3-channel false-color composite with UV254 amber, UV366 cyan, and White stain rose/magenta plus 2-channel subsets without UV254', () => {
+    // 8 pixels (4x2): upper-quartile luminance of White (~230) establishes clean silica baseline
+    // Pixel 0: Pure background (UV254 bright 185, UV366 dark 10, White bright 230)
+    // Pixel 1: UV254-only quenching (UV254 dark 30, UV366 dark 10, White bright 230)
+    // Pixel 2: UV366-only fluorescence (UV254 bright 185, UV366 bright cyan, White bright 230)
+    // Pixel 3: White-only visible stain (UV254 bright 185, UV366 dark 10, White dark stain 35)
+    // Pixels 4-7: Clean silica background to anchor 80th-percentile White baseline
+    const uv254 = new Uint8ClampedArray([
+      165, 185, 165, 255,
+      30,  30,  30,  255,
+      165, 185, 165, 255,
+      165, 185, 165, 255,
+      165, 185, 165, 255,
+      165, 185, 165, 255,
+      165, 185, 165, 255,
+      165, 185, 165, 255,
+    ]);
+    const uv366 = new Uint8ClampedArray([
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+      60,  210, 240, 255,
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+      10,  10,  15,  255,
+    ]);
+    const white = new Uint8ClampedArray([
+      230, 230, 230, 255,
+      230, 230, 230, 255,
+      230, 230, 230, 255,
+      40,  32,  35,  255,
+      230, 230, 230, 255,
+      230, 230, 230, 255,
+      230, 230, 230, 255,
+      230, 230, 230, 255,
+    ]);
+
+    const out3 = computeFalseColorComposite(uv254, uv366, 4, 2, 1.4, white);
+    expect(out3.length).toBe(32);
+
+    // Pixel 0 (clean background): remains dark matrix [12, 18, 30] without white washout
+    expect(out3[0]).toBeLessThan(55);
+    expect(out3[1]).toBeLessThan(55);
+    expect(out3[2]).toBeLessThan(65);
+
+    // Pixel 1 (UV254-only): Amber (high R & G, low B)
+    expect(out3[4]).toBeGreaterThan(180);
+    expect(out3[5]).toBeGreaterThan(110);
+    expect(out3[6]).toBeLessThan(60);
+
+    // Pixel 2 (UV366-only): Cyan (high G & B)
+    expect(out3[9]).toBeGreaterThan(150);
+    expect(out3[10]).toBeGreaterThan(200);
+
+    // Pixel 3 (White stain-only): Rose/Magenta (high R & B, low-moderate G)
+    expect(out3[12]).toBeGreaterThan(180);
+    expect(out3[13]).toBeLessThan(100);
+    expect(out3[14]).toBeGreaterThan(130);
+
+    // 2-channel subset without UV254 (UV366 + White) still maps both signals cleanly
+    const out366White = computeFalseColorComposite(null, uv366, 4, 2, 1.4, white);
+    expect(out366White[0]).toBeLessThan(55);
+    expect(out366White[9]).toBeGreaterThan(150);
+    expect(out366White[10]).toBeGreaterThan(200);
+    expect(out366White[12]).toBeGreaterThan(180);
+    expect(out366White[14]).toBeGreaterThan(130);
+
+    // 2-channel subset without UV366 (UV254 + White)
+    const out254White = computeFalseColorComposite(uv254, null, 4, 2, 1.4, white);
+    expect(out254White[4]).toBeGreaterThan(180);
+    expect(out254White[12]).toBeGreaterThan(180);
+    expect(out254White[14]).toBeGreaterThan(130);
+  });
+
+  it('hasCompositeChannels detects any 2+ loaded channels among UV254, UV366, and White', () => {
+    expect(hasCompositeChannels({})).toBe(false);
+    expect(hasCompositeChannels({ UV254: { name: 'a' } })).toBe(false);
+    expect(hasCompositeChannels({ UV254: { name: 'a' }, White: { name: 'b' } })).toBe(true);
+    expect(hasCompositeChannels({ UV366: { name: 'a' }, White: { name: 'b' } })).toBe(true);
+    expect(hasCompositeChannels({ UV254: { name: 'a' }, UV366: { name: 'b' }, White: { name: 'c' } })).toBe(true);
+    expect(hasCompositeChannels({ UV254: { name: 'a', bmp: {} }, White: { name: 'b' } }, true)).toBe(false);
+    expect(hasCompositeChannels({ UV254: { name: 'a', bmp: {} }, White: { name: 'b', bmp: {} } }, true)).toBe(true);
+  });
+
+  it('findMultiChannelSpots detects channel-unique spots across UV254, UV366, White and merges co-eluting peaks with provenance', () => {
+    const n = 400;
+    const origin = 40;
+    const front = 360; // span = 320
+    // Expected spots:
+    // - Rf 0.25 (pos 120): UV254-only quenching spot
+    // - Rf 0.40 (pos 168): Shared UV254 + UV366 + White co-eluting spot
+    // - Rf 0.55 (pos 216): UV366-only fluorescent spot
+    // - Rf 0.75 (pos 280): White-only visible/stained spot
+    const uv254Profile = Array.from({ length: n }, (_, i) => {
+      const s1 = 120 * Math.exp(-((i - 120) ** 2) / (2 * 4.5 * 4.5));
+      const shared = 110 * Math.exp(-((i - 168) ** 2) / (2 * 4.5 * 4.5));
+      return Math.max(10, 210 - s1 - shared);
+    });
+    const uv366Profile = Array.from({ length: n }, (_, i) => {
+      const shared = 130 * Math.exp(-((i - 169) ** 2) / (2 * 4.5 * 4.5));
+      const s3 = 140 * Math.exp(-((i - 216) ** 2) / (2 * 4.5 * 4.5));
+      return Math.min(250, 15 + shared + s3);
+    });
+    const whiteProfile = Array.from({ length: n }, (_, i) => {
+      const shared = 100 * Math.exp(-((i - 167) ** 2) / (2 * 4.5 * 4.5));
+      const s4 = 125 * Math.exp(-((i - 280) ** 2) / (2 * 4.5 * 4.5));
+      return Math.max(10, 225 - shared - s4);
+    });
+
+    const multi = findMultiChannelSpots({
+      profiles: {
+        UV254: uv254Profile,
+        UV366: uv366Profile,
+        White: whiteProfile,
+      },
+      origin,
+      front,
+      radius: 16,
+      minProminence: 0.15,
+    });
+
+    expect(multi.length).toBe(4);
+    expect(multi[0].rf).toBeCloseTo(0.25, 1);
+    expect(multi[0].channels).toEqual(['UV254']);
+
+    expect(multi[1].rf).toBeCloseTo(0.4, 1);
+    expect(multi[1].channels).toEqual(['UV254', 'UV366', 'White']);
+
+    expect(multi[2].rf).toBeCloseTo(0.55, 1);
+    expect(multi[2].channels).toEqual(['UV366']);
+
+    expect(multi[3].rf).toBeCloseTo(0.75, 1);
+    expect(multi[3].channels).toEqual(['White']);
+
+    // Direct mergeMultiChannelSpots check
+    const mergedOnly = mergeMultiChannelSpots({
+      UV254: [{ pos: 100, rf: 0.25, strength: 0.7, source: 'auto' }],
+      White: [{ pos: 102, rf: 0.26, strength: 0.9, source: 'auto' }],
+    });
+    expect(mergedOnly.length).toBe(1);
+    expect(mergedOnly[0].channels).toEqual(['UV254', 'White']);
+    expect(mergedOnly[0].strength).toBe(0.9);
+  });
 });
+
 
 

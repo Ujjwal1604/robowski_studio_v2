@@ -6,7 +6,16 @@ import {
   optimizePlateTlcSolvents,
   predictWellReactions,
   extractWellForPrediction,
+  buildWellTlcContext,
   WellPredictionResult,
+  composeSolventSystem,
+  computeMixtureDescriptors,
+  validateEluentCompatibility,
+  generateExtendedDynamicSpecs,
+  generatePrismaTernarySpecs,
+  invertLangmuirForPct,
+  synthesizePlateTailoredSpecs,
+  matchTlcSetNameToSolvent,
 } from '../src/engine/predictor';
 import { exampleState } from '../src/context/runPayload';
 import { RunResult } from '../src/types';
@@ -507,5 +516,450 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
         (r) => r.system.stationaryPhase === 'SiO2' && !r.system.acidModifier && !r.system.baseModifier
       )
     ).toBe(true);
+  });
+
+  it('differentiates primary/tertiary amides, ureas, sulfonamides, phenols, boronic acids, -CF3 halides, and quaternary salts (#3)', () => {
+    const primAmide = profileMoleculeForTlc(rdkit, 'NC(=O)c1ccccc1'); // benzamide
+    const tertAmide = profileMoleculeForTlc(rdkit, 'CN(C)C(=O)c1ccccc1'); // N,N-dimethylbenzamide
+    const urea = profileMoleculeForTlc(rdkit, 'O=C(Nc1ccccc1)Nc1ccccc1'); // diphenylurea
+    const sulfonamide = profileMoleculeForTlc(rdkit, 'NS(=O)(=O)c1ccccc1'); // benzenesulfonamide
+    const phenol = profileMoleculeForTlc(rdkit, 'Oc1ccccc1'); // phenol
+    const boronic = profileMoleculeForTlc(rdkit, 'OB(O)c1ccccc1'); // phenylboronic acid
+    const cf3Bromide = profileMoleculeForTlc(rdkit, 'FC(F)(F)c1ccc(Br)cc1'); // 4-bromobenzotrifluoride
+    const quatSalt = profileMoleculeForTlc(rdkit, 'C[N+](C)(C)Cc1ccccc1.[Cl-]');
+
+    expect(primAmide.primaryAmideCount).toBe(1);
+    expect(tertAmide.primaryAmideCount).toBe(0);
+    expect(tertAmide.secondaryAmideCount).toBe(0);
+    expect(urea.ureaCount).toBe(1);
+    expect(sulfonamide.sulfonamideCount).toBe(1);
+    expect(phenol.phenolCount).toBe(1);
+    expect(boronic.boronicCount).toBe(1);
+    expect(cf3Bromide.cf3Count).toBe(1);
+    expect(cf3Bromide.heavyHalogenCount).toBe(1);
+    expect(quatSalt.zwitterionOrQuatCount).toBe(1);
+    expect(primAmide.exactmw).toBeGreaterThan(100);
+
+    const etoac50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const etoac10 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_10')!;
+    const meoh7 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_7')!;
+    const c18_60 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'c18_mecn_60')!;
+
+    // Primary amide retains noticeably stronger than N,N-dimethyl tertiary amide
+    expect(predictNormalPhaseRf(tertAmide, etoac50).rf).toBeGreaterThan(
+      predictNormalPhaseRf(primAmide, etoac50).rf
+    );
+    // Free boronic acid flags streaking in 50% EtOAc/Hex and is rescued by polar MeOH/AcOH or C18
+    expect(predictNormalPhaseRf(boronic, etoac50).tailing).toBe(true);
+    expect(predictNormalPhaseRf(boronic, meoh7).tailing).toBe(false);
+    expect(predictNormalPhaseRf(boronic, c18_60).rf).toBeGreaterThan(0.5);
+    // CF3/Br arene elutes cleanly at high Rf even in 10% EtOAc/Hex
+    expect(predictNormalPhaseRf(cf3Bromide, etoac10).rf).toBeGreaterThan(0.45);
+    // Quaternary ammonium pins on SiO2 and elutes readily on C18
+    expect(predictNormalPhaseRf(quatSalt, etoac50).tailing).toBe(true);
+    expect(predictNormalPhaseRf(quatSalt, etoac50).rf).toBeLessThan(0.12);
+    expect(predictNormalPhaseRf(quatSalt, c18_60).rf).toBeGreaterThan(0.55);
+  });
+
+  it('models TsOH protonation stoichiometry and finite 1% Et3N capacity vs 2M NH3/MeOH & Basic Al2O3', async () => {
+    const aminoBenz = profileMoleculeForTlc(rdkit, 'Nc1ccc2[nH]cnc2c1'); // 5-aminobenzimidazole
+    const pyrroleKetone = profileMoleculeForTlc(rdkit, 'O=C(C(Cl)(Cl)Cl)c1ccc[nH]1'); // 2-(trichloroacetyl)pyrrole
+    const polyBasicImine = profileMoleculeForTlc(rdkit, 'c1c[nH]c(C=Nc2ccc3[nH]cnc3c2)n1'); // C11H9N5
+
+    expect(aminoBenz.basicAzoleNCount).toBe(1);
+    expect(aminoBenz.anilineCount).toBe(1);
+    expect(pyrroleKetone.basicAzoleNCount).toBe(0);
+    expect(pyrroleKetone.anilineCount).toBe(0);
+    expect(polyBasicImine.basicAzoleNCount).toBe(2);
+
+    const meoh5Et3n = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_5_et3n')!;
+    const meoh5Nh3 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_5')!;
+    const meoh7 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_7')!;
+
+    const tsoh1EqCtx = buildWellTlcContext({
+      substrates: [
+        { smiles: 'Nc1ccc2[nH]cnc2c1', equivalence: 1.0 },
+        { smiles: 'O=C(C(Cl)(Cl)Cl)c1ccc[nH]1', equivalence: 1.0 },
+      ],
+      condition: {
+        medium: 'acid',
+        additiveName: 'TsOH',
+        additiveEquiv: 1.0,
+        additivePka: 0.9,
+        temperatureC: 80,
+        waterPct: 0,
+      },
+    });
+    expect(tsoh1EqCtx.acidStrength).toBe('strong_nonvolatile');
+    expect(tsoh1EqCtx.acidLoadEq).toBeCloseTo(1.0, 1);
+
+    const acohCtx = buildWellTlcContext({
+      substrates: [{ smiles: 'Nc1ccc2[nH]cnc2c1', equivalence: 1.0 }],
+      condition: {
+        medium: 'acid',
+        additiveName: 'AcOH',
+        additiveEquiv: 0.3,
+        additivePka: 12.3,
+        temperatureC: 80,
+        waterPct: 0,
+      },
+    });
+    expect(acohCtx.acidStrength).toBe('weak');
+
+    // Non-basic pyrrole is unaffected by 1.0 eq TsOH
+    expect(predictNormalPhaseRf(pyrroleKetone, meoh5Et3n, tsoh1EqCtx).rf).toBe(
+      predictNormalPhaseRf(pyrroleKetone, meoh5Et3n).rf
+    );
+
+    // 1% Et3N cannot fully neutralize 1.0 eq TsOH + silica Si-OH for basic 5-aminobenzimidazole / poly-basic imine
+    const smBNeutral = predictNormalPhaseRf(aminoBenz, meoh5Et3n);
+    const smBTsohEt3n = predictNormalPhaseRf(aminoBenz, meoh5Et3n, tsoh1EqCtx);
+    const prod2TsohEt3n = predictNormalPhaseRf(polyBasicImine, meoh5Et3n, tsoh1EqCtx);
+    const prod2TsohNh3 = predictNormalPhaseRf(polyBasicImine, meoh5Nh3, tsoh1EqCtx);
+    const prod2TsohBasicAl = predictNormalPhaseRf(polyBasicImine, meoh7, tsoh1EqCtx, 'Al2O3_basic');
+
+    expect(smBTsohEt3n.rf).toBeLessThan(smBNeutral.rf);
+    expect(smBTsohEt3n.tailing).toBe(true);
+    expect(smBTsohEt3n.tailingReason).toMatch(/1% Et₃N/);
+    expect(prod2TsohEt3n.tailing).toBe(true);
+
+    // Weak volatile AcOH (0.3 eq) does not overwhelm 1% Et3N
+    expect(predictNormalPhaseRf(aminoBenz, meoh5Et3n, acohCtx).tailing).toBe(false);
+
+    // 2M NH3/MeOH and Basic Al2O3 neutralize 1.0 eq TsOH much cleaner than 1% Et3N
+    expect(prod2TsohNh3.tailing).toBe(false);
+    expect(prod2TsohNh3.rf).toBeGreaterThan(prod2TsohEt3n.rf);
+    expect(prod2TsohBasicAl.tailing).toBe(false);
+
+    // Plate advisor on a 1.0 eq TsOH plate emits the TsOH / 1% Et3N warning in summaryNotes and avoids ranking 1% Et3N above NH3/MeOH
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      {
+        code: 'A',
+        name: '4-Imidazolecarboxaldehyde',
+        smiles: 'O=Cc1c[nH]cn1',
+        molarMass: 96.09,
+        density: 1.2,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+      {
+        code: 'B',
+        name: '5-Aminobenzimidazole',
+        smiles: 'Nc1ccc2[nH]cnc2c1',
+        molarMass: 133.15,
+        density: 1.1,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+      {
+        code: 'C',
+        name: 'TsOH·H2O',
+        smiles: '',
+        molarMass: 190.22,
+        density: 1.2,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+    const tsohRow = {
+      local_index: 0,
+      global_index: 0,
+      combo_index: 0,
+      plate_number: 0,
+      container_id: 0,
+      recipe: [
+        { code: 'A', name: '4-Imidazolecarboxaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: '5-Aminobenzimidazole', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: 'TsOH·H2O', target_concentration: 50, equivalence: 1.0 },
+      ],
+      'vol#solvent': 400,
+    };
+    const tsohPlan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 1, rows: [tsohRow] } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 2 }
+    );
+    expect(tsohPlan.summaryNotes.some((n) => /1% Et₃N/.test(n) && /TsOH/.test(n))).toBe(true);
+    expect(tsohPlan.recommendedSystems.some((r) => r.system.baseModifier?.includes('NH₃'))).toBe(true);
+
+    // Buffered well regression: when basic azoles absorb 0.2-1.0 eq TsOH into ImH+ TsO- (effectivePhDmso ~7.0-8.0, freeAcidEq=0),
+    // buildWellTlcContext(ext, pred) must STILL model salt retention & lag in 1% Et3N vs 2M NH3/MeOH.
+    const imidAld = profileMoleculeForTlc(rdkit, 'O=Cc1c[nH]cn1');
+    const subs = [
+      { id: 'A', code: 'A', name: '4-Imidazolecarboxaldehyde', smiles: 'O=Cc1c[nH]cn1', equivalents: 1 },
+      { id: 'B', code: 'B', name: '5-Aminobenzimidazole', smiles: 'Nc1ccc2[nH]cnc2c1', equivalents: 1 },
+      { id: 'C', code: 'C', name: '2-(Trichloroacetyl)pyrrole', smiles: 'O=C(C(Cl)(Cl)Cl)c1ccc[nH]1', equivalents: 1 },
+    ];
+    const condHalf = {
+      medium: 'acid' as const,
+      additiveName: 'pTsOH',
+      additiveEquiv: 0.5,
+      additivePka: 0.9,
+      temperatureC: 80,
+      waterPct: 2,
+      solvent: 'DMSO',
+      equivBasis: 'limiting' as const,
+    };
+    const predHalf = predictWellReactions(rdkit, subs, condHalf);
+    expect(predHalf.acidBase.effectiveMedium).toBe('buffered');
+    const ctxHalf = buildWellTlcContext({ substrates: subs, condition: condHalf }, predHalf);
+    expect(ctxHalf.acidStrength).toBe('strong_nonvolatile');
+
+    const imidNeutral = predictNormalPhaseRf(imidAld, meoh5Et3n);
+    const imidHalfEt3n = predictNormalPhaseRf(imidAld, meoh5Et3n, ctxHalf);
+    const imidHalfNh3 = predictNormalPhaseRf(imidAld, meoh5Nh3, ctxHalf);
+    expect(imidHalfEt3n.rf).toBeLessThan(imidNeutral.rf - 0.15);
+    expect(imidHalfEt3n.mildStreak || imidHalfEt3n.tailing).toBe(true);
+    expect(imidHalfNh3.tailing).toBe(false);
+    expect(imidHalfNh3.rf).toBeGreaterThan(imidHalfEt3n.rf);
+    expect(predictNormalPhaseRf(aminoBenz, meoh5Et3n, ctxHalf).tailing).toBe(true);
+
+    // PTSA naming variant recognized as strong acid additive in plateBridge
+    state.reagents[2] = { ...state.reagents[2], name: 'PTSA' };
+    const extPtsa = extractWellForPrediction(state, tsohRow as any);
+    expect(extPtsa.condition.medium).toBe('acid');
+  });
+
+  it('derives solvent strength via Langmuir silanol saturation, enforces chemical compatibility, and applies toluene aromatic selectivity', async () => {
+    // 1. Langmuir non-linear silanol saturation: MeOH in DCM rises sharply at low % and saturates above 10%
+    const d1 = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 1, modifierId: 'none', stationaryPhase: 'SiO2' });
+    const d5 = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 5, modifierId: 'none', stationaryPhase: 'SiO2' });
+    const d12 = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 12, modifierId: 'none', stationaryPhase: 'SiO2' });
+    expect(d5.strength - d1.strength).toBeGreaterThan(d12.strength - d5.strength);
+    expect(d12.strength).toBeGreaterThan(d5.strength);
+
+    // EtOAc/Hexanes monotonic curve + modifier NH3/MeOH carrier MeOH contribution
+    const ea15 = composeSolventSystem({
+      id: 'etoac_hex_15',
+      strongSolvent: 'EtOAc',
+      weakSolvent: 'Hexanes',
+      strongPct: 15,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'etoac_hex',
+      preferenceTier: 'primary',
+    });
+    expect(ea15.strength).toBeGreaterThan(0.14);
+    expect(ea15.strength).toBeLessThan(0.28);
+    expect(ea15.chamberPrep50mL).toBe('7.5 mL EtOAc + 42.5 mL Hexanes');
+
+    const nh3High = composeSolventSystem({
+      id: 'nh3_meoh_dcm_high_6',
+      strongSolvent: 'MeOH',
+      weakSolvent: 'DCM',
+      strongPct: 2,
+      modifierId: 'nh3_meoh_4',
+      stationaryPhase: 'SiO2',
+      family: 'basic_mod',
+      preferenceTier: 'primary',
+    });
+    expect(nh3High.alcoholPct).toBe(6);
+    expect(nh3High.descriptors?.modifierCapacity).toBeGreaterThan(1.2);
+    expect(nh3High.chamberPrep50mL).toContain('2.0 mL (2M NH₃ in MeOH)');
+
+    // 2. Compatibility rules reject immiscible/reactive/destructive mixtures
+    expect(validateEluentCompatibility({ strongSolvent: 'MeOH', weakSolvent: 'Hexanes', strongPct: 5, modifierId: 'none', stationaryPhase: 'SiO2' }).valid).toBe(false);
+    expect(validateEluentCompatibility({ strongSolvent: 'EtOAc', weakSolvent: 'Hexanes', strongPct: 50, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' }).valid).toBe(false);
+    expect(validateEluentCompatibility({ strongSolvent: 'Acetone', weakSolvent: 'Hexanes', strongPct: 30, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' }).valid).toBe(false);
+    expect(validateEluentCompatibility({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 20, modifierId: 'none', stationaryPhase: 'SiO2' }).valid).toBe(false);
+    expect(validateEluentCompatibility({ strongSolvent: 'EtOAc', weakSolvent: 'Hexanes', strongPct: 30, modifierId: 'et3n_1', stationaryPhase: 'SiO2' }, 'Al2O3_basic').valid).toBe(false);
+
+    // 3. Aromatic pi-competition: EtOAc/Toluene 25% selectively lifts polyaromatic heterocycle relative to EtOAc/Hex 50% (similar bulk strength)
+    const polyArom = profileMoleculeForTlc(rdkit, 'O=c1[nH]c2ccccc2c2ccccc12'); // fused aromatic lactam
+    const aliphAmide = profileMoleculeForTlc(rdkit, 'CCCCCC(=O)NC1CCCCC1'); // matched non-aromatic amide
+    const eaHex50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const eaTol25 = composeSolventSystem(
+      generateExtendedDynamicSpecs({ aromaticHeavyPlate: true }).find((s) => s.id === 'etoac_toluene_25')!
+    );
+    const aromGapTol = predictNormalPhaseRf(polyArom, eaTol25).rf - predictNormalPhaseRf(aliphAmide, eaTol25).rf;
+    const aromGapHex = predictNormalPhaseRf(polyArom, eaHex50).rf - predictNormalPhaseRf(aliphAmide, eaHex50).rf;
+    expect(aromGapTol).toBeGreaterThan(aromGapHex);
+
+    // 4. Calibration matcher resolves dynamic eluent names cleanly while preserving canonical 2:1 Hex/EtOAc -> etoac_hex_25
+    expect(matchTlcSetNameToSolvent('15% EtOAc / Hexanes')?.system.id).toBe('etoac_hex_15');
+    expect(matchTlcSetNameToSolvent('25% EtOAc / Toluene')?.system.id).toBe('etoac_toluene_25');
+    expect(matchTlcSetNameToSolvent('5% MeOH / Toluene + 1% Et₃N')?.system.id).toBe('meoh_toluene_5_et3n');
+    expect(matchTlcSetNameToSolvent('94:2:4 DCM/MeOH/NH₃')?.system.id).toBe('nh3_meoh_dcm_high_6');
+    expect(matchTlcSetNameToSolvent('2:1 Hex/EtOAc')?.system.id).toBe('etoac_hex_25');
+
+    // 5. High-acid TsOH plate optimizer exposes and scores high-capacity 4% (2M NH3/MeOH) dynamic candidate cleanly
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: '4-Imidazolecarboxaldehyde', smiles: 'O=Cc1c[nH]cn1', molarMass: 96.09, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '5-Aminobenzimidazole', smiles: 'Nc1ccc2[nH]cnc2c1', molarMass: 133.15, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+    const heavyTsohRow = {
+      local_index: 0,
+      global_index: 0,
+      combo_index: 0,
+      plate_number: 0,
+      container_id: 0,
+      recipe: [
+        { code: 'A', name: '4-Imidazolecarboxaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: '5-Aminobenzimidazole', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: 'TsOH·H2O', target_concentration: 60, equivalence: 1.2 },
+      ],
+      'vol#solvent': 400,
+    };
+    const heavyPlan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 1, rows: [heavyTsohRow] } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 2 }
+    );
+    const allExposed = [...heavyPlan.recommendedSystems, ...heavyPlan.otherSystems];
+    expect(allExposed.some((e) => e.system.id.startsWith('nh3_meoh_dcm_high_'))).toBe(true);
+    const imidProf = profileMoleculeForTlc(rdkit, 'O=Cc1c[nH]cn1');
+    const pred2 = predictNormalPhaseRf(imidProf, TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_5')!, { hasAcidAdditive: true, additiveLabel: 'TsOH', acidStrength: 'strong_nonvolatile', acidLoadEq: 1.2 });
+    const pred4 = predictNormalPhaseRf(imidProf, nh3High, { hasAcidAdditive: true, additiveLabel: 'TsOH', acidStrength: 'strong_nonvolatile', acidLoadEq: 1.2 });
+    expect(pred4.rf).toBeGreaterThanOrEqual(pred2.rf);
+    expect(pred4.tailing).toBe(false);
+
+    // 6. Langmuir inversion & plate-tailored eluent synthesis + EmpiricalPlateProfile
+    const invPct = invertLangmuirForPct('EtOAc', 'Hexanes', 'none', 0.37);
+    expect(invPct).not.toBeNull();
+    const invDesc = computeMixtureDescriptors({ strongSolvent: 'EtOAc', weakSolvent: 'Hexanes', strongPct: invPct!, modifierId: 'none', stationaryPhase: 'SiO2' });
+    expect(Math.abs(invDesc.strength - 0.37)).toBeLessThan(0.05);
+
+    const synth = synthesizePlateTailoredSpecs({
+      targetStrengths: [0.36, 0.72],
+      aromaticHeavyPlate: true,
+      hasStrongWellAcid: true,
+      maxAcidStress: 1.1,
+      needsBasicMod: true,
+      needsAcidMod: false,
+    });
+    expect(synth.some((s) => s.isSynthesized && s.modifierId === 'nh3_meoh_4')).toBe(true);
+    expect(synth.some((s) => s.isSynthesized && s.weakSolvent === 'Toluene')).toBe(true);
+
+    expect(heavyPlan.empiricalProfile).toBeDefined();
+    expect(heavyPlan.empiricalProfile!.maxAcidStress).toBeGreaterThanOrEqual(0.95);
+    expect(heavyPlan.empiricalProfile!.recommendedMinBaseCap).toBe(1.35);
+    expect(heavyPlan.empiricalProfile!.meanAromaticRings).toBeGreaterThanOrEqual(1.5);
+    expect(heavyPlan.empiricalProfile!.synthesizedCandidateCount).toBeGreaterThan(0);
+    expect(heavyPlan.empiricalProfile!.prismaCandidateCount).toBeGreaterThan(0);
+  });
+
+  it('models LSER inductive EWG attenuation, Snyder-Soczewinski n_i slope, Geiss beta-front demixing, and MTBE/PRISMA ternary blends', async () => {
+    // 1. LSER + EWG inductive attenuation
+    const aniline = profileMoleculeForTlc(rdkit, 'Nc1ccccc1');
+    const cf3Aniline = profileMoleculeForTlc(rdkit, 'Nc1ccc(C(F)(F)F)cc1');
+    const nitroAniline = profileMoleculeForTlc(rdkit, 'Nc1ccc([N+](=O)[O-])cc1');
+    expect(aniline.lser).toBeDefined();
+    expect(cf3Aniline.cf3Count).toBe(1);
+    expect(nitroAniline.nitroCount).toBe(1);
+    expect(cf3Aniline.lser!.B).toBeLessThan(aniline.lser!.B);
+    expect(nitroAniline.lser!.S).toBeGreaterThan(aniline.lser!.S);
+
+    // 2. Snyder-Soczewinski displacement slope n_i: large multifunctional solute has steeper d(Rf)/d(eps0) than compact fragment
+    const compactImid = profileMoleculeForTlc(rdkit, 'O=Cc1c[nH]cn1');
+    const largeBisAmide = profileMoleculeForTlc(rdkit, 'Cc1ccc(S(=O)(=O)Nc2ccc(C(=O)Nc3ccc(OC)cc3)cc2)cc1');
+    expect(largeBisAmide.lser!.displacementN).toBeGreaterThan(1.1);
+    expect(compactImid.lser!.displacementN).toBeLessThan(largeBisAmide.lser!.displacementN);
+
+    const ea25 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_25')!;
+    const ea80 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_80')!;
+    const ea50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const largeSpan = predictNormalPhaseRf(largeBisAmide, ea80).rf - predictNormalPhaseRf(largeBisAmide, ea25).rf;
+    const compactSpan = predictNormalPhaseRf(compactImid, ea80).rf - predictNormalPhaseRf(compactImid, ea25).rf;
+    expect(largeSpan).toBeGreaterThan(compactSpan);
+    expect(predictNormalPhaseRf(cf3Aniline, ea50).rf).toBeGreaterThan(predictNormalPhaseRf(aniline, ea50).rf - 0.05);
+
+    // Apolar small halides like benzyl bromide move with the solvent front (>= 0.97) in MeOH/DCM & DCM/NH3-MeOH
+    const benzylBromide = profileMoleculeForTlc(rdkit, 'BrCc1ccccc1');
+    const nh3Dcm2 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_2')!;
+    const meohDcm3 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_3')!;
+    expect(predictNormalPhaseRf(benzylBromide, nh3Dcm2).rf).toBeGreaterThanOrEqual(0.97);
+    expect(predictNormalPhaseRf(benzylBromide, meohDcm3).rf).toBeGreaterThanOrEqual(0.98);
+
+    // 3. Geiss secondary solvent front (beta-front demixing) on dry SiO2
+    const meoh3Desc = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 3, modifierId: 'none', stationaryPhase: 'SiO2' });
+    const meoh12Desc = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 12, modifierId: 'none', stationaryPhase: 'SiO2' });
+    expect(meoh3Desc.betaFrontCeiling).toBeDefined();
+    expect(meoh12Desc.betaFrontCeiling).toBeDefined();
+    expect(meoh3Desc.betaFrontCeiling!).toBeLessThan(0.9);
+    expect(meoh12Desc.betaFrontCeiling!).toBeGreaterThan(meoh3Desc.betaFrontCeiling!);
+
+    const sysMeoh3 = composeSolventSystem({
+      id: 'meoh_dcm_3_test',
+      strongSolvent: 'MeOH',
+      weakSolvent: 'DCM',
+      strongPct: 3,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'meoh_dcm',
+      preferenceTier: 'primary',
+    });
+    const sysMeoh12 = composeSolventSystem({
+      id: 'meoh_dcm_12_test',
+      strongSolvent: 'MeOH',
+      weakSolvent: 'DCM',
+      strongPct: 12,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'meoh_dcm',
+      preferenceTier: 'primary',
+    });
+    const fastPolarAmide = profileMoleculeForTlc(rdkit, 'CCCCCCCCNC(=O)c1ccccc1O'); // H-bond dependent phenolic amide
+    const pred3 = predictNormalPhaseRf(fastPolarAmide, sysMeoh3);
+    const pred12 = predictNormalPhaseRf(fastPolarAmide, sysMeoh12);
+    expect(pred3.rf).toBeLessThanOrEqual(meoh3Desc.betaFrontCeiling! + 0.01);
+    expect(pred12.rf).toBeGreaterThan(pred3.rf);
+
+    // 4. MTBE vertex + Nyiredy PRISMA ternary blends & miscibility rules
+    const mtbe50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'mtbe_hex_50');
+    expect(mtbe50).toBeDefined();
+    expect(mtbe50!.family).toBe('mtbe_hex');
+    expect(mtbe50!.preferenceTier).toBe('secondary');
+    expect(matchTlcSetNameToSolvent('50% MTBE / Hexanes')?.system.id).toBe('mtbe_hex_50');
+
+    // Immiscible MeOH/Hex without >=25% bridging co-solvent fails, whereas 5% MeOH + 35% EtOAc + 60% Hex succeeds
+    expect(
+      validateEluentCompatibility({
+        strongSolvent: 'MeOH',
+        weakSolvent: 'Hexanes',
+        ternaryCoSolvent: { solvent: 'EtOAc', pct: 10 },
+        strongPct: 5,
+        modifierId: 'none',
+        stationaryPhase: 'SiO2',
+      }).valid
+    ).toBe(false);
+
+    const prismaBlend = composeSolventSystem({
+      id: 'prisma_test_blend',
+      strongSolvent: 'MeOH',
+      weakSolvent: 'Hexanes',
+      ternaryCoSolvent: { solvent: 'EtOAc', pct: 35 },
+      strongPct: 5,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'prisma_ternary',
+      preferenceTier: 'secondary',
+    });
+    expect(prismaBlend.chamberPrep50mL).toContain('MeOH');
+    expect(prismaBlend.chamberPrep50mL).toContain('EtOAc');
+    expect(prismaBlend.chamberPrep50mL).toContain('Hexanes');
+    expect(prismaBlend.composition?.ternaryCoSolvent).toEqual({ solvent: 'EtOAc', pct: 35 });
+    expect(prismaBlend.strength).toBeGreaterThan(0.35);
+
+    const prismaSpecs = generatePrismaTernarySpecs({
+      targetStrengths: [0.34, 0.62],
+      aromaticHeavyPlate: true,
+      hasStrongWellAcid: false,
+      maxAcidStress: 0,
+      needsBasicMod: false,
+      needsAcidMod: false,
+    });
+    expect(prismaSpecs.length).toBeGreaterThan(0);
+    expect(prismaSpecs.every((p) => p.family === 'prisma_ternary' && Boolean(p.ternaryCoSolvent))).toBe(true);
   });
 });

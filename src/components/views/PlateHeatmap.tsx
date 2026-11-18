@@ -10,6 +10,8 @@ import { RunResult, RunState, TlcSet, TlcSpot, TlcLane } from '../../types';
 import {
   PAL,
   findSpots,
+  findMultiChannelSpots,
+  getChannelHistogram,
   tlcOrigin,
   tlcFront,
   TLC_SIGNAL,
@@ -99,7 +101,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
         if (tlcChannelFilter === 'all') {
           if (activeTlcSet.imgs.UV254?.bmp) channelsToCheck.push('UV254');
           if (activeTlcSet.imgs.UV366?.bmp) channelsToCheck.push('UV366');
-          if (activeTlcSet.imgs.White?.bmp && channelsToCheck.length === 0) channelsToCheck.push('White');
+          if (activeTlcSet.imgs.White?.bmp) channelsToCheck.push('White');
         } else {
           if (activeTlcSet.imgs[tlcChannelFilter]?.bmp) {
             channelsToCheck.push(tlcChannelFilter);
@@ -114,34 +116,37 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
 
         if (lane.customSpots && lane.customSpots.length > 0) {
           mergedSpots = [...lane.customSpots];
-        } else {
+        } else if (channelsToCheck.length > 1) {
+          const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+          const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
           for (const ch of channelsToCheck) {
             const prof = getProf(activeTlcSet, ch, lane);
             if (prof && prof.length > 0) {
-              const chSpots = findSpots(prof, {
-                sign: TLC_SIGNAL[ch]?.sign ?? -1,
-                origin: oVal,
-                front: fVal,
-                radius: lane.spotRadius || 24,
-                minProminence: spotProminence,
-              });
-
-              if (chSpots && chSpots.length > 0) {
-                if (mergedSpots.length === 0) {
-                  mergedSpots = [...chSpots];
-                } else {
-                  for (const sp of chSpots) {
-                    const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
-                    if (!match) {
-                      mergedSpots.push(sp);
-                    } else if (sp.strength > match.strength) {
-                      match.strength = sp.strength;
-                      match.pos = sp.pos;
-                    }
-                  }
-                }
-              }
+              profiles[ch] = prof;
+              const chHist = getChannelHistogram(activeTlcSet, ch, getProf);
+              if (chHist) histograms[ch] = chHist;
             }
+          }
+          mergedSpots = findMultiChannelSpots({
+            profiles,
+            origin: oVal,
+            front: fVal,
+            radius: lane.spotRadius || 24,
+            minProminence: spotProminence,
+            histograms,
+          });
+        } else if (channelsToCheck.length === 1) {
+          const ch = channelsToCheck[0];
+          const prof = getProf(activeTlcSet, ch, lane);
+          if (prof && prof.length > 0) {
+            mergedSpots = findSpots(prof, {
+              sign: TLC_SIGNAL[ch]?.sign ?? -1,
+              origin: oVal,
+              front: fVal,
+              radius: lane.spotRadius || 24,
+              minProminence: spotProminence,
+              plateHistogram: getChannelHistogram(activeTlcSet, ch, getProf),
+            });
           }
         }
 

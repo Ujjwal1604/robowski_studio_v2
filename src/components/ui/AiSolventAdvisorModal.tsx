@@ -7,21 +7,81 @@ import {
 } from '../../services/aiService';
 import { useApp } from '../../context/AppContext';
 import {
+  calibrateTlcModelFromCampaign,
+  CalibratedLaneComparison,
+  computeLaneRowIntensity,
   containerOfLane,
   isKnownAdditiveReagent,
   LANE_FRAME_WIDTH,
+  laneMatrix,
   optimizePlateTlcSolvents,
   PlateSolventPlanResult,
   RecommendedPlateSolvent,
+  rfShiftAtMidplate,
   SimulatedWellLane,
   SolventPoolMode,
+  ALL_KNOWN_SOLVENT_SYSTEMS,
+  TLC_SIGNAL,
+  TlcCalibrationModel,
+  TlcCalibrationSpotPair,
+  TlcChannelKey,
   tlcLane,
   TlcStationaryPhasePreference,
   WellConditionConfig,
   WellPredictionResult,
 } from '../../engine';
+import { TlcLane, TlcSet } from '../../types';
 import { getRDKitInstance } from '../../utils/rdkit';
 import { ChemicalStructure } from './ChemicalStructure';
+
+let calibScratchCanvas: HTMLCanvasElement | null = null;
+
+function extractLaneProfileForCalibration(
+  set: TlcSet,
+  key: TlcChannelKey,
+  lane: TlcLane,
+  coreFraction: number = 0.35
+): number[] {
+  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
+  if (set.prof && set.prof[ck]) return set.prof[ck];
+
+  const im = set.imgs?.[key];
+  if (!im || !im.bmp || typeof document === 'undefined') return [];
+
+  const W = Math.max(1, Math.round(lane.width));
+  const L = Math.max(1, Math.round(lane.length));
+
+  if (!calibScratchCanvas) {
+    calibScratchCanvas = document.createElement('canvas');
+  }
+  calibScratchCanvas.width = W;
+  calibScratchCanvas.height = L;
+
+  const ctx = calibScratchCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return [];
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, L);
+
+  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+  ctx.drawImage(im.bmp, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, W, L);
+  const data = imgData.data;
+  const ch = TLC_SIGNAL[key].ch;
+  const out = new Array(L);
+
+  for (let y = 0; y < L; y++) {
+    const rowOffset = y * W * 4;
+    const rowSlice = data.subarray(rowOffset, rowOffset + W * 4);
+    out[L - 1 - y] = computeLaneRowIntensity(rowSlice, W, ch, coreFraction);
+  }
+
+  set.prof = set.prof || {};
+  set.prof[ck] = out;
+  return out;
+}
 
 interface SubstrateItem {
   code?: string;
@@ -107,7 +167,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   initialPlateIndex = 0,
   conditionOverrides,
 }) => {
-  const { state, run, triMeta, setTlcSets, view, setView } = useApp();
+  const { state, run, triMeta, tlcSets, setTlcSets, spotProminence, view, setView } = useApp();
   const hasPlateRun = Boolean(run && run.rows && run.rows.length > 0);
 
   const [advisorMode, setAdvisorMode] = useState<'plate54' | 'singleAi'>(
@@ -123,6 +183,13 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
   const [lowWeightPct, setLowWeightPct] = useState<number>(20);
+  const [calibrationEnabled, setCalibrationEnabled] = useState<boolean>(true);
+  const [showCalibVisuals, setShowCalibVisuals] = useState<boolean>(true);
+  const [setSolventOverrides, setSetSolventOverrides] = useState<Record<string, string>>({});
+  const [calibrationModel, setCalibrationModel] = useState<TlcCalibrationModel | null>(null);
+  const [hoveredCalibPair, setHoveredCalibPair] = useState<TlcCalibrationSpotPair | null>(null);
+  const [selectedComparePlateKey, setSelectedComparePlateKey] = useState<string>('');
+  const [inspectedCompWellIdx, setInspectedCompWellIdx] = useState<number | null>(null);
   const [plateLoading, setPlateLoading] = useState<boolean>(false);
   const [plateProgress, setPlateProgress] = useState<{ done: number; total: number }>({ done: 0, total: 54 });
   const [platePlan, setPlatePlan] = useState<PlateSolventPlanResult | null>(null);
@@ -155,12 +222,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     const reagentSig = (state.reagents || [])
       .map((r) => `${r.code}:${r.smiles || ''}:${r.molarMass || ''}:${r.name || ''}`)
       .join('|');
+    const triAddSig = (state.tri?.adds || [])
+      .map((a) => `${a.code}:${a.equiv}`)
+      .join('|');
     const condSig = `${state.reactionSolvent || ''}:${state.temperatureC ?? state.eln?.temperatureC ?? 25}:${state.waterPct ?? state.eln?.waterPct ?? 2}`;
     const ovSig = conditionOverrides
-      ? `${conditionOverrides.medium || ''}:${conditionOverrides.temperatureC ?? ''}:${conditionOverrides.waterPct ?? ''}`
+      ? `${conditionOverrides.medium || ''}:${conditionOverrides.additiveName || ''}:${conditionOverrides.additiveEquiv ?? ''}:${conditionOverrides.temperatureC ?? ''}:${conditionOverrides.waterPct ?? ''}`
       : '';
-    return `${run?.rows?.length || 0}::${state.mode}::${condSig}::${reagentSig}::${ovSig}::spec=${includeSpeculative}`;
-  }, [run?.rows?.length, state.mode, state.reactionSolvent, state.temperatureC, state.waterPct, state.eln?.temperatureC, state.eln?.waterPct, state.reagents, conditionOverrides, includeSpeculative]);
+    return `${run?.rows?.length || 0}::${state.mode}::${condSig}::${reagentSig}::${triAddSig}::${ovSig}::spec=${includeSpeculative}`;
+  }, [run?.rows?.length, state.mode, state.reactionSolvent, state.temperatureC, state.waterPct, state.eln?.temperatureC, state.eln?.waterPct, state.reagents, state.tri?.adds, conditionOverrides, includeSpeculative]);
 
   useEffect(() => {
     if (isOpen && hasPlateRun) {
@@ -242,6 +312,28 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
         ...(cachedPlatePredictions || {}),
       };
 
+      // Pre-fit empirical calibration from any already-measured TLC plates in the campaign
+      const calibFit = calibrateTlcModelFromCampaign({
+        rdkit,
+        state,
+        run,
+        triMeta,
+        tlcSets: tlcSets || [],
+        cachedPredictions: mergedCached,
+        spotProminence,
+        getProfile: (s, k, l) => extractLaneProfileForCalibration(s, k, l, 0.35),
+        setSolventOverrides,
+        conditionOverrides,
+      });
+
+      if (controller.signal.aborted || runSeqRef.current !== seq) return;
+
+      for (const [key, wp] of Object.entries(calibFit.newlyComputedPredictions)) {
+        mergedCached[key] = wp;
+        predCacheRef.current.preds[key] = wp;
+      }
+      setCalibrationModel(calibFit.model);
+
       const plan = await optimizePlateTlcSolvents(rdkit, state, run, triMeta, {
         plateIndex: plateIdx,
         maxSystems: numSystems,
@@ -251,6 +343,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
         cachedPredictions: mergedCached,
         includeSpeculative,
         lowTierWeight: lowWeightPct / 100,
+        calibration: calibrationEnabled ? calibFit.model : undefined,
         signal: controller.signal,
         onProgress: (done, total) => {
           if (runSeqRef.current === seq) {
@@ -261,7 +354,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
       if (controller.signal.aborted || runSeqRef.current !== seq) return;
 
-      // Save computed well predictions into session cache so toggling 2/3/4 Systems, Preference, or Stationary Phase is instant
+      // Save computed well predictions into session cache so toggling options or Calibration ON/OFF is instant
       if (plan.wellPredictions) {
         for (const [wIdxStr, wp] of Object.entries(plan.wellPredictions)) {
           predCacheRef.current.preds[`${plateIdx}-${wIdxStr}`] = wp;
@@ -292,6 +385,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     run,
     state,
     triMeta,
+    tlcSets,
+    spotProminence,
+    setSolventOverrides,
+    calibrationEnabled,
     plateIdx,
     numSystems,
     poolMode,
@@ -662,6 +759,32 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                     />
                     <span className="mono" style={{ minWidth: '32px' }}>{lowWeightPct}%</span>
                   </label>
+
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                      fontSize: '12px',
+                      cursor: 'pointer',
+                      padding: '3px 8px',
+                      borderRadius: '6px',
+                      border: calibrationEnabled
+                        ? '1px solid color-mix(in srgb, #10b981 45%, var(--line))'
+                        : '1px solid var(--line)',
+                      background: calibrationEnabled
+                        ? 'color-mix(in srgb, #10b981 10%, var(--panel))'
+                        : 'var(--panel)',
+                    }}
+                    title="Fit predicted Rf shift and uncertainty from already-measured TLC plates in this campaign"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={calibrationEnabled}
+                      onChange={(e) => setCalibrationEnabled(e.target.checked)}
+                    />
+                    <span style={{ fontWeight: 600 }}>Self-Calibrate from Measured TLCs</span>
+                  </label>
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
@@ -680,6 +803,1410 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   )}
                 </div>
               </div>
+
+              {/* Visual Self-Calibration Panel (parity plot, Rf shift meter, per-plate breakdown & OFF toggle) */}
+              {calibrationModel &&
+                (calibrationModel.plates.length > 0 || calibrationModel.unmatchedSets.length > 0) &&
+                (() => {
+                  const targetPhaseKey: TlcStationaryPhasePreference =
+                    stationaryPhasePref === 'C18'
+                      ? 'C18'
+                      : stationaryPhasePref === 'Al2O3_neutral'
+                      ? 'Al2O3_neutral'
+                      : stationaryPhasePref === 'Al2O3_basic'
+                      ? 'Al2O3_basic'
+                      : 'SiO2';
+                  const phaseFit = calibrationModel.byPhase[targetPhaseKey];
+                  const matchedPhasePlates = calibrationModel.plates.filter(
+                    (p) => p.stationaryPhase === targetPhaseKey
+                  );
+                  const allPairs = matchedPhasePlates.flatMap((p) => p.pairs);
+                  const censTotal = (phaseFit?.frontCensoredCount ?? 0) + (phaseFit?.baselineCensoredCount ?? 0);
+                  const evidenceCount = (phaseFit?.pairedSpotCount ?? 0) + censTotal;
+                  const isActive = calibrationEnabled && Boolean(phaseFit && evidenceCount > 0);
+                  const shiftSigned = phaseFit
+                    ? `${phaseFit.midplateRfShift >= 0 ? '+' : ''}${phaseFit.midplateRfShift.toFixed(2)}`
+                    : '+0.00';
+
+                  return (
+                    <div
+                      style={{
+                        border: isActive
+                          ? '1px solid color-mix(in srgb, #10b981 40%, var(--line))'
+                          : '1px solid var(--line)',
+                        borderRadius: '10px',
+                        background: 'var(--soft)',
+                        padding: '10px 14px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '10px',
+                      }}
+                    >
+                      {/* Header Strip */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          flexWrap: 'wrap',
+                          gap: '8px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <span
+                            className="mono"
+                            style={{
+                              fontSize: '10.5px',
+                              fontWeight: 700,
+                              padding: '2px 7px',
+                              borderRadius: '5px',
+                              background: isActive
+                                ? '#10b981'
+                                : !calibrationEnabled
+                                ? 'var(--panel)'
+                                : 'color-mix(in srgb, #f59e0b 20%, var(--panel))',
+                              color: isActive ? '#fff' : !calibrationEnabled ? 'var(--mut)' : '#f59e0b',
+                              border: isActive ? 'none' : '1px solid var(--line)',
+                            }}
+                          >
+                            {!calibrationEnabled
+                              ? 'CALIBRATION OFF'
+                              : isActive
+                              ? `CALIBRATED (${targetPhaseKey})`
+                              : 'NEEDS SOLVENT TAG'}
+                          </span>
+
+                          {!calibrationEnabled ? (
+                            <span style={{ fontSize: '12px', color: 'var(--mut)' }}>
+                              Using uncalibrated theoretical Rf predictions
+                              {phaseFit && evidenceCount > 0
+                                ? ` (${phaseFit.pairedSpotCount} paired + ${censTotal} boundary spots available · ${shiftSigned} Rf shift)`
+                                : ''}.
+                            </span>
+                          ) : phaseFit && evidenceCount > 0 ? (
+                            <span style={{ fontSize: '12px' }}>
+                              Fitted from <strong>{matchedPhasePlates.length}</strong> measured plate
+                              {matchedPhasePlates.length > 1 ? 's' : ''} (
+                              <span className="mono" style={{ fontWeight: 700 }}>
+                                {phaseFit.pairedSpotCount} spots · {phaseFit.matchedLaneCount} lanes
+                                {censTotal > 0 ? ` + ${phaseFit.frontCensoredCount ?? 0}▲/${phaseFit.baselineCensoredCount ?? 0}▼ bounds` : ''}
+                              </span>
+                              ) · Mid-plate Rf shift{' '}
+                              <span
+                                className="mono"
+                                style={{
+                                  fontWeight: 700,
+                                  color: Math.abs(phaseFit.midplateRfShift) >= 0.02 ? '#10b981' : 'var(--fg)',
+                                }}
+                              >
+                                {shiftSigned}
+                              </span>
+                              {phaseFit.demandSlope !== undefined && Math.abs(phaseFit.demandSlope - 1) >= 0.03 && (
+                                <span className="mono" style={{ color: 'var(--mut)', marginLeft: '4px' }}>
+                                  (spread ×{phaseFit.demandSlope.toFixed(2)})
+                                </span>
+                              )}
+                              {phaseFit.featureWeights &&
+                                Object.keys(phaseFit.featureWeights).length > 0 && (
+                                  <span
+                                    className="mono"
+                                    style={{ color: '#10b981', marginLeft: '6px', fontWeight: 700 }}
+                                    title={`Learned L2 Ridge descriptor offsets: ${Object.entries(phaseFit.featureWeights)
+                                      .map(([k, v]) => `${k} ${v >= 0 ? '+' : ''}${Number(v).toFixed(3)}`)
+                                      .join(', ')}`}
+                                  >
+                                    · Ridge 5D
+                                  </span>
+                                )}{' '}
+                              · RMSE{' '}
+                              <span className="mono" style={{ fontWeight: 700 }}>
+                                ±{phaseFit.rmseBefore.toFixed(2)} → ±{phaseFit.rmseAfter.toFixed(2)}
+                              </span>
+                            </span>
+                          ) : (
+                            <span style={{ fontSize: '12px', color: 'var(--mut)' }}>
+                              Measured TLC tabs detected below — assign their mobile phase to calibrate {targetPhaseKey} predictions.
+                            </span>
+                          )}
+                        </div>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <button
+                            type="button"
+                            className="btn sm"
+                            style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                            onClick={() => setCalibrationEnabled((v) => !v)}
+                          >
+                            {calibrationEnabled ? 'Turn Calibration Off' : 'Turn Calibration On'}
+                          </button>
+                          {(allPairs.length > 0 || calibrationModel.unmatchedSets.length > 0) && (
+                            <button
+                              type="button"
+                              className="btn sm"
+                              style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                              onClick={() => setShowCalibVisuals((v) => !v)}
+                            >
+                              {showCalibVisuals ? 'Hide Fit Visuals ▲' : 'Show Fit Visuals ▾'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Unmatched Plate Solvent Assigner */}
+                      {calibrationEnabled && calibrationModel.unmatchedSets.length > 0 && (
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            gap: '8px',
+                            alignItems: 'center',
+                            padding: '6px 10px',
+                            borderRadius: '6px',
+                            background: 'color-mix(in srgb, #f59e0b 10%, var(--panel))',
+                            border: '1px solid color-mix(in srgb, #f59e0b 35%, var(--line))',
+                            fontSize: '11.5px',
+                          }}
+                        >
+                          <span style={{ fontWeight: 600 }}>Unrecognized TLC tab:</span>
+                          {calibrationModel.unmatchedSets.map((u) => (
+                            <label
+                              key={u.key}
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                            >
+                              <span>
+                                “{u.name}” (Plate {u.plateIndex + 1}, {u.laneCountWithSpots} lanes):
+                              </span>
+                              <select
+                                className="f"
+                                style={{ height: '24px', fontSize: '11px', padding: '0 6px' }}
+                                value={setSolventOverrides[u.key] || ''}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setSetSolventOverrides((prev) => ({
+                                    ...prev,
+                                    [u.key]: val,
+                                  }));
+                                }}
+                              >
+                                <option value="">Select solvent ran on this plate…</option>
+                                {ALL_KNOWN_SOLVENT_SYSTEMS.map((sys) => (
+                                  <option key={sys.id} value={sys.id}>
+                                    {sys.name}
+                                  </option>
+                                ))}
+                                <option value="ignore">Ignore this plate</option>
+                              </select>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Expanded Visual Calibration Diagnostics */}
+                      {showCalibVisuals && phaseFit && allPairs.length > 0 && (
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'minmax(270px, 310px) 1fr',
+                            gap: '14px',
+                            alignItems: 'stretch',
+                            opacity: calibrationEnabled ? 1 : 0.55,
+                          }}
+                        >
+                          {/* 1. Parity Plot: Predicted Rf (Before & After) vs Measured Rf */}
+                          <div
+                            style={{
+                              background: 'var(--panel)',
+                              border: '1px solid var(--line2)',
+                              borderRadius: '8px',
+                              padding: '8px 10px',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '6px',
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
+                              <strong>Measured vs Predicted Rf</strong>
+                              <span style={{ color: 'var(--mut)', fontSize: '10px' }}>
+                                ○ Raw → ● Calibrated
+                              </span>
+                            </div>
+
+                            {(() => {
+                              const W = 270;
+                              const H = 200;
+                              const padL = 28;
+                              const padR = 10;
+                              const padT = 10;
+                              const padB = 24;
+                              const pw = W - padL - padR;
+                              const ph = H - padT - padB;
+                              const xOf = (rf: number) => padL + Math.max(0, Math.min(1, rf)) * pw;
+                              const yOf = (rf: number) => padT + (1 - Math.max(0, Math.min(1, rf))) * ph;
+                              const sigBand = phaseFit.calibratedSigma || 0.12;
+                              // Shaded +-sigma band polygon inside [0, 1]^2
+                              const polyPts = [
+                                `${xOf(0)},${yOf(Math.min(1, sigBand))}`,
+                                `${xOf(Math.max(0, 1 - sigBand))},${yOf(1)}`,
+                                `${xOf(1)},${yOf(1)}`,
+                                `${xOf(1)},${yOf(Math.max(0, 1 - sigBand))}`,
+                                `${xOf(Math.min(1, sigBand))},${yOf(0)}`,
+                                `${xOf(0)},${yOf(0)}`,
+                              ].join(' ');
+
+                              return (
+                                <svg
+                                  viewBox={`0 0 ${W} ${H}`}
+                                  style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
+                                >
+                                  {/* +/- sigma uncertainty band */}
+                                  <polygon points={polyPts} fill="rgba(16, 185, 129, 0.09)" />
+
+                                  {/* Grid & ticks */}
+                                  {[0, 0.25, 0.5, 0.75, 1].map((t) => (
+                                    <g key={t}>
+                                      <line
+                                        x1={xOf(t)}
+                                        y1={padT}
+                                        x2={xOf(t)}
+                                        y2={padT + ph}
+                                        stroke="var(--line2)"
+                                        strokeWidth={0.7}
+                                      />
+                                      <line
+                                        x1={padL}
+                                        y1={yOf(t)}
+                                        x2={padL + pw}
+                                        y2={yOf(t)}
+                                        stroke="var(--line2)"
+                                        strokeWidth={0.7}
+                                      />
+                                      <text
+                                        x={xOf(t)}
+                                        y={padT + ph + 11}
+                                        textAnchor="middle"
+                                        fontSize="8.5"
+                                        fill="var(--mut)"
+                                      >
+                                        {t.toFixed(2)}
+                                      </text>
+                                      <text
+                                        x={padL - 4}
+                                        y={yOf(t) + 3}
+                                        textAnchor="end"
+                                        fontSize="8.5"
+                                        fill="var(--mut)"
+                                      >
+                                        {t.toFixed(2)}
+                                      </text>
+                                    </g>
+                                  ))}
+
+                                  {/* Plot border */}
+                                  <rect
+                                    x={padL}
+                                    y={padT}
+                                    width={pw}
+                                    height={ph}
+                                    fill="none"
+                                    stroke="var(--line)"
+                                    strokeWidth={1}
+                                  />
+
+                                  {/* Ideal y = x diagonal */}
+                                  <line
+                                    x1={xOf(0)}
+                                    y1={yOf(0)}
+                                    x2={xOf(1)}
+                                    y2={yOf(1)}
+                                    stroke="var(--mut)"
+                                    strokeWidth={1}
+                                    strokeDasharray="4 3"
+                                  />
+
+                                  {/* Before -> After horizontal shift lines & points */}
+                                  {allPairs.slice(0, 500).map((pair, idx) => {
+                                    const xB = xOf(pair.predictedRfBefore);
+                                    const xA = xOf(pair.predictedRfAfter);
+                                    const yO = yOf(pair.observedRf);
+                                    const withinBand = Math.abs(pair.observedRf - pair.predictedRfAfter) <= sigBand;
+                                    const dotColor = withinBand ? '#10b981' : '#f59e0b';
+                                    const isHov = hoveredCalibPair === pair;
+                                    return (
+                                      <g
+                                        key={idx}
+                                        onMouseEnter={() => setHoveredCalibPair(pair)}
+                                        onMouseLeave={() => setHoveredCalibPair((cur) => (cur === pair ? null : cur))}
+                                        style={{ cursor: 'pointer' }}
+                                      >
+                                        {Math.abs(xA - xB) >= 1.5 && (
+                                          <line
+                                            x1={xB}
+                                            y1={yO}
+                                            x2={xA}
+                                            y2={yO}
+                                            stroke="rgba(16, 185, 129, 0.45)"
+                                            strokeWidth={1.1}
+                                          />
+                                        )}
+                                        <circle
+                                          cx={xB}
+                                          cy={yO}
+                                          r={2.4}
+                                          fill="none"
+                                          stroke="var(--mut)"
+                                          strokeWidth={1}
+                                          opacity={0.75}
+                                        />
+                                        <circle
+                                          cx={xA}
+                                          cy={yO}
+                                          r={isHov ? 4.4 : 3.0}
+                                          fill={dotColor}
+                                          stroke={isHov ? '#fff' : 'none'}
+                                          strokeWidth={1}
+                                          opacity={0.9}
+                                        />
+                                      </g>
+                                    );
+                                  })}
+
+                                  <text
+                                    x={padL + pw / 2}
+                                    y={H - 2}
+                                    textAnchor="middle"
+                                    fontSize="9"
+                                    fill="var(--mut)"
+                                  >
+                                    Predicted Rf
+                                  </text>
+                                </svg>
+                              );
+                            })()}
+
+                            <div className="mono" style={{ fontSize: '10px', color: 'var(--fg2)', minHeight: '14px' }}>
+                              {hoveredCalibPair
+                                ? `${hoveredCalibPair.wellCoord} (${hoveredCalibPair.speciesKind === 'product' ? 'Prod' : 'SM'}): Obs ${hoveredCalibPair.observedRf.toFixed(2)} | Raw ${hoveredCalibPair.predictedRfBefore.toFixed(2)} → Cal ${hoveredCalibPair.predictedRfAfter.toFixed(2)}`
+                                : 'Hover any point to inspect well, measured Rf & shift'}
+                            </div>
+                          </div>
+
+                          {/* 2. Shift Meter, Family Offsets & Plate Breakdown */}
+                          <div
+                            style={{
+                              background: 'var(--panel)',
+                              border: '1px solid var(--line2)',
+                              borderRadius: '8px',
+                              padding: '10px 12px',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              justifyContent: 'space-between',
+                              gap: '10px',
+                            }}
+                          >
+                            {/* Global Shift Gauge */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11.5px' }}>
+                                <strong>Global Plate Calibration Shift</strong>
+                                <span className="mono" style={{ fontWeight: 700, color: '#10b981' }}>
+                                  {shiftSigned} Rf at mid-plate (Δdemand {phaseFit.globalDemandShift >= 0 ? '+' : ''}
+                                  {phaseFit.globalDemandShift.toFixed(3)})
+                                </span>
+                              </div>
+                              {(() => {
+                                const maxRange = 0.22;
+                                const pct = Math.max(-1, Math.min(1, phaseFit.midplateRfShift / maxRange));
+                                const leftPct = pct < 0 ? 50 + pct * 50 : 50;
+                                const widthPct = Math.abs(pct) * 50;
+                                return (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                    <div
+                                      style={{
+                                        position: 'relative',
+                                        height: '12px',
+                                        borderRadius: '6px',
+                                        background: 'var(--soft)',
+                                        border: '1px solid var(--line2)',
+                                        overflow: 'hidden',
+                                      }}
+                                    >
+                                      <div
+                                        style={{
+                                          position: 'absolute',
+                                          left: '50%',
+                                          top: 0,
+                                          bottom: 0,
+                                          width: '1.5px',
+                                          background: 'var(--mut)',
+                                          zIndex: 2,
+                                        }}
+                                      />
+                                      <div
+                                        style={{
+                                          position: 'absolute',
+                                          left: `${leftPct}%`,
+                                          width: `${Math.max(2, widthPct)}%`,
+                                          top: '1px',
+                                          bottom: '1px',
+                                          borderRadius: '4px',
+                                          background: pct >= 0 ? '#10b981' : '#38bdf8',
+                                        }}
+                                      />
+                                    </div>
+                                    <div
+                                      className="mono"
+                                      style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        fontSize: '9.5px',
+                                        color: 'var(--mut)',
+                                      }}
+                                    >
+                                      <span>-0.22 Rf (more retained)</span>
+                                      <span>0 (raw model)</span>
+                                      <span>+0.22 Rf (elutes higher)</span>
+                                    </div>
+                                  </div>
+                                );
+                              })()}
+                              <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                                {Math.abs(phaseFit.midplateRfShift) < 0.015
+                                  ? 'Measured plates closely match baseline predictions.'
+                                  : phaseFit.midplateRfShift > 0
+                                  ? 'Measured spots ran higher Rf than raw model — recommendations shifted up to stay in 0.22–0.68 window.'
+                                  : 'Measured spots ran lower Rf than raw model — stronger eluent ratios favored automatically.'}
+                              </div>
+                            </div>
+
+                            {/* RMSE & Uncertainty + Family Offsets */}
+                            <div
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                                gap: '8px',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  padding: '6px 8px',
+                                  borderRadius: '6px',
+                                  background: 'var(--soft)',
+                                  border: '1px solid var(--line2)',
+                                  fontSize: '11px',
+                                }}
+                              >
+                                <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Rf Fit Error (RMSE)</div>
+                                <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
+                                  ±{phaseFit.rmseBefore.toFixed(2)} →{' '}
+                                  <span style={{ color: phaseFit.rmseAfter <= phaseFit.rmseBefore ? '#10b981' : '#f59e0b' }}>
+                                    ±{phaseFit.rmseAfter.toFixed(2)} Rf
+                                  </span>
+                                </div>
+                              </div>
+                              <div
+                                style={{
+                                  padding: '6px 8px',
+                                  borderRadius: '6px',
+                                  background: 'var(--soft)',
+                                  border: '1px solid var(--line2)',
+                                  fontSize: '11px',
+                                }}
+                              >
+                                <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Separation Uncertainty (σ)</div>
+                                <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
+                                  ±0.12 → <span style={{ color: '#38bdf8' }}>±{phaseFit.calibratedSigma.toFixed(2)} Rf</span>
+                                </div>
+                              </div>
+                              {Object.keys(phaseFit.familyDemandShifts).length > 0 && (
+                                <div
+                                  style={{
+                                    padding: '6px 8px',
+                                    borderRadius: '6px',
+                                    background: 'var(--soft)',
+                                    border: '1px solid var(--line2)',
+                                    fontSize: '11px',
+                                  }}
+                                >
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Solvent-Family Offsets</div>
+                                  <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
+                                    {Object.entries(phaseFit.familyDemandShifts)
+                                      .map(([fam, d]) => {
+                                        const rfD = rfShiftAtMidplate(d || 0, targetPhaseKey === 'C18');
+                                        return `${fam}: ${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)}`;
+                                      })
+                                      .join(', ')}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Contributing Measured Plates */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                              <div style={{ fontSize: '11px', fontWeight: 700 }}>
+                                Measured Plates Used ({matchedPhasePlates.length}):
+                              </div>
+                              {matchedPhasePlates.map((mp) => {
+                                const overrideKey = `${mp.setUid}:${mp.plateIndex}`;
+                                return (
+                                  <div
+                                    key={overrideKey}
+                                    style={{
+                                      display: 'flex',
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      gap: '8px',
+                                      flexWrap: 'nowrap',
+                                      padding: '4px 8px',
+                                      borderRadius: '6px',
+                                      background: 'var(--soft)',
+                                      fontSize: '11px',
+                                    }}
+                                  >
+                                    <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      <strong>{mp.setName}</strong>{' '}
+                                      <span style={{ color: 'var(--mut)' }}>
+                                        (Plate {mp.plateIndex + 1} · {mp.pairedCount} pairs · bias{' '}
+                                        <span className="mono">
+                                          {mp.meanRfResidual >= 0 ? '+' : ''}
+                                          {mp.meanRfResidual.toFixed(2)} Rf
+                                        </span>
+                                        )
+                                      </span>
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+                                      <select
+                                        className="f"
+                                        style={{ height: '22px', fontSize: '10.5px', padding: '0 6px', maxWidth: '175px' }}
+                                        value={setSolventOverrides[overrideKey] || mp.matchedSystemId}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setSetSolventOverrides((prev) => ({
+                                            ...prev,
+                                            [overrideKey]: val,
+                                          }));
+                                        }}
+                                        title="Override matched solvent system for this measured TLC plate"
+                                      >
+                                        {ALL_KNOWN_SOLVENT_SYSTEMS.map((sys) => (
+                                          <option key={sys.id} value={sys.id}>
+                                            {sys.shortLabel}
+                                          </option>
+                                        ))}
+                                        <option value="ignore">Exclude from calibration</option>
+                                      </select>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Measured vs Predicted 54-Well Plate Overlay: What Was Found vs Missing vs Unexpected */}
+                      {showCalibVisuals &&
+                        phaseFit &&
+                        matchedPhasePlates.length > 0 &&
+                        (() => {
+                          const activeCompPlate =
+                            matchedPhasePlates.find((mp) => `${mp.setUid}:${mp.plateIndex}` === selectedComparePlateKey) ||
+                            matchedPhasePlates[0];
+                          if (!activeCompPlate || !activeCompPlate.lanes || activeCompPlate.lanes.length === 0) {
+                            return null;
+                          }
+                          const plateKey = `${activeCompPlate.setUid}:${activeCompPlate.plateIndex}`;
+
+                          let foundProdCount = 0;
+                          let foundSmCount = 0;
+                          let frontSatCount = 0;
+                          let basePinCount = 0;
+                          let missingProdCount = 0;
+                          let consumedSmCount = 0;
+                          let extraSpotCount = 0;
+                          for (const lane of activeCompPlate.lanes) {
+                            if (lane.isBlank) continue;
+                            for (const p of lane.predictedSpots) {
+                              if (p.boundaryStatus === 'front_saturated') {
+                                frontSatCount++;
+                              } else if (p.boundaryStatus === 'baseline_pinned') {
+                                basePinCount++;
+                              } else if (p.kind === 'product') {
+                                if (p.found) foundProdCount++;
+                                else missingProdCount++;
+                              } else {
+                                if (p.found) foundSmCount++;
+                                else consumedSmCount++;
+                              }
+                            }
+                            for (const m of lane.measuredSpots) {
+                              if (!m.matchedLabel) extraSpotCount++;
+                            }
+                          }
+
+                          const activeWells = activeCompPlate.lanes.filter((l) => !l.isBlank);
+                          const fallbackWell =
+                            activeWells.find(
+                              (l) =>
+                                l.predictedSpots.some((p) => p.found || p.boundaryStatus === 'front_saturated' || p.boundaryStatus === 'baseline_pinned') ||
+                                l.predictedSpots.some((p) => !p.found) ||
+                                l.measuredSpots.length > 0
+                            ) || activeWells[0];
+                          const resolvedCompWellIdx =
+                            inspectedCompWellIdx !== null &&
+                            activeCompPlate.lanes[inspectedCompWellIdx] &&
+                            !activeCompPlate.lanes[inspectedCompWellIdx].isBlank
+                              ? inspectedCompWellIdx
+                              : fallbackWell?.wellIndex ?? 0;
+                          const inspectedCompLane: CalibratedLaneComparison | undefined =
+                            activeCompPlate.lanes[resolvedCompWellIdx];
+
+                          return (
+                            <div
+                              style={{
+                                background: 'var(--panel)',
+                                border: '1px solid var(--line2)',
+                                borderRadius: '8px',
+                                padding: '10px 12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '10px',
+                                opacity: calibrationEnabled ? 1 : 0.72,
+                              }}
+                            >
+                              {/* Title, Plate Selector Tabs & Legend */}
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  flexWrap: 'wrap',
+                                  gap: '8px',
+                                }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                  <div style={{ fontSize: '12px', fontWeight: 700 }}>
+                                    Measured vs Predicted Plate Map — What Was Found vs Boundary vs Missing
+                                  </div>
+                                  <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                                    Solid spots show resolved TLC bands; triangles (▲/▼) flag solvent-front or origin-pinned saturation; dashed rings show predicted spots not seen.
+                                  </div>
+                                </div>
+
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '10.5px' }}>
+                                  <span title="Predicted Product matched to a measured spot on the TLC plate">
+                                    <span style={{ color: '#10b981', fontWeight: 700 }}>●</span> Found Prod ({foundProdCount})
+                                  </span>
+                                  <span title="Remaining Starting Material matched on the TLC plate">
+                                    <span style={{ color: '#f59e0b', fontWeight: 700 }}>●</span> Found SM ({foundSmCount})
+                                  </span>
+                                  <span title="Predicted fast spot matched excess solvent-front absorption/bleed (Rf ≥ 0.92) rather than disappearing">
+                                    <span style={{ color: '#38bdf8', fontWeight: 700 }}>▲</span> Front-Sat ({frontSatCount})
+                                  </span>
+                                  <span title="Predicted polar spot matched residual origin/baseline deposit (Rf ≤ 0.05)">
+                                    <span style={{ color: '#fb7185', fontWeight: 700 }}>▼</span> Base-Pin ({basePinCount})
+                                  </span>
+                                  <span title="Predicted Product (emerald dashed) or SM (amber dashed) not detected at expected Rf">
+                                    <span style={{ color: '#10b981', fontWeight: 700 }}>◌</span> Missing ({missingProdCount}P / {consumedSmCount}SM)
+                                  </span>
+                                  <span title="Measured TLC spot with no nearby predicted SM or High/Med product">
+                                    <span style={{ color: '#c084fc', fontWeight: 700 }}>◆</span> Extra ({extraSpotCount})
+                                  </span>
+                                </div>
+                              </div>
+
+                              {/* Measured Plate Switcher */}
+                              {matchedPhasePlates.length > 1 && (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                  <span style={{ fontSize: '11px', color: 'var(--mut)', fontWeight: 600 }}>Inspect Plate:</span>
+                                  {matchedPhasePlates.map((mp) => {
+                                    const k = `${mp.setUid}:${mp.plateIndex}`;
+                                    const isSel = k === plateKey;
+                                    let pFound = 0;
+                                    let pFront = 0;
+                                    let pMiss = 0;
+                                    let pExtra = 0;
+                                    for (const l of mp.lanes || []) {
+                                      if (l.isBlank) continue;
+                                      for (const pr of l.predictedSpots) {
+                                        if (pr.boundaryStatus === 'front_saturated') pFront++;
+                                        else if (pr.kind === 'product') {
+                                          if (pr.found) pFound++;
+                                          else pMiss++;
+                                        }
+                                      }
+                                      for (const ms of l.measuredSpots) {
+                                        if (!ms.matchedLabel) pExtra++;
+                                      }
+                                    }
+                                    return (
+                                      <button
+                                        key={k}
+                                        type="button"
+                                        onClick={() => setSelectedComparePlateKey(k)}
+                                        style={{
+                                          cursor: 'pointer',
+                                          padding: '4px 9px',
+                                          borderRadius: '6px',
+                                          fontSize: '11px',
+                                          fontWeight: isSel ? 700 : 500,
+                                          border: isSel ? '1.5px solid #10b981' : '1px solid var(--line)',
+                                          background: isSel ? 'color-mix(in srgb, #10b981 12%, var(--soft))' : 'var(--soft)',
+                                          color: 'var(--fg)',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '6px',
+                                        }}
+                                      >
+                                        <span>{mp.setName}</span>
+                                        <span className="mono" style={{ fontSize: '10px', color: 'var(--mut)' }}>
+                                          ({pFound}✓{pFront > 0 ? ` / ${pFront}▲` : ''} / {pMiss}◌ / {pExtra}◆)
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              {/* 2x27 Column-Spotted Measured vs Predicted Plate Halves */}
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(440px, 1fr))', gap: '10px' }}>
+                                {[
+                                  {
+                                    title: 'Plate Half 1 (A1–C5 · Lanes 1–27)',
+                                    slice: Array.from({ length: 27 }, (_, spotIdx) => ({
+                                      spotIdx,
+                                      lane: activeCompPlate.lanes[containerOfLane(spotIdx)],
+                                    })).filter((x) => Boolean(x.lane)),
+                                  },
+                                  {
+                                    title: 'Plate Half 2 (D5–F9 · Lanes 28–54)',
+                                    slice: Array.from({ length: 27 }, (_, i) => {
+                                      const spotIdx = 27 + i;
+                                      return {
+                                        spotIdx,
+                                        lane: activeCompPlate.lanes[containerOfLane(spotIdx)],
+                                      };
+                                    }).filter((x) => Boolean(x.lane)),
+                                  },
+                                ].map((half, hIdx) => (
+                                  <div
+                                    key={hIdx}
+                                    style={{
+                                      background: 'var(--soft)',
+                                      border: '1px solid var(--line2)',
+                                      borderRadius: '7px',
+                                      padding: '7px 9px',
+                                    }}
+                                  >
+                                    <div className="mono" style={{ fontSize: '10.5px', color: 'var(--mut)', marginBottom: '5px', fontWeight: 600 }}>
+                                      {half.title}
+                                    </div>
+                                    <div
+                                      style={{
+                                        position: 'relative',
+                                        height: '138px',
+                                        display: 'grid',
+                                        gridTemplateColumns: 'repeat(27, minmax(0, 1fr))',
+                                        border: '1px solid var(--line2)',
+                                        borderRadius: '5px',
+                                        overflow: 'hidden',
+                                        background: 'var(--panel)',
+                                      }}
+                                    >
+                                      {/* Reference mid-plate zone 0.22 - 0.68 */}
+                                      <div
+                                        style={{
+                                          position: 'absolute',
+                                          left: 0,
+                                          right: 0,
+                                          top: `${(1 - 0.68) * 100}%`,
+                                          height: `${(0.68 - 0.22) * 100}%`,
+                                          background: 'color-mix(in srgb, #10b981 6%, transparent)',
+                                          borderTop: '1px dashed color-mix(in srgb, var(--line) 55%, transparent)',
+                                          borderBottom: '1px dashed color-mix(in srgb, var(--line) 55%, transparent)',
+                                          pointerEvents: 'none',
+                                        }}
+                                      />
+
+                                      {half.slice.map(({ spotIdx, lane }) => {
+                                        const isSelLane = lane.wellIndex === resolvedCompWellIdx;
+                                        const hasFoundProd = lane.predictedSpots.some((p) => p.kind === 'product' && p.found);
+                                        const hasMissingProd = lane.predictedSpots.some((p) => p.kind === 'product' && !p.found);
+                                        const hasExtra = lane.measuredSpots.some((m) => !m.matchedLabel);
+
+                                        return (
+                                          <button
+                                            key={lane.wellIndex}
+                                            type="button"
+                                            disabled={lane.isBlank}
+                                            onClick={() => !lane.isBlank && setInspectedCompWellIdx(lane.wellIndex)}
+                                            title={
+                                              lane.isBlank
+                                                ? `Lane ${spotIdx + 1} · ${lane.wellCoord} (Blank / No Well)`
+                                                : `Lane ${spotIdx + 1} · ${lane.wellCoord}: ${
+                                                    lane.predictedSpots.filter((p) => p.found).length
+                                                  } found · ${lane.predictedSpots.filter((p) => !p.found).length} missing · ${
+                                                    lane.measuredSpots.filter((m) => !m.matchedLabel).length
+                                                  } extra spot(s)`
+                                            }
+                                            style={{
+                                              position: 'relative',
+                                              height: '100%',
+                                              padding: 0,
+                                              border: 'none',
+                                              borderRight: '1px solid color-mix(in srgb, var(--line) 42%, transparent)',
+                                              cursor: lane.isBlank ? 'default' : 'pointer',
+                                              background: isSelLane
+                                                ? 'color-mix(in srgb, var(--acc) 18%, transparent)'
+                                                : hasFoundProd
+                                                ? 'color-mix(in srgb, #10b981 6%, transparent)'
+                                                : 'transparent',
+                                              boxShadow: isSelLane ? 'inset 0 0 0 1.5px var(--acc)' : 'none',
+                                            }}
+                                          >
+                                            {!lane.isBlank && (
+                                              <>
+                                                {/* Connector between matched obs Rf and predicted Rf if >= 0.03 apart */}
+                                                {lane.measuredSpots.map((m, mi) => {
+                                                  if (m.matchedPredRfAfter === undefined) return null;
+                                                  const predRf = calibrationEnabled ? m.matchedPredRfAfter : (m.matchedPredRfBefore ?? m.matchedPredRfAfter);
+                                                  if (Math.abs(m.rf - predRf) < 0.03) return null;
+                                                  const y1 = Math.max(4, Math.min(95, (1 - m.rf) * 100));
+                                                  const y2 = Math.max(4, Math.min(95, (1 - predRf) * 100));
+                                                  const top = Math.min(y1, y2);
+                                                  const height = Math.max(2, Math.abs(y1 - y2));
+                                                  return (
+                                                    <div
+                                                      key={`conn-${mi}`}
+                                                      style={{
+                                                        position: 'absolute',
+                                                        left: '50%',
+                                                        top: `${top}%`,
+                                                        height: `${height}%`,
+                                                        width: '1px',
+                                                        transform: 'translateX(-50%)',
+                                                        borderLeft: '1px dotted rgba(148, 163, 184, 0.7)',
+                                                        zIndex: 1,
+                                                      }}
+                                                    />
+                                                  );
+                                                })}
+
+                                                {/* BOUNDARY SATURATION MARKERS: Front-Saturated (▲) & Baseline-Pinned (▼) */}
+                                                {lane.predictedSpots
+                                                  .filter((p) => p.boundaryStatus === 'front_saturated')
+                                                  .slice(0, 3)
+                                                  .map((_p, bi) => (
+                                                    <div
+                                                      key={`fsat-${bi}`}
+                                                      style={{
+                                                        position: 'absolute',
+                                                        left: '50%',
+                                                        top: '5%',
+                                                        transform: 'translate(-50%, -50%)',
+                                                        width: 0,
+                                                        height: 0,
+                                                        borderLeft: '4px solid transparent',
+                                                        borderRight: '4px solid transparent',
+                                                        borderBottom: '7px solid #38bdf8',
+                                                        zIndex: 4,
+                                                      }}
+                                                    />
+                                                  ))}
+                                                {lane.predictedSpots
+                                                  .filter((p) => p.boundaryStatus === 'baseline_pinned')
+                                                  .slice(0, 3)
+                                                  .map((_p, bi) => (
+                                                    <div
+                                                      key={`bpin-${bi}`}
+                                                      style={{
+                                                        position: 'absolute',
+                                                        left: '50%',
+                                                        top: '94%',
+                                                        transform: 'translate(-50%, -50%)',
+                                                        width: 0,
+                                                        height: 0,
+                                                        borderLeft: '4px solid transparent',
+                                                        borderRight: '4px solid transparent',
+                                                        borderTop: '7px solid #fb7185',
+                                                        zIndex: 4,
+                                                      }}
+                                                    />
+                                                  ))}
+
+                                                {/* Predicted but NOT FOUND & NOT BOUNDARY SATURATED (dashed hollow rings) */}
+                                                {lane.predictedSpots
+                                                  .filter(
+                                                    (p) =>
+                                                      !p.found &&
+                                                      p.boundaryStatus !== 'front_saturated' &&
+                                                      p.boundaryStatus !== 'baseline_pinned'
+                                                  )
+                                                  .slice(0, 5)
+                                                  .map((p, pi) => {
+                                                    const rfVal = calibrationEnabled ? p.rfAfter : p.rfBefore;
+                                                    const topPct = Math.max(5, Math.min(95, (1 - rfVal) * 100));
+                                                    const col = p.kind === 'product' ? '#10b981' : '#f59e0b';
+                                                    return (
+                                                      <div
+                                                        key={`miss-${pi}`}
+                                                        style={{
+                                                          position: 'absolute',
+                                                          left: '50%',
+                                                          top: `${topPct}%`,
+                                                          transform: 'translate(-50%, -50%)',
+                                                          width: p.kind === 'product' ? '8px' : '7px',
+                                                          height: p.kind === 'product' ? '8px' : '7px',
+                                                          borderRadius: '50%',
+                                                          background: 'transparent',
+                                                          border: `1.5px dashed ${col}`,
+                                                          opacity: 0.78,
+                                                          zIndex: 2,
+                                                        }}
+                                                      />
+                                                    );
+                                                  })}
+
+                                                {/* EXTRA / UNPREDICTED MEASURED SPOTS (purple diamonds) */}
+                                                {lane.measuredSpots
+                                                  .filter((m) => !m.matchedLabel)
+                                                  .slice(0, 6)
+                                                  .map((m, mi) => {
+                                                    const topPct = Math.max(5, Math.min(95, (1 - m.rf) * 100));
+                                                    return (
+                                                      <div
+                                                        key={`ext-${mi}`}
+                                                        style={{
+                                                          position: 'absolute',
+                                                          left: '50%',
+                                                          top: `${topPct}%`,
+                                                          transform: 'translate(-50%, -50%) rotate(45deg)',
+                                                          width: '6px',
+                                                          height: '6px',
+                                                          borderRadius: '1px',
+                                                          background: '#c084fc',
+                                                          border: '1px solid var(--panel)',
+                                                          opacity: 0.92,
+                                                          zIndex: 3,
+                                                        }}
+                                                      />
+                                                    );
+                                                  })}
+
+                                                {/* CONFIRMED / FOUND MEASURED SPOTS (solid green/amber dots; boundary peaks render as ▲/▼ triangles) */}
+                                                {lane.measuredSpots
+                                                  .filter((m) => Boolean(m.matchedLabel) && m.rf > 0.05 && m.rf < 0.92)
+                                                  .slice(0, 6)
+                                                  .map((m, mi) => {
+                                                    const topPct = Math.max(5, Math.min(95, (1 - m.rf) * 100));
+                                                    const isProd = m.matchedKind === 'product';
+                                                    return (
+                                                      <div
+                                                        key={`fnd-${mi}`}
+                                                        style={{
+                                                          position: 'absolute',
+                                                          left: '50%',
+                                                          top: `${topPct}%`,
+                                                          transform: 'translate(-50%, -50%)',
+                                                          width: isProd ? '8px' : '6.5px',
+                                                          height: isProd ? '8px' : '6.5px',
+                                                          borderRadius: '50%',
+                                                          background: isProd ? '#10b981' : '#f59e0b',
+                                                          boxShadow: '0 0 0 1px rgba(0,0,0,0.2)',
+                                                          zIndex: isProd ? 5 : 4,
+                                                        }}
+                                                      />
+                                                    );
+                                                  })}
+                                              </>
+                                            )}
+                                            {/* Tiny bottom status indicator bar */}
+                                            {!lane.isBlank && (hasFoundProd || hasMissingProd || hasExtra) && (
+                                              <div
+                                                style={{
+                                                  position: 'absolute',
+                                                  bottom: 0,
+                                                  left: 0,
+                                                  right: 0,
+                                                  height: '2.5px',
+                                                  background: hasFoundProd
+                                                    ? '#10b981'
+                                                    : hasExtra
+                                                    ? '#c084fc'
+                                                    : '#f59e0b',
+                                                  opacity: 0.85,
+                                                }}
+                                              />
+                                            )}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+
+                                    {/* Lane Coordinates */}
+                                    <div
+                                      style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: 'repeat(27, minmax(0, 1fr))',
+                                        marginTop: '3px',
+                                      }}
+                                    >
+                                      {half.slice.map(({ lane }) => {
+                                        const isSel = lane.wellIndex === resolvedCompWellIdx;
+                                        const hasFoundProd = lane.predictedSpots.some((p) => p.kind === 'product' && p.found);
+                                        const hasExtra = lane.measuredSpots.some((m) => !m.matchedLabel);
+                                        return (
+                                          <div
+                                            key={lane.wellIndex}
+                                            className="mono"
+                                            style={{
+                                              fontSize: '7.5px',
+                                              textAlign: 'center',
+                                              color: isSel
+                                                ? 'var(--acc)'
+                                                : lane.isBlank
+                                                ? 'var(--mut)'
+                                                : hasFoundProd
+                                                ? '#10b981'
+                                                : hasExtra
+                                                ? '#c084fc'
+                                                : 'var(--mut)',
+                                              fontWeight: isSel || hasFoundProd ? 700 : 400,
+                                              opacity: lane.isBlank ? 0.35 : 1,
+                                            }}
+                                          >
+                                            {lane.wellCoord}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {/* Clicked Well Detailed Comparison Inspector */}
+                              {inspectedCompLane && !inspectedCompLane.isBlank && (
+                                <div
+                                  style={{
+                                    borderTop: '1px solid var(--line2)',
+                                    paddingTop: '8px',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '8px',
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      display: 'flex',
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      flexWrap: 'wrap',
+                                      gap: '8px',
+                                    }}
+                                  >
+                                    <div className="mono" style={{ fontSize: '11.5px', fontWeight: 700 }}>
+                                      Well {inspectedCompLane.wellCoord} (Lane {tlcLane(inspectedCompLane.wellIndex) + 1}) on {activeCompPlate.setName}
+                                    </div>
+                                    <span style={{ fontSize: '10.5px', color: 'var(--mut)' }}>
+                                      Click any lane above to compare measured spots vs predicted products &amp; starting materials
+                                    </span>
+                                  </div>
+
+                                  <div
+                                    style={{
+                                      display: 'grid',
+                                      gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                                      gap: '8px',
+                                    }}
+                                  >
+                                    {/* Bucket 1: Confirmed Resolved Interior Found */}
+                                    {(() => {
+                                      const confirmedInterior = inspectedCompLane.predictedSpots.filter(
+                                        (p) =>
+                                          p.found &&
+                                          p.boundaryStatus !== 'front_saturated' &&
+                                          p.boundaryStatus !== 'baseline_pinned'
+                                      );
+                                      const boundaryOrMissing = inspectedCompLane.predictedSpots.filter(
+                                        (p) =>
+                                          !p.found ||
+                                          p.boundaryStatus === 'front_saturated' ||
+                                          p.boundaryStatus === 'baseline_pinned'
+                                      );
+                                      return (
+                                        <>
+                                          <div
+                                            style={{
+                                              padding: '7px 9px',
+                                              borderRadius: '6px',
+                                              background: 'var(--soft)',
+                                              border: '1px solid color-mix(in srgb, #10b981 30%, var(--line2))',
+                                              fontSize: '11px',
+                                            }}
+                                          >
+                                            <div style={{ fontWeight: 700, color: '#10b981', marginBottom: '4px' }}>
+                                              ● Found on TLC ({confirmedInterior.length})
+                                            </div>
+                                            {confirmedInterior.length === 0 ? (
+                                              <div style={{ color: 'var(--mut)', fontSize: '10.5px' }}>
+                                                No predicted SM/product resolved cleanly in the interior of this lane.
+                                              </div>
+                                            ) : (
+                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                                {confirmedInterior.map((p, i) => {
+                                                  const predRf = calibrationEnabled ? p.rfAfter : p.rfBefore;
+                                                  return (
+                                                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                                                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                        <strong style={{ color: p.kind === 'product' ? '#10b981' : '#f59e0b' }}>
+                                                          {p.kind === 'product' ? 'Prod' : 'SM'}
+                                                        </strong>{' '}
+                                                        {p.label}
+                                                      </span>
+                                                      <span className="mono" style={{ flexShrink: 0, color: 'var(--fg2)' }}>
+                                                        Obs {p.matchedObsRf?.toFixed(2)} (Pred {predRf.toFixed(2)})
+                                                      </span>
+                                                    </div>
+                                                  );
+                                                })}
+                                              </div>
+                                            )}
+                                          </div>
+
+                                          {/* Bucket 2: Boundary-Saturated or Predicted Not Seen */}
+                                          <div
+                                            style={{
+                                              padding: '7px 9px',
+                                              borderRadius: '6px',
+                                              background: 'var(--soft)',
+                                              border: '1px solid color-mix(in srgb, #f59e0b 30%, var(--line2))',
+                                              fontSize: '11px',
+                                            }}
+                                          >
+                                            <div style={{ fontWeight: 700, color: '#f59e0b', marginBottom: '4px' }}>
+                                              ▲/◌ Boundary-Saturated or Not Seen ({boundaryOrMissing.length})
+                                            </div>
+                                            {boundaryOrMissing.length === 0 ? (
+                                              <div style={{ color: 'var(--mut)', fontSize: '10.5px' }}>
+                                                All predicted species in this well were resolved inside the plate window.
+                                              </div>
+                                            ) : (
+                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                                {boundaryOrMissing.map((p, i) => {
+                                                  const predRf = calibrationEnabled ? p.rfAfter : p.rfBefore;
+                                                  const isFrontSat = p.boundaryStatus === 'front_saturated';
+                                                  const isBasePin = p.boundaryStatus === 'baseline_pinned';
+                                                  return (
+                                                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                                                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                        <strong style={{ color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : p.kind === 'product' ? '#10b981' : '#f59e0b' }}>
+                                                          {isFrontSat
+                                                            ? `▲ Front-Sat (${p.kind === 'product' ? 'Prod' : 'SM'})`
+                                                            : isBasePin
+                                                            ? `▼ Base-Pin (${p.kind === 'product' ? 'Prod' : 'SM'})`
+                                                            : p.kind === 'product'
+                                                            ? `◌ Prod (${p.tier || 'Med'})`
+                                                            : '◌ SM (Consumed?)'}
+                                                        </strong>{' '}
+                                                        {p.label}
+                                                      </span>
+                                                      <span className="mono" style={{ flexShrink: 0, color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : 'var(--mut)' }}>
+                                                        {isFrontSat
+                                                          ? p.matchedObsRf !== undefined
+                                                            ? `Obs ${p.matchedObsRf.toFixed(2)} ≥0.92 (exp ${predRf.toFixed(2)})`
+                                                            : `Rf ≥ 0.92 (exp ${predRf.toFixed(2)})`
+                                                          : isBasePin
+                                                          ? p.matchedObsRf !== undefined
+                                                            ? `Obs ${p.matchedObsRf.toFixed(2)} ≤0.05 (exp ${predRf.toFixed(2)})`
+                                                            : `Rf ≤ 0.05 (exp ${predRf.toFixed(2)})`
+                                                          : `exp. Rf ${predRf.toFixed(2)}`}
+                                                      </span>
+                                                    </div>
+                                                  );
+                                                })}
+                                              </div>
+                                            )}
+                                          </div>
+                                        </>
+                                      );
+                                    })()}
+
+                                    {/* Bucket 3: Extra / Unpredicted Spots */}
+                                    <div
+                                      style={{
+                                        padding: '7px 9px',
+                                        borderRadius: '6px',
+                                        background: 'var(--soft)',
+                                        border: '1px solid color-mix(in srgb, #c084fc 30%, var(--line2))',
+                                        fontSize: '11px',
+                                      }}
+                                    >
+                                      <div style={{ fontWeight: 700, color: '#c084fc', marginBottom: '4px' }}>
+                                        ◆ Extra / Unpredicted Spots ({inspectedCompLane.measuredSpots.filter((m) => !m.matchedLabel).length})
+                                      </div>
+                                      {inspectedCompLane.measuredSpots.filter((m) => !m.matchedLabel).length === 0 ? (
+                                        <div style={{ color: 'var(--mut)', fontSize: '10.5px' }}>
+                                          No unexpected spots detected in this lane.
+                                        </div>
+                                      ) : (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                          {inspectedCompLane.measuredSpots
+                                            .filter((m) => !m.matchedLabel)
+                                            .map((m, i) => (
+                                              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                                                <span style={{ color: 'var(--fg2)' }}>Unassigned TLC spot #{i + 1}</span>
+                                                <span className="mono" style={{ flexShrink: 0 }}>
+                                                  Obs Rf {m.rf.toFixed(2)} · str {m.strength.toFixed(2)}
+                                                </span>
+                                              </div>
+                                            ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+                    </div>
+                  );
+                })()}
+
+              {/* Follow-Up / Rescue Solvent Suggestions Driven by Measured Plate Failures */}
+              {!plateLoading &&
+                platePlan?.followUpPlan &&
+                (platePlan.followUpPlan.recommendations.length > 0 ||
+                  platePlan.followUpPlan.summary.frontCrowdedWells.length > 0 ||
+                  platePlan.followUpPlan.summary.baselinePinnedWells.length > 0) && (
+                  <div
+                    style={{
+                      border: '1px solid color-mix(in srgb, #38bdf8 45%, var(--line))',
+                      borderRadius: '10px',
+                      background: 'color-mix(in srgb, #38bdf8 7%, var(--soft))',
+                      padding: '10px 14px',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '8px',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: '12.5px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap' }}>
+                          <span
+                            className="mono"
+                            style={{
+                              fontSize: '10px',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              background: '#38bdf8',
+                              color: '#06131f',
+                              fontWeight: 700,
+                            }}
+                          >
+                            NEXT SOLVENT FROM RESULTS
+                          </span>
+                          <span>Follow-Up / Rescue Eluents for Unresolved Measured Wells</span>
+                        </div>
+                        <div style={{ fontSize: '11.5px', color: 'var(--mut)', marginTop: '2px' }}>
+                          Measured so far: <strong style={{ color: '#10b981' }}>{platePlan.followUpPlan.summary.resolvedWellCount}</strong>/{platePlan.followUpPlan.summary.measuredWellCount} resolved
+                          {platePlan.followUpPlan.summary.frontCrowdedWells.length > 0 && (
+                            <> · <strong style={{ color: '#38bdf8' }}>{platePlan.followUpPlan.summary.frontCrowdedWells.length} front-crowded</strong></>
+                          )}
+                          {platePlan.followUpPlan.summary.baselinePinnedWells.length > 0 && (
+                            <> · <strong style={{ color: '#fb7185' }}>{platePlan.followUpPlan.summary.baselinePinnedWells.length} baseline-pinned</strong></>
+                          )}
+                          {platePlan.followUpPlan.summary.coelutedWells.length > 0 && (
+                            <> · <strong>{platePlan.followUpPlan.summary.coelutedWells.length} co-eluted</strong></>
+                          )}
+                          {' '}— run a suggested rescue tab and re-load to refine the fit.
+                        </div>
+                      </div>
+                    </div>
+
+                    {platePlan.followUpPlan.recommendations.length > 0 ? (
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))',
+                          gap: '8px',
+                        }}
+                      >
+                        {platePlan.followUpPlan.recommendations.map((opt) => {
+                          const tabName = formatTlcTabName(
+                            opt.system.name,
+                            platePlan.stationaryPhase || stationaryPhasePref
+                          );
+                          const isPreview = activeSystemPlan?.system.id === opt.system.id;
+                          return (
+                            <div
+                              key={opt.system.id}
+                              style={{
+                                padding: '9px 11px',
+                                borderRadius: '8px',
+                                background: 'var(--panel)',
+                                border: isPreview ? '1.5px solid #38bdf8' : '1px solid var(--line2)',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '5px',
+                              }}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                                <strong style={{ fontSize: '13px' }}>{opt.system.name}</strong>
+                                <span className="mono" style={{ fontSize: '10.5px', fontWeight: 700, color: '#38bdf8' }}>
+                                  +{opt.rescuedWellIndices.length} wells
+                                </span>
+                              </div>
+                              <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{opt.reason}</div>
+                              <div className="mono" style={{ fontSize: '10px', color: 'var(--mut)' }}>
+                                50 mL: {opt.system.chamberPrep50mL} · Wells: {opt.rescuedWellCoords.slice(0, 8).join(', ')}
+                                {opt.rescuedWellCoords.length > 8 ? ` +${opt.rescuedWellCoords.length - 8} more` : ''}
+                              </div>
+                              <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  style={{ height: '22px', fontSize: '10.5px', padding: '0 7px' }}
+                                  onClick={() => {
+                                    setSelectedSystemId(opt.system.id);
+                                    if (opt.rescuedWellIndices.length > 0) {
+                                      setSelectedLaneIdx(opt.rescuedWellIndices[0]);
+                                    }
+                                  }}
+                                >
+                                  Preview Plate
+                                </button>
+                                {onCreateNewSet && (
+                                  <button
+                                    type="button"
+                                    className="btn sm pri"
+                                    style={{ height: '22px', fontSize: '10.5px', padding: '0 7px', background: '#38bdf8', borderColor: '#0284c7', color: '#06131f' }}
+                                    onClick={() => {
+                                      onCreateNewSet(tabName);
+                                      toast(`Added follow-up TLC tab "${tabName}".`);
+                                    }}
+                                  >
+                                    + Add Follow-Up Tab
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+                        No single untested normal-phase eluent rescues those remaining boundary wells cleanly — consider switching Stationary Phase to <strong>Reverse Phase (C18)</strong> for ultra-polar/ionizable wells.
+                      </div>
+                    )}
+                  </div>
+                )}
 
               {substratesWithSmilesCount === 0 && (
                 <div className="issue warn" style={{ padding: '10px 14px', fontSize: '12.5px' }}>
@@ -817,6 +2344,38 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   + {rec.system.baseModifier || rec.system.acidModifier}
                                 </span>
                               )}
+                              {rec.system.family === 'prisma_ternary' && (
+                                <span
+                                  className="mono"
+                                  style={{
+                                    fontSize: '10px',
+                                    fontWeight: 700,
+                                    padding: '2px 5px',
+                                    borderRadius: '4px',
+                                    background: 'color-mix(in srgb, #a855f7 16%, transparent)',
+                                    color: '#c084fc',
+                                  }}
+                                  title={rec.system.synthesisNote || 'Nyiredy PRISMA selectivity-triangle ternary eluent'}
+                                >
+                                  PRISMA Ternary
+                                </span>
+                              )}
+                              {rec.system.isSynthesized && rec.system.family !== 'prisma_ternary' && (
+                                <span
+                                  className="mono"
+                                  style={{
+                                    fontSize: '10px',
+                                    fontWeight: 700,
+                                    padding: '2px 5px',
+                                    borderRadius: '4px',
+                                    background: 'color-mix(in srgb, #10b981 15%, transparent)',
+                                    color: '#10b981',
+                                  }}
+                                  title={rec.system.synthesisNote || 'Composed dynamically from plate target elution strength & acid stress'}
+                                >
+                                  Plate-Tuned
+                                </span>
+                              )}
                             </div>
                             <span className="mono" style={{ fontSize: '11.5px', fontWeight: 700, color: '#10b981' }}>
                               est. {rec.wellCoveragePct}% resolved
@@ -829,8 +2388,48 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             50 mL: {rec.system.chamberPrep50mL}
                           </div>
 
+                          {rec.system.descriptors && (
+                            <div
+                              className="mono"
+                              style={{
+                                fontSize: '10.5px',
+                                color: 'var(--fg2)',
+                                background: 'var(--soft)',
+                                padding: '3px 7px',
+                                borderRadius: '5px',
+                                display: 'inline-flex',
+                                flexWrap: 'wrap',
+                                gap: '6px',
+                              }}
+                              title="Empirical mixture parameters computed via Langmuir silanol saturation, Kamlet-Taft blending & Geiss secondary front demixing"
+                            >
+                              <span>ε⁰ {rec.system.descriptors.strength.toFixed(2)}</span>
+                              <span>· α {rec.system.descriptors.alphaMix.toFixed(2)}</span>
+                              <span>· β {rec.system.descriptors.betaMix.toFixed(2)}</span>
+                              <span>· π* {rec.system.descriptors.piStarMix.toFixed(2)}</span>
+                              {rec.system.descriptors.aromaticMix > 0 && (
+                                <span style={{ color: '#c084fc', fontWeight: 700 }}>
+                                  · Ar-π {rec.system.descriptors.aromaticMix.toFixed(2)}
+                                </span>
+                              )}
+                              {rec.system.descriptors.betaFrontCeiling !== undefined && (
+                                <span
+                                  style={{ color: '#f59e0b', fontWeight: 700 }}
+                                  title="Geiss secondary solvent front (β-front) demixing ceiling on dry SiO2"
+                                >
+                                  · β-front ≤{rec.system.descriptors.betaFrontCeiling.toFixed(2)}
+                                </span>
+                              )}
+                              {rec.system.descriptors.modifierCapacity > 0 && (
+                                <span style={{ color: '#38bdf8', fontWeight: 700 }}>
+                                  · Cap {rec.system.descriptors.modifierCapacity.toFixed(2)} eq
+                                </span>
+                              )}
+                            </div>
+                          )}
+
                           <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-                            {rec.system.bestFor}
+                            {rec.system.synthesisNote ? `${rec.system.synthesisNote} — ${rec.system.bestFor}` : rec.system.bestFor}
                           </div>
 
                           <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }} onClick={(e) => e.stopPropagation()}>
@@ -921,36 +2520,93 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                     })}
                   </div>
 
-                  {/* Summary Coverage Bar */}
+                  {/* Summary Coverage Bar + Empirical Solvent Physics Diagnostics */}
                   <div
                     style={{
                       display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      flexWrap: 'wrap',
-                      gap: '8px',
-                      padding: '8px 12px',
+                      flexDirection: 'column',
+                      gap: '6px',
+                      padding: '9px 12px',
                       background: 'var(--soft)',
                       borderRadius: '8px',
                       fontSize: '12px',
                     }}
                   >
-                    <div>
-                      <strong>Plate {plateIdx + 1} Set Coverage:</strong>{' '}
-                      <span className="mono" style={{ color: '#10b981', fontWeight: 700 }}>
-                        est. {platePlan.resolvedWellCount} / {platePlan.activeWellCount} active wells resolved ({platePlan.totalCoveragePct}%)
-                        {platePlan.unresolvedWellIndices.length > 0 && ` · ${platePlan.unresolvedWellIndices.length} unresolved`}
-                      </span>
-                      {platePlan.highRankedWellCount > 0 && (
-                        <span style={{ color: 'var(--mut)', marginLeft: '8px' }}>
-                          ({platePlan.highRankedWellCount} wells with High/Medium products prioritized)
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '8px',
+                      }}
+                    >
+                      <div>
+                        <strong>Plate {plateIdx + 1} Set Coverage:</strong>{' '}
+                        <span className="mono" style={{ color: '#10b981', fontWeight: 700 }}>
+                          est. {platePlan.resolvedWellCount} / {platePlan.activeWellCount} active wells resolved ({platePlan.totalCoveragePct}%)
+                          {platePlan.unresolvedWellIndices.length > 0 && ` · ${platePlan.unresolvedWellIndices.length} unresolved`}
+                        </span>
+                        {platePlan.highRankedWellCount > 0 && (
+                          <span style={{ color: 'var(--mut)', marginLeft: '8px' }}>
+                            ({platePlan.highRankedWellCount} wells with High/Medium products prioritized)
+                          </span>
+                        )}
+                      </div>
+                      {platePlan.summaryNotes.length > 1 && (
+                        <span style={{ color: 'var(--warn)', fontSize: '11.5px' }}>
+                          {platePlan.summaryNotes.slice(1).join(' · ')}
                         </span>
                       )}
                     </div>
-                    {platePlan.summaryNotes.length > 1 && (
-                      <span style={{ color: 'var(--warn)', fontSize: '11.5px' }}>
-                        {platePlan.summaryNotes.slice(1).join(' · ')}
-                      </span>
+
+                    {platePlan.empiricalProfile && (
+                      <div
+                        className="mono"
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          flexWrap: 'wrap',
+                          gap: '8px',
+                          paddingTop: '6px',
+                          borderTop: '1px solid var(--line)',
+                          fontSize: '11px',
+                          color: 'var(--fg2)',
+                        }}
+                      >
+                        <span>
+                          <strong>Empirical Rules:</strong> Target ε⁰ {platePlan.empiricalProfile.targetStrengthMin.toFixed(2)}–{platePlan.empiricalProfile.targetStrengthMax.toFixed(2)}
+                          {' · '}Avg aromatic rings {platePlan.empiricalProfile.meanAromaticRings.toFixed(1)}
+                          {' · '}Avg HBD {platePlan.empiricalProfile.meanHbd.toFixed(1)}
+                          {platePlan.empiricalProfile.maxAcidStress > 0 &&
+                            ` · Max acid stress ${platePlan.empiricalProfile.maxAcidStress.toFixed(2)} eq (${platePlan.empiricalProfile.acidLabel || 'acid'}) → min base cap ${platePlan.empiricalProfile.recommendedMinBaseCap.toFixed(2)} eq`}
+                          {platePlan.empiricalProfile.synthesizedCandidateCount > 0 &&
+                            ` · ${platePlan.empiricalProfile.synthesizedCandidateCount} Langmuir plate-tuned candidates evaluated`}
+                          {(platePlan.empiricalProfile.prismaCandidateCount ?? 0) > 0 &&
+                            ` (+ ${platePlan.empiricalProfile.prismaCandidateCount} PRISMA ternary)`}
+                        </span>
+                        {platePlan.empiricalProfile.tolueneRecommended &&
+                          platePlan.empiricalProfile.topTolueneCandidate &&
+                          poolMode === 'prefer_primary' &&
+                          !platePlan.recommendedSystems.some((r) => (r.system.descriptors?.aromaticMix ?? 0) >= 0.25) && (
+                            <button
+                              type="button"
+                              className="btn sm"
+                              style={{
+                                height: '22px',
+                                fontSize: '10.5px',
+                                padding: '0 8px',
+                                color: '#c084fc',
+                                borderColor: 'color-mix(in srgb, #c084fc 40%, transparent)',
+                              }}
+                              onClick={() => setPoolMode('balanced')}
+                              title="Toluene π-π competition matches or beats workhorse blends on this aromatic plate; switch Preference to All Systems Equal to promote it"
+                            >
+                              Ar-π alternative: {platePlan.empiricalProfile.topTolueneCandidate.name} ({platePlan.empiricalProfile.topTolueneCandidate.coveragePct}% · score {platePlan.empiricalProfile.topTolueneCandidate.meanScore.toFixed(2)}) — Try All Systems →
+                            </button>
+                          )}
+                      </div>
                     )}
                   </div>
 
@@ -969,11 +2625,38 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                         <div>
-                          <div style={{ fontSize: '13px', fontWeight: 700 }}>
-                            Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{activeSystemPlan.system.name}</span>
+                          <div style={{ fontSize: '13px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <span>
+                              Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{activeSystemPlan.system.name}</span>
+                            </span>
+                            {platePlan.calibrationApplied?.active && (
+                              <span
+                                className="mono"
+                                style={{
+                                  fontSize: '10px',
+                                  fontWeight: 700,
+                                  padding: '1px 6px',
+                                  borderRadius: '4px',
+                                  background: 'color-mix(in srgb, #10b981 16%, transparent)',
+                                  color: '#10b981',
+                                }}
+                              >
+                                Calibrated ({platePlan.calibrationApplied.midplateRfShift >= 0 ? '+' : ''}
+                                {platePlan.calibrationApplied.midplateRfShift.toFixed(2)} Rf
+                                {platePlan.calibrationApplied.hasFeatureWeights ? ' · Ridge 5D' : ''})
+                              </span>
+                            )}
                           </div>
                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
                             {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {activeSystemPlan.system.chamberPrep50mL}
+                            {activeSystemPlan.system.descriptors && (
+                              <>
+                                {' · '}ε⁰ {activeSystemPlan.system.descriptors.strength.toFixed(2)} · α {activeSystemPlan.system.descriptors.alphaMix.toFixed(2)} · β {activeSystemPlan.system.descriptors.betaMix.toFixed(2)} · π* {activeSystemPlan.system.descriptors.piStarMix.toFixed(2)}
+                                {activeSystemPlan.system.descriptors.aromaticMix > 0 && ` · Ar-π ${activeSystemPlan.system.descriptors.aromaticMix.toFixed(2)}`}
+                                {activeSystemPlan.system.descriptors.betaFrontCeiling !== undefined && ` · β-front ≤${activeSystemPlan.system.descriptors.betaFrontCeiling.toFixed(2)}`}
+                                {activeSystemPlan.system.descriptors.modifierCapacity > 0 && ` · Cap ${activeSystemPlan.system.descriptors.modifierCapacity.toFixed(2)} eq`}
+                              </>
+                            )}
                           </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '11px', color: 'var(--mut)', flexWrap: 'wrap' }}>
@@ -1257,6 +2940,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 </div>
                                 {spot.tailing && (
                                   <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center' }}>
+                                    {spot.tailingReason}
+                                  </div>
+                                )}
+                                {!spot.tailing && spot.mildStreak && spot.tailingReason && (
+                                  <div style={{ fontSize: '10px', color: 'var(--warn)', opacity: 0.85, textAlign: 'center' }}>
                                     {spot.tailingReason}
                                   </div>
                                 )}

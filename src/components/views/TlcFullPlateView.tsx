@@ -7,15 +7,18 @@ import {
   tlcOrigin,
   TlcChannelKey,
   findSpots,
+  findMultiChannelSpots,
+  getLoadedTlcChannels,
+  getChannelHistogram,
+  hasCompositeChannels,
   getEffectiveLaneSpots,
   TLC_SIGNAL,
-  extractFluorescenceOverlay,
   computeFalseColorComposite,
 } from '../../engine';
 import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
 
-export type CompositeSubMode = 'glow' | 'false-color' | 'split';
+export type CompositeSubMode = 'false-color';
 
 interface TlcFullPlateViewProps {
   currentSet: TlcSet;
@@ -166,15 +169,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   // Rf Badges & Spot Annotations toggle
   const [showRfBadges, setShowRfBadges] = useState(true);
 
-  // Dual-channel composite sub-mode: 'glow' (isolated fluorescence overlay) | 'false-color' | 'split' (interactive curtain)
-  const [compositeSubMode, setCompositeSubMode] = useState<CompositeSubMode>('glow');
-  const [compositeBlend, setCompositeBlend] = useState(0.85);
-  const [fluoThreshold, setFluoThreshold] = useState<number>(0.18);
-  const [fluoGain, setFluoGain] = useState<number>(1.6);
-  const [splitPos, setSplitPos] = useState<number>(0.50);
-  const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
+  // Unified Multi-Channel False-Color Composite gain (matches Lane Details Composite default 1.4x)
+  const [fluoGain, setFluoGain] = useState<number>(1.4);
 
-  // Offscreen canvas cache for background-subtracted fluorescence and false-color composite
+  // Offscreen canvas cache for false-color composite
   const compositeCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositeCacheKeyRef = useRef<string>('');
 
@@ -235,7 +233,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     const has254 = Boolean(currentSet.imgs.UV254?.bmp);
     const has366 = Boolean(currentSet.imgs.UV366?.bmp);
     const hasWhite = Boolean(currentSet.imgs.White?.bmp);
-    const canComposite = Boolean(has254 && has366);
+    const canComposite = hasCompositeChannels(currentSet.imgs, true);
 
     return (
       <div
@@ -322,9 +320,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               fontWeight: activeChannel === 'composite' ? 800 : 600,
             }}
             onClick={() => onSelectChannel('composite')}
-            title="Dual-Channel Composite (blends UV254 quenching with UV365 fluorescence)"
+            title="False-Color Composite across all loaded channels (UV254 quenching + UV365 fluorescence + Visible stain)"
           >
-            ✨ Dual Composite
+            ✨ Composite
           </button>
         )}
       </div>
@@ -345,20 +343,43 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const oVal = tlcOrigin(currentSet, l, getProfile as any);
       const fVal = tlcFront(currentSet, l, getProfile);
       const span = Math.max(1, fVal - oVal);
-      const spotChannel: TlcChannelKey = isComposite
-        ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
-        : (activeChannel as TlcChannelKey);
       let autoSpots: TlcSpot[] = [];
-      if (getProfile && currentSet.imgs[spotChannel]) {
-        const prof = getProfile(currentSet, spotChannel, l);
-        if (prof && prof.length > 0) {
-          autoSpots = findSpots(prof, {
-            sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
+      if (getProfile) {
+        if (isComposite) {
+          const loadedChannels = getLoadedTlcChannels(currentSet.imgs, true);
+          const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+          const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+          for (const ch of loadedChannels) {
+            const p = getProfile(currentSet, ch, l);
+            if (p && p.length > 0) {
+              profiles[ch] = p;
+              const chHist = getChannelHistogram(currentSet, ch, getProfile);
+              if (chHist) histograms[ch] = chHist;
+            }
+          }
+          autoSpots = findMultiChannelSpots({
+            profiles,
             origin: oVal,
             front: fVal,
             radius: l.spotRadius || 24,
             minProminence: spotProminence,
+            histograms,
           });
+        } else {
+          const spotChannel = activeChannel as TlcChannelKey;
+          if (currentSet.imgs[spotChannel]) {
+            const prof = getProfile(currentSet, spotChannel, l);
+            if (prof && prof.length > 0) {
+              autoSpots = findSpots(prof, {
+                sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
+                origin: oVal,
+                front: fVal,
+                radius: l.spotRadius || 24,
+                minProminence: spotProminence,
+                plateHistogram: getChannelHistogram(currentSet, spotChannel, getProfile),
+              });
+            }
+          }
         }
       }
       const baseSpots = getEffectiveLaneSpots(l, autoSpots);
@@ -423,119 +444,44 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     try {
       ctx.scale(dpr * scale, dpr * scale);
 
-      // Draw full plate bitmap with advanced dual composite rendering
-      if (isComposite && currentSet.imgs.UV254?.bmp && currentSet.imgs.UV366?.bmp) {
-        const bmp254 = currentSet.imgs.UV254.bmp;
-        const bmp366 = currentSet.imgs.UV366.bmp;
+      // Draw full plate bitmap using unified multi-channel False-Color Composite (matches Lane Details Composite)
+      if (isComposite && hasCompositeChannels(currentSet.imgs, true)) {
+        const bmp254 = currentSet.imgs.UV254?.bmp;
+        const bmp366 = currentSet.imgs.UV366?.bmp;
+        const bmpWhite = currentSet.imgs.White?.bmp;
+        const refBmp = bmp254 || bmp366 || bmpWhite || bmp;
+        const w = refBmp.width;
+        const h = refBmp.height;
+        const cacheKey = `${currentSet.uid}_fc_${w}_${h}_${Boolean(bmp254)}_${Boolean(bmp366)}_${Boolean(bmpWhite)}_${fluoGain.toFixed(2)}`;
 
-        if (compositeSubMode === 'split') {
-          // Mode 1: Split-Wavelength Wipe (Interactive Comparison Curtain)
-          const splitX = Math.round(bmp254.width * splitPos);
-          // Draw UV254 on left
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(0, 0, splitX, bmp254.height);
-          ctx.clip();
-          ctx.drawImage(bmp254, 0, 0);
-          ctx.restore();
-
-          // Draw UV366 on right, normalized to bmp254 dimensions
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(splitX, 0, bmp254.width - splitX, bmp254.height);
-          ctx.clip();
-          ctx.drawImage(bmp366, 0, 0, bmp254.width, bmp254.height);
-          ctx.restore();
-
-          // Draw vertical divider line & handle
-          ctx.save();
-          ctx.beginPath();
-          ctx.strokeStyle = '#facc15';
-          ctx.lineWidth = 2.5 / scale;
-          ctx.moveTo(splitX, 0);
-          ctx.lineTo(splitX, bmp254.height);
-          ctx.stroke();
-
-          const handleY = bmp254.height / 2;
-          ctx.fillStyle = '#0f172a';
-          ctx.strokeStyle = '#facc15';
-          ctx.lineWidth = 2 / scale;
-          ctx.beginPath();
-          ctx.arc(splitX, handleY, 18 / scale, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.fillStyle = '#facc15';
-          ctx.font = `bold ${Math.max(10, Math.round(13 / scale))}px sans-serif`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText('◀ 254 | 365 ▶', splitX, handleY - 26 / scale);
-          ctx.fillText('↔', splitX, handleY);
-          ctx.restore();
-        } else if (compositeSubMode === 'false-color') {
-          // Mode 2: Multi-channel False Color (Amber = UV254 Quenching, Cyan = UV365 Fluorescence)
-          const cacheKey = `${currentSet.uid}_fc_${bmp254.width}_${bmp254.height}_${fluoGain.toFixed(2)}`;
-          if (compositeCacheKeyRef.current !== cacheKey || !compositeCacheCanvasRef.current) {
-            if (!compositeCacheCanvasRef.current) {
-              compositeCacheCanvasRef.current = document.createElement('canvas');
-            }
-            const cCanvas = compositeCacheCanvasRef.current;
-            cCanvas.width = bmp254.width;
-            cCanvas.height = bmp254.height;
-            const cCtx = cCanvas.getContext('2d');
-            if (cCtx) {
-              cCtx.clearRect(0, 0, bmp254.width, bmp254.height);
-              cCtx.drawImage(bmp254, 0, 0);
-              const d254 = cCtx.getImageData(0, 0, bmp254.width, bmp254.height);
-              cCtx.clearRect(0, 0, bmp254.width, bmp254.height);
-              cCtx.drawImage(bmp366, 0, 0, bmp254.width, bmp254.height);
-              const d366 = cCtx.getImageData(0, 0, bmp254.width, bmp254.height);
-
-              const fcData = computeFalseColorComposite(d254.data, d366.data, bmp254.width, bmp254.height, fluoGain);
-              const outImg = cCtx.createImageData(bmp254.width, bmp254.height);
-              outImg.data.set(fcData);
-              cCtx.putImageData(outImg, 0, 0);
-              compositeCacheKeyRef.current = cacheKey;
-            }
+        if (compositeCacheKeyRef.current !== cacheKey || !compositeCacheCanvasRef.current) {
+          if (!compositeCacheCanvasRef.current) {
+            compositeCacheCanvasRef.current = document.createElement('canvas');
           }
-          if (compositeCacheCanvasRef.current) {
-            ctx.drawImage(compositeCacheCanvasRef.current, 0, 0);
-          }
-        } else {
-          // Mode 3: Isolated Fluorescence Glow Overlay (Smart Background Subtraction)
-          // 1. Draw the pure UV254 plate (green phosphor with dark quenching spots)
-          ctx.drawImage(bmp254, 0, 0);
+          const cCanvas = compositeCacheCanvasRef.current;
+          cCanvas.width = w;
+          cCanvas.height = h;
+          const cCtx = cCanvas.getContext('2d');
+          if (cCtx) {
+            const readBmpBytes = (b: ImageBitmap | undefined): Uint8ClampedArray | null => {
+              if (!b) return null;
+              cCtx.clearRect(0, 0, w, h);
+              cCtx.drawImage(b, 0, 0, w, h);
+              return cCtx.getImageData(0, 0, w, h).data;
+            };
+            const d254 = readBmpBytes(bmp254);
+            const d366 = readBmpBytes(bmp366);
+            const dWhite = readBmpBytes(bmpWhite);
 
-          // 2. Compute or retrieve background-subtracted fluorescent layer
-          const cacheKey = `${currentSet.uid}_glow_${bmp254.width}_${bmp254.height}_${fluoThreshold.toFixed(2)}_${fluoGain.toFixed(2)}`;
-          if (compositeCacheKeyRef.current !== cacheKey || !compositeCacheCanvasRef.current) {
-            if (!compositeCacheCanvasRef.current) {
-              compositeCacheCanvasRef.current = document.createElement('canvas');
-            }
-            const cCanvas = compositeCacheCanvasRef.current;
-            cCanvas.width = bmp254.width;
-            cCanvas.height = bmp254.height;
-            const cCtx = cCanvas.getContext('2d');
-            if (cCtx) {
-              cCtx.clearRect(0, 0, bmp254.width, bmp254.height);
-              cCtx.drawImage(bmp366, 0, 0, bmp254.width, bmp254.height);
-              const d366 = cCtx.getImageData(0, 0, bmp254.width, bmp254.height);
-              const glowData = extractFluorescenceOverlay(d366.data, bmp254.width, bmp254.height, fluoThreshold, fluoGain);
-              const outImg = cCtx.createImageData(bmp254.width, bmp254.height);
-              outImg.data.set(glowData);
-              cCtx.putImageData(outImg, 0, 0);
-              compositeCacheKeyRef.current = cacheKey;
-            }
+            const fcData = computeFalseColorComposite(d254, d366, w, h, fluoGain, dWhite);
+            const outImg = cCtx.createImageData(w, h);
+            outImg.data.set(fcData);
+            cCtx.putImageData(outImg, 0, 0);
+            compositeCacheKeyRef.current = cacheKey;
           }
-
-          // 3. Overlay isolated fluorescence with screen blend without touching dark quenching spots
-          if (compositeCacheCanvasRef.current) {
-            ctx.save();
-            ctx.globalAlpha = compositeBlend;
-            ctx.globalCompositeOperation = 'screen';
-            ctx.drawImage(compositeCacheCanvasRef.current, 0, 0);
-            ctx.restore();
-          }
+        }
+        if (compositeCacheCanvasRef.current) {
+          ctx.drawImage(compositeCacheCanvasRef.current, 0, 0);
         }
       } else {
         compositeCacheKeyRef.current = '';
@@ -940,11 +886,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     getProfile,
     showRfBadges,
     isComposite,
-    compositeBlend,
-    compositeSubMode,
-    fluoThreshold,
     fluoGain,
-    splitPos,
     activeChannel,
     picks,
     straighten,
@@ -1146,14 +1088,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     setMousePos({ x: e.clientX, y: e.clientY });
 
-    // Handle dragging the split-wipe comparison divider line
-    if (isDraggingSplit && canvasRef.current) {
-      const rect = canvasRef.current.getBoundingClientRect();
-      const mouseFrac = (e.clientX - rect.left) / rect.width;
-      setSplitPos(Math.max(0.02, Math.min(0.98, +mouseFrac.toFixed(3))));
-      return;
-    }
-
     // Handle dragging a spot along the lane trajectory
     if (isDraggingSpot && dragSpotRef.current && onUpdateLane && imgEntry?.bmp) {
       const canvas = canvasRef.current;
@@ -1230,17 +1164,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
   // Mouse Down: select lane, start spot drag, add spot (Shift), delete spot (Alt), or drag lane
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    // Check if user clicked near the split wipe curtain handle
-    if (isComposite && compositeSubMode === 'split' && canvasRef.current) {
-      const rect = canvasRef.current.getBoundingClientRect();
-      const mouseFrac = (e.clientX - rect.left) / rect.width;
-      if (Math.abs(mouseFrac - splitPos) < 0.05 || e.altKey) {
-        setIsDraggingSplit(true);
-        setSplitPos(Math.max(0.02, Math.min(0.98, +mouseFrac.toFixed(3))));
-        return;
-      }
-    }
-
     const hit = findLaneAtPoint(e.clientX, e.clientY);
 
     // Pick mode: a click picks the detected spot nearest to the click, and never moves a lane
@@ -1256,19 +1179,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         const dy = e.clientY - rect.top - l.y0 * imgScale * scale;
         const localY = dx * Math.sin(-th) + dy * Math.cos(-th);
         const dist = -localY / (imgScale * scale); // px along the lane, from its start
-        const ch: TlcChannelKey = isComposite
-          ? (currentSet.imgs.UV254 ? 'UV254' : 'UV366')
-          : (activeChannel as TlcChannelKey);
-        const prof = currentSet.imgs[ch] ? getProfile(currentSet, ch, l) : [];
-        if (prof && prof.length) {
-          const { spots } = getLaneEffectiveSpots(l);
-          let best: (typeof spots)[number] | null = null;
-          for (const sp of spots) {
-            if (!best || Math.abs(sp.pos - dist) < Math.abs(best.pos - dist)) best = sp;
-          }
-          if (best && Math.abs(best.pos - dist) <= Math.max(20, (l.spotRadius || 24) * 0.9)) {
-            onPickSpot(l.id, best.pos);
-          }
+        const { spots } = getLaneEffectiveSpots(l);
+        let best: (typeof spots)[number] | null = null;
+        for (const sp of spots) {
+          if (!best || Math.abs(sp.pos - dist) < Math.abs(best.pos - dist)) best = sp;
+        }
+        if (best && Math.abs(best.pos - dist) <= Math.max(20, (l.spotRadius || 24) * 0.9)) {
+          onPickSpot(l.id, best.pos);
         }
       }
       return;
@@ -1339,7 +1256,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
   const handleMouseUp = () => {
     setIsDragging(false);
-    setIsDraggingSplit(false);
     setIsDraggingSpot(false);
     dragStartRef.current = null;
     dragSpotRef.current = null;
@@ -1350,7 +1266,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     setHoveredSpotInfo(null);
     setMousePos(null);
     setIsDragging(false);
-    setIsDraggingSplit(false);
     setIsDraggingSpot(false);
     dragStartRef.current = null;
     dragSpotRef.current = null;
@@ -1722,7 +1637,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     fontWeight: activeHudModule === 'composite' ? 800 : 600,
                   }}
                   onClick={() => setActiveHudModule((m) => (m === 'composite' ? 'none' : 'composite'))}
-                  title="Dual-channel composite blending (Glow overlay, False-color, Split wipe)"
+                  title="Multi-channel False-Color composite intensity & legend"
                 >
                   ✨ Composite
                 </button>
@@ -2548,7 +2463,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px',
+                gap: '10px',
                 background: 'rgba(4, 47, 46, 0.85)',
                 padding: '6px 10px',
                 borderRadius: '8px',
@@ -2556,114 +2471,31 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 flexWrap: 'wrap',
               }}
             >
-              <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('glow')}
-                >
-                  ✨ Glow
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('false-color')}
-                >
-                  🔬 False-Color
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('split')}
-                >
-                  ↔ Split Wipe
-                </button>
+              <span style={{ fontSize: '10px', fontWeight: 700, color: '#5eead4' }}>
+                🔬 False-Color Composite
+              </span>
+              {currentSet.imgs.UV254?.bmp && (
+                <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 UV254 Quench</span>
+              )}
+              {currentSet.imgs.UV366?.bmp && (
+                <span style={{ fontSize: '10px', color: '#22d3ee' }}>🔵 UV365 Fluo</span>
+              )}
+              {currentSet.imgs.White?.bmp && (
+                <span style={{ fontSize: '10px', color: '#f472b6' }}>🟣 Visible Stain</span>
+              )}
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '4px' }}>
+                <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Gain:</span>
+                <input
+                  type="range"
+                  min={0.8}
+                  max={2.5}
+                  step={0.1}
+                  value={fluoGain}
+                  onChange={(e) => setFluoGain(+e.target.value)}
+                  style={{ ...hudSliderTrack, width: '65px', accentColor: '#06b6d4' }}
+                />
+                <span className="mono" style={{ fontSize: '10px', color: '#67e8f9' }}>{fluoGain.toFixed(1)}×</span>
               </div>
-
-              {compositeSubMode === 'glow' && (
-                <>
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
-                    <input
-                      type="range"
-                      min={0.05}
-                      max={0.4}
-                      step={0.01}
-                      value={fluoThreshold}
-                      onChange={(e) => setFluoThreshold(+e.target.value)}
-                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#14b8a6' }}
-                    />
-                    <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
-                  </div>
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
-                    <input
-                      type="range"
-                      min={1.0}
-                      max={2.8}
-                      step={0.1}
-                      value={fluoGain}
-                      onChange={(e) => setFluoGain(+e.target.value)}
-                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#10b981' }}
-                    />
-                    <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
-                  </div>
-                </>
-              )}
-
-              {compositeSubMode === 'false-color' && (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
-                  <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
-                  <span style={{ fontSize: '10px', color: '#a7f3d0', marginLeft: '4px' }}>Gain:</span>
-                  <input
-                    type="range"
-                    min={0.8}
-                    max={2.5}
-                    step={0.1}
-                    value={fluoGain}
-                    onChange={(e) => setFluoGain(+e.target.value)}
-                    style={{ ...hudSliderTrack, width: '55px', accentColor: '#06b6d4' }}
-                  />
-                </div>
-              )}
-
-              {compositeSubMode === 'split' && (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                  <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
-                  <input
-                    type="range"
-                    min={0.02}
-                    max={0.98}
-                    step={0.01}
-                    value={splitPos}
-                    onChange={(e) => setSplitPos(+e.target.value)}
-                    style={{ ...hudSliderTrack, width: '70px', accentColor: '#facc15' }}
-                  />
-                  <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
-                </div>
-              )}
             </div>
           )}
 
@@ -2971,7 +2803,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     fontWeight: overviewModule === 'composite' ? 800 : 600,
                   }}
                   onClick={() => setOverviewModule((m) => (m === 'composite' ? 'none' : 'composite'))}
-                  title="Dual-channel composite controls"
+                  title="Multi-channel False-Color composite controls"
                 >
                   ✨ Composite
                 </button>
@@ -3150,7 +2982,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px',
+                gap: '10px',
                 background: 'rgba(4, 47, 46, 0.85)',
                 padding: '6px 10px',
                 borderRadius: '6px',
@@ -3158,104 +2990,31 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 flexWrap: 'wrap',
               }}
             >
-              <div style={{ display: 'inline-flex', gap: '2px', background: '#0f172a', padding: '2px', borderRadius: '4px' }}>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'glow' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'glow' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'glow' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('glow')}
-                >
-                  ✨ Glow
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'false-color' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'false-color' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'false-color' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('false-color')}
-                >
-                  🔬 False-Color
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    ...hudBtn,
-                    padding: '2px 6px',
-                    fontSize: '10px',
-                    background: compositeSubMode === 'split' ? '#0d9488' : 'transparent',
-                    borderColor: compositeSubMode === 'split' ? '#14b8a6' : 'transparent',
-                    color: compositeSubMode === 'split' ? '#fff' : '#94a3b8',
-                  }}
-                  onClick={() => setCompositeSubMode('split')}
-                >
-                  ↔ Split Wipe
-                </button>
+              <span style={{ fontSize: '10px', fontWeight: 700, color: '#5eead4' }}>
+                🔬 False-Color Composite
+              </span>
+              {currentSet.imgs.UV254?.bmp && (
+                <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 UV254 Quench</span>
+              )}
+              {currentSet.imgs.UV366?.bmp && (
+                <span style={{ fontSize: '10px', color: '#22d3ee' }}>🔵 UV365 Fluo</span>
+              )}
+              {currentSet.imgs.White?.bmp && (
+                <span style={{ fontSize: '10px', color: '#f472b6' }}>🟣 Visible Stain</span>
+              )}
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '4px' }}>
+                <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Gain:</span>
+                <input
+                  type="range"
+                  min={0.8}
+                  max={2.5}
+                  step={0.1}
+                  value={fluoGain}
+                  onChange={(e) => setFluoGain(+e.target.value)}
+                  style={{ ...hudSliderTrack, width: '65px', accentColor: '#06b6d4' }}
+                />
+                <span className="mono" style={{ fontSize: '10px', color: '#67e8f9' }}>{fluoGain.toFixed(1)}×</span>
               </div>
-
-              {compositeSubMode === 'glow' && (
-                <>
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Cutoff:</span>
-                    <input
-                      type="range"
-                      min={0.05}
-                      max={0.4}
-                      step={0.01}
-                      value={fluoThreshold}
-                      onChange={(e) => setFluoThreshold(+e.target.value)}
-                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#14b8a6' }}
-                    />
-                    <span className="mono" style={{ fontSize: '10px', color: '#5eead4' }}>{Math.round(fluoThreshold * 100)}%</span>
-                  </div>
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                    <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Boost:</span>
-                    <input
-                      type="range"
-                      min={1.0}
-                      max={2.8}
-                      step={0.1}
-                      value={fluoGain}
-                      onChange={(e) => setFluoGain(+e.target.value)}
-                      style={{ ...hudSliderTrack, width: '55px', accentColor: '#10b981' }}
-                    />
-                    <span className="mono" style={{ fontSize: '10px', color: '#34d399' }}>{fluoGain.toFixed(1)}×</span>
-                  </div>
-                </>
-              )}
-
-              {compositeSubMode === 'false-color' && (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ fontSize: '10px', color: '#fbbf24' }}>🟡 Quench</span>
-                  <span style={{ fontSize: '10px', color: '#38bdf8' }}>🔵 Fluo</span>
-                </div>
-              )}
-
-              {compositeSubMode === 'split' && (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                  <span style={{ fontSize: '10px', color: '#a7f3d0' }}>Wipe:</span>
-                  <input
-                    type="range"
-                    min={0.02}
-                    max={0.98}
-                    step={0.01}
-                    value={splitPos}
-                    onChange={(e) => setSplitPos(+e.target.value)}
-                    style={{ ...hudSliderTrack, width: '70px', accentColor: '#facc15' }}
-                  />
-                  <span className="mono" style={{ fontSize: '10px', color: '#fef08a' }}>{Math.round(splitPos * 100)}%</span>
-                </div>
-              )}
             </div>
           )}
 
@@ -3499,11 +3258,11 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             {isComposite && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#10b981' }}>
                 <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '2px', background: '#10b981' }} />
-                {compositeSubMode === 'split'
-                  ? 'Dual Split-Wavelength Wipe (◀ UV254 | UV365 ▶)'
-                  : compositeSubMode === 'false-color'
-                  ? 'Dual False-Color (🟡 Quenching + 🔵 Fluorescence)'
-                  : 'Dual Isolated Glow (Background-Subtracted Fluorescence)'}
+                False-Color Composite ({[
+                  currentSet.imgs.UV254?.bmp ? '🟡 UV254 Quench' : null,
+                  currentSet.imgs.UV366?.bmp ? '🔵 UV365 Fluo' : null,
+                  currentSet.imgs.White?.bmp ? '🟣 Visible Stain' : null,
+                ].filter(Boolean).join(' + ')})
               </span>
             )}
           </div>
@@ -3522,7 +3281,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         >
           <div style={{ fontSize: '36px', marginBottom: '8px' }}>📷</div>
           <div style={{ fontWeight: 700, fontSize: '15px', marginBottom: '6px' }}>
-            No {activeChannel === 'composite' ? 'Dual Composite (UV254 + UV365)' : activeChannel} Plate Image Loaded
+            No {activeChannel === 'composite' ? 'Multi-Channel Composite' : activeChannel} Plate Image Loaded
           </div>
           <p style={{ fontSize: '13px', color: 'var(--mut)', margin: '0 0 16px' }}>
             Upload your laboratory TLC plate photograph (PNG, JPEG, WebP) or click below to load a synthetic demonstration plate.

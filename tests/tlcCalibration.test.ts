@@ -607,6 +607,10 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
       { code: 'D', name: 'CyclohexylPropionamide', smiles: 'CCC(=O)NC1CCCCC1', aromBias: -0.09 },
       { code: 'E', name: 'AdamantylAcetamide', smiles: 'CC(=O)NC12CC3CC(CC(C3)C1)C2', aromBias: -0.09 },
       { code: 'F', name: 'Octanamide', smiles: 'CCCCCCCC(=O)N(C)C', aromBias: -0.08 },
+      { code: 'G', name: 'Acetonaphthone', smiles: 'CC(=O)c1cccc2ccccc12', aromBias: 0.17 },
+      { code: 'H', name: 'Benzanilide', smiles: 'O=C(Nc1ccccc1)c1ccccc1', aromBias: 0.17 },
+      { code: 'I', name: 'Valerylcyclopentylamide', smiles: 'CCCCC(=O)NC1CCCC1', aromBias: -0.09 },
+      { code: 'J', name: 'Diethylisovaleramide', smiles: 'CC(C)CC(=O)N(CC)CC', aromBias: -0.08 },
     ];
     state.reagents = mols.map((m) => ({
       code: m.code,
@@ -619,8 +623,8 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
     }));
 
     const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
-    // 18 single-substrate wells (3 replicates per molecule) so 18 >= 10 paired spots with strong aromatic-ring systematic offset
-    const rows = Array.from({ length: 18 }, (_, w) => {
+    // 30 single-substrate wells (3 replicates of 10 distinct molecules): ridge needs >= 30 pairs and >= 8 distinct compounds
+    const rows = Array.from({ length: 30 }, (_, w) => {
       const m = mols[w % mols.length];
       return {
         local_index: w,
@@ -631,7 +635,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
         recipe: [{ code: m.code, name: m.name, target_concentration: 50, equivalence: 1 }],
       };
     });
-    const fakeRun = { plates: 1, reactions: 18, rows } as unknown as RunResult;
+    const fakeRun = { plates: 1, reactions: 30, rows } as unknown as RunResult;
 
     const lanes = [];
     const prof: Record<string, number[]> = {};
@@ -647,7 +651,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
         length: 400,
         zeroRf: 40,
       });
-      if (wellIdx < 18) {
+      if (wellIdx < 30) {
         const m = mols[wellIdx % mols.length];
         const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys50).rf;
         const obsRf = Math.max(0.08, Math.min(0.9, baseRf + m.aromBias));
@@ -680,7 +684,8 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
 
     const fit = model.byPhase.SiO2;
     expect(fit).toBeDefined();
-    expect(fit!.pairedSpotCount).toBe(18);
+    expect(fit!.pairedSpotCount).toBe(30);
+    expect(fit!.uniqueCompounds).toBe(10);
     expect(fit!.featureWeights).toBeDefined();
     // Aromatic rings elute higher than predicted (lower effective polarity demand -> negative weight on aromaticRings)
     expect(fit!.featureWeights!.aromaticRings).toBeLessThan(-0.004);
@@ -692,6 +697,105 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
       calibration: model,
     });
     expect(calPlan.calibrationApplied?.hasFeatureWeights).toBe(true);
+  });
+
+  it('reports distinct-compound count, held-out error and a floored sigma; repeated wells of one compound count once', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    // Diverse aromatic vs aliphatic reagent panel so standardized features have healthy variance
+    const mols = [
+      { code: 'A', name: 'Naphthylamide', smiles: 'CC(=O)Nc1ccc2ccccc2c1', aromBias: 0.1 },
+      { code: 'B', name: 'Biphenylketone', smiles: 'O=C(c1ccccc1)c1ccc(-c2ccccc2)cc1', aromBias: 0.1 },
+      { code: 'C', name: 'AnthraceneCarbaldehyde', smiles: 'O=Cc1c2ccccc2cc2ccccc12', aromBias: 0.1 },
+      { code: 'D', name: 'CyclohexylPropionamide', smiles: 'CCC(=O)NC1CCCCC1', aromBias: 0.1 },
+      { code: 'E', name: 'AdamantylAcetamide', smiles: 'CC(=O)NC12CC3CC(CC(C3)C1)C2', aromBias: 0.1 },
+      { code: 'F', name: 'Octanamide', smiles: 'CCCCCCCC(=O)N(C)C', aromBias: 0.1 },
+      { code: 'G', name: 'Acetonaphthone', smiles: 'CC(=O)c1cccc2ccccc12', aromBias: 0.1 },
+      { code: 'H', name: 'Benzanilide', smiles: 'O=C(Nc1ccccc1)c1ccccc1', aromBias: 0.1 },
+      { code: 'I', name: 'Valerylcyclopentylamide', smiles: 'CCCCC(=O)NC1CCCC1', aromBias: 0.1 },
+      { code: 'J', name: 'Diethylisovaleramide', smiles: 'CC(C)CC(=O)N(CC)CC', aromBias: 0.1 },
+    ];
+    state.reagents = mols.map((m) => ({
+      code: m.code,
+      name: m.name,
+      smiles: m.smiles,
+      molarMass: 200,
+      density: 1.05,
+      stock: 500,
+      solvent: 'DMSO',
+    }));
+
+    const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    // 30 single-substrate wells (3 replicates of 10 distinct molecules): ridge needs >= 30 pairs and >= 8 distinct compounds
+    const rows = Array.from({ length: 30 }, (_, w) => {
+      const m = mols[w % mols.length];
+      return {
+        local_index: w,
+        global_index: w,
+        combo_index: w,
+        plate_number: 0,
+        container_id: w,
+        recipe: [{ code: m.code, name: m.name, target_concentration: 50, equivalence: 1 }],
+      };
+    });
+    const fakeRun = { plates: 1, reactions: 30, rows } as unknown as RunResult;
+
+    const lanes = [];
+    const prof: Record<string, number[]> = {};
+    for (let laneId = 0; laneId < 54; laneId++) {
+      const wellIdx = containerOfLane(laneId);
+      lanes.push({
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+      });
+      if (wellIdx < 30) {
+        const m = mols[wellIdx % mols.length];
+        const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys50).rf;
+        const obsRf = Math.max(0.08, Math.min(0.9, baseRf + m.aromBias));
+        prof[`UV254:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
+        prof[`White:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
+      } else {
+        prof[`UV254:${laneId}:0.35`] = buildSyntheticPlateProfile([], 400, 40, 360);
+        prof[`White:${laneId}:0.35`] = buildSyntheticPlateProfile([], 400, 40, 360);
+      }
+    }
+
+    const measSet: TlcSet = {
+      uid: 'set_noise',
+      name: '50% EtOAc / Hexanes',
+      cfg: { lanes },
+      cfgName: 'noise',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+      prof,
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [measSet],
+    });
+
+    const fit = model.byPhase.SiO2;
+    expect(fit).toBeDefined();
+    expect(fit!.uniqueCompounds).toBe(10);
+    expect(fit!.validated).toBe(true);
+    expect(fit!.cvRmse).toBeDefined();
+    expect(fit!.calibrationApplied).toBe(true);
+    // sigma never below the floor
+    expect(fit!.calibratedSigma).toBeGreaterThanOrEqual(0.09);
+    // 30 wells of 10 compounds: effective weight of the pairs is about one unit per compound, not per well
+    const wSumPairs = model.plates[0].pairs.reduce((a, p) => a + p.weight, 0);
+    expect(wSumPairs).toBeLessThanOrEqual(10.05);
   });
 });
 

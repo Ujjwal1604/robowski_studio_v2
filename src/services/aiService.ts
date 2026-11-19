@@ -210,4 +210,68 @@ export async function fetchAiMeetingBullets(payload: MeetingBulletsPayload): Pro
   }
 }
 
+export interface TlcVisionQcLaneSummary {
+  well: string;
+  laneId: number;
+  half: number;
+  spots: number[];
+}
+
+export interface TlcVisionQcPayload {
+  imageBase64: string;
+  mimeType: string;
+  channelLabel: string;
+  plateNumber: number;
+  lanesSummary: TlcVisionQcLaneSummary[];
+  warnings?: string[];
+}
+
+export interface TlcVisionQcAuditItem {
+  half: number;
+  status: 'ok' | 'shift';
+  suggestedShiftRf: number;
+  note: string;
+}
+
+export interface TlcVisionQcSpotCorrection {
+  well: string;
+  laneId: number;
+  action: 'add' | 'remove';
+  rf: number;
+  confidence: 'high' | 'medium';
+  reason: string;
+}
+
+export interface TlcVisionQcResult {
+  overallVerdict: 'good' | 'minor_fixes' | 'needs_attention';
+  summary: string;
+  laneAlignmentWarning: string;
+  frontAudit: TlcVisionQcAuditItem[];
+  originAudit: TlcVisionQcAuditItem[];
+  spotCorrections: TlcVisionQcSpotCorrection[];
+  model?: string;
+}
+
+export async function fetchAiTlcVisionQc(payload: TlcVisionQcPayload): Promise<TlcVisionQcResult> {
+  try {
+    const res = await fetch('/api/ai/tlc-vision-qc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || `Server error: ${res.status}`);
+    }
+    return data.data;
+  } catch (err: any) {
+    if (err.name === 'TimeoutError' || err.message?.includes('aborted')) {
+      throw new Error('AI Vision QC timed out after 60 seconds. Please try again.');
+    }
+    throw err;
+  }
+}
+
 

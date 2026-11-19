@@ -1,6 +1,6 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 const app = express();
 const port = 3000;
@@ -550,6 +550,291 @@ Return ONLY a valid JSON array of 3 strings:
     res.json({ success: true, bullets });
   } catch (err: any) {
     console.error('Error generating slide bullets:', err);
+    res.status(500).json({ error: cleanErrorMessage(err) });
+  }
+});
+
+// 6. AI Vision Final TLC Plate QC Audit (Gemini Multimodal Vision)
+app.post('/api/ai/tlc-vision-qc', async (req, res) => {
+  try {
+    const ai = getGenAIClient();
+    if (!ai) {
+      res.status(503).json({
+        error: 'Gemini API key is not configured. Please check Settings > Secrets.',
+      });
+      return;
+    }
+
+    const { imageBase64, mimeType, channelLabel, plateNumber, lanesSummary, warnings } = req.body || {};
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      res.status(400).json({ error: 'Missing annotated plate image for Vision QC.' });
+      return;
+    }
+
+    const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+    const resolvedMime =
+      typeof mimeType === 'string' && /^image\/(jpeg|png|webp)$/.test(mimeType)
+        ? mimeType
+        : 'image/jpeg';
+
+    const qcSchema = {
+      type: Type.OBJECT,
+      properties: {
+        overallVerdict: {
+          type: Type.STRING,
+          description: 'One of: good, minor_fixes, needs_attention',
+        },
+        summary: {
+          type: Type.STRING,
+          description:
+            '1-2 concise sentences from a synthetic chemist summarizing origin, solvent front, lane alignment, and spot accuracy.',
+        },
+        laneAlignmentWarning: {
+          type: Type.STRING,
+          description:
+            'Short warning ONLY if lane boxes visibly miss the silica plate or straddle glass edges; otherwise empty string.',
+        },
+        frontAudit: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              half: { type: Type.INTEGER, description: '0 for lower half (A1-C5), 1 for upper half (D5-F9)' },
+              status: { type: Type.STRING, description: 'ok or shift' },
+              suggestedShiftRf: {
+                type: Type.NUMBER,
+                description:
+                  'Fractional shift along the lane length (-0.18 to +0.18; positive moves front UP, negative moves front DOWN; 0 if ok).',
+              },
+              note: { type: Type.STRING },
+            },
+            required: ['half', 'status', 'suggestedShiftRf', 'note'],
+          },
+        },
+        originAudit: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              half: { type: Type.INTEGER, description: '0 for lower half (A1-C5), 1 for upper half (D5-F9)' },
+              status: { type: Type.STRING, description: 'ok or shift' },
+              suggestedShiftRf: {
+                type: Type.NUMBER,
+                description:
+                  'Fractional shift along the lane length (-0.12 to +0.12; positive moves origin UP, negative moves origin DOWN; 0 if ok).',
+              },
+              note: { type: Type.STRING },
+            },
+            required: ['half', 'status', 'suggestedShiftRf', 'note'],
+          },
+        },
+        spotCorrections: {
+          type: Type.ARRAY,
+          description: 'Up to 24 highest-impact missed spots to add or bogus markers to remove.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              well: { type: Type.STRING, description: 'Exact well label printed below the lane, e.g. F7 or E3' },
+              laneId: { type: Type.INTEGER, description: 'Exact laneId from the provided lanesSummary JSON' },
+              action: { type: Type.STRING, description: 'add or remove' },
+              rf: {
+                type: Type.NUMBER,
+                description: 'Estimated Rf between 0.03 and 0.97 read against the yellow origin (0.0) and cyan front (1.0).',
+              },
+              confidence: { type: Type.STRING, description: 'high or medium' },
+              reason: { type: Type.STRING, description: 'Short 4-10 word chemist reason' },
+            },
+            required: ['well', 'laneId', 'action', 'rf', 'confidence', 'reason'],
+          },
+        },
+      },
+      required: ['overallVerdict', 'summary', 'laneAlignmentWarning', 'frontAudit', 'originAudit', 'spotCorrections'],
+    };
+
+    const promptText = `You are a senior synthetic / high-throughput experimentation (HTE) chemist performing a visual quality-control (QC) audit on an annotated 54-well TLC plate image.
+
+PLATE METADATA:
+- Plate #${plateNumber || 1}, Channel: ${channelLabel || 'UV 254 nm'}
+- Overlay legend drawn on the image:
+  * Teal vertical rectangles = lane boxes with white well labels printed below each box (Lower tier = half 0, Upper tier = half 1).
+  * Yellow horizontal line near the bottom of each tier = detected ORIGIN (Rf = 0.00).
+  * Cyan horizontal line near the top of each tier = detected SOLVENT FRONT (Rf = 1.00).
+  * Bright magenta circles with horizontal ticks = currently detected SPOTS.
+  * White ticks along left/right edges = Rf ruler (0.0 to 1.0).
+- Current automated detections (JSON):
+${JSON.stringify(lanesSummary || [])}
+${warnings?.length ? `- System notes: ${JSON.stringify(warnings)}` : ''}
+
+AUDIT RULES (THINK LIKE A CHEMIST):
+1. Check whether the lane boxes actually sit on the physical silica plate or if outer lanes sit in the black surround / straddle the vertical glass cut edge. If misaligned, explain concisely in laneAlignmentWarning.
+2. Check the yellow ORIGIN line for half 0 (lower) and half 1 (upper). Is it centered on the spotting baseline? Only suggest status="shift" if visibly off by > 0.025 Rf.
+3. Check the cyan SOLVENT FRONT line for half 0 (lower) and half 1 (upper). Is it sitting on the true solvent front meniscus (NOT floating in black void above the glass and NOT sitting on handwriting/ink)? Only suggest status="shift" if visibly off by > 0.025 Rf.
+4. Inspect every on-plate lane for:
+   - MISSED SPOTS (action="add"): Clear dark UV-quenching or fluorescent/stained spots inside the lane between Rf 0.04 and 0.96 that have NO magenta circle (especially wide coalesced spots spanning adjacent lanes). Estimate Rf carefully using the yellow origin (0.0) and cyan front (1.0).
+   - FALSE POSITIVES (action="remove"): Magenta circles sitting on clean empty silica, pitch-black off-plate surround, vertical glass edges, pencil/pen writing, or dust.
+   - NEVER suggest adding a spot on off-plate black background, on the origin baseline (Rf < 0.03), or on handwriting/plate edges.
+   - Use ONLY valid well labels and matching laneIds from the lanesSummary JSON. Return at most 24 highest-impact corrections.`;
+
+    const visionModels = [
+      {
+        name: 'gemini-4-hydrogen',
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: qcSchema,
+        },
+      },
+      {
+        name: 'gemini-3.1-flash-lite',
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: qcSchema,
+        },
+      },
+    ];
+
+    let rawText = '';
+    let usedModel = '';
+    let lastErr: any = null;
+
+    for (const m of visionModels) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await Promise.race([
+            ai.models.generateContent({
+              model: m.name,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    { text: promptText },
+                    { inlineData: { mimeType: resolvedMime, data: cleanBase64 } },
+                  ],
+                },
+              ],
+              config: m.config,
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error(`Timeout after 40s on ${m.name}`)), 40000)
+            ),
+          ]);
+          if (response?.text) {
+            rawText = response.text;
+            usedModel = m.name;
+            break;
+          }
+        } catch (err: any) {
+          lastErr = err;
+          const msg = err?.message || String(err);
+          if (msg.includes('503') && attempt === 1) {
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+          break;
+        }
+      }
+      if (rawText) break;
+    }
+
+    if (!rawText) {
+      throw lastErr || new Error('Vision AI QC failed to produce a response.');
+    }
+
+    let cleaned = rawText.trim();
+    if (cleaned.startsWith('```json')) {
+      cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    const parsed = JSON.parse(cleaned);
+
+    // Validate & clamp numeric bounds against known lanesSummary
+    const validLaneMap = new Map<number, string>();
+    const wellToLane = new Map<string, number>();
+    if (Array.isArray(lanesSummary)) {
+      for (const l of lanesSummary) {
+        if (typeof l?.laneId === 'number' && typeof l?.well === 'string') {
+          validLaneMap.set(l.laneId, l.well);
+          wellToLane.set(l.well.toUpperCase(), l.laneId);
+        }
+      }
+    }
+
+    const clampNum = (v: any, lo: number, hi: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : 0;
+    };
+
+    const frontAudit = Array.isArray(parsed.frontAudit)
+      ? parsed.frontAudit
+          .filter((a: any) => a && (a.half === 0 || a.half === 1))
+          .map((a: any) => ({
+            half: Number(a.half),
+            status: a.status === 'shift' ? 'shift' : 'ok',
+            suggestedShiftRf: +clampNum(a.suggestedShiftRf, -0.18, 0.18).toFixed(3),
+            note: String(a.note || ''),
+          }))
+      : [];
+
+    const originAudit = Array.isArray(parsed.originAudit)
+      ? parsed.originAudit
+          .filter((a: any) => a && (a.half === 0 || a.half === 1))
+          .map((a: any) => ({
+            half: Number(a.half),
+            status: a.status === 'shift' ? 'shift' : 'ok',
+            suggestedShiftRf: +clampNum(a.suggestedShiftRf, -0.12, 0.12).toFixed(3),
+            note: String(a.note || ''),
+          }))
+      : [];
+
+    const spotCorrections = Array.isArray(parsed.spotCorrections)
+      ? parsed.spotCorrections
+          .map((c: any) => {
+            const rawWell = String(c?.well || '').trim().toUpperCase();
+            let laneId = Number(c?.laneId);
+            if (!validLaneMap.has(laneId) && wellToLane.has(rawWell)) {
+              laneId = wellToLane.get(rawWell)!;
+            }
+            if (!validLaneMap.has(laneId)) return null;
+            const action = c?.action === 'add' ? 'add' : c?.action === 'remove' ? 'remove' : null;
+            if (!action) return null;
+            const rf = +clampNum(c?.rf, 0.03, 0.97).toFixed(3);
+            return {
+              well: validLaneMap.get(laneId)!,
+              laneId,
+              action,
+              rf,
+              confidence: c?.confidence === 'high' ? 'high' : 'medium',
+              reason: String(c?.reason || ''),
+            };
+          })
+          .filter(Boolean)
+          .slice(0, 24)
+      : [];
+
+    const verdict =
+      parsed.overallVerdict === 'good' ||
+      parsed.overallVerdict === 'minor_fixes' ||
+      parsed.overallVerdict === 'needs_attention'
+        ? parsed.overallVerdict
+        : spotCorrections.length > 0
+        ? 'minor_fixes'
+        : 'good';
+
+    res.json({
+      success: true,
+      data: {
+        overallVerdict: verdict,
+        summary: String(parsed.summary || 'Vision QC audit complete.'),
+        laneAlignmentWarning: String(parsed.laneAlignmentWarning || ''),
+        frontAudit,
+        originAudit,
+        spotCorrections,
+        model: usedModel,
+      },
+    });
+  } catch (err: any) {
+    console.error('Error running TLC Vision QC:', err);
     res.status(500).json({ error: cleanErrorMessage(err) });
   }
 });

@@ -303,6 +303,15 @@ export interface TlcCalibrationPhaseFit {
   meanRfBias: number;
   rmseBefore: number;
   rmseAfter: number;
+  /** number of distinct compounds behind the fit (a compound seen in many wells counts once) */
+  uniqueCompounds?: number;
+  /** true when a leave-compounds-out check could be run */
+  validated?: boolean;
+  /** held-out Rf error of the fitted model / of the uncalibrated model (only when validated) */
+  cvRmse?: number;
+  cvRmseBaseline?: number;
+  /** false when the correction did not beat the uncalibrated model on held-out compounds and was switched off */
+  calibrationApplied?: boolean;
 }
 
 export interface TlcCalibrationModel {
@@ -515,6 +524,71 @@ function getTlcQuery(rdkit: any, key: string, smarts: string): any | null {
     map.set(key, null);
     return null;
   }
+}
+
+const ACETONE_REACTIVE_SMARTS: Array<[string, string]> = [
+  ['primary amine', '[NX3;H2;!$(NC=[O,S,N]);!$(N-a)][CX4]'],
+  ['aniline', '[NX3;H2]-c'],
+  ['hydrazine/hydrazide', '[NX3;H2]-[NX3]'],
+];
+const MEOH_REACTIVE_SMARTS: Array<[string, string]> = [
+  ['acid chloride', '[CX3](=O)[Cl,Br]'],
+  ['anhydride', '[CX3](=O)O[CX3](=O)'],
+  ['sulfonyl chloride', 'S(=O)(=O)[Cl,F]'],
+  ['isocyanate/isothiocyanate', 'N=C=[O,S]'],
+  ['NHS/active ester', '[CX3](=O)ON1C(=O)CCC1=O'],
+];
+
+function matchesAny(rdkit: any, smiles: string, list: Array<[string, string]>): string | null {
+  let mol: any = null;
+  try {
+    mol = rdkit.get_mol(smiles);
+    if (!mol) return null;
+    for (const [label, sma] of list) {
+      const q = getTlcQuery(rdkit, `rx_${label}`, sma);
+      if (!q) continue;
+      try {
+        const m = JSON.parse(mol.get_substruct_matches(q) || '[]');
+        if (Array.isArray(m) && m.length > 0) return label;
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    try { mol?.delete(); } catch { /* ignore */ }
+  }
+  return null;
+}
+
+/** Warns when a recommended eluent can chemically react with a sample component on the plate. */
+export function eluentReactivityWarnings(
+  rdkit: any,
+  substrateSmiles: string[],
+  systems: TlcSolventSystemDef[]
+): string[] {
+  const out: string[] = [];
+  const uniq = Array.from(new Set(substrateSmiles.map((x) => (x || '').trim()).filter(Boolean)));
+  const hasAcetone = systems.some(
+    (s) => s.family === 'acetone_hex' || s.composition?.strongSolvent === 'Acetone' || s.composition?.ternaryCoSolvent?.solvent === 'Acetone'
+  );
+  const hasMeOH = systems.some(
+    (s) => /MeOH/i.test(s.name || '') || s.composition?.strongSolvent === 'MeOH' || s.composition?.ternaryCoSolvent?.solvent === 'MeOH' || Boolean(s.baseModifier?.includes('NH₃'))
+  );
+  if (hasAcetone) {
+    const hit = uniq.map((u) => matchesAny(rdkit, u, ACETONE_REACTIVE_SMARTS)).find(Boolean);
+    if (hit) {
+      out.push(`Acetone eluent with a ${hit} component on the plate: it can condense to an imine/hydrazone on the silica and create an artefact spot; prefer an EtOAc or MTBE system for those wells.`);
+    }
+  }
+  if (hasMeOH) {
+    const hit = uniq.map((u) => matchesAny(rdkit, u, MEOH_REACTIVE_SMARTS)).find(Boolean);
+    if (hit) {
+      out.push(`MeOH-containing eluent with a reactive ${hit} sample component: it can be methanolysed to the methyl ester/carbamate on the plate; quench the aliquot or use a non-alcohol eluent.`);
+    }
+  }
+  return out;
 }
 
 export function profileMoleculeForTlc(
@@ -1348,8 +1422,8 @@ export function predictTlcRf(
 
   const rf = Math.round(Math.max(0.02, Math.min(0.99, rawRf)) * 100) / 100;
 
-  // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
-  // tiny tie-break only (NH₃ listed first when equal); the real answer is the "or" alternative shown on the card.
+  // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N, so Et₃N eluents keep a tiny penalty
+  // for basic amines (a tie-break only: NH₃ is listed first when equal; the card also offers the "or" swap).
   if (!tailing && !mildStreak && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N')) {
     mildStreak = true;
   }
@@ -1395,6 +1469,12 @@ function smWindowScore(rf: number): number {
 // Rf predictions are hand-tuned guesses (error roughly +-0.12), so separation is scored as the
 // probability that two spots really are apart, not as a point estimate of the gap.
 export const RF_SIGMA = 0.12;
+
+/** A well counts as resolved when its (set) score reaches this value; shared by the engine and the UI. */
+export const RESOLVED_SCORE = 0.55;
+
+/** A plate-tailored eluent only joins the pool if it beats the best standard eluent by this much for a well. */
+const DYNAMIC_MIN_GAIN = 0.05;
 const RF_MIN_VISIBLE_GAP = 0.03;
 
 function erf(x: number): number {
@@ -1738,7 +1818,7 @@ function buildSystemPlanEntry(
 
     const isAssignedHere = bestOwnerByWell.get(w) === sys.id;
     if (isAssignedHere) assignedWellIndices.push(w);
-    if (evalRes.score >= 0.55) {
+    if (evalRes.score >= RESOLVED_SCORE) {
       resCount++;
       if (wData.hasHighOrMed) highMedCount++;
     }
@@ -1935,9 +2015,7 @@ export async function optimizePlateTlcSolvents(
     });
 
     const hasHighOrMed = products.some((p) => p.tier === 'High' || p.tier === 'Medium');
-    const topScore = products[0]?.score ?? 0;
     const importanceWeight = hasHighOrMed ? 1.0 : products.length > 0 ? 0.9 : 0.5;
-    void topScore;
 
     const wellCtx = buildWellTlcContext(ext, pred);
 
@@ -2156,7 +2234,7 @@ export async function optimizePlateTlcSolvents(
         const sc = sysMap.get(w.wellIndex)!.score;
         totalScore += sc;
         const coreBest = coreBestByWell.get(w.wellIndex) ?? 0;
-        if (sc > coreBest + 0.015) {
+        if (sc > coreBest + DYNAMIC_MIN_GAIN) {
           improvedCount++;
           gainSum += sc - coreBest;
         }
@@ -2496,7 +2574,6 @@ export async function optimizePlateTlcSolvents(
 
   let chosenSystems = bestComboIdx.map((idx) => searchPool[idx]);
 
-  const RESOLVED_SCORE = 0.55;
   const resolvedCountFor = (systems: TlcSolventSystemDef[]): number => {
     let n = 0;
     for (let wi = 0; wi < numActive; wi++) {
@@ -2659,8 +2736,6 @@ export async function optimizePlateTlcSolvents(
       coveragePct: activeWells.length > 0 ? Math.round((groupResolved / activeWells.length) * 100) : 0,
     });
   }
-  const groupedIds = new Set(otherGroups.flatMap((gr) => gr.systems.map((e) => e.system.id)));
-  void groupedIds;
 
 
   const highRankedWellCount = activeWells.filter((w) => w.hasHighOrMed).length;
@@ -2692,6 +2767,13 @@ export async function optimizePlateTlcSolvents(
   } else if (stationaryPhasePref === 'SiO2') {
     summaryNotes.push('Normal-Phase Silica Gel (SiO₂) mode.');
   }
+  summaryNotes.push(
+    ...eluentReactivityWarnings(
+      rdkit,
+      activeWells.flatMap((w) => w.substrates.map((x) => x.smiles)),
+      recommendedSystems.map((r) => r.system)
+    )
+  );
   const hasNh3 = recommendedSystems.some((s) => s.system.baseModifier?.includes('NH₃'));
   const hasEt3n = recommendedSystems.some((s) => s.system.baseModifier?.includes('Et₃N'));
   if (hasNh3) {
@@ -2840,7 +2922,7 @@ export async function optimizePlateTlcSolvents(
         const interiorFoundProd = lane.predictedSpots.some(
           (p) => p.kind === 'product' && p.found && p.rfAfter >= 0.12 && p.rfAfter <= 0.85
         );
-        const modelOkHere = (evalMatrix.get(sysDef.id)?.get(wi)?.score ?? 0) >= 0.55;
+        const modelOkHere = (evalMatrix.get(sysDef.id)?.get(wi)?.score ?? 0) >= RESOLVED_SCORE;
         if (
           !isFrontPlate &&
           !isBasePlate &&
@@ -2901,7 +2983,7 @@ export async function optimizePlateTlcSolvents(
             }
 
             const evalRes = sysMap.get(wi);
-            if (!evalRes || evalRes.score < 0.55) continue;
+            if (!evalRes || evalRes.score < RESOLVED_SCORE) continue;
 
             // Ensure spots in this candidate follow-up solvent actually sit inside 0.12..0.84 (not re-saturating!)
             const prodSpotsHere = evalRes.spots.filter((sp) => sp.kind === 'product');
@@ -2983,7 +3065,7 @@ export async function optimizePlateTlcSolvents(
       for (const w of activeWells) {
         const sc = sysMap?.get(w.wellIndex)?.score ?? 0;
         sSum += sc;
-        if (sc >= 0.55) res++;
+        if (sc >= RESOLVED_SCORE) res++;
       }
       const meanScore = activeWells.length > 0 ? Math.round((sSum / activeWells.length) * 100) / 100 : 0;
       const coveragePct = activeWells.length > 0 ? Math.round((res / activeWells.length) * 100) : 0;

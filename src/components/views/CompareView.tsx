@@ -22,14 +22,14 @@ import {
   WellPredictionResult,
   buildWellComparisonMatrix,
   compareRunsSummary,
-  computeLaneRowIntensity,
   extractDensitogram,
+  extractLaneProfile2d,
   extractWellSnapshot,
   findFirstOccupiedWell,
   findMultiChannelSpots,
   getChannelHistogram,
   getEffectiveLaneSpots,
-  laneMatrix,
+  getLane2dMetrics,
   predictWellReactions,
   tlcFront,
   tlcOrigin,
@@ -46,51 +46,13 @@ import { CompareWellPicker } from '../ui/CompareWellPicker';
 
 type AspectFilter = 'all' | 'recipe' | 'conditions' | 'predict' | 'tlc' | 'eln';
 
-let cmpScratchCanvas: HTMLCanvasElement | null = null;
-
 function extractLaneProfileOnce(
   set: TlcSet,
   key: TlcChannelKey,
   lane: TlcLane,
   coreFraction: number = 0.35
 ): number[] {
-  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
-  if (set.prof && set.prof[ck]) return set.prof[ck];
-
-  const im = set.imgs?.[key];
-  if (!im || !im.bmp || typeof document === 'undefined') return [];
-
-  const W = Math.max(1, Math.round(lane.width));
-  const L = Math.max(1, Math.round(lane.length));
-
-  if (!cmpScratchCanvas) cmpScratchCanvas = document.createElement('canvas');
-  cmpScratchCanvas.width = W;
-  cmpScratchCanvas.height = L;
-
-  const ctx = cmpScratchCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return [];
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, W, L);
-  const data = imgData.data;
-  const ch = TLC_SIGNAL[key].ch;
-  const out = new Array(L);
-
-  for (let y = 0; y < L; y++) {
-    const rowOffset = y * W * 4;
-    const rowSlice = data.subarray(rowOffset, rowOffset + W * 4);
-    out[L - 1 - y] = computeLaneRowIntensity(rowSlice, W, ch, coreFraction);
-  }
-
-  set.prof = set.prof || {};
-  set.prof[ck] = out;
-  return out;
+  return extractLaneProfile2d(set, key, lane, coreFraction);
 }
 
 function resolveSpotsForSnapshot(
@@ -114,12 +76,15 @@ function resolveSpotsForSnapshot(
   if (preferredChannel === 'composite') {
     const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
     const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+    const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
     for (const ch of available) {
       const p = extractLaneProfileOnce(tlcSet, ch, lane);
       if (p.length) {
         profiles[ch] = p;
         const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileOnce);
         if (chHist) histograms[ch] = chHist;
+        const m2d = getLane2dMetrics(tlcSet, ch, lane);
+        if (m2d) lane2dByChannel[ch] = m2d;
       }
     }
     const merged = findMultiChannelSpots({
@@ -129,6 +94,7 @@ function resolveSpotsForSnapshot(
       radius: lane.spotRadius ?? undefined,
       minProminence: tlcSet.spotProminence ?? 0.28,
       histograms,
+      lane2dByChannel,
     });
     return getEffectiveLaneSpots(lane, merged);
   }
@@ -148,6 +114,7 @@ function resolveSpotsForSnapshot(
     radius: lane.spotRadius ?? undefined,
     minProminence: tlcSet.spotProminence ?? 0.28,
     plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileOnce),
+    lane2d: getLane2dMetrics(tlcSet, traceKey, lane),
   });
   return getEffectiveLaneSpots(lane, dens.spots);
 }

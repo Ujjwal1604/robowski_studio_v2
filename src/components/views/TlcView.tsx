@@ -24,9 +24,17 @@ import {
   mergeMultiChannelSpots,
   getLoadedTlcChannels,
   getChannelHistogram,
+  getLane2dMetrics,
+  extractLaneProfile2d,
+  setBlankSilicaRef,
+  clearBlankSilicaRef,
+  getBlankSilicaMeta,
+  setBlankSilicaEnabled,
+  isBlankSilicaEnabled,
+  findSimilarSpotsByColor,
+  rescueSharedReagentSpots,
   hasCompositeChannels,
   extractDensitogram,
-  computeLaneRowIntensity,
   tlcHalf,
   tlcFront,
   tlcOrigin,
@@ -67,14 +75,16 @@ import {
   TlcSpot,
   TlcDensitogramData,
 } from '../../types';
-import { putTlcImage, deleteTlcSetImages, deleteAllSetImages, getAllSetImages } from '../../context/tlcStorage';
+import { putTlcImage, getTlcImage, deleteTlcSetImages, deleteAllSetImages, getAllSetImages } from '../../context/tlcStorage';
 import { detectLaneRows, laneConfigFromDetection } from '../../engine/tlcLaneDetect';
+import { fetchAiTlcVisionQc, TlcVisionQcResult, TlcVisionQcLaneSummary } from '../../services/aiService';
 import { TlcFullPlateView } from './TlcFullPlateView';
 import { parseWellQuery } from '../ui/CommandPalette';
 import { AiTlcInterpreter } from '../ui/AiTlcInterpreter';
 import { AiSolventAdvisorModal } from '../ui/AiSolventAdvisorModal';
 import { WellPredictedProductsPanel } from '../ui/WellPredictedProductsPanel';
 
+const BLANK_SILICA_UID = '__blank_silica__';
 const TLC_KEYS: TlcChannelKey[] = ['UV254', 'White', 'UV366'];
 
 const TLC_LABEL: Record<TlcChannelKey, string> = {
@@ -102,6 +112,7 @@ function tlcNewSet(n: number): TlcSet {
     frameW: LANE_FRAME_WIDTH,
     frontPx: null,
     frontAuto: {},
+    frontAutoByLane: {},
     originPx: null,
     originAuto: {},
     imgs: {},
@@ -137,56 +148,14 @@ export interface RfMarker {
   y: number;
 }
 
-// Off-screen canvas scratchpad for sampling lane pixels
-let tlcScratchCanvas: HTMLCanvasElement | null = null;
-
-// Center-weighted lane extraction to suppress edge bleeding from neighboring wells
+// Full-RGB 2D lane extraction: computes 1D profile + caches 2D lateral metrics & RGB core vectors
 export function extractLaneProfile(
   set: TlcSet,
   key: TlcChannelKey,
   lane: TlcLane,
   coreFraction: number = 0.35
 ): number[] {
-  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
-  if (set.prof && set.prof[ck]) return set.prof[ck];
-
-  const im = set.imgs[key];
-  if (!im || !im.bmp) return [];
-
-  const W = Math.max(1, Math.round(lane.width));
-  const L = Math.max(1, Math.round(lane.length));
-
-  if (!tlcScratchCanvas) {
-    tlcScratchCanvas = document.createElement('canvas');
-  }
-  tlcScratchCanvas.width = W;
-  tlcScratchCanvas.height = L;
-
-  const ctx = tlcScratchCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return [];
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, W, L);
-  const data = imgData.data;
-  const ch = TLC_SIGNAL[key].ch;
-  const out = new Array(L);
-
-  for (let y = 0; y < L; y++) {
-    const rowOffset = y * W * 4;
-    const rowSlice = data.subarray(rowOffset, rowOffset + W * 4);
-    // Center-weighted cosine sampling: isolates the true middle trajectory and ignores edge spillover
-    out[L - 1 - y] = computeLaneRowIntensity(rowSlice, W, ch, coreFraction);
-  }
-
-  set.prof = set.prof || {};
-  set.prof[ck] = out;
-  return out;
+  return extractLaneProfile2d(set, key, lane, coreFraction);
 }
 
 // Draw lane panels upright with origin ticks and pink spot ticks
@@ -520,7 +489,23 @@ export const TlcView: React.FC = () => {
 
   const fileCsvRef = useRef<HTMLInputElement>(null);
   const fileImgRef = useRef<HTMLInputElement>(null);
+  const fileBlankRef = useRef<HTMLInputElement>(null);
   const bigCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Blank Silica Flat-Field Calibration (persisted once per camera/channel in IndexedDB)
+  const [blankMeta, setBlankMeta] = useState<Partial<Record<TlcChannelKey, { name: string }>>>(() =>
+    getBlankSilicaMeta()
+  );
+  const [blankEnabled, setBlankEnabled] = useState<boolean>(() => isBlankSilicaEnabled());
+
+  // AI Vision Final Plate QC Audit state
+  const [qcLoading, setQcLoading] = useState(false);
+  const [qcError, setQcError] = useState<string | null>(null);
+  const [qcResult, setQcResult] = useState<TlcVisionQcResult | null>(null);
+  const [qcChannel, setQcChannel] = useState<TlcChannelKey>('UV254');
+  const [qcSelectedSpots, setQcSelectedSpots] = useState<Record<number, boolean>>({});
+  const [qcSelectedFront, setQcSelectedFront] = useState<Record<number, boolean>>({});
+  const [qcSelectedOrigin, setQcSelectedOrigin] = useState<Record<number, boolean>>({});
 
   // Modal spot dragging & fine interaction state for zoomed-in lane
   const [isDraggingModalSpot, setIsDraggingModalSpot] = useState(false);
@@ -638,6 +623,105 @@ export const TlcView: React.FC = () => {
       cancelled = true;
     };
   }, [setUidsKey, setSets]);
+
+  // Clear cached 1D/2D profiles and auto front/origin across all sets & plates (e.g. when blank flat-field changes)
+  const invalidateAllPlateCaches = useCallback(() => {
+    setSets((prev) =>
+      prev.map((s) => {
+        const nextPlateData = s.plateData
+          ? Object.fromEntries(
+              Object.entries(s.plateData).map(([pK, pd]) => [
+                pK,
+                { ...pd, prof: {}, frontAuto: {}, frontAutoByLane: {}, originAuto: {}, originAutoByLane: {} },
+              ])
+            )
+          : undefined;
+        return {
+          ...s,
+          prof: {},
+          frontAuto: {},
+          frontAutoByLane: {},
+          originAuto: {},
+          originAutoByLane: {},
+          ...(nextPlateData ? { plateData: nextPlateData } : {}),
+        };
+      })
+    );
+  }, [setSets]);
+
+  // Hydrate persisted Blank Silica Flat-Field reference photos from IndexedDB on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let loadedAny = false;
+      for (const ch of TLC_KEYS) {
+        try {
+          const rec = await getTlcImage(BLANK_SILICA_UID, ch);
+          if (rec && !cancelled) {
+            const bmp = await createImageBitmap(rec.blob);
+            if (!cancelled) {
+              setBlankSilicaRef(ch, { name: rec.name, bmp });
+              loadedAny = true;
+            }
+          }
+        } catch {
+          // soft fail
+        }
+      }
+      if (loadedAny && !cancelled) {
+        setBlankMeta(getBlankSilicaMeta());
+        invalidateAllPlateCaches();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [invalidateAllPlateCaches]);
+
+  const handleLoadBlankSilica = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files ? Array.from(e.target.files) : [];
+    if (!files.length) return;
+    const assigned: string[] = [];
+    const usedThisBatch: Record<string, TlcImageEntry> = {};
+    for (const f of files) {
+      const detected =
+        tlcKeyOf(f.name, usedThisBatch) ||
+        (fullPlateChannel !== 'composite' ? fullPlateChannel : 'UV254');
+      try {
+        const bmp = await createImageBitmap(f);
+        setBlankSilicaRef(detected, { name: f.name, bmp });
+        usedThisBatch[detected] = { name: f.name, bmp };
+        await putTlcImage(BLANK_SILICA_UID, detected, f.name, f);
+        assigned.push(detected);
+      } catch (err: any) {
+        toast(`Could not load blank silica photo ${f.name}: ${err?.message || err}`);
+      }
+    }
+    if (assigned.length > 0) {
+      setBlankSilicaEnabled(true);
+      setBlankEnabled(true);
+      setBlankMeta(getBlankSilicaMeta());
+      invalidateAllPlateCaches();
+      toast(
+        `Calibrated blank silica flat-field reference for ${assigned.join(', ')}. Lamp shading & glare will now divide out automatically.`
+      );
+    }
+    e.target.value = '';
+  };
+
+  const handleClearBlankSilica = async (key?: TlcChannelKey) => {
+    clearBlankSilicaRef(key);
+    await deleteTlcSetImages(BLANK_SILICA_UID, key ? [key] : TLC_KEYS);
+    setBlankMeta(getBlankSilicaMeta());
+    invalidateAllPlateCaches();
+    toast(key ? `Removed blank silica reference for ${key}.` : 'Cleared all blank silica flat-field references.');
+  };
+
+  const handleToggleBlankSilica = (enabled: boolean) => {
+    setBlankSilicaEnabled(enabled);
+    setBlankEnabled(enabled);
+    invalidateAllPlateCaches();
+  };
 
   // Load Lane Config CSV (scoped to active plate)
   const handleLoadCsv = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -942,6 +1026,7 @@ export const TlcView: React.FC = () => {
       const origin = tlcOrigin(set, lane, get);
       const front = tlcFront(set, lane, get);
       const plateHistogram = getChannelHistogram(set, key, get);
+      const lane2d = getLane2dMetrics(set, key, lane, coreFraction);
       return {
         prof,
         origin,
@@ -952,10 +1037,85 @@ export const TlcView: React.FC = () => {
           radius: lane.spotRadius || 24,
           minProminence: spotProminence,
           plateHistogram,
+          lane2d,
         },
       };
     },
     [coreFraction, spotProminence]
+  );
+
+  // Plate-wide shared-reagent cross-lane coherence cache: rescues faint spots that appear
+  // consistently at the same Rf across >= 3 wells sharing a starting material from the run recipe.
+  const coherenceCache = useRef(new Map<string, { key: string; map: Map<number, TlcSpot[]> }>());
+  const getCoherenceRescuedMap = useCallback(
+    (set: TlcSet, key: TlcChannelKey): Map<number, TlcSpot[]> => {
+      const emptyMap = new Map<number, TlcSpot[]>();
+      if (!run?.rows?.length || !set.cfg?.lanes?.length || !set.imgs?.[key]?.bmp) return emptyMap;
+      const cacheId = `${set.uid}:p${plate}:${key}`;
+      const sig = `${spotProminence}|${coreFraction}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${set.originPx ?? ''}`;
+      const hit = coherenceCache.current.get(cacheId);
+      if (hit && hit.key === sig) return hit.map;
+
+      const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+      const plateHistogram = getChannelHistogram(set, key, get);
+      const relaxedProm = Math.max(0.08, +(spotProminence * 0.52).toFixed(3));
+      const plateRowsByVial = new Map<number, string[]>();
+      for (const row of run.rows) {
+        if (row.plate_number !== plate) continue;
+        const codes = (row.recipe || [])
+          .filter((rc) => Number(rc.target_concentration) > 0)
+          .map((rc) => rc.code);
+        if (codes.length > 0) plateRowsByVial.set(row.container_id, codes);
+      }
+
+      const inputs: Parameters<typeof rescueSharedReagentSpots>[0] = [];
+      for (const l of set.cfg.lanes) {
+        if (l.id < 0 || l.id > 53) continue;
+        const vialId = containerOfLane(l.id);
+        const reagentCodes = plateRowsByVial.get(vialId);
+        if (!reagentCodes || reagentCodes.length === 0) continue;
+        const prof = get(set, key, l);
+        if (!prof.length) continue;
+        const oVal = tlcOrigin(set, l, get);
+        const fVal = tlcFront(set, l, get);
+        const lane2d = getLane2dMetrics(set, key, l, coreFraction);
+        const soloSpots = findSpots(prof, {
+          sign: TLC_SIGNAL[key].sign,
+          origin: oVal,
+          front: fVal,
+          radius: l.spotRadius || 24,
+          minProminence: spotProminence,
+          plateHistogram,
+          lane2d,
+        });
+        const relaxedCandidates =
+          relaxedProm < spotProminence - 0.02
+            ? findSpots(prof, {
+                sign: TLC_SIGNAL[key].sign,
+                origin: oVal,
+                front: fVal,
+                radius: l.spotRadius || 24,
+                minProminence: relaxedProm,
+                plateHistogram,
+                lane2d,
+              })
+            : [];
+        inputs.push({
+          laneId: l.id,
+          reagentCodes,
+          origin: oVal,
+          front: fVal,
+          soloSpots,
+          relaxedCandidates,
+        });
+      }
+
+      const rescued = inputs.length >= 3 ? rescueSharedReagentSpots(inputs, 0.025) : emptyMap;
+      if (coherenceCache.current.size > 30) coherenceCache.current.clear();
+      coherenceCache.current.set(cacheId, { key: sig, map: rescued });
+      return rescued;
+    },
+    [run, plate, spotProminence, coreFraction]
   );
 
   const getEdgeFits = useCallback(
@@ -980,12 +1140,15 @@ export const TlcView: React.FC = () => {
           } else {
             const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
             const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+            const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
             for (const ch of loadedChs) {
               const p = get(set, ch, lane);
               if (p && p.length >= 10) {
                 profiles[ch] = p;
                 const chHist = getChannelHistogram(set, ch, get);
                 if (chHist) histograms[ch] = chHist;
+                const m2d = getLane2dMetrics(set, ch, lane, coreFraction);
+                if (m2d) lane2dByChannel[ch] = m2d;
               }
             }
             laneSpots = findMultiChannelSpots({
@@ -995,6 +1158,7 @@ export const TlcView: React.FC = () => {
               radius: lane.spotRadius || 24,
               minProminence: spotProminence,
               histograms,
+              lane2dByChannel,
             });
           }
           for (const sp of laneSpots) {
@@ -1087,7 +1251,18 @@ export const TlcView: React.FC = () => {
       if (!set.imgs[key]) return null;
       const d = detectOptsFor(set, key, lane);
       if (!d) return null;
-      const autoSpots = findSpots(d.prof, d.opts);
+      let autoSpots = findSpots(d.prof, d.opts);
+      const rescued = getCoherenceRescuedMap(set, key).get(lane.id);
+      if (rescued && rescued.length > 0) {
+        const merged = [...autoSpots];
+        for (const sp of rescued) {
+          if (!merged.some((m) => Math.abs(m.rf - sp.rf) < 0.025)) {
+            merged.push(sp);
+          }
+        }
+        merged.sort((a, b) => a.pos - b.pos);
+        autoSpots = merged;
+      }
       const spots = getEffectiveLaneSpots(lane, autoSpots);
       if (!spots.length) return spots;
       const h = tlcHalf(lane);
@@ -1097,7 +1272,7 @@ export const TlcView: React.FC = () => {
       if (!edgeActive(fit, setting)) return spots;
       return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
     },
-    [detectOptsFor, edgeSettingFor, getEdgeFits]
+    [detectOptsFor, getCoherenceRescuedMap, edgeSettingFor, getEdgeFits]
   );
 
   // Unified 3-channel spot detection across UV254, UV366, and White for Composite mode
@@ -1110,22 +1285,47 @@ export const TlcView: React.FC = () => {
       const front = tlcFront(set, lane, get);
       const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
       const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+      const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
       for (const ch of loaded) {
         const p = get(set, ch, lane);
         if (p && p.length >= 10) {
           profiles[ch] = p;
           const chHist = getChannelHistogram(set, ch, get);
           if (chHist) histograms[ch] = chHist;
+          const m2d = getLane2dMetrics(set, ch, lane, coreFraction);
+          if (m2d) lane2dByChannel[ch] = m2d;
         }
       }
-      const autoSpots = findMultiChannelSpots({
+      let autoSpots = findMultiChannelSpots({
         profiles,
         origin,
         front,
         radius: lane.spotRadius || 24,
         minProminence: spotProminence,
         histograms,
+        lane2dByChannel,
       });
+      // Include cross-lane shared-reagent rescued spots from any loaded channel
+      const rescuedByCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
+      let hasRescued = false;
+      for (const ch of loaded) {
+        const r = getCoherenceRescuedMap(set, ch).get(lane.id);
+        if (r && r.length > 0) {
+          rescuedByCh[ch] = r;
+          hasRescued = true;
+        }
+      }
+      if (hasRescued) {
+        const mergedRescued = mergeMultiChannelSpots(rescuedByCh, 0.035);
+        const combined = [...autoSpots];
+        for (const sp of mergedRescued) {
+          if (!combined.some((m) => Math.abs(m.rf - sp.rf) < 0.03)) {
+            combined.push(sp);
+          }
+        }
+        combined.sort((a, b) => a.rf - b.rf || a.pos - b.pos);
+        autoSpots = combined;
+      }
       const spots = getEffectiveLaneSpots(lane, autoSpots);
       if (!spots.length) return spots;
       const h = tlcHalf(lane);
@@ -1135,7 +1335,7 @@ export const TlcView: React.FC = () => {
       if (!edgeActive(fit, setting)) return spots;
       return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
     },
-    [coreFraction, spotProminence, edgeSettingFor, getEdgeFits]
+    [coreFraction, spotProminence, getCoherenceRescuedMap, edgeSettingFor, getEdgeFits]
   );
 
   // Helper to extract panels for lane t
@@ -1334,6 +1534,7 @@ export const TlcView: React.FC = () => {
               minProminence: spotProminence,
               minDistance,
               plateHistogram: getChannelHistogram(s, k, getDensProf),
+              lane2d: getLane2dMetrics(s, k, l, coreFraction),
             });
             const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
             const corrSpots = isCorr ? correctSpots(baseSpots, gain, offset) : baseSpots;
@@ -1668,6 +1869,7 @@ export const TlcView: React.FC = () => {
           cfg: { ...slice.cfg, lanes: newLanes },
           prof: {},
           frontAuto: {},
+          frontAutoByLane: {},
           originAuto: {},
           originAutoByLane: {},
         };
@@ -1691,6 +1893,7 @@ export const TlcView: React.FC = () => {
         cfg: prevCfg,
         prof: {},
         frontAuto: {},
+        frontAutoByLane: {},
         originAuto: {},
         originAutoByLane: {},
       });
@@ -1733,6 +1936,7 @@ export const TlcView: React.FC = () => {
         cfg: JSON.parse(JSON.stringify(origSetCfg)),
         prof: {},
         frontAuto: {},
+        frontAutoByLane: {},
         originAuto: {},
         originAutoByLane: {},
       });
@@ -1758,12 +1962,14 @@ export const TlcView: React.FC = () => {
             frontHalfPx: nextHalfFront,
             prof: {},
             frontAuto: {},
+            frontAutoByLane: {},
           };
         }
         return {
           frontPx: frontPx != null && frontPx > 0 ? frontPx : null,
           prof: {},
           frontAuto: {},
+          frontAutoByLane: {},
         };
       });
       return next;
@@ -1801,6 +2007,7 @@ export const TlcView: React.FC = () => {
           frontHalfPx: undefined,
           prof: {},
           frontAuto: {},
+          frontAutoByLane: {},
           originAuto: {},
           originAutoByLane: {},
         };
@@ -1988,6 +2195,515 @@ export const TlcView: React.FC = () => {
     handleUpdateLane(laneId, { customSpots: undefined }, true);
     toast('Reset lane spots back to automated detection.');
   }, [inspectWell, activePlateSet.cfg, handleSnapshotHistory]);
+
+  // 1-Click Color-Signature Plate-Wide Spot Finder:
+  // Samples the RGB color vector (ΔR, ΔG, ΔB) of a clicked spot and scans all 54 lanes on the
+  // active plate for 2D-centered spots with matching chromatic direction and contrast.
+  const handleFindSimilarSpotsOnPlate = useCallback(
+    (refSpot: TlcSpot) => {
+      if (inspectWell === null || !activePlateSet.cfg) return;
+      const refLaneId = tlcLane(inspectWell, 'column');
+      const refLane = activePlateSet.cfg.lanes.find((l) => l.id === refLaneId);
+      if (!refLane) return;
+
+      const loaded = getLoadedTlcChannels(activePlateSet.imgs, true);
+      if (!loaded.length) {
+        toast('Load a plate photo first to match spots by color.');
+        return;
+      }
+
+      // Pick the best channel for sampling this spot's color vector
+      let targetCh: TlcChannelKey = loaded[0];
+      if (densViewMode !== 'overlay' && loaded.includes(densViewMode)) {
+        targetCh = densViewMode;
+      } else {
+        let bestMag = -1;
+        const preferredOrder: TlcChannelKey[] = refSpot.channels?.length
+          ? [
+              ...refSpot.channels.filter((c): c is TlcChannelKey => loaded.includes(c as TlcChannelKey)),
+              ...loaded.filter((c) => !refSpot.channels?.includes(c)),
+            ]
+          : loaded;
+        for (const ch of preferredOrder) {
+          const m = getLane2dMetrics(activePlateSet, ch, refLane, coreFraction);
+          if (!m) continue;
+          const idx = Math.max(0, Math.min(m.coreRgb.length / 3 - 1, Math.round(refSpot.pos)));
+          const mag = Math.hypot(
+            m.coreRgb[idx * 3] - m.bgRgb[0],
+            m.coreRgb[idx * 3 + 1] - m.bgRgb[1],
+            m.coreRgb[idx * 3 + 2] - m.bgRgb[2]
+          );
+          if (mag > bestMag) {
+            bestMag = mag;
+            targetCh = ch;
+          }
+        }
+      }
+
+      const refMetrics = getLane2dMetrics(activePlateSet, targetCh, refLane, coreFraction);
+      if (!refMetrics) {
+        toast('Could not sample spot color from the plate image.');
+        return;
+      }
+
+      const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+      const plateLanes = activePlateSet.cfg.lanes.filter((l) => l.id >= 0 && l.id <= 53);
+      const laneInputs = plateLanes
+        .map((l) => {
+          const metrics = getLane2dMetrics(activePlateSet, targetCh, l, coreFraction);
+          if (!metrics) return null;
+          return {
+            laneId: l.id,
+            origin: tlcOrigin(activePlateSet, l, get),
+            front: tlcFront(activePlateSet, l, get),
+            metrics,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
+      const matches = findSimilarSpotsByColor(refMetrics, refSpot.pos, laneInputs);
+      if (!matches.length) {
+        toast('No additional spots matched that color signature on this plate.');
+        return;
+      }
+
+      const updatesByLane = new Map<number, TlcSpot[]>();
+      let addedCount = 0;
+      let lanesTouched = 0;
+
+      for (const m of matches) {
+        const laneObj = plateLanes.find((l) => l.id === m.laneId);
+        if (!laneObj) continue;
+        const baseSpots =
+          laneObj.customSpots !== undefined
+            ? [...laneObj.customSpots]
+            : densViewMode === 'overlay'
+            ? [...(getCompositeSpotsForLane(activePlateSet, laneObj) || [])]
+            : [...(getSpotsForLane(activePlateSet, targetCh, laneObj) || [])];
+
+        let laneAdded = 0;
+        for (const cand of m.spots) {
+          if (!baseSpots.some((ex) => Math.abs(ex.rf - cand.rf) < 0.035)) {
+            baseSpots.push({
+              ...cand,
+              channels: [targetCh],
+              source: 'auto',
+            });
+            laneAdded++;
+            addedCount++;
+          }
+        }
+        if (laneAdded > 0) {
+          baseSpots.sort((a, b) => a.pos - b.pos);
+          updatesByLane.set(m.laneId, baseSpots);
+          lanesTouched++;
+        }
+      }
+
+      if (addedCount === 0) {
+        toast(`All matching spots (${TLC_LABEL[targetCh]}) are already marked on this plate.`);
+        return;
+      }
+
+      handleSnapshotHistory();
+      setSets((prev) => {
+        const next = [...prev];
+        if (!next[cur]) return next;
+        next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+          if (!slice.cfg) return {};
+          return {
+            cfg: {
+              ...slice.cfg,
+              lanes: slice.cfg.lanes.map((l) =>
+                updatesByLane.has(l.id) ? { ...l, customSpots: updatesByLane.get(l.id) } : l
+              ),
+            },
+          };
+        });
+        return next;
+      });
+      toast(
+        `Matched ${addedCount} similar spot${addedCount === 1 ? '' : 's'} across ${lanesTouched} lane${lanesTouched === 1 ? '' : 's'} (${TLC_LABEL[targetCh]} · Ctrl+Z to undo).`
+      );
+    },
+    [
+      inspectWell,
+      activePlateSet,
+      densViewMode,
+      coreFraction,
+      getCompositeSpotsForLane,
+      getSpotsForLane,
+      handleSnapshotHistory,
+      setSets,
+      cur,
+      plate,
+      toast,
+    ]
+  );
+
+  // Render an annotated JPEG of the active plate (lane boxes, well labels, yellow origin, cyan front,
+  // magenta spot ticks, and Rf scale ruler) for Gemini Vision Final Plate QC Audit.
+  const renderAnnotatedPlateForQc = useCallback(
+    (
+      targetCh: TlcChannelKey
+    ): { imageBase64: string; lanesSummary: TlcVisionQcLaneSummary[]; warnings: string[] } | null => {
+      const im = activePlateSet.imgs?.[targetCh];
+      const cfg = activePlateSet.cfg;
+      if (!im?.bmp || !cfg?.lanes?.length) return null;
+
+      const bmp = im.bmp;
+      const maxW = 1400;
+      const scale = bmp.width > maxW ? maxW / bmp.width : 1;
+      const cw = Math.max(1, Math.round(bmp.width * scale));
+      const ch = Math.max(1, Math.round(bmp.height * scale));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.drawImage(bmp, 0, 0, cw, ch);
+
+      const frameScale = (bmp.width / (activePlateSet.frameW || LANE_FRAME_WIDTH)) * scale;
+      const get = (s: TlcSet, k: TlcChannelKey, ln: TlcLane) => extractLaneProfile(s, k, ln, coreFraction);
+      const lanesSummary: TlcVisionQcLaneSummary[] = [];
+
+      const lanePoint = (l: TlcLane, alongPx: number, acrossPx: number): [number, number] => {
+        const th = (l.angle * Math.PI) / 180;
+        const dx = Math.sin(th);
+        const dy = -Math.cos(th);
+        const nx = Math.cos(th);
+        const ny = Math.sin(th);
+        return [
+          (l.x0 + alongPx * dx + acrossPx * nx) * frameScale,
+          (l.y0 + alongPx * dy + acrossPx * ny) * frameScale,
+        ];
+      };
+
+      for (const lane of cfg.lanes) {
+        const half = tlcHalf(lane);
+        const well = wellLabel(containerOfLane(lane.id));
+        const origin = tlcOrigin(activePlateSet, lane, get);
+        const front = tlcFront(activePlateSet, lane, get);
+        const spots = getSpotsForLane(activePlateSet, targetCh, lane) || [];
+
+        lanesSummary.push({
+          well,
+          laneId: lane.id,
+          half,
+          spots: spots.map((s) => +s.rf.toFixed(3)),
+        });
+
+        const hw = lane.width / 2;
+        const pBL = lanePoint(lane, 0, -hw);
+        const pBR = lanePoint(lane, 0, hw);
+        const pTR = lanePoint(lane, lane.length, hw);
+        const pTL = lanePoint(lane, lane.length, -hw);
+
+        // Teal lane outline
+        ctx.strokeStyle = 'rgba(20, 184, 166, 0.78)';
+        ctx.lineWidth = Math.max(1, 1.3 * scale);
+        ctx.beginPath();
+        ctx.moveTo(pBL[0], pBL[1]);
+        ctx.lineTo(pBR[0], pBR[1]);
+        ctx.lineTo(pTR[0], pTR[1]);
+        ctx.lineTo(pTL[0], pTL[1]);
+        ctx.closePath();
+        ctx.stroke();
+
+        // Yellow origin line (Rf = 0.0)
+        const oL = lanePoint(lane, origin, -hw);
+        const oR = lanePoint(lane, origin, hw);
+        ctx.strokeStyle = '#facc15';
+        ctx.lineWidth = Math.max(1.5, 2.2 * scale);
+        ctx.beginPath();
+        ctx.moveTo(oL[0], oL[1]);
+        ctx.lineTo(oR[0], oR[1]);
+        ctx.stroke();
+
+        // Cyan solvent front line (Rf = 1.0)
+        const fL = lanePoint(lane, front, -hw);
+        const fR = lanePoint(lane, front, hw);
+        ctx.strokeStyle = '#22d3ee';
+        ctx.lineWidth = Math.max(1.5, 2.2 * scale);
+        ctx.beginPath();
+        ctx.moveTo(fL[0], fL[1]);
+        ctx.lineTo(fR[0], fR[1]);
+        ctx.stroke();
+
+        // Bright magenta circles + horizontal ticks on currently detected spots
+        for (const sp of spots) {
+          const [sx, sy] = lanePoint(lane, sp.pos, 0);
+          ctx.strokeStyle = '#ff2bd6';
+          ctx.fillStyle = '#ff2bd6';
+          ctx.lineWidth = Math.max(1.4, 2 * scale);
+          ctx.beginPath();
+          ctx.moveTo(sx - 6, sy);
+          ctx.lineTo(sx + 6, sy);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(sx, sy, Math.max(3, 3.8 * scale), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+
+        // Crisp well label below lane base
+        const [lx, ly] = lanePoint(lane, -16, 0);
+        const fontSize = Math.max(9, Math.min(13, Math.round(lane.width * frameScale * 0.42)));
+        ctx.font = `700 ${fontSize}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+        const tw = ctx.measureText(well).width;
+        ctx.fillRect(lx - tw / 2 - 2, ly - 1, tw + 4, fontSize + 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(well, lx, ly);
+      }
+
+      // Draw Rf scale ticks (0.0 .. 1.0) on left & right of each tier so Vision AI reads exact Rf
+      for (const halfIdx of [0, 1]) {
+        const tierLanes = cfg.lanes.filter((l) => tlcHalf(l) === halfIdx).sort((a, b) => a.id - b.id);
+        if (!tierLanes.length) continue;
+        const leftLane = tierLanes[0];
+        const o0 = tlcOrigin(activePlateSet, leftLane, get);
+        const f0 = tlcFront(activePlateSet, leftLane, get);
+        const span0 = Math.max(1, f0 - o0);
+        ctx.font = '700 11px monospace';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        for (const rfTick of [0, 0.2, 0.4, 0.6, 0.8, 1.0]) {
+          const [tx, ty] = lanePoint(leftLane, o0 + rfTick * span0, -leftLane.width * 0.8);
+          const lbl = rfTick.toFixed(1);
+          const xDraw = Math.max(24, tx);
+          ctx.fillStyle = 'rgba(0,0,0,0.75)';
+          ctx.fillRect(xDraw - 22, ty - 7, 24, 14);
+          ctx.fillStyle = rfTick === 0 ? '#facc15' : rfTick === 1 ? '#22d3ee' : '#e2e8f0';
+          ctx.fillText(lbl, xDraw, ty);
+        }
+      }
+
+      const notes = tlcDetectionNotes(activePlateSet, get)
+        .filter((n) => n.warning)
+        .map((n) => `${n.label}: ${n.warning}`);
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+      return {
+        imageBase64: dataUrl.replace(/^data:image\/jpeg;base64,/, ''),
+        lanesSummary,
+        warnings: notes,
+      };
+    },
+    [activePlateSet, coreFraction, getSpotsForLane]
+  );
+
+  const handleRunVisionQc = useCallback(async () => {
+    if (!activePlateSet.cfg?.lanes?.length) {
+      toast('Load or auto-detect lanes before running AI Vision QC.');
+      return;
+    }
+    const targetCh: TlcChannelKey | undefined =
+      fullPlateChannel !== 'composite' && activePlateSet.imgs?.[fullPlateChannel]?.bmp
+        ? fullPlateChannel
+        : TLC_KEYS.find((k) => Boolean(activePlateSet.imgs?.[k]?.bmp));
+    if (!targetCh) {
+      toast('Upload at least one TLC plate photo first.');
+      return;
+    }
+
+    const rendered = renderAnnotatedPlateForQc(targetCh);
+    if (!rendered) {
+      toast('Could not render annotated plate snapshot for Vision QC.');
+      return;
+    }
+
+    setQcChannel(targetCh);
+    setQcLoading(true);
+    setQcError(null);
+    try {
+      const result = await fetchAiTlcVisionQc({
+        imageBase64: rendered.imageBase64,
+        mimeType: 'image/jpeg',
+        channelLabel: TLC_LABEL[targetCh],
+        plateNumber: plate + 1,
+        lanesSummary: rendered.lanesSummary,
+        warnings: rendered.warnings,
+      });
+      setQcResult(result);
+
+      const spotChecks: Record<number, boolean> = {};
+      result.spotCorrections.forEach((c, idx) => {
+        spotChecks[idx] = c.confidence === 'high';
+      });
+      setQcSelectedSpots(spotChecks);
+
+      const frontChecks: Record<number, boolean> = {};
+      result.frontAudit.forEach((f) => {
+        if (f.status === 'shift' && Math.abs(f.suggestedShiftRf) >= 0.025) {
+          frontChecks[f.half] = true;
+        }
+      });
+      setQcSelectedFront(frontChecks);
+
+      const originChecks: Record<number, boolean> = {};
+      result.originAudit.forEach((o) => {
+        if (o.status === 'shift' && Math.abs(o.suggestedShiftRf) >= 0.025) {
+          originChecks[o.half] = true;
+        }
+      });
+      setQcSelectedOrigin(originChecks);
+    } catch (err: any) {
+      setQcError(err?.message || 'AI Vision QC failed.');
+    } finally {
+      setQcLoading(false);
+    }
+  }, [activePlateSet, fullPlateChannel, plate, renderAnnotatedPlateForQc, toast]);
+
+  const handleApplyVisionQcFixes = useCallback(() => {
+    if (!qcResult || !activePlateSet.cfg?.lanes?.length) return;
+    const get = (s: TlcSet, k: TlcChannelKey, ln: TlcLane) => extractLaneProfile(s, k, ln, coreFraction);
+
+    const frontShifts = qcResult.frontAudit.filter(
+      (f) => f.status === 'shift' && Math.abs(f.suggestedShiftRf) >= 0.015 && qcSelectedFront[f.half]
+    );
+    const originShifts = qcResult.originAudit.filter(
+      (o) => o.status === 'shift' && Math.abs(o.suggestedShiftRf) >= 0.015 && qcSelectedOrigin[o.half]
+    );
+    const chosenSpots = qcResult.spotCorrections.filter((_c, idx) => qcSelectedSpots[idx]);
+
+    if (!frontShifts.length && !originShifts.length && !chosenSpots.length) {
+      toast('Select at least one Vision QC fix to apply.');
+      return;
+    }
+
+    handleSnapshotHistory();
+
+    // Compute updated frontHalfPx
+    const nextFrontHalf: Record<number, number> = { ...(activePlateSet.frontHalfPx || {}) };
+    for (const fs of frontShifts) {
+      const sampleLane = activePlateSet.cfg.lanes.find((l) => tlcHalf(l) === fs.half);
+      if (!sampleLane) continue;
+      const curO = tlcOrigin(activePlateSet, sampleLane, get);
+      const curF = tlcFront(activePlateSet, sampleLane, get);
+      const span = Math.max(20, curF - curO);
+      const nextF = Math.round(
+        Math.max(sampleLane.length * 0.50, Math.min(sampleLane.length * 0.98, curF + fs.suggestedShiftRf * span))
+      );
+      nextFrontHalf[fs.half] = nextF;
+    }
+
+    // Group spot corrections by laneId
+    const corrByLane = new Map<number, typeof chosenSpots>();
+    for (const c of chosenSpots) {
+      const arr = corrByLane.get(c.laneId) || [];
+      arr.push(c);
+      corrByLane.set(c.laneId, arr);
+    }
+
+    let spotsAdded = 0;
+    let spotsRemoved = 0;
+
+    setSets((prev) => {
+      const next = [...prev];
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        if (!slice.cfg) return {};
+        const updatedLanes = slice.cfg.lanes.map((lane) => {
+          const half = tlcHalf(lane);
+          let nextLane = lane;
+
+          const oShift = originShifts.find((o) => o.half === half);
+          const baseOrigin = tlcOrigin(activePlateSet, lane, get);
+          const baseFront = nextFrontHalf[half] ?? tlcFront(activePlateSet, lane, get);
+          const baseSpan = Math.max(20, baseFront - baseOrigin);
+
+          let effOrigin = baseOrigin;
+          if (oShift) {
+            effOrigin = Math.round(
+              Math.max(lane.length * 0.03, Math.min(lane.length * 0.30, baseOrigin + oShift.suggestedShiftRf * baseSpan))
+            );
+            nextLane = { ...nextLane, zeroRf: effOrigin };
+          }
+
+          const laneCorrs = corrByLane.get(lane.id);
+          if (laneCorrs && laneCorrs.length > 0) {
+            const effSpan = Math.max(20, baseFront - effOrigin);
+            const baseSpots =
+              lane.customSpots !== undefined
+                ? [...lane.customSpots]
+                : [...(getSpotsForLane(activePlateSet, qcChannel, lane) || [])];
+
+            for (const c of laneCorrs) {
+              if (c.action === 'add') {
+                if (!baseSpots.some((ex) => Math.abs(ex.rf - c.rf) < 0.032)) {
+                  const pos = Math.round(effOrigin + c.rf * effSpan);
+                  baseSpots.push({
+                    pos,
+                    rf: c.rf,
+                    strength: 0.65,
+                    source: 'manual',
+                    channels: [qcChannel],
+                  });
+                  spotsAdded++;
+                }
+              } else if (c.action === 'remove') {
+                let bestIdx = -1;
+                let bestDist = 0.065;
+                baseSpots.forEach((ex, i) => {
+                  const d = Math.abs(ex.rf - c.rf);
+                  if (d < bestDist) {
+                    bestDist = d;
+                    bestIdx = i;
+                  }
+                });
+                if (bestIdx >= 0) {
+                  baseSpots.splice(bestIdx, 1);
+                  spotsRemoved++;
+                }
+              }
+            }
+            baseSpots.sort((a, b) => a.pos - b.pos);
+            nextLane = { ...nextLane, customSpots: baseSpots };
+          }
+          return nextLane;
+        });
+
+        return {
+          cfg: {
+            ...slice.cfg,
+            hasZeroRf: originShifts.length > 0 ? true : slice.cfg.hasZeroRf,
+            lanes: updatedLanes,
+          },
+          ...(frontShifts.length > 0 ? { frontHalfPx: nextFrontHalf } : {}),
+        };
+      });
+      return next;
+    });
+
+    const parts: string[] = [];
+    if (frontShifts.length) parts.push(`${frontShifts.length} front shift`);
+    if (originShifts.length) parts.push(`${originShifts.length} origin shift`);
+    if (spotsAdded) parts.push(`+${spotsAdded} missed spot${spotsAdded === 1 ? '' : 's'}`);
+    if (spotsRemoved) parts.push(`−${spotsRemoved} false spot${spotsRemoved === 1 ? '' : 's'}`);
+    toast(`Applied AI Vision QC fixes (${parts.join(', ') || 'updated'} · Ctrl+Z to undo).`);
+    setQcResult(null);
+  }, [
+    qcResult,
+    activePlateSet,
+    coreFraction,
+    qcSelectedFront,
+    qcSelectedOrigin,
+    qcSelectedSpots,
+    handleSnapshotHistory,
+    setSets,
+    cur,
+    plate,
+    getSpotsForLane,
+    qcChannel,
+    toast,
+  ]);
 
   // Window mousemove and mouseup listeners for continuous dragging across canvas & densitometer
   useEffect(() => {
@@ -2402,6 +3118,29 @@ export const TlcView: React.FC = () => {
             style={{ display: 'none' }}
             onChange={handleLoadImages}
           />
+
+          <button
+            type="button"
+            className="btn"
+            onClick={handleRunVisionQc}
+            disabled={!hasImages || !hasConfig || qcLoading}
+            title="Send an annotated snapshot of this plate to Gemini Vision AI to audit origin, solvent front, missed coalesced spots, and false-positive markers."
+            style={{
+              background: 'rgba(139, 92, 246, 0.14)',
+              borderColor: 'rgba(139, 92, 246, 0.5)',
+              color: '#a78bfa',
+              fontWeight: 600,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z" />
+              <circle cx="8" cy="8" r="2" />
+            </svg>
+            {qcLoading ? 'Auditing Plate…' : 'AI Vision QC'}
+          </button>
 
           <button
             type="button"
@@ -2828,7 +3567,7 @@ export const TlcView: React.FC = () => {
                       ? Object.fromEntries(
                           Object.entries(s.plateData).map(([pK, pd]) => [
                             pK,
-                            { ...pd, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} },
+                            { ...pd, prof: {}, frontAuto: {}, frontAutoByLane: {}, originAuto: {}, originAutoByLane: {} },
                           ])
                         )
                       : undefined;
@@ -2836,6 +3575,7 @@ export const TlcView: React.FC = () => {
                       ...s,
                       prof: {},
                       frontAuto: {},
+                      frontAutoByLane: {},
                       originAuto: {},
                       originAutoByLane: {},
                       ...(nextPlateData ? { plateData: nextPlateData } : {}),
@@ -2849,32 +3589,76 @@ export const TlcView: React.FC = () => {
             </span>
           </label>
 
+          <div style={{ height: '16px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
+
+          {/* Once-per-camera Blank Silica Flat-Field Calibration */}
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => fileBlankRef.current?.click()}
+              title="Upload a photo of a blank unspotted silica plate (once per camera/channel) to divide out uneven UV lamps, lens vignetting, and UV365 glare across all plates."
+              style={{ fontSize: '11px' }}
+            >
+              Blank Silica Flat-Field
+            </button>
+            <input
+              ref={fileBlankRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              multiple
+              style={{ display: 'none' }}
+              onChange={handleLoadBlankSilica}
+            />
+            {Object.keys(blankMeta).length > 0 && (
+              <>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '11px' }}>
+                  <input
+                    type="checkbox"
+                    checked={blankEnabled}
+                    onChange={(e) => handleToggleBlankSilica(e.target.checked)}
+                  />
+                  <span style={{ color: blankEnabled ? '#10b981' : 'var(--mut)', fontWeight: 600 }}>
+                    Active
+                  </span>
+                </label>
+                {TLC_KEYS.filter((k) => Boolean(blankMeta[k])).map((k) => (
+                  <span
+                    key={k}
+                    className="chip"
+                    style={{
+                      fontSize: '10px',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      padding: '1px 6px',
+                      background: blankEnabled ? 'rgba(16, 185, 129, 0.14)' : 'var(--panel)',
+                      borderColor: blankEnabled ? 'rgba(16, 185, 129, 0.4)' : 'var(--line)',
+                    }}
+                    title={`Flat-field reference for ${k}: ${blankMeta[k]?.name}`}
+                  >
+                    <span>{k}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleClearBlankSilica(k)}
+                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--mut)', padding: 0, fontSize: '11px' }}
+                      title={`Remove ${k} blank silica reference`}
+                    >
+                      ✕
+                    </button>
+                  </span>
+                ))}
+              </>
+            )}
+          </div>
+
           <button
             type="button"
             className="btn sm"
             onClick={() => {
               setFilters({ brightness: 100, contrast: 100, invert: false });
               setCoreFraction(0.35);
-              setSets((prev) =>
-                prev.map((s) => {
-                  const nextPlateData = s.plateData
-                    ? Object.fromEntries(
-                        Object.entries(s.plateData).map(([pK, pd]) => [
-                          pK,
-                          { ...pd, prof: {}, frontAuto: {}, originAuto: {}, originAutoByLane: {} },
-                        ])
-                      )
-                    : undefined;
-                  return {
-                    ...s,
-                    prof: {},
-                    frontAuto: {},
-                    originAuto: {},
-                    originAutoByLane: {},
-                    ...(nextPlateData ? { plateData: nextPlateData } : {}),
-                  };
-                })
-              );
+              invalidateAllPlateCaches();
             }}
             style={{ marginLeft: 'auto', fontSize: '11px' }}
           >
@@ -2906,6 +3690,7 @@ export const TlcView: React.FC = () => {
                           frameW: v,
                           prof: {},
                           frontAuto: {},
+                          frontAutoByLane: {},
                           originAuto: {},
                           originAutoByLane: {},
                         });
@@ -2968,6 +3753,7 @@ export const TlcView: React.FC = () => {
                         frontPx: v && v > 0 ? v : null,
                         prof: {},
                         frontAuto: {},
+                        frontAutoByLane: {},
                       });
                       return next;
                     });
@@ -3007,6 +3793,272 @@ export const TlcView: React.FC = () => {
           </div>
         </details>
       </div>
+
+      {/* Gemini Vision AI Final Plate QC Report Card */}
+      {(qcLoading || qcError || qcResult) && (
+        <div
+          className="card"
+          style={{
+            marginBottom: '14px',
+            borderColor: qcError
+              ? 'rgba(239, 68, 68, 0.5)'
+              : qcResult?.overallVerdict === 'good'
+              ? 'rgba(16, 185, 129, 0.45)'
+              : 'rgba(139, 92, 246, 0.45)',
+            background: 'var(--panel)',
+            padding: '12px 14px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <strong style={{ fontSize: '13px' }}>AI Vision Plate QC ({TLC_LABEL[qcChannel]})</strong>
+              {qcLoading && (
+                <span style={{ fontSize: '12px', color: 'var(--mut)' }}>
+                  Inspecting annotated plate image for missed spots, false positives, and front/origin drift…
+                </span>
+              )}
+              {!qcLoading && qcResult && (
+                <span
+                  className={`chip ${qcResult.overallVerdict === 'good' ? 'ok' : 'warn'}`}
+                  style={{ fontSize: '11px', fontWeight: 600 }}
+                >
+                  {qcResult.overallVerdict === 'good'
+                    ? 'Looks Clean'
+                    : qcResult.overallVerdict === 'minor_fixes'
+                    ? 'Minor Fixes Suggested'
+                    : 'Needs Attention'}
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                setQcResult(null);
+                setQcError(null);
+              }}
+              style={{ fontSize: '11px' }}
+            >
+              Dismiss
+            </button>
+          </div>
+
+          {qcError && (
+            <div style={{ marginTop: '8px', fontSize: '12px', color: '#ef4444' }}>{qcError}</div>
+          )}
+
+          {!qcLoading && qcResult && (
+            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '12px' }}>
+              <div style={{ color: 'var(--fg)', lineHeight: 1.45 }}>{qcResult.summary}</div>
+
+              {qcResult.laneAlignmentWarning && (
+                <div
+                  style={{
+                    padding: '7px 10px',
+                    borderRadius: '6px',
+                    background: 'rgba(245, 158, 11, 0.12)',
+                    border: '1px solid rgba(245, 158, 11, 0.35)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <span style={{ color: '#f59e0b', fontWeight: 600 }}>
+                    Lane Alignment: {qcResult.laneAlignmentWarning}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn sm pri"
+                    onClick={() => {
+                      setQcResult(null);
+                      handleAutoDetectLanes();
+                    }}
+                    style={{ fontSize: '11px' }}
+                  >
+                    Auto-detect lanes
+                  </button>
+                </div>
+              )}
+
+              {/* Front & Origin Shift Audits */}
+              {(qcResult.frontAudit.some((f) => f.status === 'shift') ||
+                qcResult.originAudit.some((o) => o.status === 'shift')) && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {qcResult.frontAudit
+                    .filter((f) => f.status === 'shift' && Math.abs(f.suggestedShiftRf) >= 0.015)
+                    .map((f) => (
+                      <label
+                        key={`front-${f.half}`}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          padding: '4px 8px',
+                          background: 'var(--soft)',
+                          borderRadius: '6px',
+                          border: '1px solid var(--line)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={Boolean(qcSelectedFront[f.half])}
+                          onChange={(e) =>
+                            setQcSelectedFront((prev) => ({ ...prev, [f.half]: e.target.checked }))
+                          }
+                        />
+                        <span style={{ color: '#22d3ee', fontWeight: 600 }}>
+                          {f.half === 0 ? 'Lower' : 'Upper'} Front {f.suggestedShiftRf > 0 ? '+' : ''}
+                          {Math.round(f.suggestedShiftRf * 100)}%
+                        </span>
+                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>— {f.note}</span>
+                      </label>
+                    ))}
+                  {qcResult.originAudit
+                    .filter((o) => o.status === 'shift' && Math.abs(o.suggestedShiftRf) >= 0.015)
+                    .map((o) => (
+                      <label
+                        key={`origin-${o.half}`}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          padding: '4px 8px',
+                          background: 'var(--soft)',
+                          borderRadius: '6px',
+                          border: '1px solid var(--line)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={Boolean(qcSelectedOrigin[o.half])}
+                          onChange={(e) =>
+                            setQcSelectedOrigin((prev) => ({ ...prev, [o.half]: e.target.checked }))
+                          }
+                        />
+                        <span style={{ color: '#facc15', fontWeight: 600 }}>
+                          {o.half === 0 ? 'Lower' : 'Upper'} Origin {o.suggestedShiftRf > 0 ? '+' : ''}
+                          {Math.round(o.suggestedShiftRf * 100)}%
+                        </span>
+                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>— {o.note}</span>
+                      </label>
+                    ))}
+                </div>
+              )}
+
+              {/* Spot Additions & False-Positive Removals */}
+              {qcResult.spotCorrections.length > 0 && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                    gap: '6px',
+                    maxHeight: '210px',
+                    overflowY: 'auto',
+                    padding: '4px 2px',
+                  }}
+                >
+                  {qcResult.spotCorrections.map((c, idx) => (
+                    <div
+                      key={`${c.laneId}-${c.action}-${c.rf}-${idx}`}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '5px 8px',
+                        background: 'var(--soft)',
+                        borderRadius: '6px',
+                        border: '1px solid var(--line)',
+                        fontSize: '11.5px',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(qcSelectedSpots[idx])}
+                        onChange={(e) =>
+                          setQcSelectedSpots((prev) => ({ ...prev, [idx]: e.target.checked }))
+                        }
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInspectWell(containerOfLane(c.laneId));
+                          setPinnedMarkers([]);
+                          setHoverRf(null);
+                          setHoverY(null);
+                          setHoverSpot(null);
+                        }}
+                        className="mono"
+                        style={{
+                          border: 'none',
+                          background: 'var(--panel)',
+                          color: 'var(--fg)',
+                          fontWeight: 700,
+                          padding: '1px 5px',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                        }}
+                        title={`Inspect Well ${c.well}`}
+                      >
+                        {c.well}
+                      </button>
+                      <span
+                        style={{
+                          fontWeight: 700,
+                          color: c.action === 'add' ? '#10b981' : '#f43f5e',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {c.action === 'add' ? '+ Add' : '− Remove'}
+                      </span>
+                      <span className="mono" style={{ color: 'var(--fg)' }}>
+                        Rf {c.rf.toFixed(2)}
+                      </span>
+                      <span
+                        style={{
+                          color: 'var(--mut)',
+                          fontSize: '10.5px',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          flex: 1,
+                        }}
+                        title={c.reason}
+                      >
+                        {c.reason}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {(qcResult.spotCorrections.length > 0 ||
+                qcResult.frontAudit.some((f) => f.status === 'shift') ||
+                qcResult.originAudit.some((o) => o.status === 'shift')) && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '2px' }}>
+                  <button
+                    type="button"
+                    className="btn sm pri"
+                    onClick={handleApplyVisionQcFixes}
+                  >
+                    Apply Checked Fixes (
+                    {Object.values(qcSelectedSpots).filter(Boolean).length +
+                      Object.values(qcSelectedFront).filter(Boolean).length +
+                      Object.values(qcSelectedOrigin).filter(Boolean).length}
+                    )
+                  </button>
+                  <span style={{ fontSize: '11px', color: 'var(--mut)' }}>
+                    Applies cleanly with Ctrl+Z undo support.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* View Mode: Full Plate Photo vs 54-Well Sliced Grid */}
       {viewMode === 'full-plate' ? (
@@ -4686,6 +5738,15 @@ export const TlcView: React.FC = () => {
                                     title="Nudge Rf +0.05"
                                   >
                                     +0.05
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ fontSize: '10px', padding: '2px 7px', height: '22px', background: '#0f172a', color: '#38bdf8', border: '1px solid #0284c7', borderRadius: '3px', cursor: 'pointer', fontWeight: 600 }}
+                                    onClick={() => handleFindSimilarSpotsOnPlate(sp)}
+                                    title="Sample this spot's RGB color signature and mark all matching spots across the 54 lanes on this plate"
+                                  >
+                                    Find similar
                                   </button>
                                   <button
                                     type="button"

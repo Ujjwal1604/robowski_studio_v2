@@ -5,6 +5,7 @@ import {
   containerOfLane,
   findSpots,
   getChannelHistogram,
+  getLane2dMetrics,
   TLC_SIGNAL,
   TlcChannelKey,
   tlcFront,
@@ -40,6 +41,12 @@ import {
   generatePrismaTernarySpecs,
 } from './solventSystemModel';
 import { PredictedSpecies, WellPredictionResult } from './types';
+
+// Predicted products may not have formed (or may be mis-paired), so they anchor the fit far less than
+// starting materials, whose identity is known.
+const PRODUCT_ANCHOR_WEIGHT = 0.3;
+// Never report a calibrated sigma tighter than this: it comes from a few compounds on a few plates.
+const SIGMA_FLOOR = 0.09;
 
 const CORE_SYSTEM_IDS = new Set(TLC_SOLVENT_LIBRARY.map((s) => s.id));
 const DYNAMIC_SOLVENT_SYSTEMS: TlcSolventSystemDef[] = [
@@ -404,6 +411,7 @@ export function extractMeasuredWellSpotsForSet(
             radius: lane.spotRadius || 24,
             minProminence: spotProm,
             plateHistogram: getChannelHistogram(setSlice, ch, getProf),
+            lane2d: getLane2dMetrics(setSlice, ch, lane),
           });
           for (const sp of chSpots) {
             const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
@@ -866,7 +874,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             kind: 'product',
             tier: sp.tier,
             rf: res.rf,
-            weight: sp.tier === 'High' ? 1.0 : 0.85,
+            weight: sp.tier === 'High' ? PRODUCT_ANCHOR_WEIGHT : PRODUCT_ANCHOR_WEIGHT * 0.85,
             profile: prof,
           });
           if (seenProd.size >= 4) break;
@@ -1086,9 +1094,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
 
   // Fit shrinkage-regularized offsets & optional logit polarity slope per stationary phase
   // incorporating both interior spot pairs AND left/right censored boundary hits (front/baseline saturation)
-  const GLOBAL_LAMBDA = 6.0;
-  const SLOPE_LAMBDA = 22.0;
-  const FAMILY_LAMBDA = 10.0;
+  // Weights are per compound (not per well), so the prior pull is expressed in 'compound' units.
+  const GLOBAL_LAMBDA = 1.6;
+  const SLOPE_LAMBDA = 6.0;
+  const FAMILY_LAMBDA = 3.0;
   const SIGMA_PRIOR_N = 8.0;
 
   const allPhases = new Set<TlcStationaryPhasePreference>([
@@ -1103,151 +1112,262 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     const isC18 = phase === 'C18';
     const kPhase = isC18 ? 4.8 : 6.2;
 
-    const evalPhaseObjective = (shift: number, slope: number): number => {
-      let loss = GLOBAL_LAMBDA * shift * shift + SLOPE_LAMBDA * (slope - 1) * (slope - 1);
-      for (const rec of records) {
-        const dispScale = isC18 ? 0.6 + 0.4 * rec.displacementN : rec.displacementN;
-        const kEff = kPhase * dispScale;
-        const zB = logitRf(rec.pair.predictedRfBefore);
-        const zObs = logitRf(rec.pair.observedRf);
-        const zAfter = slope * (zB - kEff * shift);
-        const residD = (zAfter - zObs) / kEff;
-        loss += rec.pair.weight * residD * residD;
-      }
-      for (const cr of censRecords) {
-        const zB = logitRf(cr.predictedRfBefore);
-        const zBound = logitRf(cr.boundRf);
-        const zAfter = slope * (zB - kPhase * shift);
-        if (cr.kind === 'front' && zAfter < zBound) {
-          const gapD = (zBound - zAfter) / kPhase;
-          loss += cr.weight * gapD * gapD;
-        } else if (cr.kind === 'baseline' && zAfter > zBound) {
-          const gapD = (zAfter - zBound) / kPhase;
-          loss += cr.weight * gapD * gapD;
-        }
-      }
-      return loss;
-    };
-
-    // Fast 2D coordinate refinement (shift in [-0.22, +0.22], slope in [0.82, 1.25])
-    let globalDemandShift = 0;
-    let demandSlope = 1.0;
-    if (records.length > 0) {
-      let wS = 0;
-      let wrS = 0;
-      for (const rec of records) {
-        wS += rec.pair.weight;
-        wrS += rec.pair.weight * rec.pair.residualDemand;
-      }
-      globalDemandShift = clamp(wrS / (wS + GLOBAL_LAMBDA), -0.22, 0.22);
+    interface PhaseFitResult {
+      globalDemandShift: number;
+      demandSlope: number;
+      familyDemandShifts: Partial<Record<SolventFamily, number>>;
+      featureWeights?: TlcCalibrationFeatureWeights;
     }
-    const allowSlopeFit = records.length >= 6 || (records.length >= 2 && censRecords.length >= 2);
-    const steps = [0.04, 0.015, 0.005, 0.0015];
-    for (const h of steps) {
-      let improved = true;
-      let iter = 0;
-      while (improved && iter < 15) {
-        improved = false;
-        iter++;
-        const curObj = evalPhaseObjective(globalDemandShift, demandSlope);
-        for (const ds of [-h, h]) {
-          const ns = clamp(globalDemandShift + ds, -0.22, 0.22);
-          if (evalPhaseObjective(ns, demandSlope) + 1e-12 < curObj) {
-            globalDemandShift = ns;
-            improved = true;
+
+    // Fits shift / slope (+ optional family shifts and descriptor ridge when allowExtras) on a set of records.
+    const fitPhaseModel = (
+      fitRecords: RawPairRecord[],
+      fitCensRecords: CensoredBoundaryRecord[],
+      allowExtras: boolean,
+      uniqueCount: number
+    ): PhaseFitResult => {
+      const evalPhaseObjective = (shift: number, slope: number): number => {
+        let loss = GLOBAL_LAMBDA * shift * shift + SLOPE_LAMBDA * (slope - 1) * (slope - 1);
+        for (const rec of fitRecords) {
+          const dispScale = isC18 ? 0.6 + 0.4 * rec.displacementN : rec.displacementN;
+          const kEff = kPhase * dispScale;
+          const zB = logitRf(rec.pair.predictedRfBefore);
+          const zObs = logitRf(rec.pair.observedRf);
+          const zAfter = slope * (zB - kEff * shift);
+          const residD = (zAfter - zObs) / kEff;
+          loss += rec.pair.weight * residD * residD;
+        }
+        for (const cr of fitCensRecords) {
+          const zB = logitRf(cr.predictedRfBefore);
+          const zBound = logitRf(cr.boundRf);
+          const zAfter = slope * (zB - kPhase * shift);
+          if (cr.kind === 'front' && zAfter < zBound) {
+            const gapD = (zBound - zAfter) / kPhase;
+            loss += cr.weight * gapD * gapD;
+          } else if (cr.kind === 'baseline' && zAfter > zBound) {
+            const gapD = (zAfter - zBound) / kPhase;
+            loss += cr.weight * gapD * gapD;
           }
         }
-        if (allowSlopeFit) {
-          const curObj2 = evalPhaseObjective(globalDemandShift, demandSlope);
-          for (const dsl of [-h * 1.2, h * 1.2]) {
-            const nsl = clamp(demandSlope + dsl, 0.82, 1.25);
-            if (evalPhaseObjective(globalDemandShift, nsl) + 1e-12 < curObj2) {
-              demandSlope = nsl;
+        return loss;
+      };
+
+      // Fast 2D coordinate refinement (shift in [-0.22, +0.22], slope in [0.82, 1.25])
+      let globalDemandShift = 0;
+      let demandSlope = 1.0;
+      if (fitRecords.length > 0) {
+        let wS = 0;
+        let wrS = 0;
+        for (const rec of fitRecords) {
+          wS += rec.pair.weight;
+          wrS += rec.pair.weight * rec.pair.residualDemand;
+        }
+        globalDemandShift = clamp(wrS / (wS + GLOBAL_LAMBDA), -0.22, 0.22);
+      }
+      const allowSlopeFit = uniqueCount >= 4 || (uniqueCount >= 2 && fitCensRecords.length >= 2);
+      const steps = [0.04, 0.015, 0.005, 0.0015];
+      for (const h of steps) {
+        let improved = true;
+        let iter = 0;
+        while (improved && iter < 15) {
+          improved = false;
+          iter++;
+          const curObj = evalPhaseObjective(globalDemandShift, demandSlope);
+          for (const ds of [-h, h]) {
+            const ns = clamp(globalDemandShift + ds, -0.22, 0.22);
+            if (evalPhaseObjective(ns, demandSlope) + 1e-12 < curObj) {
+              globalDemandShift = ns;
               improved = true;
             }
           }
-        }
-      }
-    }
-    globalDemandShift = Math.round(globalDemandShift * 10000) / 10000;
-    demandSlope = Math.round(demandSlope * 1000) / 1000;
-
-    // Optional solvent-family residual shifts (only when a family has meaningful evidence)
-    const familySums = new Map<SolventFamily, { w: number; wr: number }>();
-    for (const rec of records) {
-      const cur = familySums.get(rec.family) || { w: 0, wr: 0 };
-      const residAfterGlobal = rec.pair.residualDemand - globalDemandShift;
-      cur.w += rec.pair.weight;
-      cur.wr += rec.pair.weight * residAfterGlobal;
-      familySums.set(rec.family, cur);
-    }
-
-    const familyDemandShifts: Partial<Record<SolventFamily, number>> = {};
-    for (const [fam, stats] of familySums.entries()) {
-      if (stats.w >= 4.5) {
-        const famShift = clamp(stats.wr / (stats.w + FAMILY_LAMBDA), -0.12, 0.12);
-        if (Math.abs(famShift) >= 0.005) {
-          familyDemandShifts[fam] = Math.round(famShift * 10000) / 10000;
-        }
-      }
-    }
-
-    // Multivariate 5D L2-regularized Ridge regression on post-shift/slope descriptor residuals
-    // Only activates when >= 10 paired spots exist and keeps uniform shifts strictly untouched.
-    let featureWeights: TlcCalibrationFeatureWeights | undefined;
-    if (records.length >= 10) {
-      const RIDGE_LAMBDA = 24.0;
-      const featMeans = [0, 0, 0, 0, 0];
-      let wTot = 0;
-      for (const rec of records) {
-        wTot += rec.pair.weight;
-        for (let j = 0; j < 5; j++) featMeans[j] += rec.pair.weight * rec.features[j];
-      }
-      if (wTot > 0) {
-        for (let j = 0; j < 5; j++) featMeans[j] /= wTot;
-
-        const A: number[][] = Array.from({ length: 5 }, (_, r) =>
-          Array.from({ length: 5 }, (__, c) => (r === c ? RIDGE_LAMBDA : 0))
-        );
-        const b: number[] = [0, 0, 0, 0, 0];
-
-        for (const rec of records) {
-          const dispScale = isC18 ? 0.6 + 0.4 * rec.displacementN : rec.displacementN;
-          const kEff = kPhase * dispScale;
-          const famShift = familyDemandShifts[rec.family] ?? 0;
-          const zB = logitRf(rec.pair.predictedRfBefore);
-          const zObs = logitRf(rec.pair.observedRf);
-          const postResid = clamp((zB - zObs / demandSlope) / kEff - (globalDemandShift + famShift), -0.25, 0.25);
-          const xc = rec.features.map((f, j) => f - featMeans[j]);
-          for (let r = 0; r < 5; r++) {
-            b[r] += rec.pair.weight * xc[r] * postResid;
-            for (let c = 0; c < 5; c++) {
-              A[r][c] += rec.pair.weight * xc[r] * xc[c];
+          if (allowSlopeFit) {
+            const curObj2 = evalPhaseObjective(globalDemandShift, demandSlope);
+            for (const dsl of [-h * 1.2, h * 1.2]) {
+              const nsl = clamp(demandSlope + dsl, 0.82, 1.25);
+              if (evalPhaseObjective(globalDemandShift, nsl) + 1e-12 < curObj2) {
+                demandSlope = nsl;
+                improved = true;
+              }
             }
           }
         }
+      }
+      globalDemandShift = Math.round(globalDemandShift * 10000) / 10000;
+      demandSlope = Math.round(demandSlope * 1000) / 1000;
 
-        const rawW = solveSmallLinearSystem(A, b);
-        if (rawW) {
-          const clampedW = rawW.map((v) => {
-            const c = clamp(v, -0.08, 0.08);
-            return Math.abs(c) < 0.005 ? 0 : Math.round(c * 10000) / 10000;
-          });
-          if (clampedW.some((v) => Math.abs(v) >= 0.005)) {
-            featureWeights = {
-              tpsa: clampedW[0],
-              hbd: clampedW[1],
-              aromaticRings: clampedW[2],
-              basicN: clampedW[3],
-              clogP: clampedW[4],
-            };
-            // Preserve exact training-centroid mean by folding centroid feature offset into globalDemandShift
-            let meanDot = 0;
-            for (let j = 0; j < 5; j++) meanDot += clampedW[j] * featMeans[j];
-            globalDemandShift = Math.round(clamp(globalDemandShift - meanDot, -0.22, 0.22) * 10000) / 10000;
+      // Optional solvent-family residual shifts (only when a family has meaningful evidence)
+      const familySums = new Map<SolventFamily, { w: number; wr: number }>();
+      for (const rec of fitRecords) {
+        const cur = familySums.get(rec.family) || { w: 0, wr: 0 };
+        const residAfterGlobal = rec.pair.residualDemand - globalDemandShift;
+        cur.w += rec.pair.weight;
+        cur.wr += rec.pair.weight * residAfterGlobal;
+        familySums.set(rec.family, cur);
+      }
+
+      const familyDemandShifts: Partial<Record<SolventFamily, number>> = {};
+      for (const [fam, stats] of familySums.entries()) {
+        if (allowExtras && stats.w >= 2.5) {
+          const famShift = clamp(stats.wr / (stats.w + FAMILY_LAMBDA), -0.12, 0.12);
+          if (Math.abs(famShift) >= 0.005) {
+            familyDemandShifts[fam] = Math.round(famShift * 10000) / 10000;
           }
         }
       }
+
+      // Multivariate 5D L2-regularized Ridge regression on post-shift/slope descriptor residuals
+      // Only activates with sufficient distinct compounds & paired spots; keeps uniform shifts strictly untouched.
+      let featureWeights: TlcCalibrationFeatureWeights | undefined;
+      if (allowExtras && fitRecords.length >= 20 && uniqueCount >= 6) {
+        const RIDGE_LAMBDA = 1.5;
+        const featMeans = [0, 0, 0, 0, 0];
+        let wTot = 0;
+        for (const rec of fitRecords) {
+          wTot += rec.pair.weight;
+          for (let j = 0; j < 5; j++) featMeans[j] += rec.pair.weight * rec.features[j];
+        }
+        if (wTot > 0) {
+          for (let j = 0; j < 5; j++) featMeans[j] /= wTot;
+
+          const A: number[][] = Array.from({ length: 5 }, (_, r) =>
+            Array.from({ length: 5 }, (__, c) => (r === c ? RIDGE_LAMBDA : 0))
+          );
+          const b: number[] = [0, 0, 0, 0, 0];
+
+          for (const rec of fitRecords) {
+            const dispScale = isC18 ? 0.6 + 0.4 * rec.displacementN : rec.displacementN;
+            const kEff = kPhase * dispScale;
+            const famShift = familyDemandShifts[rec.family] ?? 0;
+            const zB = logitRf(rec.pair.predictedRfBefore);
+            const zObs = logitRf(rec.pair.observedRf);
+            const postResid = clamp((zB - zObs / demandSlope) / kEff - (globalDemandShift + famShift), -0.25, 0.25);
+            const xc = rec.features.map((f, j) => f - featMeans[j]);
+            for (let r = 0; r < 5; r++) {
+              b[r] += rec.pair.weight * xc[r] * postResid;
+              for (let c = 0; c < 5; c++) {
+                A[r][c] += rec.pair.weight * xc[r] * xc[c];
+              }
+            }
+          }
+
+          const rawW = solveSmallLinearSystem(A, b);
+          if (rawW) {
+            const clampedW = rawW.map((v) => {
+              const c = clamp(v, -0.08, 0.08);
+              return Math.abs(c) < 0.005 ? 0 : Math.round(c * 10000) / 10000;
+            });
+            if (clampedW.some((v) => Math.abs(v) >= 0.005)) {
+              featureWeights = {
+                tpsa: clampedW[0],
+                hbd: clampedW[1],
+                aromaticRings: clampedW[2],
+                basicN: clampedW[3],
+                clogP: clampedW[4],
+              };
+              // Preserve exact training-centroid mean by folding centroid feature offset into globalDemandShift
+              let meanDot = 0;
+              for (let j = 0; j < 5; j++) meanDot += clampedW[j] * featMeans[j];
+              globalDemandShift = Math.round(clamp(globalDemandShift - meanDot, -0.22, 0.22) * 10000) / 10000;
+            }
+          }
+        }
+      }
+
+      return {
+        globalDemandShift,
+        demandSlope,
+        familyDemandShifts,
+        ...(featureWeights ? { featureWeights } : {}),
+      };
+    };
+
+    // Effective weights: a compound seen in many wells counts about once overall, not once per well.
+    const compoundCount = new Map<TlcMolProfile, number>();
+    for (const rec of records) compoundCount.set(rec.profile, (compoundCount.get(rec.profile) ?? 0) + 1);
+    for (const rec of records) {
+      rec.pair.weight = Math.round((rec.pair.weight / (compoundCount.get(rec.profile) ?? 1)) * 10000) / 10000;
+    }
+    const uniqueCompounds = compoundCount.size;
+    // Censored front / baseline hits are per well too: cap their total pull at about one unit per compound.
+    const censCap = Math.max(2, uniqueCompounds);
+    const censTotal = censRecords.reduce((a, c) => a + c.weight, 0);
+    if (censTotal > censCap) {
+      const f = censCap / censTotal;
+      for (const c of censRecords) c.weight = c.weight * f;
+    }
+
+    // Grouped (leave-compounds-out) validation: an eluent-polarity correction must predict compounds it has
+    // not seen. Candidate A = global shift + slope only; candidate B adds family shifts / descriptor ridge.
+    const predictRf = (rec: RawPairRecord, phaseFit: PhaseFitResult): number => {
+      const famShift = phaseFit.familyDemandShifts[rec.family] ?? 0;
+      return applyCalibrationShiftToRf(
+        rec.pair.predictedRfBefore,
+        phaseFit.globalDemandShift + famShift,
+        isC18,
+        phaseFit.demandSlope,
+        computeFeatureDemandDelta(rec.profile, phaseFit.featureWeights),
+        rec.displacementN
+      );
+    };
+    let cvRmse: number | undefined;
+    let cvRmseBaseline: number | undefined;
+    let useExtras = false;
+    let validated = false;
+    if (uniqueCompounds >= 4 && records.length >= 6) {
+      const compounds = Array.from(compoundCount.keys());
+      const folds = Math.min(5, compounds.length);
+      const foldOf = new Map<TlcMolProfile, number>();
+      compounds.forEach((c, i) => foldOf.set(c, i % folds));
+      const cvError = (allowExtras: boolean): number => {
+        let se = 0;
+        let wt = 0;
+        for (let f = 0; f < folds; f++) {
+          const train = records.filter((r) => foldOf.get(r.profile) !== f);
+          const test = records.filter((r) => foldOf.get(r.profile) === f);
+          if (test.length === 0 || train.length === 0) continue;
+          const tc = new Set(train.map((r) => r.profile)).size;
+          const foldFit = fitPhaseModel(train, censRecords, allowExtras, tc);
+          for (const r of test) {
+            const e = r.pair.observedRf - predictRf(r, foldFit);
+            se += r.pair.weight * e * e;
+            wt += r.pair.weight;
+          }
+        }
+        return wt > 0 ? Math.sqrt(se / wt) : NaN;
+      };
+      let baseSe = 0;
+      let baseW = 0;
+      for (const r of records) {
+        const e = r.pair.observedRf - r.pair.predictedRfBefore;
+        baseSe += r.pair.weight * e * e;
+        baseW += r.pair.weight;
+      }
+      cvRmseBaseline = baseW > 0 ? Math.sqrt(baseSe / baseW) : undefined;
+      const cvA = cvError(false);
+      // family shifts / descriptor ridge are only even considered with enough pairs and distinct compounds
+      const extrasEligible = records.length >= 30 && uniqueCompounds >= 8;
+      const cvB = extrasEligible ? cvError(true) : cvA;
+      if (Number.isFinite(cvA) && Number.isFinite(cvB)) {
+        validated = true;
+        useExtras = extrasEligible && cvB < cvA - 0.003;
+        cvRmse = Math.min(cvA, cvB);
+      }
+    }
+
+    let { globalDemandShift, demandSlope, familyDemandShifts, featureWeights } = fitPhaseModel(
+      records,
+      censRecords,
+      useExtras,
+      uniqueCompounds
+    );
+    // If held-out error is no better than the uncalibrated model, do not apply a correction at all.
+    const calibrationHelps =
+      !validated || cvRmseBaseline === undefined || cvRmse === undefined || cvRmse < cvRmseBaseline - 0.002;
+    if (!calibrationHelps) {
+      globalDemandShift = 0;
+      demandSlope = 1;
+      familyDemandShifts = {};
+      featureWeights = undefined;
     }
 
     // Re-evaluate all pairs after calibration to fill parity points & RMSE
@@ -1306,8 +1426,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     const n = records.length;
     const rmseBefore = n > 0 ? Math.round(Math.sqrt(sqErrBefore / n) * 1000) / 1000 : 0.12;
     const rmseAfter = n > 0 ? Math.round(Math.sqrt(sqErrAfter / n) * 1000) / 1000 : 0.12;
+    // In-sample error flatters the fit; use the held-out error when we have it, and never go below the floor.
+    const sigmaErr = cvRmse !== undefined ? Math.max(rmseAfter, cvRmse) : Math.max(rmseAfter, RF_SIGMA);
     const calibratedSigma = Math.round(
-      clamp((SIGMA_PRIOR_N * RF_SIGMA + wSum * rmseAfter) / (SIGMA_PRIOR_N + wSum), 0.065, 0.17) * 1000
+      clamp((SIGMA_PRIOR_N * RF_SIGMA + wSum * sigmaErr) / (SIGMA_PRIOR_N + wSum), SIGMA_FLOOR, 0.17) * 1000
     ) / 1000;
 
     // Update EVERY plate in this phase (including plates that only contributed censored front/baseline constraints)
@@ -1374,6 +1496,11 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       meanRfBias: n > 0 ? Math.round((rfBiasSum / n) * 1000) / 1000 : 0,
       rmseBefore,
       rmseAfter,
+      uniqueCompounds,
+      validated,
+      ...(cvRmse !== undefined ? { cvRmse: Math.round(cvRmse * 1000) / 1000 } : {}),
+      ...(cvRmseBaseline !== undefined ? { cvRmseBaseline: Math.round(cvRmseBaseline * 1000) / 1000 } : {}),
+      calibrationApplied: calibrationHelps,
     };
     model.byPhase[phase] = fit;
   }

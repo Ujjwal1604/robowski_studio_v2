@@ -9,11 +9,21 @@ import {
   TlcDensitogramData,
   TlcSet,
   ProfileHistogramStats,
+  Lane2dMetrics,
 } from '../types';
-export type { ProfileHistogramStats };
+export type { ProfileHistogramStats, Lane2dMetrics };
 import { parseDelimited } from './importers/tableReader';
 import { csvText } from './exporters/csv';
 import { getTlcPlateSlice } from './tlcPlateSlice';
+import {
+  analyzeLaneStripRgb,
+  applyFlatFieldCorrection,
+  detectCurvedFrontSeam,
+  detectGlassTopEdge,
+  isProfileOnPlate,
+  CurvedFrontChannelInput,
+  CurvedFrontSeamResult,
+} from './tlcVision2d';
 
 export const LANE_FRAME_WIDTH = 3280;
 export const TLC_ROWS = 6;
@@ -266,6 +276,179 @@ export function computeLaneRowIntensity(
   }
 
   return weightSum > 0 ? sum / weightSum : 0;
+}
+
+// Shared off-screen scratch canvases for 2D full-RGB lane strip extraction & blank silica flat-fielding
+let sharedLaneScratchCanvas: HTMLCanvasElement | null = null;
+let sharedBlankScratchCanvas: HTMLCanvasElement | null = null;
+
+export interface BlankSilicaEntry {
+  name: string;
+  bmp: ImageBitmap;
+}
+
+const blankSilicaRefs: Partial<Record<TlcChannelKey, BlankSilicaEntry>> = {};
+let blankSilicaEnabled = true;
+let blankSilicaVersion = 0;
+
+export function setBlankSilicaRef(key: TlcChannelKey, entry: BlankSilicaEntry): void {
+  blankSilicaRefs[key] = entry;
+  blankSilicaVersion++;
+}
+
+export function clearBlankSilicaRef(key?: TlcChannelKey): void {
+  if (key) {
+    delete blankSilicaRefs[key];
+  } else {
+    delete blankSilicaRefs.UV254;
+    delete blankSilicaRefs.UV366;
+    delete blankSilicaRefs.White;
+  }
+  blankSilicaVersion++;
+}
+
+export function setBlankSilicaEnabled(enabled: boolean): void {
+  if (blankSilicaEnabled !== enabled) {
+    blankSilicaEnabled = enabled;
+    blankSilicaVersion++;
+  }
+}
+
+export function isBlankSilicaEnabled(): boolean {
+  return blankSilicaEnabled;
+}
+
+export function getBlankSilicaMeta(): Partial<Record<TlcChannelKey, { name: string }>> {
+  const out: Partial<Record<TlcChannelKey, { name: string }>> = {};
+  for (const k of ['UV254', 'UV366', 'White'] as TlcChannelKey[]) {
+    if (blankSilicaRefs[k]) out[k] = { name: blankSilicaRefs[k]!.name };
+  }
+  return out;
+}
+
+export function getBlankSilicaSignature(): string {
+  const active = blankSilicaEnabled
+    ? (['UV254', 'UV366', 'White'] as TlcChannelKey[])
+        .filter((k) => Boolean(blankSilicaRefs[k]?.bmp))
+        .map((k) => `${k}:${blankSilicaRefs[k]!.name}`)
+        .join(',')
+    : 'off';
+  return `blank:${blankSilicaVersion}:${active}`;
+}
+
+/**
+ * Extracts a full-RGB 1D chromatographic profile AND caches 2D lateral strip metrics
+ * (`lateralExcess`, `edgeRatio`, `coreRgb`, `bgRgb`, `offPlate`, `borderStraddle`) on the TlcSet.
+ * When a blank silica flat-field reference photo is loaded & enabled for `key`, divides out uneven
+ * UV lamp shading / lens vignetting (or subtracts UV366 stray chamber glare) automatically.
+ */
+export function extractLaneProfile2d(
+  set: TlcSet,
+  key: TlcChannelKey,
+  lane: TlcLane,
+  coreFraction: number = 0.35
+): number[] {
+  const bSig = getBlankSilicaSignature();
+  if ((set as any)._blankSig !== bSig) {
+    if (set.imgs?.[key]?.bmp) {
+      set.prof = {};
+      (set as any)._prof2d = {};
+    }
+    (set as any)._blankSig = bSig;
+  }
+
+  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
+  const cached2d = (set as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
+  if (set.prof && set.prof[ck] && (cached2d?.[ck] || !set.imgs?.[key]?.bmp)) {
+    return set.prof[ck];
+  }
+
+  const im = set.imgs?.[key];
+  if (!im || !im.bmp || typeof document === 'undefined') {
+    return set.prof?.[ck] || [];
+  }
+
+  const W = Math.max(1, Math.round(lane.width));
+  const L = Math.max(1, Math.round(lane.length));
+
+  if (!sharedLaneScratchCanvas) {
+    sharedLaneScratchCanvas = document.createElement('canvas');
+  }
+  sharedLaneScratchCanvas.width = W;
+  sharedLaneScratchCanvas.height = L;
+
+  const ctx = sharedLaneScratchCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return set.prof?.[ck] || [];
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, L);
+
+  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+  ctx.drawImage(im.bmp, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, W, L);
+  let stripRgba: Uint8ClampedArray = imgData.data;
+
+  // Apply once-per-camera blank silica flat-field calibration when available & enabled
+  const blankRef = blankSilicaEnabled ? blankSilicaRefs[key] : undefined;
+  if (blankRef?.bmp) {
+    if (!sharedBlankScratchCanvas) {
+      sharedBlankScratchCanvas = document.createElement('canvas');
+    }
+    sharedBlankScratchCanvas.width = W;
+    sharedBlankScratchCanvas.height = L;
+    const bCtx = sharedBlankScratchCanvas.getContext('2d', { willReadFrequently: true });
+    if (bCtx) {
+      bCtx.setTransform(1, 0, 0, 1, 0, 0);
+      bCtx.clearRect(0, 0, W, L);
+      const bm = laneMatrix(lane, blankRef.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+      bCtx.setTransform(bm[0], bm[1], bm[2], bm[3], bm[4], bm[5]);
+      bCtx.drawImage(blankRef.bmp, 0, 0);
+      const blankData = bCtx.getImageData(0, 0, W, L);
+      stripRgba = applyFlatFieldCorrection(imgData.data, blankData.data, W, L, key);
+    }
+  }
+
+  const { profile, metrics } = analyzeLaneStripRgb(
+    stripRgba,
+    W,
+    L,
+    key,
+    coreFraction,
+    lane.id >= 1000
+  );
+
+  set.prof = set.prof || {};
+  set.prof[ck] = profile;
+  const map2d: Record<string, Lane2dMetrics> = ((set as any)._prof2d = (set as any)._prof2d || {});
+  map2d[ck] = metrics;
+  return profile;
+}
+
+/**
+ * Returns cached 2D lateral strip metrics for a lane/channel (extracting on demand if a bitmap is loaded).
+ */
+export function getLane2dMetrics(
+  set: TlcSet,
+  key: TlcChannelKey,
+  lane: TlcLane,
+  coreFraction: number = 0.35
+): Lane2dMetrics | undefined {
+  const bSig = getBlankSilicaSignature();
+  if ((set as any)._blankSig !== bSig && set.imgs?.[key]?.bmp) {
+    set.prof = {};
+    (set as any)._prof2d = {};
+    (set as any)._blankSig = bSig;
+  }
+  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
+  const map2d = (set as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
+  if (map2d?.[ck]) return map2d[ck];
+  if (set.imgs?.[key]?.bmp && typeof document !== 'undefined') {
+    extractLaneProfile2d(set, key, lane, coreFraction);
+    return ((set as any)._prof2d as Record<string, Lane2dMetrics> | undefined)?.[ck];
+  }
+  return undefined;
 }
 
 // Moving average box filter for signal smoothing
@@ -566,10 +749,12 @@ export function getChannelHistogram(
   const sig = autoCacheSignature(set);
   if ((set as any)._autoCacheSig !== sig) {
     set.frontAuto = {};
+    set.frontAutoByLane = {};
     set.originAuto = {};
     set.originAutoByLane = {};
     set.autoConf = {};
     (set as any)._histCache = {};
+    (set as any)._prof2d = {};
     (set as any)._autoCacheSig = sig;
   }
   const cache: Record<string, ProfileHistogramStats> = ((set as any)._histCache =
@@ -591,7 +776,8 @@ export function getChannelHistogram(
 export function detectFrontDetailed(
   profile: number[],
   sign: number = 1,
-  hist?: ProfileHistogramStats
+  hist?: ProfileHistogramStats,
+  maxHi?: number
 ): FrontDetectionResult {
   const n = profile.length;
   if (n < 20) return { pos: 0, score: 0 };
@@ -602,7 +788,9 @@ export function detectFrontDetailed(
 
   const s = movingAvg(profile, 3);
   const lo = Math.max(4, Math.floor(n * 0.50));
-  const hi = Math.min(n - 4, Math.floor(n * 0.96));
+  const rawHi = Math.min(n - 4, Math.floor(n * 0.96));
+  const hi = maxHi != null ? Math.min(rawHi, maxHi) : rawHi;
+  const topLim = maxHi != null ? Math.min(n - 1, maxHi + 4) : n - 1;
   if (hi <= lo) return { pos: 0, score: 0 };
 
   const count = hi - lo + 1;
@@ -637,9 +825,9 @@ export function detectFrontDetailed(
 
   for (let i = lo; i <= hi; i++) {
     // 1. Bilateral thin-line ridge response (suppresses spots and one-sided border cliffs)
-    const c = windowMean(s, i - rCore, i + rCore);
+    const c = windowMean(s, i - rCore, Math.min(topLim, i + rCore));
     const mLT = windowMean(s, i - tOut, i - tIn);
-    const mRT = windowMean(s, i + tIn, i + tOut);
+    const mRT = windowMean(s, Math.min(topLim, i + tIn), Math.min(topLim, i + tOut));
     const dL = sign * (c - mLT);
     const dR = sign * (c - mRT);
 
@@ -647,13 +835,13 @@ export function detectFrontDetailed(
     if (dL > 1.0 && dR > 1.0 && Math.min(dL, dR) >= 0.30 * Math.max(dL, dR)) {
       const tightRidge = 0.7 * Math.min(dL, dR) + 0.3 * 0.5 * (dL + dR);
       const mLM = windowMedian(s, i - mOut, i - mIn, buf);
-      let mRM = windowMedian(s, i + mIn, i + mOut, buf);
+      let mRM = windowMedian(s, Math.min(topLim, i + mIn), Math.min(topLim, i + mOut), buf);
       // Near the far end of the lane (e.g. half-plate edge / midline divider), a dark gap or label strip
       // just beyond the dry front rim can drop into `i + mIn .. i + mOut` and invert `dRM`.
       if (i >= n * 0.78 && sign * (c - mRM) < 0.35 * dR) {
-        const tailEnd = windowMean(s, Math.min(n - 1, i + mOut - 4), Math.min(n - 1, i + mOut + 12));
+        const tailEnd = windowMean(s, Math.min(topLim, i + mOut - 4), Math.min(topLim, i + mOut + 12));
         if (sign * (tailEnd - mRT) > 2.0) {
-          const shelf = windowQuantile(s, i + mIn, i + mOut, buf, sign < 0 ? 0.80 : 0.20);
+          const shelf = windowQuantile(s, Math.min(topLim, i + mIn), Math.min(topLim, i + mOut), buf, sign < 0 ? 0.80 : 0.20);
           mRM = sign < 0 ? Math.max(mRT, shelf) : Math.min(mRT, shelf);
         }
       }
@@ -668,15 +856,15 @@ export function detectFrontDetailed(
 
     // 2. Persistent wet-vs-dry background step across `i` (polarity-guarded against borders/glare/ink)
     let stepAmp = 0;
-    if (i + bgNear <= n - 1 && i - bgNear >= 0) {
-      const medAfter = windowMedian(s, i + bgNear, Math.min(n - 1, i + bgMid), buf);
+    if (i + bgNear <= topLim && i - bgNear >= 0) {
+      const medAfter = windowMedian(s, i + bgNear, Math.min(topLim, i + bgMid), buf);
       const medBefore = windowMedian(s, Math.max(0, i - bgMid), i - bgNear, buf);
       const farBefore =
         i - Math.round(n * 0.06) >= 3
           ? windowMedian(s, Math.max(0, i - bgFarLo), i - Math.max(bgNear + 2, Math.round(n * 0.06)), buf)
           : medBefore;
       const edgeL = windowMean(s, Math.max(0, i - rCore - eWin), Math.max(0, i - rCore - 1));
-      const edgeR = windowMean(s, Math.min(n - 1, i + rCore + 1), Math.min(n - 1, i + rCore + eWin));
+      const edgeR = windowMean(s, Math.min(topLim, i + rCore + 1), Math.min(topLim, i + rCore + eWin));
       const macroDelta = medAfter - medBefore;
       const farDelta = medAfter - farBefore;
       const localDelta = edgeR - edgeL;
@@ -1119,6 +1307,10 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
 
   if (end <= start) return [];
 
+  // Never mark spots on lanes sitting completely off the silica glass (pitch-black surround)
+  // or straddling the vertical glass cut edge (where 1px edge wobble produces bogus ripple spots).
+  if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return [];
+
   // Compute baseline noise & physical signal range specifically within the chromatographic migration window (chrom)
   const chrom = d.slice(Math.max(start, 0), Math.min(n, end));
   const dmax = chrom.length > 0 ? Math.max(...chrom, 1e-9) : Math.max(...d, 1e-9);
@@ -1128,6 +1320,9 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     : 1.4826 * pctile(d.map((v) => Math.abs(v - med)), 0.5);
 
   const profSlice = profile.slice(Math.max(0, start), Math.min(n, end));
+  // 1D off-plate guard for UV254/White (bright-silica channels): pure pitch-black surround has no silica
+  if (o.sign < 0 && profSlice.length >= 10 && pctile(profSlice, 0.80) < 35) return [];
+
   const dynSpan = profSlice.length > 4
     ? Math.abs(pctile(profSlice, 0.98) - pctile(profSlice, 0.02))
     : 100;
@@ -1184,7 +1379,34 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const frontCoreEnd = Math.min(n - 1, Math.round(o.front + Math.max(6, r * 0.35)));
   const flankRadius = Math.max(halfWin * 2, Math.round(0.10 * span));
 
+  const hasLane2d = Boolean(o.lane2d && o.lane2d.lateralExcess.length === n && o.lane2d.edgeRatio.length === n);
+
   const filteredCandidates = candidates.filter((p) => {
+    // (a0) 2D lateral verification (when 2D strip metrics are available):
+    //      Rejects horizontal illumination/meniscus bands (spanning center + both flanks equally)
+    //      and adjacent-lane spillover peaking at the outer lane edge, while preserving real
+    //      centered spots even beside an identical co-migrating neighbor.
+    if (hasLane2d && o.lane2d) {
+      const l2Lo = Math.max(0, p.pos - 2);
+      const l2Hi = Math.min(n - 1, p.pos + 2);
+      let maxLat = -Infinity;
+      let minEdge = Infinity;
+      for (let k = l2Lo; k <= l2Hi; k++) {
+        if (o.lane2d.lateralExcess[k] > maxLat) maxLat = o.lane2d.lateralExcess[k];
+        if (o.lane2d.edgeRatio[k] < minEdge) minEdge = o.lane2d.edgeRatio[k];
+      }
+      // Adjacent-lane spillover: outer flank deviates much more than lane center on a weak invading shoulder
+      if (minEdge > 1.55 && p.val < 42 && maxLat < Math.max(2.5, 0.25 * p.val)) {
+        return false;
+      }
+      // Low-contrast horizontal illumination / wetness band: spans center + both flanks equally.
+      // Strong dark UV-quenching / stained spots (p.val >= 38) are NEVER erased even when adjacent
+      // HTE wells coalesce into a wide band touching both flanks of an interior lane.
+      if (p.val < 38 && maxLat < Math.max(1.8, 0.16 * p.val)) {
+        return false;
+      }
+    }
+
     // (a1) Raw pixel persistence check: a genuine chromatographic band spans >= 3 raw pixels,
     //      whereas dead pixels or dust specks are only 1-2 pixels wide even at extreme amplitude.
     const rWinLo = Math.max(Math.round(o.origin + 1), p.pos - 6);
@@ -1482,6 +1704,7 @@ export interface MultiChannelSpotsOptions {
   minDistance?: number;
   rfMergeTolerance?: number;
   histograms?: Partial<Record<TlcChannelKey, ProfileHistogramStats>>;
+  lane2dByChannel?: Partial<Record<TlcChannelKey, Lane2dMetrics>>;
 }
 
 /**
@@ -1498,6 +1721,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
     minDistance,
     rfMergeTolerance = 0.035,
     histograms,
+    lane2dByChannel,
   } = options;
 
   const perChannel: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
@@ -1512,6 +1736,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
       minProminence,
       minDistance,
       plateHistogram: histograms?.[ch],
+      lane2d: lane2dByChannel?.[ch],
     });
   }
 
@@ -1532,6 +1757,7 @@ export function getLaneMultiChannelSpots(
     minProminence?: number;
     minDistance?: number;
     rfMergeTolerance?: number;
+    coreFraction?: number;
   } = {}
 ): TlcSpot[] {
   if (lane.customSpots !== undefined && Array.isArray(lane.customSpots)) {
@@ -1544,12 +1770,16 @@ export function getLaneMultiChannelSpots(
   const fVal = options.front ?? tlcFront(set, lane, getProfile);
   const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
   const histograms: Partial<Record<TlcChannelKey, ProfileHistogramStats>> = {};
+  const lane2dByChannel: Partial<Record<TlcChannelKey, Lane2dMetrics>> = {};
+  const cf = options.coreFraction ?? 0.35;
   for (const ch of channels) {
     const p = getProfile(set, ch, lane);
     if (p && p.length >= 10) {
       profiles[ch] = p;
       const chHist = getChannelHistogram(set, ch, getProfile);
       if (chHist) histograms[ch] = chHist;
+      const m2d = getLane2dMetrics(set, ch, lane, cf);
+      if (m2d) lane2dByChannel[ch] = m2d;
     }
   }
 
@@ -1562,6 +1792,7 @@ export function getLaneMultiChannelSpots(
     minDistance: options.minDistance,
     rfMergeTolerance: options.rfMergeTolerance,
     histograms,
+    lane2dByChannel,
   });
 }
 
@@ -1663,20 +1894,22 @@ function autoCacheSignature(set: TlcSet): string {
     .join(';');
   const l0 = set.cfg?.lanes[0];
   const laneSig = set.cfg ? `${set.cfg.lanes.length}_${l0?.x0 ?? 0}_${l0?.y0 ?? 0}_${l0?.length ?? 0}` : 'none';
-  return `${imgSig}|${laneSig}`;
+  return `${imgSig}|${laneSig}|${getBlankSilicaSignature()}`;
 }
 
 function detectDiffuseChannelFront(
   medProfile: number[],
   profiles: number[][],
-  sign: number
+  sign: number,
+  maxHi?: number
 ): FrontDetectionResult {
   const n = medProfile.length;
   if (n < 20 || profiles.length < 6) return { pos: 0, score: 0 };
 
   const s = movingAvg(medProfile, 5);
   const lo = Math.max(4, Math.floor(n * 0.80));
-  const hi = Math.min(n - 4, Math.floor(n * 0.96));
+  const rawHi = Math.min(n - 4, Math.floor(n * 0.96));
+  const hi = maxHi != null ? Math.min(rawHi, maxHi) : rawHi;
   if (hi <= lo) return { pos: 0, score: 0 };
 
   const rCore = Math.max(1, Math.round(n * 0.005));
@@ -1759,7 +1992,8 @@ function measureFrontContinuity(
   smoothed: number[][],
   pos: number,
   sign: number,
-  laneLen: number
+  laneLen: number,
+  effEnd?: number
 ): { frac: number; allThirds: boolean } {
   const N = smoothed.length;
   if (N === 0 || pos <= 0) return { frac: 0, allThirds: false };
@@ -1780,26 +2014,27 @@ function measureFrontContinuity(
 
   for (let li = 0; li < N; li++) {
     const s = smoothed[li];
+    const topLim = effEnd != null ? Math.min(s.length - 1, effEnd) : s.length - 1;
     const third = Math.min(2, Math.floor((li * 3) / N));
     thirdTot[third]++;
     const kLo = Math.max(tOut + 1, pos - bowTol);
-    const kHi = Math.min(s.length - tOut - 2, pos + bowTol);
+    const kHi = Math.min(topLim - tOut - 1, pos + bowTol);
     let hit = false;
     for (let k = kLo; k <= kHi; k++) {
-      const c = windowMean(s, k - rCore, k + rCore);
+      const c = windowMean(s, k - rCore, Math.min(topLim, k + rCore));
       const mLT = windowMean(s, k - tOut, k - tIn);
-      const mRT = windowMean(s, k + tIn, k + tOut);
+      const mRT = windowMean(s, Math.min(topLim, k + tIn), Math.min(topLim, k + tOut));
       const dL = sign * (c - mLT);
       const dR = sign * (c - mRT);
       if (dL > 2.5 && dR > 2.5 && Math.min(dL, dR) >= 0.25 * Math.max(dL, dR)) {
         hit = true;
         break;
       }
-      if (k + bgNear <= s.length - 1 && k - bgNear >= 0) {
+      if (k + bgNear <= topLim && k - bgNear >= 0) {
         const edgeL = windowMean(s, Math.max(0, k - rCore - eWin), Math.max(0, k - rCore - 1));
-        const edgeR = windowMean(s, Math.min(s.length - 1, k + rCore + 1), Math.min(s.length - 1, k + rCore + eWin));
+        const edgeR = windowMean(s, Math.min(topLim, k + rCore + 1), Math.min(topLim, k + rCore + eWin));
         if ((edgeR - edgeL) * dirSign > 2.5) {
-          const medAfter = windowMedian(s, k + bgNear, Math.min(s.length - 1, k + bgMid), buf);
+          const medAfter = windowMedian(s, k + bgNear, Math.min(topLim, k + bgMid), buf);
           const medBefore = windowMedian(s, Math.max(0, k - bgMid), k - bgNear, buf);
           if ((medAfter - medBefore) * dirSign > 4.0) {
             hit = true;
@@ -1823,13 +2058,15 @@ function detectOtsuWetDryFront(
   profiles: number[][],
   sign: number,
   upperHist: ProfileHistogramStats,
-  laneLen: number
+  laneLen: number,
+  maxHi?: number
 ): FrontDetectionResult {
   const n = medProfile.length;
   if (n < 20 || upperHist.otsuEta < 0.50) return { pos: 0, score: 0 };
 
   const lo = Math.max(4, Math.floor(n * 0.50));
-  const hi = Math.min(n - 4, Math.floor(n * 0.96));
+  const rawHi = Math.min(n - 4, Math.floor(n * 0.96));
+  const hi = maxHi != null ? Math.min(rawHi, maxHi) : rawHi;
   if (hi <= lo + 8) return { pos: 0, score: 0 };
 
   const s = movingAvg(medProfile, 5);
@@ -1898,15 +2135,26 @@ function detectOtsuWetDryFront(
   };
 }
 
-function detectChannelFront(profiles: number[][], sign: number, laneLen: number): FrontDetectionResult {
+function detectChannelFront(rawProfiles: number[][], sign: number, laneLen: number): FrontDetectionResult {
+  if (!rawProfiles.length) return { pos: 0, score: 0 };
+
+  // Filter out off-plate pitch-black profiles so unaligned outer lanes don't corrupt median/voting
+  const onPlate = rawProfiles.filter((p) => isProfileOnPlate(p, sign));
+  const profiles = onPlate.length >= Math.min(4, rawProfiles.length) ? onPlate : rawProfiles;
   if (!profiles.length) return { pos: 0, score: 0 };
+
+  const minLen = Math.min(...profiles.map((p) => p.length));
+  if (minLen < 20) return { pos: 0, score: 0 };
+
+  // Clamp upper search ceiling strictly inside physical top glass edge when lane boxes extend into black void
+  const glassEdge = detectGlassTopEdge(profiles, sign);
+  const maxHi = glassEdge < minLen - 4 ? Math.max(Math.floor(minLen * 0.55), glassEdge - 6) : undefined;
+  const effEnd = glassEdge < minLen - 4 ? glassEdge - 2 : undefined;
 
   let medProfile: number[];
   if (profiles.length === 1) {
     medProfile = profiles[0];
   } else {
-    const minLen = Math.min(...profiles.map((p) => p.length));
-    if (minLen < 20) return { pos: 0, score: 0 };
     medProfile = new Array(minLen);
     const colBuf = new Float64Array(profiles.length);
     for (let i = 0; i < minLen; i++) {
@@ -1915,14 +2163,15 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
     }
   }
 
-  const plateHist = analyzeProfileHistogram(profiles, sign, 0.12, 0.95);
-  const upperHist = analyzeProfileHistogram(profiles, sign, 0.50, 0.95);
-  const otsuCandidate = detectOtsuWetDryFront(medProfile, profiles, sign, upperHist, laneLen);
+  const hiFrac = maxHi != null ? Math.min(0.95, maxHi / minLen) : 0.95;
+  const plateHist = analyzeProfileHistogram(profiles, sign, 0.12, hiFrac);
+  const upperHist = analyzeProfileHistogram(profiles, sign, 0.50, hiFrac);
+  const otsuCandidate = detectOtsuWetDryFront(medProfile, profiles, sign, upperHist, laneLen, maxHi);
 
-  let best = detectFrontDetailed(medProfile, sign, plateHist);
+  let best = detectFrontDetailed(medProfile, sign, plateHist, maxHi);
   const smoothed = profiles.length >= 6 ? profiles.map((p) => movingAvg(p, 3)) : [];
   if (profiles.length >= 6 && best.pos > 0) {
-    const cont = measureFrontContinuity(smoothed, best.pos, sign, laneLen);
+    const cont = measureFrontContinuity(smoothed, best.pos, sign, laneLen, effEnd);
     if (cont.frac < 0.65 || !cont.allThirds) {
       best = { pos: 0, score: 0 };
     } else {
@@ -1934,7 +2183,7 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
   // line across the plate so high-Rf spot bands in a subset of wells cannot beat the real front.
   if (profiles.length >= 3) {
     const laneHits = profiles
-      .map((p) => detectFrontDetailed(p, sign, plateHist))
+      .map((p) => detectFrontDetailed(p, sign, plateHist, maxHi))
       .filter((r) => r.pos > 0);
     const minNeeded =
       profiles.length >= 6
@@ -1951,7 +2200,7 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
         const clusterPos = cPos[cPos.length >> 1];
         let contFactor = 1;
         if (profiles.length >= 6) {
-          const cont = measureFrontContinuity(smoothed, clusterPos, sign, laneLen);
+          const cont = measureFrontContinuity(smoothed, clusterPos, sign, laneLen, effEnd);
           if (cont.frac < 0.68 || !cont.allThirds) continue;
           contFactor = 0.3 + 0.7 * cont.frac;
         }
@@ -1977,7 +2226,7 @@ function detectChannelFront(profiles: number[][], sign: number, laneLen: number)
   }
 
   if (best.pos === 0 && profiles.length >= 6) {
-    best = detectDiffuseChannelFront(medProfile, profiles, sign);
+    best = detectDiffuseChannelFront(medProfile, profiles, sign, maxHi);
   }
 
   // Fallback to strong bimodal wet-vs-dry histogram transition if ridge/diffuse found nothing
@@ -2030,41 +2279,107 @@ export function tlcFront(
   const sig = autoCacheSignature(set);
   if ((set as any)._autoCacheSig !== sig) {
     set.frontAuto = {};
+    set.frontAutoByLane = {};
     set.originAuto = {};
     set.originAutoByLane = {};
     set.autoConf = {};
     (set as any)._histCache = {};
+    (set as any)._prof2d = {};
     (set as any)._autoCacheSig = sig;
   }
 
   set.frontAuto = set.frontAuto || {};
+  set.frontAutoByLane = set.frontAutoByLane || {};
   if (set.frontAuto[h] == null && set.cfg) {
-    const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
-    let best: FrontDetectionResult = { pos: 0, score: 0 };
-    // Strips of bare silica between the lanes carry no spots or smears, so a front or pencil line is
-    // far cleaner there than down the lanes; sample them first and fall back to the lane centres.
+    const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h).sort((a, b) => a.id - b.id);
+    const halfLaneIds = halfLanes.map((l) => l.id);
+    let bestFlat: FrontDetectionResult = { pos: 0, score: 0 };
+    let bestSeam: CurvedFrontSeamResult = { medianPos: 0, byLane: {}, score: 0, isCurved: false };
+
+    // Strips of bare silica between the lanes carry no spots or smears, so a front or meniscus
+    // is far cleaner there than down the lanes; sample them first and fall back to the lane centres.
     const gutters = gutterLanes(halfLanes);
     const laneSets = gutters.length >= 4 ? [gutters, halfLanes] : [halfLanes];
+    let physicalGlassCeiling = lane.length - 1;
     for (const lanesToUse of laneSets) {
+      const seamInputs: CurvedFrontChannelInput[] = [];
       for (const ch of channels) {
         const profiles = lanesToUse.map((l) => getProfile(set, ch, l)).filter((p) => p.length > 0);
         if (!profiles.length) continue;
-        const res = detectChannelFront(profiles, TLC_SIGNAL[ch]?.sign ?? 1, lane.length);
-        if (res.score > best.score && res.pos > 0) {
-          best = res;
+        const chSign = TLC_SIGNAL[ch]?.sign ?? 1;
+        if (chSign < 0) {
+          const ge = detectGlassTopEdge(profiles, chSign);
+          if (ge < lane.length - 4) {
+            physicalGlassCeiling = Math.min(physicalGlassCeiling, ge - 8);
+          }
+        }
+        const res = detectChannelFront(profiles, chSign, lane.length);
+        if (res.score > bestFlat.score && res.pos > 0) {
+          bestFlat = res;
+        }
+        if (profiles.length >= 4) {
+          seamInputs.push({ profiles, sign: chSign });
         }
       }
-      if (best.pos > 0) break;
+
+      // 2D smooth curved solvent-front seam tracker (single-channel & multi-channel fused):
+      // Tracks smiling/frowning/tilted fronts that smear out under 1D flat median aggregation
+      // and fuses faint agreeing channels (UV254 + UV366 + White) into one confident curve.
+      if (seamInputs.length > 0 && halfLaneIds.length >= 4) {
+        const fused = detectCurvedFrontSeam(seamInputs, halfLaneIds, lane.length);
+        if (fused.medianPos > 0 && fused.score > bestSeam.score) {
+          bestSeam = fused;
+        }
+        if (seamInputs.length > 1) {
+          for (const single of seamInputs) {
+            const singleRes = detectCurvedFrontSeam([single], halfLaneIds, lane.length);
+            if (singleRes.medianPos > 0 && singleRes.score > bestSeam.score) {
+              bestSeam = singleRes;
+            }
+          }
+        }
+      }
+
+      if (bestFlat.pos > 0 || bestSeam.medianPos > 0) break;
     }
-    set.frontAuto[h] = best.pos > 0 ? best.pos : Math.round(lane.length * 0.93);
+
+    // Prefer curved seam when a genuine bow/tilt is detected (flat median smears edge lanes)
+    // or when multi-channel seam fusion beats single-channel flat detection.
+    const useSeam =
+      bestSeam.medianPos > 0 &&
+      (bestFlat.pos <= 0 ||
+        (bestSeam.isCurved && bestSeam.score >= Math.max(4.5, bestFlat.score * 0.72)) ||
+        bestSeam.score > bestFlat.score);
+
+    const detected = useSeam || bestFlat.pos > 0;
+    const defaultFront = Math.max(
+      Math.round(lane.length * 0.55),
+      Math.min(Math.round(lane.length * 0.93), physicalGlassCeiling)
+    );
+    const medianFront = useSeam
+      ? bestSeam.medianPos
+      : bestFlat.pos > 0
+      ? bestFlat.pos
+      : defaultFront;
+    const chosenScore = useSeam ? bestSeam.score : bestFlat.pos > 0 ? bestFlat.score : 0;
+
+    set.frontAuto[h] = medianFront;
+    if (useSeam) {
+      Object.assign(set.frontAutoByLane, bestSeam.byLane);
+    } else {
+      for (const l of halfLanes) {
+        set.frontAutoByLane[l.id] = medianFront;
+      }
+    }
     set.autoConf = set.autoConf || {};
-    set.autoConf[`front${h}`] = { detected: best.pos > 0, score: best.pos > 0 ? best.score : 0 };
+    set.autoConf[`front${h}`] = { detected, score: chosenScore };
   }
-  return set.frontAuto[h] ?? Math.round(lane.length * 0.93);
+  return set.frontAutoByLane?.[lane.id] ?? set.frontAuto?.[h] ?? Math.round(lane.length * 0.93);
 }
 
 interface ChannelOriginResult extends FrontDetectionResult {
   byLane?: Record<number, number>;
+  lockedLanes?: number[];
   validFrac?: number;
   medFeat?: number;
 }
@@ -2331,12 +2646,15 @@ function detectFaintOriginRow(
 }
 
 export function detectChannelOrigin(
-  laneEntries: Array<{ laneId: number; profile: number[] }>,
+  rawLaneEntries: Array<{ laneId: number; profile: number[] }>,
   sign: number,
   laneLen: number,
   hist?: ProfileHistogramStats
 ): ChannelOriginResult {
-  if (!laneEntries.length) return { pos: 0, score: 0 };
+  if (!rawLaneEntries.length) return { pos: 0, score: 0 };
+
+  const onPlateEntries = rawLaneEntries.filter((e) => isProfileOnPlate(e.profile, sign));
+  const laneEntries = onPlateEntries.length >= Math.min(3, rawLaneEntries.length) ? onPlateEntries : rawLaneEntries;
 
   const h = hist ?? analyzeProfileHistogram(laneEntries.map((e) => e.profile), sign, 0.06, 0.90);
   const histBgSigma = h.sampleCount >= 16 ? h.bgSigma : undefined;
@@ -2457,12 +2775,36 @@ export function detectChannelOrigin(
 
         let validCount = 0;
         const byLane: Record<number, number> = {};
+        const lockedLanes: number[] = [];
+        const smearTol = Math.max(6, Math.round(laneLen * 0.010));
+        const smFlankIn = Math.max(6, Math.round(laneLen * 0.022));
+        const smFlankOut = smFlankIn + Math.max(8, Math.round(laneLen * 0.030));
+        const smBuf = new Float64Array(24);
+        const profileById = new Map<number, number[]>(sortedEntries.map((e) => [e.laneId, e.profile]));
+
         for (const entry of detected) {
+          const refLine = Math.round(refinedBackbone?.[entry.laneId] ?? entry.refPos);
           if (entry.pos > 0) {
+            let finalPos = entry.pos;
+            // Smear-proof upward-tailing guard: if a polar compound tails upward from the origin
+            // and drags the detected peak well above the smooth plate backbone, snap back to the backbone.
+            if (finalPos > refLine + smearTol) {
+              const prof = profileById.get(entry.laneId);
+              if (prof && prof.length > refLine + smFlankOut + 1 && refLine - smFlankOut >= 0) {
+                const mBelow = windowMedian(prof, refLine - smFlankOut, refLine - smFlankIn, smBuf);
+                const mAbove = windowMedian(prof, refLine + smFlankIn, refLine + smFlankOut, smBuf);
+                // Positive upwardTail means the region above refLine is stained/quenched relative to below
+                const upwardTail = sign * (mAbove - mBelow);
+                if (upwardTail > Math.max(4.0, 0.15 * medFeat)) {
+                  finalPos = refLine;
+                }
+              }
+            }
             validCount++;
-            byLane[entry.laneId] = entry.pos;
+            byLane[entry.laneId] = finalPos;
+            lockedLanes.push(entry.laneId);
           } else {
-            byLane[entry.laneId] = Math.round(refinedBackbone?.[entry.laneId] ?? entry.refPos);
+            byLane[entry.laneId] = refLine;
           }
         }
 
@@ -2471,6 +2813,7 @@ export function detectChannelOrigin(
             pos,
             score: Math.max(best.score, aggScore),
             byLane,
+            lockedLanes,
             validFrac: validCount / laneEntries.length,
             medFeat,
           };
@@ -2487,7 +2830,7 @@ export function detectChannelOrigin(
   return best;
 }
 
-// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> clearest-channel origin peak -> fallback ~10% lane length
+// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> multi-channel joint origin peak -> fallback ~10% lane length
 export function tlcOrigin(
   set: TlcSet,
   lane: TlcLane,
@@ -2504,10 +2847,12 @@ export function tlcOrigin(
   const sig = autoCacheSignature(set);
   if ((set as any)._autoCacheSig !== sig) {
     set.frontAuto = {};
+    set.frontAutoByLane = {};
     set.originAuto = {};
     set.originAutoByLane = {};
     set.autoConf = {};
     (set as any)._histCache = {};
+    (set as any)._prof2d = {};
     (set as any)._autoCacheSig = sig;
   }
 
@@ -2518,6 +2863,16 @@ export function tlcOrigin(
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
     let best: ChannelOriginResult = { pos: 0, score: 0 };
     let bestClipped = false;
+    let bestChannel: TlcChannelKey | null = null;
+    const perChannelData: Array<{
+      ch: TlcChannelKey;
+      sign: number;
+      entries: Array<{ laneId: number; profile: number[] }>;
+      hist: ProfileHistogramStats;
+      clipped: boolean;
+      res: ChannelOriginResult;
+    }> = [];
+
     for (const ch of channels) {
       const chSign = TLC_SIGNAL[ch]?.sign ?? -1;
       const entries = halfLanes
@@ -2529,12 +2884,14 @@ export function tlcOrigin(
         analyzeProfileHistogram(entries.map((e) => e.profile), chSign, 0.06, 0.90);
       const resClipped = chSign < 0 ? chHist.clipHighFrac > 0.25 : chHist.clipLowFrac > 0.25;
       const res = detectChannelOrigin(entries, chSign, lane.length, chHist);
+      perChannelData.push({ ch, sign: chSign, entries, hist: chHist, clipped: resClipped, res });
       if (res.pos <= 10) continue;
       const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
       if (!bestSolid) {
         if (res.score > best.score) {
           best = res;
           bestClipped = resClipped;
+          bestChannel = ch;
         }
       } else if (
         (bestClipped && !resClipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
@@ -2544,8 +2901,87 @@ export function tlcOrigin(
       ) {
         best = res;
         bestClipped = resClipped;
+        bestChannel = ch;
       }
     }
+
+    // Multi-channel joint origin refinement:
+    // If lanes are UV-silent in the primary channel (not individually locked), rescue their
+    // exact origin deposit dot from any agreeing unclipped secondary channel (e.g., White stain
+    // or UV366 fluorescence) and refit the smooth plate backbone across all locked anchors.
+    if (best.pos > 10 && best.byLane && perChannelData.length > 1) {
+      const agreeTol = Math.max(16, Math.round(lane.length * 0.035));
+      const localRadius = Math.max(12, Math.round(lane.length * 0.016));
+      const locked = new Set<number>(best.lockedLanes || []);
+      const fusedByLane: Record<number, number> = { ...best.byLane };
+
+      const secondaryChannels = perChannelData.filter(
+        (c) =>
+          c.ch !== bestChannel &&
+          !c.clipped &&
+          (c.res.pos <= 10 || Math.abs(c.res.pos - best.pos) <= agreeTol)
+      );
+
+      let rescuedAny = false;
+      for (const l of halfLanes) {
+        if (locked.has(l.id)) continue;
+        const refPos = fusedByLane[l.id] ?? best.pos;
+        for (const sec of secondaryChannels) {
+          // If the secondary channel already locked this lane cleanly near refPos, use it directly
+          if (sec.res.lockedLanes?.includes(l.id) && sec.res.byLane?.[l.id]) {
+            const secPos = sec.res.byLane[l.id];
+            if (Math.abs(secPos - refPos) <= localRadius) {
+              fusedByLane[l.id] = secPos;
+              locked.add(l.id);
+              rescuedAny = true;
+              break;
+            }
+          }
+          // Otherwise probe strictly around refPos on the secondary channel
+          const entry = sec.entries.find((e) => e.laneId === l.id);
+          if (!entry) continue;
+          const secFeatFloor =
+            sec.hist.sampleCount >= 16
+              ? Math.min(14.0, Math.max(5.0, 4.0 * sec.hist.bgSigma, 0.12 * sec.hist.contrastSpan))
+              : 14.0;
+          const secBiFloor = Math.min(8.0, Math.max(3.0, 0.55 * secFeatFloor));
+          const p = detectOriginNear(
+            entry.profile,
+            sec.sign,
+            refPos,
+            localRadius,
+            secFeatFloor,
+            6.0,
+            secBiFloor
+          );
+          if (p > 0) {
+            fusedByLane[l.id] = p;
+            locked.add(l.id);
+            rescuedAny = true;
+            break;
+          }
+        }
+      }
+
+      if (rescuedAny && locked.size >= 4) {
+        const lockedPts = Array.from(locked).map((id) => ({ laneId: id, pos: fusedByLane[id] }));
+        const jointBackbone = fitOriginQuadCurve(lockedPts, best.pos, lane.length);
+        if (jointBackbone) {
+          for (const l of halfLanes) {
+            if (!locked.has(l.id) && jointBackbone[l.id] != null) {
+              fusedByLane[l.id] = Math.round(jointBackbone[l.id]);
+            }
+          }
+        }
+      }
+      best = {
+        ...best,
+        byLane: fusedByLane,
+        lockedLanes: Array.from(locked),
+        validFrac: halfLanes.length > 0 ? locked.size / halfLanes.length : best.validFrac,
+      };
+    }
+
     set.autoConf = set.autoConf || {};
     set.autoConf[`origin${h}`] = { detected: best.pos > 10, score: best.pos > 10 ? best.score : 0 };
     if (best.pos > 10) {

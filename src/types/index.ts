@@ -363,6 +363,21 @@ export interface ProfileHistogramStats {
   sampleCount: number;
 }
 
+export interface Lane2dMetrics {
+  /** Center-vs-gutter contrast at each pixel row (positive = lane center differs from clean flanking silica) */
+  lateralExcess: Float32Array;
+  /** Ratio of max(leftEdge, rightEdge) deviation to center deviation (>1.55 indicates neighbor lane spillover) */
+  edgeRatio: Float32Array;
+  /** Interleaved [R, G, B] mean of the lane center core at each row (length = L * 3) */
+  coreRgb: Float32Array;
+  /** Clean silica background [R, G, B] estimated from the lane flanks */
+  bgRgb: [number, number, number];
+  /** True when the lane sits off the physical silica plate (pitch-black cabinet surround in UV254/White) */
+  offPlate?: boolean;
+  /** True when the lane straddles the vertical glass-plate edge (one flank on black void, one on silica) */
+  borderStraddle?: boolean;
+}
+
 export interface TlcProfileOptions {
   sign: number;
   origin: number;
@@ -371,6 +386,8 @@ export interface TlcProfileOptions {
   minProminence?: number;
   minDistance?: number;
   plateHistogram?: ProfileHistogramStats;
+  /** Optional 2D lateral lane strip metrics for neighbor-spillover & horizontal-band artifact rejection */
+  lane2d?: Lane2dMetrics;
 }
 
 export interface TlcDensitogramPoint {
@@ -417,6 +434,7 @@ export interface TlcPlateData {
   frontPx?: number | null;
   frontHalfPx?: Record<number, number>; // side 0 (Lanes 0-26) and side 1 (Lanes 27-53)
   frontAuto?: Record<number, number>;
+  frontAutoByLane?: Record<number, number>;
   /** per half: whether auto front/origin was genuinely detected (vs default guess) and signal strength */
   autoConf?: Record<string, { detected: boolean; score: number }>;
   originPx?: number | null;

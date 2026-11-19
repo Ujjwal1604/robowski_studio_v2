@@ -9,14 +9,14 @@ import { useApp } from '../../context/AppContext';
 import {
   calibrateTlcModelFromCampaign,
   CalibratedLaneComparison,
-  computeLaneRowIntensity,
   containerOfLane,
+  extractLaneProfile2d,
   isKnownAdditiveReagent,
   LANE_FRAME_WIDTH,
-  laneMatrix,
   optimizePlateTlcSolvents,
   PlateSolventPlanResult,
   RecommendedPlateSolvent,
+  RESOLVED_SCORE,
   rfShiftAtMidplate,
   SimulatedWellLane,
   SolventPoolMode,
@@ -34,53 +34,13 @@ import { TlcLane, TlcSet } from '../../types';
 import { getRDKitInstance } from '../../utils/rdkit';
 import { ChemicalStructure } from './ChemicalStructure';
 
-let calibScratchCanvas: HTMLCanvasElement | null = null;
-
 function extractLaneProfileForCalibration(
   set: TlcSet,
   key: TlcChannelKey,
   lane: TlcLane,
   coreFraction: number = 0.35
 ): number[] {
-  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
-  if (set.prof && set.prof[ck]) return set.prof[ck];
-
-  const im = set.imgs?.[key];
-  if (!im || !im.bmp || typeof document === 'undefined') return [];
-
-  const W = Math.max(1, Math.round(lane.width));
-  const L = Math.max(1, Math.round(lane.length));
-
-  if (!calibScratchCanvas) {
-    calibScratchCanvas = document.createElement('canvas');
-  }
-  calibScratchCanvas.width = W;
-  calibScratchCanvas.height = L;
-
-  const ctx = calibScratchCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return [];
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, W, L);
-  const data = imgData.data;
-  const ch = TLC_SIGNAL[key].ch;
-  const out = new Array(L);
-
-  for (let y = 0; y < L; y++) {
-    const rowOffset = y * W * 4;
-    const rowSlice = data.subarray(rowOffset, rowOffset + W * 4);
-    out[L - 1 - y] = computeLaneRowIntensity(rowSlice, W, ch, coreFraction);
-  }
-
-  set.prof = set.prof || {};
-  set.prof[ck] = out;
-  return out;
+  return extractLaneProfile2d(set, key, lane, coreFraction);
 }
 
 interface SubstrateItem {
@@ -124,7 +84,7 @@ const STATIONARY_PHASES = [
 
 function laneScoreColor(score: number): string {
   if (score >= 0.72) return '#10b981';
-  if (score >= 0.48) return '#38bdf8';
+  if (score >= RESOLVED_SCORE) return '#38bdf8';
   if (score >= 0.25) return '#f59e0b';
   return '#ef4444';
 }
@@ -1300,6 +1260,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   <span style={{ color: phaseFit.rmseAfter <= phaseFit.rmseBefore ? '#10b981' : '#f59e0b' }}>
                                     ±{phaseFit.rmseAfter.toFixed(2)} Rf
                                   </span>
+                                </div>
+                                <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px' }}>
+                                  {phaseFit.validated && phaseFit.cvRmse !== undefined
+                                    ? `Held-out (unseen compounds): ±${phaseFit.cvRmse.toFixed(2)} vs ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(2)} uncalibrated`
+                                    : 'Not validated: too few distinct compounds'}
+                                  {' · '}
+                                  {phaseFit.uniqueCompounds ?? '?'} distinct compounds
+                                  {phaseFit.calibrationApplied === false ? ' · correction switched off (no held-out gain)' : ''}
                                 </div>
                               </div>
                               <div

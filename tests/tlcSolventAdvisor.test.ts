@@ -16,6 +16,7 @@ import {
   invertLangmuirForPct,
   synthesizePlateTailoredSpecs,
   matchTlcSetNameToSolvent,
+  eluentReactivityWarnings,
 } from '../src/engine/predictor';
 import { exampleState } from '../src/context/runPayload';
 import { RunResult } from '../src/types';
@@ -1038,5 +1039,19 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
         expect(clearlyTrackedOnSomePlate).toBe(true);
       }
     }
+  });
+});
+
+describe('eluent reactivity warnings', () => {
+  it('flags acetone with primary amines/hydrazines and MeOH with acid chlorides, but not benign cases', () => {
+    const acetone = TLC_SOLVENT_LIBRARY.find((s) => s.family === 'acetone_hex' || s.composition?.strongSolvent === 'Acetone');
+    const meoh = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_et3n')!;
+    const etoac = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    if (acetone) {
+      expect(eluentReactivityWarnings(rdkit, ['NNc1ccccc1'], [acetone]).join(' ')).toMatch(/Acetone/);
+      expect(eluentReactivityWarnings(rdkit, ['CC(=O)Nc1ccccc1'], [acetone])).toHaveLength(0);
+    }
+    expect(eluentReactivityWarnings(rdkit, ['O=C(Cl)c1ccccc1'], [meoh]).join(' ')).toMatch(/MeOH/);
+    expect(eluentReactivityWarnings(rdkit, ['O=C(Cl)c1ccccc1'], [etoac])).toHaveLength(0);
   });
 });

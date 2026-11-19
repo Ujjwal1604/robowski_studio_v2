@@ -1,0 +1,669 @@
+From 237a2c588cd2c01e859eed831fda2c972e984eea Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 09:46:53 +0900
+Subject: [PATCH] Calibration validation (held-out CV, per-compound weights,
+ sigma floor), advisor cleanups, eluent reactivity warnings
+
+- tlcCalibration: grouped leave-compounds-out CV, per-compound effective weights, product anchors down-weighted, sigma floor/held-out sigma, correction disabled when it does not beat baseline
+- advisor: single RESOLVED_SCORE constant (also used by UI), dead code removed, larger dynamic-eluent gain margin
+- warn on acetone eluents with primary amines/hydrazines and MeOH eluents with reactive electrophiles
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/components/ui/AiSolventAdvisorModal.tsx |  11 +-
+ src/engine/predictor/tlcCalibration.ts      | 144 ++++++++++++++++++--
+ src/engine/predictor/tlcSolventAdvisor.ts   | 106 ++++++++++++--
+ tests/tlcCalibration.test.ts                | 114 +++++++++++++++-
+ tests/tlcSolventAdvisor.test.ts             |  15 ++
+ 5 files changed, 363 insertions(+), 27 deletions(-)
+
+diff --git a/src/components/ui/AiSolventAdvisorModal.tsx b/src/components/ui/AiSolventAdvisorModal.tsx
+index 8eb59c6..941f3d0 100644
+--- a/src/components/ui/AiSolventAdvisorModal.tsx
++++ b/src/components/ui/AiSolventAdvisorModal.tsx
+@@ -15,6 +15,7 @@ import {
+   LANE_FRAME_WIDTH,
+   laneMatrix,
+   optimizePlateTlcSolvents,
++  RESOLVED_SCORE,
+   PlateSolventPlanResult,
+   RecommendedPlateSolvent,
+   rfShiftAtMidplate,
+@@ -124,7 +125,7 @@ const STATIONARY_PHASES = [
+ 
+ function laneScoreColor(score: number): string {
+   if (score >= 0.72) return '#10b981';
+-  if (score >= 0.48) return '#38bdf8';
++  if (score >= RESOLVED_SCORE) return '#38bdf8';
+   if (score >= 0.25) return '#f59e0b';
+   return '#ef4444';
+ }
+@@ -1301,6 +1302,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                                     ±{phaseFit.rmseAfter.toFixed(2)} Rf
+                                   </span>
+                                 </div>
++                                <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px' }}>
++                                  {phaseFit.validated && phaseFit.cvRmse !== undefined
++                                    ? `Held-out (unseen compounds): ±${phaseFit.cvRmse.toFixed(2)} vs ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(2)} uncalibrated`
++                                    : 'Not validated: too few distinct compounds'}
++                                  {' · '}
++                                  {phaseFit.uniqueCompounds ?? '?'} distinct compounds
++                                  {phaseFit.calibrationApplied === false ? ' · correction switched off (no held-out gain)' : ''}
++                                </div>
+                               </div>
+                               <div
+                                 style={{
+diff --git a/src/engine/predictor/tlcCalibration.ts b/src/engine/predictor/tlcCalibration.ts
+index e8ecdea..addf6bd 100644
+--- a/src/engine/predictor/tlcCalibration.ts
++++ b/src/engine/predictor/tlcCalibration.ts
+@@ -41,6 +41,12 @@ import {
+ } from './solventSystemModel';
+ import { PredictedSpecies, WellPredictionResult } from './types';
+ 
++// Predicted products may not have formed (or may be mis-paired), so they anchor the fit far less than
++// starting materials, whose identity is known.
++const PRODUCT_ANCHOR_WEIGHT = 0.3;
++// Never report a calibrated sigma tighter than this: it comes from a few compounds on a few plates.
++const SIGMA_FLOOR = 0.09;
++
+ const CORE_SYSTEM_IDS = new Set(TLC_SOLVENT_LIBRARY.map((s) => s.id));
+ const DYNAMIC_SOLVENT_SYSTEMS: TlcSolventSystemDef[] = [
+   ...generateExtendedDynamicSpecs({
+@@ -866,7 +872,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+             kind: 'product',
+             tier: sp.tier,
+             rf: res.rf,
+-            weight: sp.tier === 'High' ? 1.0 : 0.85,
++            weight: sp.tier === 'High' ? PRODUCT_ANCHOR_WEIGHT : PRODUCT_ANCHOR_WEIGHT * 0.85,
+             profile: prof,
+           });
+           if (seenProd.size >= 4) break;
+@@ -1086,9 +1092,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+ 
+   // Fit shrinkage-regularized offsets & optional logit polarity slope per stationary phase
+   // incorporating both interior spot pairs AND left/right censored boundary hits (front/baseline saturation)
+-  const GLOBAL_LAMBDA = 6.0;
+-  const SLOPE_LAMBDA = 22.0;
+-  const FAMILY_LAMBDA = 10.0;
++  // Weights are per compound (not per well), so the prior pull is expressed in 'compound' units.
++  const GLOBAL_LAMBDA = 1.6;
++  const SLOPE_LAMBDA = 6.0;
++  const FAMILY_LAMBDA = 3.0;
+   const SIGMA_PRIOR_N = 8.0;
+ 
+   const allPhases = new Set<TlcStationaryPhasePreference>([
+@@ -1103,6 +1110,20 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+     const isC18 = phase === 'C18';
+     const kPhase = isC18 ? 4.8 : 6.2;
+ 
++    interface PhaseFitResult {
++      globalDemandShift: number;
++      demandSlope: number;
++      familyDemandShifts: Partial<Record<SolventFamily, number>>;
++      featureWeights?: TlcCalibrationFeatureWeights;
++    }
++
++    // Fits shift / slope (+ optional family shifts and descriptor ridge when allowExtras) on a set of records.
++    const fitPhaseModel = (
++      records: RawPairRecord[],
++      censRecords: CensoredBoundaryRecord[],
++      allowExtras: boolean,
++      uniqueCount: number
++    ): PhaseFitResult => {
+     const evalPhaseObjective = (shift: number, slope: number): number => {
+       let loss = GLOBAL_LAMBDA * shift * shift + SLOPE_LAMBDA * (slope - 1) * (slope - 1);
+       for (const rec of records) {
+@@ -1141,7 +1162,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+       }
+       globalDemandShift = clamp(wrS / (wS + GLOBAL_LAMBDA), -0.22, 0.22);
+     }
+-    const allowSlopeFit = records.length >= 6 || (records.length >= 2 && censRecords.length >= 2);
++    const allowSlopeFit = uniqueCount >= 4 || (uniqueCount >= 2 && censRecords.length >= 2);
+     const steps = [0.04, 0.015, 0.005, 0.0015];
+     for (const h of steps) {
+       let improved = true;
+@@ -1184,7 +1205,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+ 
+     const familyDemandShifts: Partial<Record<SolventFamily, number>> = {};
+     for (const [fam, stats] of familySums.entries()) {
+-      if (stats.w >= 4.5) {
++      if (allowExtras && stats.w >= 2.5) {
+         const famShift = clamp(stats.wr / (stats.w + FAMILY_LAMBDA), -0.12, 0.12);
+         if (Math.abs(famShift) >= 0.005) {
+           familyDemandShifts[fam] = Math.round(famShift * 10000) / 10000;
+@@ -1195,8 +1216,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+     // Multivariate 5D L2-regularized Ridge regression on post-shift/slope descriptor residuals
+     // Only activates when >= 10 paired spots exist and keeps uniform shifts strictly untouched.
+     let featureWeights: TlcCalibrationFeatureWeights | undefined;
+-    if (records.length >= 10) {
+-      const RIDGE_LAMBDA = 24.0;
++    if (allowExtras && records.length >= 20 && uniqueCount >= 6) {
++      const RIDGE_LAMBDA = 1.5;
+       const featMeans = [0, 0, 0, 0, 0];
+       let wTot = 0;
+       for (const rec of records) {
+@@ -1250,6 +1271,104 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+       }
+     }
+ 
++
++    return {
++      globalDemandShift,
++      demandSlope,
++      familyDemandShifts,
++      ...(featureWeights ? { featureWeights } : {}),
++    };
++    };
++
++    // Effective weights: a compound seen in many wells counts about once overall, not once per well.
++    const compoundCount = new Map<TlcMolProfile, number>();
++    for (const rec of records) compoundCount.set(rec.profile, (compoundCount.get(rec.profile) ?? 0) + 1);
++    for (const rec of records) {
++      rec.pair.weight = Math.round((rec.pair.weight / (compoundCount.get(rec.profile) ?? 1)) * 10000) / 10000;
++    }
++    const uniqueCompounds = compoundCount.size;
++    // Censored front / baseline hits are per well too: cap their total pull at about one unit per compound.
++    const censCap = Math.max(2, uniqueCompounds);
++    const censTotal = censRecords.reduce((a, c) => a + c.weight, 0);
++    if (censTotal > censCap) {
++      const f = censCap / censTotal;
++      for (const c of censRecords) c.weight = c.weight * f;
++    }
++
++    // Grouped (leave-compounds-out) validation: an eluent-polarity correction must predict compounds it has
++    // not seen. Candidate A = global shift + slope only; candidate B adds family shifts / descriptor ridge.
++    const predictRf = (rec: RawPairRecord, fit: PhaseFitResult): number => {
++      const famShift = fit.familyDemandShifts[rec.family] ?? 0;
++      return applyCalibrationShiftToRf(
++        rec.pair.predictedRfBefore,
++        fit.globalDemandShift + famShift,
++        isC18,
++        fit.demandSlope,
++        computeFeatureDemandDelta(rec.profile, fit.featureWeights),
++        rec.displacementN
++      );
++    };
++    let cvRmse: number | undefined;
++    let cvRmseBaseline: number | undefined;
++    let useExtras = false;
++    let validated = false;
++    if (uniqueCompounds >= 4 && records.length >= 6) {
++      const compounds = Array.from(compoundCount.keys());
++      const folds = Math.min(5, compounds.length);
++      const foldOf = new Map<TlcMolProfile, number>();
++      compounds.forEach((c, i) => foldOf.set(c, i % folds));
++      const cvError = (allowExtras: boolean): number => {
++        let se = 0;
++        let wt = 0;
++        for (let f = 0; f < folds; f++) {
++          const train = records.filter((r) => foldOf.get(r.profile) !== f);
++          const test = records.filter((r) => foldOf.get(r.profile) === f);
++          if (test.length === 0 || train.length === 0) continue;
++          const tc = new Set(train.map((r) => r.profile)).size;
++          const fit = fitPhaseModel(train, censRecords, allowExtras, tc);
++          for (const r of test) {
++            const e = r.pair.observedRf - predictRf(r, fit);
++            se += r.pair.weight * e * e;
++            wt += r.pair.weight;
++          }
++        }
++        return wt > 0 ? Math.sqrt(se / wt) : NaN;
++      };
++      let baseSe = 0;
++      let baseW = 0;
++      for (const r of records) {
++        const e = r.pair.observedRf - r.pair.predictedRfBefore;
++        baseSe += r.pair.weight * e * e;
++        baseW += r.pair.weight;
++      }
++      cvRmseBaseline = baseW > 0 ? Math.sqrt(baseSe / baseW) : undefined;
++      const cvA = cvError(false);
++      // family shifts / descriptor ridge are only even considered with enough pairs and distinct compounds
++      const extrasEligible = records.length >= 30 && uniqueCompounds >= 8;
++      const cvB = extrasEligible ? cvError(true) : cvA;
++      if (Number.isFinite(cvA) && Number.isFinite(cvB)) {
++        validated = true;
++        useExtras = extrasEligible && cvB < cvA - 0.003;
++        cvRmse = Math.min(cvA, cvB);
++      }
++    }
++
++    let { globalDemandShift, demandSlope, familyDemandShifts, featureWeights } = fitPhaseModel(
++      records,
++      censRecords,
++      useExtras,
++      uniqueCompounds
++    );
++    // If held-out error is no better than the uncalibrated model, do not apply a correction at all.
++    const calibrationHelps =
++      !validated || cvRmseBaseline === undefined || cvRmse === undefined || cvRmse < cvRmseBaseline - 0.002;
++    if (!calibrationHelps) {
++      globalDemandShift = 0;
++      demandSlope = 1;
++      familyDemandShifts = {};
++      featureWeights = undefined;
++    }
++
+     // Re-evaluate all pairs after calibration to fill parity points & RMSE
+     let wSum = 0;
+     let sqErrBefore = 0;
+@@ -1306,8 +1425,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+     const n = records.length;
+     const rmseBefore = n > 0 ? Math.round(Math.sqrt(sqErrBefore / n) * 1000) / 1000 : 0.12;
+     const rmseAfter = n > 0 ? Math.round(Math.sqrt(sqErrAfter / n) * 1000) / 1000 : 0.12;
++    // In-sample error flatters the fit; use the held-out error when we have it, and never go below the floor.
++    const sigmaErr = cvRmse !== undefined ? Math.max(rmseAfter, cvRmse) : Math.max(rmseAfter, RF_SIGMA);
+     const calibratedSigma = Math.round(
+-      clamp((SIGMA_PRIOR_N * RF_SIGMA + wSum * rmseAfter) / (SIGMA_PRIOR_N + wSum), 0.065, 0.17) * 1000
++      clamp((SIGMA_PRIOR_N * RF_SIGMA + wSum * sigmaErr) / (SIGMA_PRIOR_N + wSum), SIGMA_FLOOR, 0.17) * 1000
+     ) / 1000;
+ 
+     // Update EVERY plate in this phase (including plates that only contributed censored front/baseline constraints)
+@@ -1374,6 +1495,11 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
+       meanRfBias: n > 0 ? Math.round((rfBiasSum / n) * 1000) / 1000 : 0,
+       rmseBefore,
+       rmseAfter,
++      uniqueCompounds,
++      validated,
++      ...(cvRmse !== undefined ? { cvRmse: Math.round(cvRmse * 1000) / 1000 } : {}),
++      ...(cvRmseBaseline !== undefined ? { cvRmseBaseline: Math.round(cvRmseBaseline * 1000) / 1000 } : {}),
++      calibrationApplied: calibrationHelps,
+     };
+     model.byPhase[phase] = fit;
+   }
+diff --git a/src/engine/predictor/tlcSolventAdvisor.ts b/src/engine/predictor/tlcSolventAdvisor.ts
+index b2019be..da83395 100644
+--- a/src/engine/predictor/tlcSolventAdvisor.ts
++++ b/src/engine/predictor/tlcSolventAdvisor.ts
+@@ -303,6 +303,15 @@ export interface TlcCalibrationPhaseFit {
+   meanRfBias: number;
+   rmseBefore: number;
+   rmseAfter: number;
++  /** number of distinct compounds behind the fit (a compound seen in many wells counts once) */
++  uniqueCompounds?: number;
++  /** true when a leave-compounds-out check could be run */
++  validated?: boolean;
++  /** held-out Rf error of the fitted model / of the uncalibrated model (only when validated) */
++  cvRmse?: number;
++  cvRmseBaseline?: number;
++  /** false when the correction did not beat the uncalibrated model on held-out compounds and was switched off */
++  calibrationApplied?: boolean;
+ }
+ 
+ export interface TlcCalibrationModel {
+@@ -517,6 +526,71 @@ function getTlcQuery(rdkit: any, key: string, smarts: string): any | null {
+   }
+ }
+ 
++const ACETONE_REACTIVE_SMARTS: Array<[string, string]> = [
++  ['primary amine', '[NX3;H2;!$(NC=[O,S,N]);!$(N-a)][CX4]'],
++  ['aniline', '[NX3;H2]-c'],
++  ['hydrazine/hydrazide', '[NX3;H2]-[NX3]'],
++];
++const MEOH_REACTIVE_SMARTS: Array<[string, string]> = [
++  ['acid chloride', '[CX3](=O)[Cl,Br]'],
++  ['anhydride', '[CX3](=O)O[CX3](=O)'],
++  ['sulfonyl chloride', 'S(=O)(=O)[Cl,F]'],
++  ['isocyanate/isothiocyanate', 'N=C=[O,S]'],
++  ['NHS/active ester', '[CX3](=O)ON1C(=O)CCC1=O'],
++];
++
++function matchesAny(rdkit: any, smiles: string, list: Array<[string, string]>): string | null {
++  let mol: any = null;
++  try {
++    mol = rdkit.get_mol(smiles);
++    if (!mol) return null;
++    for (const [label, sma] of list) {
++      const q = getTlcQuery(rdkit, `rx_${label}`, sma);
++      if (!q) continue;
++      try {
++        const m = JSON.parse(mol.get_substruct_matches(q) || '[]');
++        if (Array.isArray(m) && m.length > 0) return label;
++      } catch {
++        /* ignore */
++      }
++    }
++  } catch {
++    return null;
++  } finally {
++    try { mol?.delete(); } catch { /* ignore */ }
++  }
++  return null;
++}
++
++/** Warns when a recommended eluent can chemically react with a sample component on the plate. */
++export function eluentReactivityWarnings(
++  rdkit: any,
++  substrateSmiles: string[],
++  systems: TlcSolventSystemDef[]
++): string[] {
++  const out: string[] = [];
++  const uniq = Array.from(new Set(substrateSmiles.map((x) => (x || '').trim()).filter(Boolean)));
++  const hasAcetone = systems.some(
++    (s) => s.family === 'acetone_hex' || s.composition?.strongSolvent === 'Acetone' || s.composition?.ternaryCoSolvent?.solvent === 'Acetone'
++  );
++  const hasMeOH = systems.some(
++    (s) => /MeOH/i.test(s.name || '') || s.composition?.strongSolvent === 'MeOH' || s.composition?.ternaryCoSolvent?.solvent === 'MeOH' || Boolean(s.baseModifier?.includes('NH₃'))
++  );
++  if (hasAcetone) {
++    const hit = uniq.map((u) => matchesAny(rdkit, u, ACETONE_REACTIVE_SMARTS)).find(Boolean);
++    if (hit) {
++      out.push(`Acetone eluent with a ${hit} component on the plate: it can condense to an imine/hydrazone on the silica and create an artefact spot; prefer an EtOAc or MTBE system for those wells.`);
++    }
++  }
++  if (hasMeOH) {
++    const hit = uniq.map((u) => matchesAny(rdkit, u, MEOH_REACTIVE_SMARTS)).find(Boolean);
++    if (hit) {
++      out.push(`MeOH-containing eluent with a reactive ${hit} sample component: it can be methanolysed to the methyl ester/carbamate on the plate; quench the aliquot or use a non-alcohol eluent.`);
++    }
++  }
++  return out;
++}
++
+ export function profileMoleculeForTlc(
+   rdkit: any,
+   smiles: string,
+@@ -1348,8 +1422,8 @@ export function predictTlcRf(
+ 
+   const rf = Math.round(Math.max(0.02, Math.min(0.99, rawRf)) * 100) / 100;
+ 
+-  // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N. Where NH₃ can be used (MeOH/DCM)
+-  // tiny tie-break only (NH₃ listed first when equal); the real answer is the "or" alternative shown on the card.
++  // In practice 2M NH₃/MeOH suppresses amine streaking better than Et₃N, so Et₃N eluents keep a tiny penalty
++  // for basic amines (a tie-break only: NH₃ is listed first when equal; the card also offers the "or" swap).
+   if (!tailing && !mildStreak && profile.aliphAmineCount > 0 && !!system.baseModifier?.includes('Et₃N')) {
+     mildStreak = true;
+   }
+@@ -1395,6 +1469,12 @@ function smWindowScore(rf: number): number {
+ // Rf predictions are hand-tuned guesses (error roughly +-0.12), so separation is scored as the
+ // probability that two spots really are apart, not as a point estimate of the gap.
+ export const RF_SIGMA = 0.12;
++
++/** A well counts as resolved when its (set) score reaches this value; shared by the engine and the UI. */
++export const RESOLVED_SCORE = 0.55;
++
++/** A plate-tailored eluent only joins the pool if it beats the best standard eluent by this much for a well. */
++const DYNAMIC_MIN_GAIN = 0.05;
+ const RF_MIN_VISIBLE_GAP = 0.03;
+ 
+ function erf(x: number): number {
+@@ -1738,7 +1818,7 @@ function buildSystemPlanEntry(
+ 
+     const isAssignedHere = bestOwnerByWell.get(w) === sys.id;
+     if (isAssignedHere) assignedWellIndices.push(w);
+-    if (evalRes.score >= 0.55) {
++    if (evalRes.score >= RESOLVED_SCORE) {
+       resCount++;
+       if (wData.hasHighOrMed) highMedCount++;
+     }
+@@ -1935,9 +2015,7 @@ export async function optimizePlateTlcSolvents(
+     });
+ 
+     const hasHighOrMed = products.some((p) => p.tier === 'High' || p.tier === 'Medium');
+-    const topScore = products[0]?.score ?? 0;
+     const importanceWeight = hasHighOrMed ? 1.0 : products.length > 0 ? 0.9 : 0.5;
+-    void topScore;
+ 
+     const wellCtx = buildWellTlcContext(ext, pred);
+ 
+@@ -2156,7 +2234,7 @@ export async function optimizePlateTlcSolvents(
+         const sc = sysMap.get(w.wellIndex)!.score;
+         totalScore += sc;
+         const coreBest = coreBestByWell.get(w.wellIndex) ?? 0;
+-        if (sc > coreBest + 0.015) {
++        if (sc > coreBest + DYNAMIC_MIN_GAIN) {
+           improvedCount++;
+           gainSum += sc - coreBest;
+         }
+@@ -2496,7 +2574,6 @@ export async function optimizePlateTlcSolvents(
+ 
+   let chosenSystems = bestComboIdx.map((idx) => searchPool[idx]);
+ 
+-  const RESOLVED_SCORE = 0.55;
+   const resolvedCountFor = (systems: TlcSolventSystemDef[]): number => {
+     let n = 0;
+     for (let wi = 0; wi < numActive; wi++) {
+@@ -2659,8 +2736,6 @@ export async function optimizePlateTlcSolvents(
+       coveragePct: activeWells.length > 0 ? Math.round((groupResolved / activeWells.length) * 100) : 0,
+     });
+   }
+-  const groupedIds = new Set(otherGroups.flatMap((gr) => gr.systems.map((e) => e.system.id)));
+-  void groupedIds;
+ 
+ 
+   const highRankedWellCount = activeWells.filter((w) => w.hasHighOrMed).length;
+@@ -2692,6 +2767,13 @@ export async function optimizePlateTlcSolvents(
+   } else if (stationaryPhasePref === 'SiO2') {
+     summaryNotes.push('Normal-Phase Silica Gel (SiO₂) mode.');
+   }
++  summaryNotes.push(
++    ...eluentReactivityWarnings(
++      rdkit,
++      activeWells.flatMap((w) => w.substrates.map((x) => x.smiles)),
++      recommendedSystems.map((r) => r.system)
++    )
++  );
+   const hasNh3 = recommendedSystems.some((s) => s.system.baseModifier?.includes('NH₃'));
+   const hasEt3n = recommendedSystems.some((s) => s.system.baseModifier?.includes('Et₃N'));
+   if (hasNh3) {
+@@ -2840,7 +2922,7 @@ export async function optimizePlateTlcSolvents(
+         const interiorFoundProd = lane.predictedSpots.some(
+           (p) => p.kind === 'product' && p.found && p.rfAfter >= 0.12 && p.rfAfter <= 0.85
+         );
+-        const modelOkHere = (evalMatrix.get(sysDef.id)?.get(wi)?.score ?? 0) >= 0.55;
++        const modelOkHere = (evalMatrix.get(sysDef.id)?.get(wi)?.score ?? 0) >= RESOLVED_SCORE;
+         if (
+           !isFrontPlate &&
+           !isBasePlate &&
+@@ -2901,7 +2983,7 @@ export async function optimizePlateTlcSolvents(
+             }
+ 
+             const evalRes = sysMap.get(wi);
+-            if (!evalRes || evalRes.score < 0.55) continue;
++            if (!evalRes || evalRes.score < RESOLVED_SCORE) continue;
+ 
+             // Ensure spots in this candidate follow-up solvent actually sit inside 0.12..0.84 (not re-saturating!)
+             const prodSpotsHere = evalRes.spots.filter((sp) => sp.kind === 'product');
+@@ -2983,7 +3065,7 @@ export async function optimizePlateTlcSolvents(
+       for (const w of activeWells) {
+         const sc = sysMap?.get(w.wellIndex)?.score ?? 0;
+         sSum += sc;
+-        if (sc >= 0.55) res++;
++        if (sc >= RESOLVED_SCORE) res++;
+       }
+       const meanScore = activeWells.length > 0 ? Math.round((sSum / activeWells.length) * 100) / 100 : 0;
+       const coveragePct = activeWells.length > 0 ? Math.round((res / activeWells.length) * 100) : 0;
+diff --git a/tests/tlcCalibration.test.ts b/tests/tlcCalibration.test.ts
+index 1bcd64a..af3e074 100644
+--- a/tests/tlcCalibration.test.ts
++++ b/tests/tlcCalibration.test.ts
+@@ -607,6 +607,10 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+       { code: 'D', name: 'CyclohexylPropionamide', smiles: 'CCC(=O)NC1CCCCC1', aromBias: -0.09 },
+       { code: 'E', name: 'AdamantylAcetamide', smiles: 'CC(=O)NC12CC3CC(CC(C3)C1)C2', aromBias: -0.09 },
+       { code: 'F', name: 'Octanamide', smiles: 'CCCCCCCC(=O)N(C)C', aromBias: -0.08 },
++      { code: 'G', name: 'Acetonaphthone', smiles: 'CC(=O)c1cccc2ccccc12', aromBias: 0.17 },
++      { code: 'H', name: 'Benzanilide', smiles: 'O=C(Nc1ccccc1)c1ccccc1', aromBias: 0.17 },
++      { code: 'I', name: 'Valerylcyclopentylamide', smiles: 'CCCCC(=O)NC1CCCC1', aromBias: -0.09 },
++      { code: 'J', name: 'Diethylisovaleramide', smiles: 'CC(C)CC(=O)N(CC)CC', aromBias: -0.08 },
+     ];
+     state.reagents = mols.map((m) => ({
+       code: m.code,
+@@ -619,8 +623,8 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+     }));
+ 
+     const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+-    // 18 single-substrate wells (3 replicates per molecule) so 18 >= 10 paired spots with strong aromatic-ring systematic offset
+-    const rows = Array.from({ length: 18 }, (_, w) => {
++    // 30 single-substrate wells (3 replicates of 10 distinct molecules): ridge needs >= 30 pairs and >= 8 distinct compounds
++    const rows = Array.from({ length: 30 }, (_, w) => {
+       const m = mols[w % mols.length];
+       return {
+         local_index: w,
+@@ -631,7 +635,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+         recipe: [{ code: m.code, name: m.name, target_concentration: 50, equivalence: 1 }],
+       };
+     });
+-    const fakeRun = { plates: 1, reactions: 18, rows } as unknown as RunResult;
++    const fakeRun = { plates: 1, reactions: 30, rows } as unknown as RunResult;
+ 
+     const lanes = [];
+     const prof: Record<string, number[]> = {};
+@@ -647,7 +651,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+         length: 400,
+         zeroRf: 40,
+       });
+-      if (wellIdx < 18) {
++      if (wellIdx < 30) {
+         const m = mols[wellIdx % mols.length];
+         const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys50).rf;
+         const obsRf = Math.max(0.08, Math.min(0.9, baseRf + m.aromBias));
+@@ -680,7 +684,8 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+ 
+     const fit = model.byPhase.SiO2;
+     expect(fit).toBeDefined();
+-    expect(fit!.pairedSpotCount).toBe(18);
++    expect(fit!.pairedSpotCount).toBe(30);
++    expect(fit!.uniqueCompounds).toBe(10);
+     expect(fit!.featureWeights).toBeDefined();
+     // Aromatic rings elute higher than predicted (lower effective polarity demand -> negative weight on aromaticRings)
+     expect(fit!.featureWeights!.aromaticRings).toBeLessThan(-0.004);
+@@ -693,6 +698,105 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
+     });
+     expect(calPlan.calibrationApplied?.hasFeatureWeights).toBe(true);
+   });
++
++  it('reports distinct-compound count, held-out error and a floored sigma; repeated wells of one compound count once', async () => {
++    const state = exampleState();
++    state.mode = 'concentration';
++    // Diverse aromatic vs aliphatic reagent panel so standardized features have healthy variance
++    const mols = [
++      { code: 'A', name: 'Naphthylamide', smiles: 'CC(=O)Nc1ccc2ccccc2c1', aromBias: 0.1 },
++      { code: 'B', name: 'Biphenylketone', smiles: 'O=C(c1ccccc1)c1ccc(-c2ccccc2)cc1', aromBias: 0.1 },
++      { code: 'C', name: 'AnthraceneCarbaldehyde', smiles: 'O=Cc1c2ccccc2cc2ccccc12', aromBias: 0.1 },
++      { code: 'D', name: 'CyclohexylPropionamide', smiles: 'CCC(=O)NC1CCCCC1', aromBias: 0.1 },
++      { code: 'E', name: 'AdamantylAcetamide', smiles: 'CC(=O)NC12CC3CC(CC(C3)C1)C2', aromBias: 0.1 },
++      { code: 'F', name: 'Octanamide', smiles: 'CCCCCCCC(=O)N(C)C', aromBias: 0.1 },
++      { code: 'G', name: 'Acetonaphthone', smiles: 'CC(=O)c1cccc2ccccc12', aromBias: 0.1 },
++      { code: 'H', name: 'Benzanilide', smiles: 'O=C(Nc1ccccc1)c1ccccc1', aromBias: 0.1 },
++      { code: 'I', name: 'Valerylcyclopentylamide', smiles: 'CCCCC(=O)NC1CCCC1', aromBias: 0.1 },
++      { code: 'J', name: 'Diethylisovaleramide', smiles: 'CC(C)CC(=O)N(CC)CC', aromBias: 0.1 },
++    ];
++    state.reagents = mols.map((m) => ({
++      code: m.code,
++      name: m.name,
++      smiles: m.smiles,
++      molarMass: 200,
++      density: 1.05,
++      stock: 500,
++      solvent: 'DMSO',
++    }));
++
++    const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
++    // 30 single-substrate wells (3 replicates of 10 distinct molecules): ridge needs >= 30 pairs and >= 8 distinct compounds
++    const rows = Array.from({ length: 30 }, (_, w) => {
++      const m = mols[w % mols.length];
++      return {
++        local_index: w,
++        global_index: w,
++        combo_index: w,
++        plate_number: 0,
++        container_id: w,
++        recipe: [{ code: m.code, name: m.name, target_concentration: 50, equivalence: 1 }],
++      };
++    });
++    const fakeRun = { plates: 1, reactions: 30, rows } as unknown as RunResult;
++
++    const lanes = [];
++    const prof: Record<string, number[]> = {};
++    for (let laneId = 0; laneId < 54; laneId++) {
++      const wellIdx = containerOfLane(laneId);
++      lanes.push({
++        id: laneId,
++        x0: 10 + laneId * 20,
++        y0: 0,
++        x1: 10 + laneId * 20,
++        y1: 400,
++        width: 14,
++        length: 400,
++        zeroRf: 40,
++      });
++      if (wellIdx < 30) {
++        const m = mols[wellIdx % mols.length];
++        const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys50).rf;
++        const obsRf = Math.max(0.08, Math.min(0.9, baseRf + m.aromBias));
++        prof[`UV254:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
++        prof[`White:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
++      } else {
++        prof[`UV254:${laneId}:0.35`] = buildSyntheticPlateProfile([], 400, 40, 360);
++        prof[`White:${laneId}:0.35`] = buildSyntheticPlateProfile([], 400, 40, 360);
++      }
++    }
++
++    const measSet: TlcSet = {
++      uid: 'set_noise',
++      name: '50% EtOAc / Hexanes',
++      cfg: { lanes },
++      cfgName: 'noise',
++      frameW: LANE_FRAME_WIDTH,
++      frontPx: 360,
++      originPx: 40,
++      imgs: {},
++      prof,
++    };
++
++    const { model } = calibrateTlcModelFromCampaign({
++      rdkit,
++      state,
++      run: fakeRun,
++      tlcSets: [measSet],
++    });
++
++    const fit = model.byPhase.SiO2;
++    expect(fit).toBeDefined();
++    expect(fit!.uniqueCompounds).toBe(10);
++    expect(fit!.validated).toBe(true);
++    expect(fit!.cvRmse).toBeDefined();
++    expect(fit!.calibrationApplied).toBe(true);
++    // sigma never below the floor
++    expect(fit!.calibratedSigma).toBeGreaterThanOrEqual(0.09);
++    // 30 wells of 10 compounds: effective weight of the pairs is about one unit per compound, not per well
++    const wSumPairs = model.plates[0].pairs.reduce((a, p) => a + p.weight, 0);
++    expect(wSumPairs).toBeLessThanOrEqual(10.05);
++  });
+ });
+ 
+ 
+diff --git a/tests/tlcSolventAdvisor.test.ts b/tests/tlcSolventAdvisor.test.ts
+index 5cf064c..6cc5351 100644
+--- a/tests/tlcSolventAdvisor.test.ts
++++ b/tests/tlcSolventAdvisor.test.ts
+@@ -16,6 +16,7 @@ import {
+   invertLangmuirForPct,
+   synthesizePlateTailoredSpecs,
+   matchTlcSetNameToSolvent,
++  eluentReactivityWarnings,
+ } from '../src/engine/predictor';
+ import { exampleState } from '../src/context/runPayload';
+ import { RunResult } from '../src/types';
+@@ -1040,3 +1041,17 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
+     }
+   });
+ });
++
++describe('eluent reactivity warnings', () => {
++  it('flags acetone with primary amines/hydrazines and MeOH with acid chlorides, but not benign cases', () => {
++    const acetone = TLC_SOLVENT_LIBRARY.find((s) => s.family === 'acetone_hex' || s.composition?.strongSolvent === 'Acetone');
++    const meoh = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_et3n')!;
++    const etoac = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
++    if (acetone) {
++      expect(eluentReactivityWarnings(rdkit, ['NNc1ccccc1'], [acetone]).join(' ')).toMatch(/Acetone/);
++      expect(eluentReactivityWarnings(rdkit, ['CC(=O)Nc1ccccc1'], [acetone])).toHaveLength(0);
++    }
++    expect(eluentReactivityWarnings(rdkit, ['O=C(Cl)c1ccccc1'], [meoh]).join(' ')).toMatch(/MeOH/);
++    expect(eluentReactivityWarnings(rdkit, ['O=C(Cl)c1ccccc1'], [etoac])).toHaveLength(0);
++  });
++});
+-- 
+2.43.0

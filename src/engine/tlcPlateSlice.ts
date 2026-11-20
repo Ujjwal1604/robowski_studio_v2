@@ -168,6 +168,7 @@ function serializePlateData(pd: TlcPlateData, defaultProminence?: number) {
     edgePicks: pd.edgePicks || [],
     edgeSettings: pd.edgeSettings || {},
     spotProminence: pd.spotProminence ?? defaultProminence,
+    ...(pd.spotDetectorMode ? { spotDetectorMode: pd.spotDetectorMode } : {}),
     imgMeta: Object.entries(pd.imgs || {}).map(([k, im]) => ({
       key: k,
       name: im.name,
@@ -196,6 +197,7 @@ function deserializePlateData(raw: any): TlcPlateData {
     edgePicks: raw?.edgePicks || [],
     edgeSettings: raw?.edgeSettings || {},
     spotProminence: raw?.spotProminence,
+    spotDetectorMode: raw?.spotDetectorMode === '1d' ? '1d' : raw?.spotDetectorMode === '2d' ? '2d' : undefined,
     imgs: {},
     preRunImgs: {},
     preRunEnabled: raw?.preRunEnabled !== false,

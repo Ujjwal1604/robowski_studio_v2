@@ -789,6 +789,260 @@ describe('tlcVision2d: 2D smooth curved solvent-front seam tracking', () => {
     expect(Math.abs(seam.byLane[13] - trueOuterEdge(13))).toBeLessThanOrEqual(5);
     expect(Math.abs(seam.byLane[26] - trueOuterEdge(26))).toBeLessThanOrEqual(5);
   });
+
+  it('tracks a very light solvent front (~92%) ahead of bright high-Rf UV366/UV254 compound spots (~73%) while ignoring 9.5/10.5 cm pencil lines on both halves', () => {
+    const rand = rng(419);
+    const L = 1000;
+    const lanes: TlcLane[] = [];
+    // Lower half (ids 0..26, running UP from y=1950 toward midline y=1000)
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: i, x0: 260 + i * 100, y0: 1950, length: L, width: 82, angle: 0, zeroRf: 0 });
+    }
+    // Upper half (ids 27..53, running DOWN from y=50 toward midline y=1000)
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: 27 + i, x0: 260 + i * 100, y0: 50, length: L, width: 82, angle: 180, zeroRf: 0 });
+    }
+
+    // Real faint front outer edges at ~91.5% (upper y=965, lower y=1035), pencil lines at y=982 & y=1018
+    const upperFrontY = (col: number) => Math.round(965 - 4 * Math.cos((col / 26) * Math.PI));
+    const lowerFrontY = (col: number) => Math.round(1035 + 4 * Math.cos((col / 26) * Math.PI));
+
+    const plateValAt = (key: 'UV254' | 'UV366', x: number, py: number): number => {
+      const col = Math.max(0, Math.min(26, Math.round((x - 260) / 100)));
+      const edgeWeight = 1 + 1.6 * Math.pow((col - 13) / 13, 2); // darker/stronger near plate margins
+      const uF = upperFrontY(col);
+      const lF = lowerFrontY(col);
+      const hasHighRfSpot = col <= 23; // 24/27 lanes have huge high-Rf compound spots; cols 24-26 are blanks
+
+      if (key === 'UV254') {
+        let g = 190 + rand() * 0.9;
+        // Dry middle strip is slightly brighter (+5) than wet silica
+        if (py > uF && py < lF) g += 5;
+        // Very light solvent front band (~22 px wide): -4.5 center, -11.5 edges
+        const fAmp = 4.6 * edgeWeight;
+        if (py <= uF && py >= uF - 22) g -= fAmp * Math.min(1, (uF - py + 1) / 3);
+        if (py >= lF && py <= lF + 22) g -= fAmp * Math.min(1, (py - lF + 1) / 3);
+        // Strong high-Rf compound spot cloud at ~73% (upper y=780, lower y=1220)
+        if (hasHighRfSpot) {
+          g -= 52 * Math.exp(-Math.pow((py - 780) / 14, 2));
+          g -= 55 * Math.exp(-Math.pow((py - 1220) / 14, 2));
+        }
+        // Sharp 2-px dark graphite ruler pencil lines at y=982 and y=1018
+        if (Math.abs(py - 982) <= 1 || Math.abs(py - 1018) <= 1) g -= 58;
+        // Sparse middle handwriting at y=995..1005
+        if (py >= 995 && py <= 1005 && col % 4 === 1) g -= 45;
+        return Math.max(10, Math.min(250, g));
+      } else {
+        let b = 52 + rand() * 0.9;
+        if (py > uF && py < lF) b -= 4;
+        // Faint UV366 glow at real front (+6 center, +13 edges), completely dwarfed by +140 high-Rf spots
+        const fAmp = 6.0 * edgeWeight;
+        if (py <= uF && py >= uF - 20) b += fAmp * Math.min(1, (uF - py + 1) / 3);
+        if (py >= lF && py <= lF + 20) b += fAmp * Math.min(1, (py - lF + 1) / 3);
+        if (hasHighRfSpot) {
+          b += 140 * Math.exp(-Math.pow((py - 780) / 15, 2));
+          b += 145 * Math.exp(-Math.pow((py - 1220) / 15, 2));
+        }
+        // Graphite pencil line slightly darkens UV366 (opposite polarity)
+        if (Math.abs(py - 982) <= 1 || Math.abs(py - 1018) <= 1) b -= 6;
+        return Math.max(5, Math.min(250, b));
+      }
+    };
+
+    const set: TlcSet = {
+      uid: 'light-front-dual-25-75',
+      name: 'UJG-C0022-like',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      imgs: {
+        UV254: { name: 'uv254.png', url: '', bmp: {} as any },
+        UV366: { name: 'uv366.png', url: '', bmp: {} as any },
+      },
+      cfg: { lanes, hasZeroRf: false, warnings: [] },
+    };
+
+    const getProfile = (_s: TlcSet, key: string, lane: TlcLane) => {
+      const dy = -Math.cos((lane.angle * Math.PI) / 180);
+      return Array.from({ length: lane.length }, (_, pos) =>
+        plateValAt(key as 'UV254' | 'UV366', lane.x0, Math.round(lane.y0 + dy * pos))
+      );
+    };
+
+    // Both halves must lock onto the outer edge of the real light front (~915), NOT the ~730 spots and NOT the ~932 pencil line
+    for (const col of [0, 13, 26]) {
+      const lowerExp = 1950 - lowerFrontY(col);
+      const lowerDet = tlcFront(set, lanes[col], getProfile as any);
+      expect(Math.abs(lowerDet - lowerExp)).toBeLessThanOrEqual(7);
+
+      const upperExp = upperFrontY(col) - 50;
+      const upperDet = tlcFront(set, lanes[27 + col], getProfile as any);
+      expect(Math.abs(upperDet - upperExp)).toBeLessThanOrEqual(7);
+    }
+  });
+
+  it('rescues a very light continuous front band via aligned cross-plate stacking without false-triggering on pure noise', () => {
+    const rand = rng(421);
+    const L = 900;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const trueEdge = 828;
+
+    const faintProfs = laneIds.map((col) => {
+      const amp = 4.2 + 5.5 * Math.pow((col - 13) / 13, 2); // -4.2 center, -9.7 edges
+      return Array.from({ length: L }, (_, i) => {
+        let v = 190 + rand() * 1.1;
+        if (i >= trueEdge - 20 && i <= trueEdge) {
+          v -= amp * Math.min(1, (trueEdge - i + 1) / 3);
+        }
+        return v;
+      });
+    });
+
+    const rescued = detectCurvedFrontSeam([{ profiles: faintProfs, sign: -1, channel: 'UV254' }], laneIds, L);
+    expect(rescued.medianPos).toBeGreaterThan(0);
+    expect(Math.abs(rescued.medianPos - trueEdge)).toBeLessThanOrEqual(6);
+
+    // Pure Gaussian-like noise with no solvent front must still return medianPos === 0
+    const noiseProfs = laneIds.map(() =>
+      Array.from({ length: L }, () => 190 + rand() * 2.2)
+    );
+    const blankRes = detectCurvedFrontSeam([{ profiles: noiseProfs, sign: -1, channel: 'UV254' }], laneIds, L);
+    expect(blankRes.medianPos).toBe(0);
+  });
+
+  const runNativePencilScenario = (opts: {
+    channels: Array<'UV254' | 'UV366' | 'White'>;
+    pencilFwhm: number;
+    pencilY0: number;
+    pencil2Y0?: number;
+    frontY0: number | null;
+    pencilDipUv366: number;
+  }) => {
+    const L = 1073;
+    const nLanes = 27;
+    const baseLanes: TlcLane[] = Array.from({ length: nLanes }, (_, i) => ({
+      id: i + 1,
+      x0: 100 + i * 80,
+      y0: L + 100,
+      length: L,
+      width: 40,
+      angle: 0,
+      well: `A${i + 1}`,
+      zeroRf: null,
+    }));
+    const rand = rng(9123);
+    const sigmaPencil = opts.pencilFwhm / 2.355;
+    const profs: Record<string, Record<number, number[]>> = {};
+
+    const buildProfile = (ch: 'UV254' | 'UV366' | 'White', colIdx: number, isGutter: boolean): number[] => {
+      const pY = opts.pencilY0 + 0.3 * colIdx;
+      const p2Y = opts.pencil2Y0 != null ? opts.pencil2Y0 + 0.3 * colIdx : null;
+      const edgeFactor = Math.abs(colIdx - 13) / 13;
+      const frontY =
+        opts.frontY0 != null
+          ? opts.frontY0 + Math.round(4 * Math.sin((colIdx / 26) * Math.PI) + 6 * edgeFactor * edgeFactor)
+          : null;
+      return Array.from({ length: L }, (_, y) => {
+        let v = ch === 'UV366' ? 28 : ch === 'White' ? 195 : 175;
+        v += rand() * 1.2;
+        if (!isGutter && colIdx % 3 !== 2) {
+          const spotY = Math.round(L * 0.73) + ((colIdx * 7) % 15) - 7;
+          const dSpot = (y - spotY) / 14;
+          if (ch === 'UV254') v -= 55 * Math.exp(-0.5 * dSpot * dSpot);
+          if (ch === 'UV366') v += 90 * Math.exp(-0.5 * dSpot * dSpot);
+        }
+        if (frontY != null) {
+          const dyF = y - frontY;
+          if (dyF <= 8 && dyF >= -58) {
+            const bp =
+              dyF > 0
+                ? Math.exp(-0.5 * (dyF / 3.5) ** 2)
+                : Math.exp(-0.5 * (Math.max(0, -dyF - 14.4) / 17.6) ** 2);
+            const sc = 0.65 + 0.75 * edgeFactor;
+            if (ch === 'UV254') v -= 7 * sc * bp;
+            if (ch === 'UV366') v += 7 * sc * bp;
+          }
+        }
+        const gP = Math.exp(-0.5 * ((y - pY) / sigmaPencil) ** 2);
+        if (ch === 'UV254') v -= 65 * gP;
+        if (ch === 'White') v -= 75 * gP;
+        if (ch === 'UV366') v -= opts.pencilDipUv366 * gP;
+        if (p2Y != null) {
+          const gP2 = Math.exp(-0.5 * ((y - p2Y) / sigmaPencil) ** 2);
+          if (ch === 'UV254') v -= 58 * gP2;
+          if (ch === 'White') v -= 68 * gP2;
+          if (ch === 'UV366') v -= opts.pencilDipUv366 * gP2;
+        }
+        return Math.max(0, Math.min(255, v));
+      });
+    };
+
+    for (const ch of opts.channels) {
+      profs[ch] = {};
+      for (let i = 0; i < nLanes; i++) {
+        profs[ch][baseLanes[i].id] = buildProfile(ch, i, false);
+        if (i < nLanes - 1) profs[ch][baseLanes[i].id + 1000] = buildProfile(ch, i + 0.5, true);
+      }
+    }
+
+    const set: TlcSet = {
+      uid: `native-pencil-${opts.channels.join('-')}`,
+      name: 'native-pencil',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      originPx: null,
+      originAuto: {},
+      imgs: Object.fromEntries(opts.channels.map((ch) => [ch, { name: `${ch}.png`, url: '', bmp: {} as any }])),
+      cfg: { lanes: baseLanes, frameW: 3280, frameH: 3280 } as any,
+    };
+    const front = tlcFront(set, baseLanes[13], (_s, ch, l) => profs[ch]?.[l.id] ?? []);
+    return { medianPos: set.frontAuto?.[0] ?? front, detected: set.autoConf?.front0?.detected ?? false };
+  };
+
+  it('distinguishes and erases native-resolution (0.6 mm) straight graphite ruler pencil lines across UV254+UV366+White, UV254+UV366, UV254+White, and UV254-only', () => {
+    for (const channels of [
+      ['UV254', 'UV366', 'White'],
+      ['UV254', 'UV366'],
+      ['UV254', 'White'],
+      ['UV254'],
+    ] as Array<Array<'UV254' | 'UV366' | 'White'>>) {
+      const res = runNativePencilScenario({
+        channels,
+        pencilFwhm: 9,
+        pencilY0: 1005,
+        frontY0: 955,
+        pencilDipUv366: 3.5,
+      });
+      expect(res.detected).toBe(true);
+      expect(Math.abs(res.medianPos - 963)).toBeLessThanOrEqual(8);
+    }
+  });
+
+  it('erases two parallel ruler pencil lines and refuses to false-lock onto a pencil-only blank plate', () => {
+    const twoPencil = runNativePencilScenario({
+      channels: ['UV254', 'UV366', 'White'],
+      pencilFwhm: 8,
+      pencilY0: 988,
+      pencil2Y0: 1030,
+      frontY0: 944,
+      pencilDipUv366: 3.5,
+    });
+    expect(twoPencil.detected).toBe(true);
+    expect(Math.abs(twoPencil.medianPos - 953)).toBeLessThanOrEqual(8);
+
+    const pencilOnly = runNativePencilScenario({
+      channels: ['UV254', 'UV366', 'White'],
+      pencilFwhm: 9,
+      pencilY0: 1005,
+      frontY0: null,
+      pencilDipUv366: 4,
+    });
+    expect(pencilOnly.detected).toBe(false);
+  });
 });
 
 describe('tlcVision2d: multi-channel joint origin & smear-proof snapping', () => {

@@ -20,6 +20,11 @@ import {
 } from '../../engine';
 import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
+import {
+  getSpotConfidenceStyle,
+  confidenceRgba,
+  SPOT_CONFIDENCE_GRADIENT_CSS,
+} from '../../utils/spotConfidence';
 
 export type CompositeSubMode = 'false-color';
 
@@ -399,6 +404,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             minProminence: spotProminence,
             histograms,
             lane2dByChannel,
+            detectorMode: currentSet.spotDetectorMode,
           });
         } else {
           const spotChannel = activeChannel as TlcChannelKey;
@@ -413,6 +419,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 minProminence: spotProminence,
                 plateHistogram: getChannelHistogram(currentSet, spotChannel, getProfile),
                 lane2d: getLane2dMetrics(currentSet, spotChannel, l),
+                detectorMode: currentSet.spotDetectorMode,
               });
             }
           }
@@ -795,19 +802,20 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ? Math.min(w * 0.95, 36 / scale)
               : Math.min(w * 0.75, 22 / scale);
 
-            // Determine spot color & styling based on source (manual vs adjusted vs auto)
+            // Determine spot color & styling based on provenance and continuous confidence scale
             const spotSource = sp.source || 'auto';
+            const confStyle = getSpotConfidenceStyle(sp.confidence);
             const baseColor = isDragged
               ? '#facc15'
               : spotSource === 'manual'
               ? '#f59e0b'
               : spotSource === 'adjusted'
               ? '#a855f7'
+              : isHoveredSpot
+              ? confStyle.text
               : isSelected
-              ? '#38bdf8'
-              : isHovered
-              ? '#ec4899'
-              : 'rgba(56, 189, 248, 0.85)';
+              ? confStyle.color
+              : confidenceRgba(confStyle, 0.92);
 
             // If edge correction is active, draw the leveled alignment tick in emerald
             if (isCorrecting && !straightHere && sp.rfRaw != null && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)) {
@@ -834,23 +842,31 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ctx.stroke();
               ctx.restore();
             } else {
+              // Subtle dark backing stroke keeps all gradient stops crisp on bright UV254 / White plates
+              ctx.beginPath();
+              ctx.moveTo(-markerW / 2, rawSpotY);
+              ctx.lineTo(markerW / 2, rawSpotY);
+              ctx.strokeStyle = 'rgba(15, 23, 42, 0.65)';
+              ctx.lineWidth = (isHoveredSpot || isSelected ? 4.0 : 2.8) / scale;
+              ctx.stroke();
+
               // Horizontal tick at physical spot location
               ctx.beginPath();
               ctx.moveTo(-markerW / 2, rawSpotY);
               ctx.lineTo(markerW / 2, rawSpotY);
               ctx.strokeStyle = baseColor;
-              ctx.lineWidth = (isHoveredSpot || isSelected ? 2.5 : 1.5) / scale;
+              ctx.lineWidth = (isHoveredSpot || isSelected ? 2.5 : 1.6) / scale;
               ctx.stroke();
             }
 
-            // Draggable Centroid Grab Handle: distinct ring + inner dot
+            // Draggable Centroid Grab Handle: distinct ring + inner dot (diamond for manual picks)
             const handleRadius = isDragged
               ? 6.5 / scale
               : isHoveredSpot
               ? 6 / scale
               : isSelected
               ? 4.2 / scale
-              : 2.8 / scale;
+              : 2.9 / scale;
 
             if (spotSource === 'manual' || spotSource === 'adjusted' || isHoveredSpot || isDragged) {
               // Draw provenance aura / grab target halo
@@ -859,19 +875,46 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ctx.fillStyle = isDragged
                 ? 'rgba(250, 204, 21, 0.45)'
                 : spotSource === 'manual'
-                ? 'rgba(245, 158, 11, 0.32)'
+                ? 'rgba(245, 158, 11, 0.34)'
                 : spotSource === 'adjusted'
-                ? 'rgba(168, 85, 247, 0.32)'
-                : 'rgba(56, 189, 248, 0.28)';
+                ? 'rgba(168, 85, 247, 0.34)'
+                : confidenceRgba(confStyle, 0.30);
               ctx.fill();
             }
 
+            const isLowConfAuto = spotSource === 'auto' && confStyle.needsReview;
+            if (spotSource === 'auto' && confStyle.reviewRingAlpha > 0 && !isDragged) {
+              ctx.save();
+              ctx.beginPath();
+              ctx.setLineDash([2.5 / scale, 2 / scale]);
+              ctx.arc(0, rawSpotY, handleRadius + 3.2 / scale, 0, Math.PI * 2);
+              ctx.strokeStyle = confidenceRgba(confStyle, confStyle.reviewRingAlpha);
+              ctx.lineWidth = 1.4 / scale;
+              ctx.stroke();
+              ctx.restore();
+            }
+
+            // Draw centroid marker: rotated diamond for manual picks so provenance never
+            // clashes with the continuous auto-confidence color gradient
             ctx.beginPath();
-            ctx.arc(0, rawSpotY, handleRadius, 0, Math.PI * 2);
+            if (spotSource === 'manual' && !isDragged) {
+              const dr = handleRadius * 1.28;
+              ctx.moveTo(0, rawSpotY - dr);
+              ctx.lineTo(dr, rawSpotY);
+              ctx.lineTo(0, rawSpotY + dr);
+              ctx.lineTo(-dr, rawSpotY);
+              ctx.closePath();
+            } else {
+              ctx.arc(0, rawSpotY, handleRadius, 0, Math.PI * 2);
+            }
             ctx.fillStyle = isDragged ? '#facc15' : baseColor;
             ctx.fill();
+            // Thin dark outer halo + crisp white inner rim for readability on every channel
+            ctx.strokeStyle = 'rgba(15, 23, 42, 0.72)';
+            ctx.lineWidth = 2.4 / scale;
+            ctx.stroke();
             ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.3 / scale;
+            ctx.lineWidth = 1.25 / scale;
             ctx.stroke();
 
             // Spots picked as 'same compound' for edge correction
@@ -893,9 +936,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             // High-contrast Rf badge on selected, hovered, or actively manipulated spot
             if (isSelected || isHovered || isDragged || isHoveredSpot) {
               const sourceBadge = spotSource === 'manual' ? ' ✋' : spotSource === 'adjusted' ? ' ✨' : '';
+              const confSuffix =
+                spotSource === 'auto' && typeof sp.confidence === 'number'
+                  ? ` · ${confStyle.pct}%${isLowConfAuto ? '?' : ''}`
+                  : '';
               const rfStr = isCorrecting && sp.rfRaw != null && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)
-                ? `Rf ${sp.rf.toFixed(2)} (${sp.rfRaw.toFixed(2)})${sourceBadge}`
-                : `Rf ${sp.rf.toFixed(2)}${sourceBadge}`;
+                ? `Rf ${sp.rf.toFixed(2)} (${sp.rfRaw.toFixed(2)})${confSuffix}${sourceBadge}`
+                : `Rf ${sp.rf.toFixed(2)}${confSuffix}${sourceBadge}`;
               ctx.font = `bold ${Math.max(10, Math.round(12 / scale))}px monospace`;
               const textMetrics = ctx.measureText(rfStr);
               const badgeW = textMetrics.width + 8 / scale;
@@ -912,10 +959,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 ? '#f59e0b'
                 : spotSource === 'adjusted'
                 ? '#a855f7'
-                : isSelected
-                ? (isCorrecting ? '#10b981' : '#38bdf8')
-                : '#ec4899';
-              ctx.lineWidth = (isDragged ? 2 : 1) / scale;
+                : isCorrecting
+                ? '#10b981'
+                : confStyle.color;
+              ctx.lineWidth = (isDragged ? 2 : 1.1) / scale;
               ctx.beginPath();
               if ((ctx as any).roundRect) {
                 (ctx as any).roundRect(badgeX, badgeY, badgeW, badgeH, 3 / scale);
@@ -937,7 +984,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 ? 'rgba(168, 85, 247, 0.6)'
                 : isCorrecting
                 ? 'rgba(16, 185, 129, 0.5)'
-                : 'rgba(56, 189, 248, 0.4)';
+                : confidenceRgba(confStyle, 0.55);
               ctx.lineWidth = 1 / scale;
               ctx.stroke();
 
@@ -948,9 +995,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 ? '#fde68a'
                 : spotSource === 'adjusted'
                 ? '#e9d5ff'
-                : isSelected
-                ? (isCorrecting ? '#a7f3d0' : '#38bdf8')
-                : '#f472b6';
+                : isCorrecting
+                ? '#a7f3d0'
+                : confStyle.text;
               ctx.textAlign = 'left';
               ctx.textBaseline = 'middle';
               ctx.fillText(rfStr, badgeX + 4 / scale, isCorrecting ? correctedSpotY : rawSpotY);
@@ -2397,9 +2444,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 >
                   {selectedLaneSpots.map((sp, idx) => {
                     const src = sp.source || 'auto';
-                    const srcColor = src === 'manual' ? '#f59e0b' : src === 'adjusted' ? '#a855f7' : '#38bdf8';
-                    const srcBg = src === 'manual' ? 'rgba(245, 158, 11, 0.15)' : src === 'adjusted' ? 'rgba(168, 85, 247, 0.15)' : 'rgba(56, 189, 248, 0.12)';
-                    const srcBorder = src === 'manual' ? '#b45309' : src === 'adjusted' ? '#7e22ce' : '#0369a1';
+                    const confStyle = getSpotConfidenceStyle(sp.confidence);
+                    const srcColor = src === 'manual' ? '#f59e0b' : src === 'adjusted' ? '#a855f7' : confStyle.color;
+                    const srcBg = src === 'manual' ? 'rgba(245, 158, 11, 0.15)' : src === 'adjusted' ? 'rgba(168, 85, 247, 0.15)' : confStyle.bg;
+                    const srcBorder = src === 'manual' ? '#b45309' : src === 'adjusted' ? '#7e22ce' : confStyle.border;
                     return (
                       <div
                         key={idx}
@@ -2423,18 +2471,29 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                                 fontSize: '10px',
                                 fontWeight: 700,
                                 background: srcBg,
-                                color: srcColor,
+                                color: src === 'auto' ? confStyle.text : srcColor,
                                 border: `1px solid ${srcBorder}`,
                                 padding: '1px 5px',
                                 borderRadius: '3px',
                               }}
+                              title={
+                                src === 'auto' && typeof sp.confidence === 'number'
+                                  ? `Auto-detected confidence: ${confStyle.pct}% (${confStyle.label})`
+                                  : undefined
+                              }
                             >
-                              {src === 'manual' ? '✋ Manual' : src === 'adjusted' ? '✨ Adjusted' : 'Auto'}
+                              {src === 'manual'
+                                ? '✋ Manual'
+                                : src === 'adjusted'
+                                ? '✨ Adjusted'
+                                : typeof sp.confidence === 'number'
+                                ? `${confStyle.pct}% ${confStyle.shortLabel}`
+                                : 'Auto'}
                             </span>
                           </div>
 
                           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: srcColor }}>
+                            <span className="mono" style={{ fontSize: '12px', fontWeight: 700, color: src === 'auto' ? confStyle.text : srcColor }}>
                               Rf {sp.rf.toFixed(2)}
                             </span>
                             <button
@@ -3323,12 +3382,35 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               <span style={{ display: 'inline-block', width: '12px', height: '3px', background: '#38bdf8' }} />
               Solvent Front (Rf = 1)
             </span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
-              <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#38bdf8' }} />
-              Auto Pick
+            <span
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+              title="Auto-detected spot confidence scale: Rose (Trace/Very Low) → Orange (Low) → Gold (Medium) → Teal (High) → Cyan (Very High)"
+            >
+              <span>Auto Confidence:</span>
+              <span style={{ fontSize: '10px', color: '#f43f5e', fontWeight: 600 }}>Low</span>
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '68px',
+                  height: '7px',
+                  borderRadius: '4px',
+                  background: SPOT_CONFIDENCE_GRADIENT_CSS,
+                  border: '1px solid rgba(255,255,255,0.22)',
+                }}
+              />
+              <span style={{ fontSize: '10px', color: '#38bdf8', fontWeight: 600 }}>High</span>
             </span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#f59e0b' }}>
-              <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#f59e0b', border: '1px solid #ffffff' }} />
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '7px',
+                  height: '7px',
+                  transform: 'rotate(45deg)',
+                  background: '#f59e0b',
+                  border: '1px solid #ffffff',
+                }}
+              />
               ✋ Manual Pick
             </span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#c084fc' }}>

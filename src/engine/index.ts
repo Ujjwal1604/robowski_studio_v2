@@ -22,6 +22,7 @@ export * from './presets';
 export * from './dilutionTier';
 export * from './tlcLanes';
 export * from './tlcVision2d';
+export * from './tlcSpots2d';
 export * from './tlcLabPipeline';
 export * from './tlcPlateSlice';
 export * from './tlcLaneDetect';

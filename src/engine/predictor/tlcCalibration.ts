@@ -473,6 +473,7 @@ export function extractMeasuredWellSpotsForSet(
             minProminence: spotProm,
             plateHistogram: getChannelHistogram(setSlice, ch, getProf),
             lane2d: getLane2dMetrics(setSlice, ch, lane),
+            detectorMode: setSlice.spotDetectorMode,
           });
           for (const sp of chSpots) {
             const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);

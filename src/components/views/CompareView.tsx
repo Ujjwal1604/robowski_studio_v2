@@ -95,6 +95,7 @@ function resolveSpotsForSnapshot(
       minProminence: tlcSet.spotProminence ?? 0.28,
       histograms,
       lane2dByChannel,
+      detectorMode: tlcSet.spotDetectorMode,
     });
     return getEffectiveLaneSpots(lane, merged);
   }
@@ -115,6 +116,7 @@ function resolveSpotsForSnapshot(
     minProminence: tlcSet.spotProminence ?? 0.28,
     plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileOnce),
     lane2d: getLane2dMetrics(tlcSet, traceKey, lane),
+    detectorMode: tlcSet.spotDetectorMode,
   });
   return getEffectiveLaneSpots(lane, dens.spots);
 }

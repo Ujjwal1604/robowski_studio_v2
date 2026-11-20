@@ -16,6 +16,7 @@ import {
   tlcLane,
   tlcOrigin,
 } from '../../engine';
+import { getSpotConfidenceStyle } from '../../utils/spotConfidence';
 
 interface WellTlcPreviewProps {
   tlcSet?: TlcSet;
@@ -250,13 +251,16 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
 
       for (const sp of densitogramInfo.spots) {
         const y = k * (lane.length - sp.pos);
+        const confStyle = getSpotConfidenceStyle(sp.confidence);
         ctx.strokeStyle =
-          sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : '#FF4D8D';
+          sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : confStyle.color;
         ctx.lineWidth = 2;
+        ctx.setLineDash((!sp.source || sp.source === 'auto') && confStyle.needsReview ? [2, 2] : []);
         ctx.beginPath();
         ctx.moveTo(targetW - 8, y);
         ctx.lineTo(targetW, y);
         ctx.stroke();
+        ctx.setLineDash([]);
       }
     }
   }, [tlcSet, lane, activeMode, densitogramInfo]);
@@ -507,6 +511,9 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
 
               {spotsToShow.slice(0, 6).map((sp, idx) => {
                 const sx = padL + ((Math.max(-0.05, Math.min(1.05, sp.rf)) + 0.05) / 1.1) * plotW;
+                const confStyle = getSpotConfidenceStyle(sp.confidence);
+                const spCol =
+                  sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : confStyle.color;
                 return (
                   <g key={idx}>
                     <line
@@ -514,7 +521,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                       y1={padT}
                       x2={sx}
                       y2={padT + plotH}
-                      stroke="#FF4D8D"
+                      stroke={spCol}
                       strokeWidth="1"
                       strokeDasharray="2,2"
                     />
@@ -524,7 +531,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
                       fontSize="7"
                       fontFamily="IBM Plex Mono, monospace"
                       fontWeight="600"
-                      fill="#FF4D8D"
+                      fill={spCol}
                       textAnchor="middle"
                     >
                       {sp.rf.toFixed(2)}

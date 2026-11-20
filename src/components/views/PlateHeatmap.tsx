@@ -12,6 +12,7 @@ import {
   findSpots,
   findMultiChannelSpots,
   getChannelHistogram,
+  getLane2dMetrics,
   tlcOrigin,
   tlcFront,
   TLC_SIGNAL,
@@ -119,12 +120,15 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
         } else if (channelsToCheck.length > 1) {
           const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
           const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+          const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
           for (const ch of channelsToCheck) {
             const prof = getProf(activeTlcSet, ch, lane);
             if (prof && prof.length > 0) {
               profiles[ch] = prof;
               const chHist = getChannelHistogram(activeTlcSet, ch, getProf);
               if (chHist) histograms[ch] = chHist;
+              const m2d = getLane2dMetrics(activeTlcSet, ch, lane, 0.35);
+              if (m2d) lane2dByChannel[ch] = m2d;
             }
           }
           mergedSpots = findMultiChannelSpots({
@@ -134,6 +138,8 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
             radius: lane.spotRadius || 24,
             minProminence: spotProminence,
             histograms,
+            lane2dByChannel,
+            detectorMode: activeTlcSet.spotDetectorMode,
           });
         } else if (channelsToCheck.length === 1) {
           const ch = channelsToCheck[0];
@@ -146,6 +152,8 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               radius: lane.spotRadius || 24,
               minProminence: spotProminence,
               plateHistogram: getChannelHistogram(activeTlcSet, ch, getProf),
+              lane2d: getLane2dMetrics(activeTlcSet, ch, lane, 0.35),
+              detectorMode: activeTlcSet.spotDetectorMode,
             });
           }
         }

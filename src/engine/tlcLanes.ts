@@ -33,6 +33,7 @@ import {
   inspectLabTlcFilename,
   sampleFloatRgbLaneStrip,
 } from './tlcLabPipeline';
+import { computeArplsBaseline, segmentLaneSpots2d } from './tlcSpots2d';
 
 export const LANE_FRAME_WIDTH = 3280;
 export const TLC_ROWS = 6;
@@ -1232,24 +1233,35 @@ function refineOriginCoreDetailed(
   const nearFwdMed = fwdProbeB >= fwdProbeA ? windowMedian(s, fwdProbeA, fwdProbeB, buf) : cleanFwdBg;
   const fwdTailSig = Math.max(0, sign * (nearFwdMed - bg));
 
-  // Trim 1 (faint/moderate forward tail): solvent never elutes backward, so NEVER clamp
-  // backEdge forward; trim ONLY an asymmetric forward slope tail beyond pHi.
+  // Trim 1 (forward elution tail): solvent never elutes backward, so NEVER clamp backEdge forward.
+  // Normal developed circular dots naturally have a sharp un-eluted back rim (backSlope50 ~ 3-5 px)
+  // and a slightly softer forward side (~8-12 px); only trim when there is genuine asymmetric tailing
+  // so round developed dots stay dead-centered instead of being pushed down onto their bottom rim.
   let usedFwd50 = fwdEdge50;
   let usedFwd64 = fwdEdge64;
-  if (fwdSlope50 > 1.12 * backSlope50 + 0.5) {
-    usedFwd50 = Math.min(usedFwd50, pHi + 1.10 * backSlope50 + 0.5);
+  const hasGenuineFwdTail =
+    (fwdTailSig > 0.14 * coreMax && fwdSlope50 > 1.55 * backSlope50 + 2.0) ||
+    fwdSlope50 > 2.25 * backSlope50 + 3.0;
+  if (hasGenuineFwdTail) {
+    const minHalfDiam = opts?.plateMedianDiam ? 0.45 * opts.plateMedianDiam : 0;
+    usedFwd50 = Math.min(usedFwd50, pHi + Math.max(1.35 * backSlope50 + 1.5, minHalfDiam));
   }
-  if (fwdSlope64 > 1.12 * backSlope64 + 0.5) {
-    usedFwd64 = Math.min(usedFwd64, pHi + 1.10 * backSlope64 + 0.5);
+  const hasGenuineFwdTail64 =
+    (fwdTailSig > 0.14 * coreMax && fwdSlope64 > 1.55 * backSlope64 + 1.5) ||
+    fwdSlope64 > 2.25 * backSlope64 + 2.5;
+  if (hasGenuineFwdTail64) {
+    const minHalfDiam64 = opts?.plateMedianDiam ? 0.36 * opts.plateMedianDiam : 0;
+    usedFwd64 = Math.min(usedFwd64, pHi + Math.max(1.35 * backSlope64 + 1.2, minHalfDiam64));
   }
 
   let isTailing =
     fwdTailSig > 0.20 * coreMax ||
-    (fwdTailSig > 0.14 * coreMax && fwdSlope50 > 1.25 * backSlope50 + 2.5);
+    (fwdTailSig > 0.14 * coreMax && fwdSlope50 > 1.45 * backSlope50 + 2.5);
 
   // Trim 2 (heavy saturated comet tail where even pHi stretched forward):
   // Compare vertical span against the dot's 2D circular horizontal diameter (solvent elutes
-  // vertically and does not widen the origin deposit sideways!).
+  // vertically and does not widen the origin deposit sideways!), floored by the plate's clean
+  // circular dot diameter so wetted developed dots are never under-sized toward their bottom rim.
   let cappedByCircular = false;
   if (opts?.metrics && opts.laneWidthPx && opts.laneWidthPx > 0) {
     const sw = opts.metrics.spotWidth;
@@ -1264,12 +1276,15 @@ function refineOriginCoreDetailed(
     }
     if (maxSw >= 0.12) {
       const dHorizPx = maxSw * (0.76 * opts.laneWidthPx);
-      const diamFactor = maxSw >= 0.90 ? 1.18 : 1.08;
-      const expectedVert50 = diamFactor * dHorizPx;
+      const diamFactor = maxSw >= 0.85 ? 1.26 : 1.18;
+      const expectedVert50 = Math.max(
+        diamFactor * dHorizPx,
+        opts.plateMedianDiam ? 0.96 * opts.plateMedianDiam : 0
+      );
       if (
         dHorizPx >= 6 &&
         usedFwd50 - backEdge50 > 1.18 * expectedVert50 &&
-        (fwdTailSig > 0.16 * coreMax || usedFwd50 - backEdge50 > 1.45 * dHorizPx)
+        (fwdTailSig > 0.16 * coreMax || usedFwd50 - backEdge50 > 1.50 * expectedVert50)
       ) {
         usedFwd50 = Math.min(usedFwd50, backEdge50 + expectedVert50);
         usedFwd64 = Math.min(usedFwd64, backEdge64 + 0.92 * expectedVert50);
@@ -1547,10 +1562,27 @@ export function analyzeLaneBoundaryOccupancy(
   return out;
 }
 
-// Find spots in a lane profile using interior-clamped rolling percentile baseline, artifact guards, and prominence consolidation
+// Find spots in a lane: uses true 2D connected-region & intensity-guided watershed segmentation
+// whenever a 2D lane strip map is available (detectorMode !== '1d'), with a unified arPLS-baseline
+// 1D detector as clean fallback for pure-1D profiles or legacy comparison.
 export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const n = profile.length;
   if (n < 10) return [];
+  if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return [];
+
+  if (o.detectorMode !== '1d' && o.lane2d?.spotMap2d) {
+    return segmentLaneSpots2d(o.lane2d.spotMap2d, {
+      origin: o.origin,
+      front: o.front,
+      minProminence: o.minProminence,
+      minDistance: o.minDistance,
+      radius: o.radius,
+      plateHistogram: o.plateHistogram,
+      offPlate: o.lane2d.offPlate,
+      borderStraddle: o.lane2d.borderStraddle,
+    });
+  }
+
   const r = o.radius || 24;
   const span = Math.max(1, o.front - o.origin);
   const minProm = o.minProminence ?? 0.28;
@@ -1577,40 +1609,9 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     )
   );
 
-  // Restrict rolling baseline estimation strictly to chromatographic interior [origin + originBuffer, front]
-  // so dark outer plate borders (< origin or > front) do not drag the baseline down near Rf ~0.04 or Rf ~0.95.
-  const baseLo = Math.max(0, Math.round(o.origin + originBuffer));
-  const baseHi = Math.min(n - 1, Math.round(o.front));
-  const useRestrictedBase = baseHi - baseLo >= 16;
-
-  const step = 5;
-  // Scale rolling baseline half-window with span (~28% Rf, min 100 px) so a broad low-Rf doublet
-  // (~120-180 px tall on a 900 px high-res camera lane) never traps the 90th-percentile baseline
-  // inside dark spots and inverts/erases the lower spot.
-  const win = Math.max(100, Math.round(0.28 * span));
-  const base = new Array(n);
-  const q = o.sign < 0 ? 0.9 : 0.1;
-  const pts: [number, number][] = [];
-
-  const effStart = useRestrictedBase ? baseLo : 0;
-  const effEnd = useRestrictedBase ? baseHi : n - 1;
-
-  for (let i = 0; i < n; i += step) {
-    const cStart = Math.max(effStart, i - win);
-    const cEnd = Math.min(effEnd, i + win);
-    const sliceLo = cStart <= cEnd ? cStart : effStart;
-    const sliceHi = cStart <= cEnd ? cEnd : effEnd;
-    const chunk = sm1.slice(sliceLo, sliceHi + 1);
-    pts.push([i, chunk.length > 0 ? pctile(chunk, q) : sm1[Math.min(n - 1, Math.max(0, i))]]);
-  }
-  pts.push([n - 1, pts[pts.length - 1][1]]);
-
-  for (let j = 0, i = 0; i < n; i++) {
-    while (j < pts.length - 2 && pts[j + 1][0] < i) j++;
-    const [x0, y0] = pts[j];
-    const [x1, y1] = pts[j + 1];
-    base[i] = x1 === x0 ? y0 : y0 + ((y1 - y0) * (i - x0)) / (x1 - x0);
-  }
+  // Unified O(N) arPLS smooth baseline strictly inside chromatographic interior [origin, front]
+  const baseArr = computeArplsBaseline(sm1, o.sign, o.origin, o.front);
+  const base = Array.from(baseArr);
 
   // Raw baseline-subtracted signal (zero outside [origin - 2, front] so outer steps don't bleed in)
   const rawDiff = sm1.map((v, i) => {
@@ -1662,13 +1663,15 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   // - On bright-silica channels (UV254/White, sign < 0), require a human-visible contrast floor so
   //   camera compression / silica grain (2-5 units on a 240-green plate) never triggers phantom spots.
   // - On dark-background UV366 (sign > 0), keep sensitive down to ~2.0 units for faint fluorophores.
+  // Cap plate-wide bgSigma at 2.8 so 20 cm illumination vignette across 54 lanes never inflates the floor.
+  const localHistSigma = Math.min(h.bgSigma, 2.8);
   const histFloor =
     o.sign < 0
       ? h.sampleCount >= 8
-        ? Math.max(4.0, 3.2 * h.bgSigma, 0.034 * h.contrastSpan)
+        ? Math.max(4.5, 3.0 * localHistSigma, 0.032 * h.contrastSpan)
         : 5.5
       : h.sampleCount >= 8
-      ? Math.max(2.0, 2.8 * h.bgSigma, 0.016 * h.contrastSpan)
+      ? Math.max(2.2, 2.8 * localHistSigma, 0.016 * h.contrastSpan)
       : 4.5;
   const minAbsFloor = Math.max(histFloor, (o.sign < 0 ? 0.030 : 0.018) * dynSpan);
 
@@ -2159,14 +2162,68 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     }
   }
 
-  // 3. Final formatted spots sorted by position
+  // 3. Measure true 1D peak boundaries (valley-to-valley / 10%-height), areaPct, and confidence
   merged.sort((a, b) => a.pos - b.pos);
 
-  return merged.map((p) => ({
+  const bounds = merged.map((p, idx) => {
+    const prevPos = idx > 0 ? merged[idx - 1].pos : start;
+    const nextPos = idx < merged.length - 1 ? merged[idx + 1].pos : end;
+    const cut = Math.max(thr * 0.35, p.val * 0.10);
+
+    // Walk left until signal drops below 10% of peak or reaches the valley minimum to prev peak
+    let lb = p.pos;
+    let leftStop = prevPos;
+    if (idx > 0) {
+      let vMin = Infinity;
+      for (let k = prevPos; k <= p.pos; k++) {
+        if (d[k] < vMin) {
+          vMin = d[k];
+          leftStop = k;
+        }
+      }
+    }
+    while (lb > leftStop && d[lb] > cut) lb--;
+
+    let rb = p.pos;
+    let rightStop = nextPos;
+    if (idx < merged.length - 1) {
+      let vMin = Infinity;
+      for (let k = p.pos; k <= nextPos; k++) {
+        if (d[k] < vMin) {
+          vMin = d[k];
+          rightStop = k;
+        }
+      }
+    }
+    while (rb < rightStop && d[rb] > cut) rb++;
+
+    let area = 0;
+    for (let k = lb; k <= rb; k++) area += Math.max(0, rawDiff[k]);
+
+    const upperHalf = Math.max(1, rb - p.pos);
+    const lowerHalf = Math.max(1, p.pos - lb);
+    const tailing = +Math.max(upperHalf / lowerHalf, lowerHalf / upperHalf).toFixed(2);
+    const snr = p.val / Math.max(noise, 0.8);
+    const confidence = +Math.max(0.15, Math.min(0.98, (snr - 2.2) / 10)).toFixed(2);
+    return { lb, rb, area, tailing, confidence };
+  });
+
+  const totalArea = Math.max(
+    bounds.reduce((acc, b) => acc + b.area, 0),
+    1e-6
+  );
+
+  return merged.map((p, idx) => ({
     pos: p.pos,
     rf: Math.max(0, Math.min(1, +((p.pos - o.origin) / span).toFixed(3))),
     strength: Math.min(1, Math.max(0, +(p.val / dmax).toFixed(3))),
+    areaPct: Math.max(1, Math.min(100, Math.round((bounds[idx].area / totalArea) * 100))),
+    confidence: bounds[idx].confidence,
+    extentStart: bounds[idx].lb,
+    extentEnd: bounds[idx].rb,
+    tailing: bounds[idx].tailing,
     source: 'auto' as const,
+    detector: '1d' as const,
   }));
 }
 
@@ -2245,7 +2302,17 @@ export function mergeMultiChannelSpots(
           bestMatch.rf = sp.rf;
           if (sp.areaPct != null) bestMatch.areaPct = sp.areaPct;
           if (sp.rfRaw != null) bestMatch.rfRaw = sp.rfRaw;
+          if (sp.extentStart != null) bestMatch.extentStart = sp.extentStart;
+          if (sp.extentEnd != null) bestMatch.extentEnd = sp.extentEnd;
+          if (sp.widthFrac != null) bestMatch.widthFrac = sp.widthFrac;
+          if (sp.tailing != null) bestMatch.tailing = sp.tailing;
+          if (sp.detector != null) bestMatch.detector = sp.detector;
         }
+        // Multi-channel agreement confidence boost: seeing the exact same compound across
+        // UV254 + UV366 (or White) strongly increases detection certainty.
+        const c1 = bestMatch.confidence ?? 0.65;
+        const c2 = sp.confidence ?? 0.65;
+        bestMatch.confidence = +Math.min(0.99, 1 - (1 - c1) * (1 - c2) * 0.65).toFixed(2);
       }
     }
   }
@@ -2264,6 +2331,7 @@ export interface MultiChannelSpotsOptions {
   rfMergeTolerance?: number;
   histograms?: Partial<Record<TlcChannelKey, ProfileHistogramStats>>;
   lane2dByChannel?: Partial<Record<TlcChannelKey, Lane2dMetrics>>;
+  detectorMode?: '2d' | '1d';
 }
 
 /**
@@ -2281,6 +2349,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
     rfMergeTolerance = 0.035,
     histograms,
     lane2dByChannel,
+    detectorMode,
   } = options;
 
   const perChannel: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
@@ -2296,6 +2365,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
       minDistance,
       plateHistogram: histograms?.[ch],
       lane2d: lane2dByChannel?.[ch],
+      detectorMode,
     });
   }
 
@@ -2352,10 +2422,12 @@ export function getLaneMultiChannelSpots(
     rfMergeTolerance: options.rfMergeTolerance,
     histograms,
     lane2dByChannel,
+    detectorMode: set.spotDetectorMode,
   });
 }
 
-// Complete 1D Densitometry extraction: returns profile curve, rolling baseline, baseline-subtracted signal & spots
+// Complete 1D Densitometry extraction: shares the EXACT arPLS baseline and segmented spot
+// boundaries as findSpots() so plotted curves, baselines, and integrated areas always agree.
 export function extractDensitogram(
   profile: number[],
   o: TlcProfileOptions
@@ -2372,27 +2444,18 @@ export function extractDensitogram(
     };
   }
 
-  const sm = movingAvg(profile, 7);
-  const step = 5;
-  const win = 100;
-  const base = new Array(n);
-  const q = o.sign < 0 ? 0.9 : 0.1;
-  const pts: [number, number][] = [];
-
-  for (let i = 0; i < n; i += step) {
-    const chunk = sm.slice(Math.max(0, i - win), Math.min(n, i + win + 1));
-    pts.push([i, pctile(chunk, q)]);
-  }
-  pts.push([n - 1, pts[pts.length - 1][1]]);
-
-  for (let j = 0, i = 0; i < n; i++) {
-    while (j < pts.length - 2 && pts[j + 1][0] < i) j++;
-    const [x0, y0] = pts[j];
-    const [x1, y1] = pts[j + 1];
-    base[i] = x1 === x0 ? y0 : y0 + ((y1 - y0) * (i - x0)) / (x1 - x0);
-  }
-
   const span = Math.max(1, o.front - o.origin);
+  const chromLo = Math.max(0, Math.round(o.origin));
+  const chromHi = Math.min(n - 1, Math.round(o.front));
+  const useChromClamp = chromHi - chromLo >= 20;
+  const boundedProf = useChromClamp
+    ? profile.map((v, i) => (i < chromLo ? profile[chromLo] : i > chromHi ? profile[chromHi] : v))
+    : profile;
+
+  const smWin = span < 450 ? 5 : 7;
+  const sm = movingAvg(boundedProf, smWin);
+  const base = computeArplsBaseline(sm, o.sign, o.origin, o.front);
+
   const spots = findSpots(profile, o);
 
   const points: TlcDensitogramData['points'] = [];
@@ -2403,11 +2466,14 @@ export function extractDensitogram(
     const rawVal = profile[i];
     const smoothVal = sm[i];
     const baseVal = base[i];
-    const sig = Math.max(0, o.sign < 0 ? baseVal - smoothVal : smoothVal - baseVal);
+    const sig =
+      useChromClamp && (i < chromLo - 1 || i > chromHi)
+        ? 0
+        : Math.max(0, o.sign < 0 ? baseVal - smoothVal : smoothVal - baseVal);
     const rf = (i - o.origin) / span;
 
     if (sig > maxSignal) maxSignal = sig;
-    if (i >= o.origin && i <= o.front) {
+    if (i >= chromLo && i <= chromHi) {
       totalArea += sig;
     }
 
@@ -2421,18 +2487,58 @@ export function extractDensitogram(
     });
   }
 
-  // Calculate area percentage for each spot with bounded chromatographic integration windows
+  // Integrate area percentage over each spot's real segmented boundaries [extentStart, extentEnd]
+  // (never capped at an arbitrary +/-15 px window), clipped cleanly at adjacent valleys.
   if (totalArea > 0 && spots.length > 0) {
     spots.forEach((sp, idx) => {
-      const prevPos = idx > 0 ? spots[idx - 1].pos : o.origin;
-      const nextPos = idx < spots.length - 1 ? spots[idx + 1].pos : o.front;
-      const leftBound = Math.max(0, Math.floor((sp.pos + prevPos) / 2), sp.pos - 15);
-      const rightBound = Math.min(n - 1, Math.ceil((sp.pos + nextPos) / 2), sp.pos + 15);
-      let peakArea = 0;
-      for (let k = leftBound; k <= rightBound; k++) {
-        peakArea += points[k]?.signal || 0;
+      const prevPos = idx > 0 ? spots[idx - 1].pos : chromLo;
+      const nextPos = idx < spots.length - 1 ? spots[idx + 1].pos : chromHi;
+
+      // Valley minimum between neighboring peaks prevents double-counting overlapping tails
+      let leftValley = chromLo;
+      if (idx > 0) {
+        let vMin = Infinity;
+        for (let k = Math.max(0, prevPos); k <= Math.min(n - 1, sp.pos); k++) {
+          const sv = points[k]?.signal ?? 0;
+          if (sv < vMin) {
+            vMin = sv;
+            leftValley = k;
+          }
+        }
       }
-      sp.areaPct = Math.min(100, Math.round((peakArea / totalArea) * 100));
+      let rightValley = chromHi;
+      if (idx < spots.length - 1) {
+        let vMin = Infinity;
+        for (let k = Math.max(0, sp.pos); k <= Math.min(n - 1, nextPos); k++) {
+          const sv = points[k]?.signal ?? 0;
+          if (sv < vMin) {
+            vMin = sv;
+            rightValley = k;
+          }
+        }
+      }
+
+      const leftBound = Math.max(
+        chromLo,
+        leftValley,
+        sp.extentStart != null ? Math.min(sp.pos, sp.extentStart) : leftValley
+      );
+      const rightBound = Math.min(
+        chromHi,
+        rightValley,
+        sp.extentEnd != null ? Math.max(sp.pos, sp.extentEnd) : rightValley
+      );
+      sp.extentStart = leftBound;
+      sp.extentEnd = rightBound;
+
+      // Keep 2D integrated areaPct if already computed by 2D segmentation; otherwise integrate 1D curve
+      if (sp.detector !== '2d' || sp.areaPct == null) {
+        let peakArea = 0;
+        for (let k = leftBound; k <= rightBound; k++) {
+          peakArea += points[k]?.signal || 0;
+        }
+        sp.areaPct = Math.max(1, Math.min(100, Math.round((peakArea / totalArea) * 100)));
+      }
     });
   }
 
@@ -2889,6 +2995,7 @@ export function tlcFront(
 
     let bestFlat: FrontDetectionResult = { pos: 0, score: 0 };
     let bestSeam: CurvedFrontSeamResult = { medianPos: 0, byLane: {}, score: 0, isCurved: false };
+    const suppressedPencilPositions: number[] = [];
 
     // Strips of bare silica between the lanes carry no spots or smears, so a front or meniscus
     // is far cleaner there than down the lanes; sample them first at their exact midpoint
@@ -3017,15 +3124,55 @@ export function tlcFront(
       // Uses 2D horizontal-continuity strip metrics, outer dry-side band edges, White-light pencil
       // suppression, and a penalized smoothing spline across exact lane/gutter coordinates so wavy
       // fronts, edge-curled aluminium plates, bows, and tilts are tracked per lane.
+      const minFrontGap = Math.max(18, Math.round(lane.length * 0.035));
+      const shouldPreferSeam = (cand: CurvedFrontSeamResult, cur: CurvedFrontSeamResult): boolean => {
+        if (cand.medianPos <= 0) return false;
+        if (cur.medianPos <= 0) return true;
+        // A genuine sustained band/step-backed solvent front always outranks a ridge-only thin line
+        // (such as a residual pencil mark or scratch) regardless of darkness.
+        if (cand.bandOrStepBacked && !cur.bandOrStepBacked && cand.score >= 3.8) {
+          return true;
+        }
+        if (cur.bandOrStepBacked && !cand.bandOrStepBacked && cur.score >= 3.8) {
+          return false;
+        }
+        // Chromatography physics: a confirmed continuous band/step-backed outer front (e.g. very light
+        // UV254 front) physically outranks an inner bright high-Rf compound spot band (e.g. UV366 spots).
+        if (cand.medianPos > cur.medianPos + minFrontGap && cand.bandOrStepBacked && cand.score >= 3.8) {
+          return true;
+        }
+        if (cur.medianPos > cand.medianPos + minFrontGap && cur.bandOrStepBacked && cur.score >= 3.8) {
+          return false;
+        }
+        return cand.score > cur.score;
+      };
       if (seamInputs.length > 0 && halfLaneIds.length >= 4) {
         const fused = detectCurvedFrontSeam(seamInputs, halfLaneIds, lane.length, seamOpts);
-        if (fused.medianPos > 0 && fused.score > bestSeam.score) {
+        if (fused.suppressedPencilPositions?.length) {
+          suppressedPencilPositions.push(...fused.suppressedPencilPositions);
+        }
+        if (shouldPreferSeam(fused, bestSeam)) {
           bestSeam = fused;
         }
         if (seamInputs.length > 1) {
+          const hasUvInSet = seamInputs.some(
+            (s) => s.channel === 'UV254' || s.channel === 'UV366'
+          );
+          const singleOpts: CurvedFrontSeamOptions = {
+            ...(seamOpts ?? {}),
+            referenceChannels: seamInputs,
+          };
           for (const single of seamInputs) {
-            const singleRes = detectCurvedFrontSeam([single], halfLaneIds, lane.length, seamOpts);
-            if (singleRes.medianPos > 0 && singleRes.score > bestSeam.score) {
+            const singleRes = detectCurvedFrontSeam([single], halfLaneIds, lane.length, singleOpts);
+            if (singleRes.suppressedPencilPositions?.length) {
+              suppressedPencilPositions.push(...singleRes.suppressedPencilPositions);
+            }
+            // When UV channels are loaded, never let a White-only ridge-only hit (typically graphite
+            // pencil lines or plate marks) override a UV-backed seam.
+            if (hasUvInSet && single.channel === 'White' && !singleRes.bandOrStepBacked) {
+              continue;
+            }
+            if (shouldPreferSeam(singleRes, bestSeam)) {
               bestSeam = singleRes;
             }
           }
@@ -3038,15 +3185,31 @@ export function tlcFront(
       if (gutterStrongEnough || (bestFlat.pos > 0 && !saw2dMetrics)) break;
     }
 
+    // Never allow the legacy 1D flat median fallback to resurrect a confirmed straight graphite pencil line
+    if (bestFlat.pos > 0 && suppressedPencilPositions.length > 0) {
+      const pencilMatchTol = Math.max(18, Math.round(lane.length * 0.025));
+      if (suppressedPencilPositions.some((pp) => Math.abs(bestFlat.pos - pp) <= pencilMatchTol)) {
+        bestFlat = { pos: 0, score: 0 };
+      }
+    }
+
     // Prefer curved/outer-edge 2D seam whenever it finds a strong, continuous front (2D seam handles
     // wavy fronts, outer dry-side band edges, and pencil-line suppression far better than 1D flat median).
     const flatScoreCapped = Math.min(16, bestFlat.score);
     const sameFrontAsFlat =
       bestFlat.pos > 0 &&
       Math.abs(bestSeam.medianPos - bestFlat.pos) <= Math.max(35, lane.length * 0.06);
+    const outerSeamBeatsInnerFlat =
+      bestSeam.medianPos > 0 &&
+      bestSeam.bandOrStepBacked &&
+      bestSeam.score >= 3.8 &&
+      bestFlat.pos > 0 &&
+      bestSeam.medianPos > bestFlat.pos + Math.max(18, Math.round(lane.length * 0.035));
     const useSeam =
       bestSeam.medianPos > 0 &&
       (bestFlat.pos <= 0 ||
+        outerSeamBeatsInnerFlat ||
+        (bestSeam.bandOrStepBacked && bestSeam.score >= 3.8) ||
         bestSeam.score >= 8.0 ||
         (bestSeam.isCurved && sameFrontAsFlat && bestSeam.score >= 4.5) ||
         (bestSeam.isCurved && bestSeam.score >= Math.max(4.5, flatScoreCapped * 0.72)) ||
@@ -3776,19 +3939,31 @@ export function detectChannelOrigin(
           if (entry.pos > 0) {
             let finalPos = entry.pos;
             let flaggedTail = entry.isTailing;
-            // Smear-proof upward-tailing guard: if a polar compound rooted at refLine tails forward
-            // and drags the detected peak well ahead of the smooth plate backbone, snap back to refLine.
+            // Smear-proof upward-tailing & rim-drift guard:
+            // 1. If a polar compound rooted at refLine tails forward and drags the detected peak
+            //    ahead of the smooth plate backbone, snap back to refLine.
+            // 2. If a lane slipped behind refLine onto the back rim while refLine itself sits inside
+            //    the strong dot core, snap back to refLine.
             if (finalPos > refLine + smearTol) {
               const prof = profileById.get(entry.laneId);
               if (prof && prof.length > refLine + smFlankOut + 1 && refLine - smFlankOut >= 0) {
                 const mBelow = windowMedian(prof, refLine - smFlankOut, refLine - smFlankIn, smBuf);
                 const mAbove = windowMedian(prof, refLine + smFlankIn, refLine + smFlankOut, smBuf);
                 const sigAtRef = sign * (prof[refLine] - mBelow);
-                // Positive upwardTail means the region ahead of refLine is stained/quenched relative to behind
                 const upwardTail = sign * (mAbove - mBelow);
                 if (upwardTail > Math.max(4.0, 0.14 * medFeat) && sigAtRef > Math.max(8.0, 0.25 * medFeat)) {
                   finalPos = refLine;
                   flaggedTail = true;
+                }
+              }
+            } else if (finalPos < refLine - smearTol) {
+              const prof = profileById.get(entry.laneId);
+              if (prof && prof.length > refLine + smFlankOut + 1 && refLine - smFlankOut >= 0) {
+                const mBelow = windowMedian(prof, Math.max(0, refLine - smFlankOut), Math.max(0, refLine - smFlankIn), smBuf);
+                const sigAtRef = sign * (prof[refLine] - mBelow);
+                const sigAtFinal = sign * (prof[finalPos] - mBelow);
+                if (sigAtRef > Math.max(10.0, 0.35 * medFeat) && sigAtRef >= sigAtFinal * 0.92) {
+                  finalPos = refLine;
                 }
               }
             }
@@ -4142,7 +4317,7 @@ function solveMultiChannelHalfOrigin(
           entry.profile,
           sec.sign,
           refPos,
-          localRadius,
+          isLocked ? Math.min(localRadius, Math.max(6, Math.round(laneLen * 0.008))) : localRadius,
           secFeatFloor,
           6.5,
           secBiFloor,
@@ -4151,7 +4326,16 @@ function solveMultiChannelHalfOrigin(
             laneWidthPx: l.width,
           }
         );
-        if (near.pos > 0 && (!isLocked || !near.isTailing)) {
+        // When a lane is already locked on the primary channel (just tailing), only allow a
+        // secondary channel to refine it within tight agreement (never let a UV366 halo/rim jump
+        // the baseline below or ahead of the primary dark origin dot).
+        const maxUpgradeShift = Math.max(5, Math.round(laneLen * 0.007));
+        const withinLockedUpgrade =
+          !isLocked ||
+          (!near.isTailing &&
+            Math.abs(near.pos - refPos) <= maxUpgradeShift &&
+            near.pos <= refPos + 3);
+        if (near.pos > 0 && withinLockedUpgrade) {
           fusedByLane[l.id] = near.pos;
           locked.add(l.id);
           if (!near.isTailing) tailingSet.delete(l.id);

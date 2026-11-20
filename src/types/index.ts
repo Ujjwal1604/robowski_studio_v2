@@ -349,6 +349,18 @@ export interface TlcSpot {
   edgeOffset?: number; // additive Rf shift used for the correction
   source?: 'auto' | 'adjusted' | 'manual';
   channels?: ('UV254' | 'UV366' | 'White')[];
+  /** Detection confidence score in [0..1] based on SNR, lateral centering, band specificity, and channel agreement */
+  confidence?: number;
+  /** Segmented lower (origin-side) boundary in lane pixels */
+  extentStart?: number;
+  /** Segmented upper (front-side) boundary in lane pixels */
+  extentEnd?: number;
+  /** 2D horizontal spot width fraction relative to lane width (0..1) */
+  widthFrac?: number;
+  /** Chromatographic asymmetry / tailing factor (~1.0 symmetric, >1.5 tailing/fronting) */
+  tailing?: number;
+  /** Which spot detector produced this spot ('2d' watershed segmentation or '1d' legacy fallback) */
+  detector?: '2d' | '1d';
 }
 
 export interface ProfileHistogramStats {
@@ -361,6 +373,23 @@ export interface ProfileHistogramStats {
   otsuThresh: number;
   otsuEta: number;
   sampleCount: number;
+}
+
+export interface LaneSpotMap2d {
+  /** Working grid width (downsampled to <= 32 px for fast 2D segmentation) */
+  w: number;
+  /** Working grid height (downsampled to <= 512 px; row 0 = origin end, row h-1 = front end) */
+  h: number;
+  /** Original lane pixel length L (origPos = row * (L - 1) / (h - 1)) */
+  origLen: number;
+  /** Channel-calibrated 2D spot intensity above clean silica (length = w * h, ~0..255 scale) */
+  map: Float32Array;
+  /** Row-gutter-suppressed 2D intensity (cancels full-width horizontal solvent-front bands & pencil lines) */
+  localMap: Float32Array;
+  /** Robust 2D background pixel noise estimate */
+  bgSigma: number;
+  /** Channel identity for physics-aware thresholds */
+  channel: 'UV254' | 'UV366' | 'White';
 }
 
 export interface Lane2dMetrics {
@@ -384,6 +413,8 @@ export interface Lane2dMetrics {
   flankProfile?: Float32Array;
   /** Optional signed lateral centerline offset in lane-width pixels (length = L, index 0 = bottom/origin) when curved-lane automiddle tracking is active */
   automiddleOffsets?: Float32Array;
+  /** Compact 2D channel-calibrated spot-likelihood map for true 2D connected-region & watershed spot segmentation */
+  spotMap2d?: LaneSpotMap2d;
 }
 
 export interface TlcProfileOptions {
@@ -396,6 +427,8 @@ export interface TlcProfileOptions {
   plateHistogram?: ProfileHistogramStats;
   /** Optional 2D lateral lane strip metrics for neighbor-spillover & horizontal-band artifact rejection */
   lane2d?: Lane2dMetrics;
+  /** Spot detection engine: '2d' (default when spotMap2d is available) or '1d' (legacy fallback) */
+  detectorMode?: '2d' | '1d';
 }
 
 export interface TlcDensitogramPoint {
@@ -476,6 +509,8 @@ export interface TlcPlateData {
   edgePicks?: EdgePick[];
   edgeSettings?: Record<number, EdgeSetting>;
   spotProminence?: number;
+  /** Spot detection mode ('2d' watershed segmentation default, or '1d' legacy fallback for A/B comparison) */
+  spotDetectorMode?: '2d' | '1d';
 }
 
 export interface TlcSet extends TlcPlateData {

@@ -5,6 +5,7 @@
 // and automated peak finding + separation metrics.
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
+import { getSpotConfidenceStyle } from '../../utils/spotConfidence';
 import {
   LANE_FRAME_WIDTH,
   tlcLane,
@@ -316,16 +317,25 @@ function drawLanePanels(
     ctx.lineTo(x + w, y);
     ctx.stroke();
 
-    // Ticks at spots with provenance coloring
+    // Ticks at spots with provenance & continuous multi-level confidence coloring
     if (showSpots && p.spots && p.spots.length) {
       for (const sp of p.spots) {
         const y = top + k * (l.length - sp.pos);
-        ctx.strokeStyle = sp.source === 'manual' ? '#f59e0b' : sp.source === 'adjusted' ? '#a855f7' : '#FF4D8D';
-        ctx.lineWidth = 1.8;
+        const isAuto = !sp.source || sp.source === 'auto';
+        const confStyle = getSpotConfidenceStyle(sp.confidence);
+        ctx.strokeStyle =
+          sp.source === 'manual'
+            ? '#f59e0b'
+            : sp.source === 'adjusted'
+            ? '#a855f7'
+            : confStyle.color;
+        ctx.lineWidth = 2.0;
+        ctx.setLineDash(isAuto && confStyle.needsReview ? [2, 2] : []);
         ctx.beginPath();
         ctx.moveTo(x + w - 8, y);
         ctx.lineTo(x + w, y);
         ctx.stroke();
+        ctx.setLineDash([]);
       }
     }
 
@@ -1411,6 +1421,7 @@ export const TlcView: React.FC = () => {
           minProminence: spotProminence,
           plateHistogram,
           lane2d,
+          detectorMode: set.spotDetectorMode,
         },
       };
     },
@@ -1425,7 +1436,7 @@ export const TlcView: React.FC = () => {
       const emptyMap = new Map<number, TlcSpot[]>();
       if (!run?.rows?.length || !set.cfg?.lanes?.length || !set.imgs?.[key]?.bmp) return emptyMap;
       const cacheId = `${set.uid}:p${plate}:${key}`;
-      const sig = `${spotProminence}|${coreFraction}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${JSON.stringify(set.frontHalfPx || '')}|${set.originPx ?? ''}`;
+      const sig = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${JSON.stringify(set.frontHalfPx || '')}|${set.originPx ?? ''}`;
       const hit = coherenceCache.current.get(cacheId);
       if (hit && hit.key === sig) return hit.map;
 
@@ -1460,6 +1471,7 @@ export const TlcView: React.FC = () => {
           minProminence: spotProminence,
           plateHistogram,
           lane2d,
+          detectorMode: set.spotDetectorMode,
         });
         const relaxedCandidates =
           relaxedProm < spotProminence - 0.02
@@ -1471,6 +1483,7 @@ export const TlcView: React.FC = () => {
                 minProminence: relaxedProm,
                 plateHistogram,
                 lane2d,
+                detectorMode: set.spotDetectorMode,
               })
             : [];
         inputs.push({
@@ -1495,7 +1508,7 @@ export const TlcView: React.FC = () => {
     (set: TlcSet): (EdgeFit | null)[] => {
       const picks = set.edgePicks || [];
       const cacheMapKey = `${set.uid}:p${plate}`;
-      const key = `${spotProminence}|${coreFraction}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
+      const key = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
       const hit = edgeCache.current.get(cacheMapKey);
       if (hit && hit.key === key) return hit.fits;
       const loadedChs = getLoadedTlcChannels(set.imgs, false);
@@ -1532,6 +1545,7 @@ export const TlcView: React.FC = () => {
               minProminence: spotProminence,
               histograms,
               lane2dByChannel,
+              detectorMode: set.spotDetectorMode,
             });
           }
           for (const sp of laneSpots) {
@@ -1677,6 +1691,7 @@ export const TlcView: React.FC = () => {
         minProminence: spotProminence,
         histograms,
         lane2dByChannel,
+        detectorMode: set.spotDetectorMode,
       });
       // Include cross-lane shared-reagent rescued spots from any loaded channel
       const rescuedByCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
@@ -1908,6 +1923,7 @@ export const TlcView: React.FC = () => {
               minDistance,
               plateHistogram: getChannelHistogram(s, k, getDensProf),
               lane2d: getLane2dMetrics(s, k, l, coreFraction),
+              detectorMode: s.spotDetectorMode,
             });
             const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
             const corrSpots = isCorr ? correctSpots(baseSpots, gain, offset) : baseSpots;
@@ -3716,6 +3732,55 @@ export const TlcView: React.FC = () => {
                   {Math.round(spotProminence * 100)}%
                 </span>
               </div>
+
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '2px',
+                  paddingLeft: '6px',
+                  borderLeft: '1px solid var(--line)',
+                  marginLeft: '2px',
+                }}
+              >
+                {(['2d', '1d'] as const).map((mode) => {
+                  const isActive = (activePlateSet.spotDetectorMode ?? '2d') === mode;
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => {
+                        const uid = currentSet.uid;
+                        setSets((prev) =>
+                          prev.map((s) =>
+                            s.uid === uid
+                              ? updateTlcPlateSlice(s, plate, { spotDetectorMode: mode })
+                              : s
+                          )
+                        );
+                      }}
+                      style={{
+                        border: 'none',
+                        background: isActive ? 'var(--bg)' : 'transparent',
+                        color: isActive ? 'var(--pri)' : 'var(--mut)',
+                        fontSize: '10px',
+                        fontWeight: isActive ? 700 : 500,
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        boxShadow: isActive ? '0 1px 2px rgba(0,0,0,0.08)' : 'none',
+                      }}
+                      title={
+                        mode === '2d'
+                          ? '2D Region & Watershed Segmentation (default) — segments real 2D spot boundaries and suppresses solvent-front bands'
+                          : 'Legacy 1D Profile Peak Detector — fallback for A/B comparison'
+                      }
+                    >
+                      {mode === '2d' ? '2D Seg' : '1D Legacy'}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -4906,7 +4971,7 @@ export const TlcView: React.FC = () => {
                       >
                         {hoverSpot
                           ? (hoverSpot.strength > 0
-                              ? `Peak Apex: Rf ${hoverSpot.rf.toFixed(2)}${hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005 ? ` (${hoverSpot.rfRaw.toFixed(2)} raw)` : ''} (${hoverSpot.strength > 0.5 ? 'strong' : hoverSpot.strength > 0.2 ? 'medium' : 'weak'}, ${hoverSpot.areaPct || 0}% area)`
+                              ? `Peak Apex: Rf ${hoverSpot.rf.toFixed(2)}${hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005 ? ` (${hoverSpot.rfRaw.toFixed(2)} raw)` : ''} (${hoverSpot.strength > 0.5 ? 'strong' : hoverSpot.strength > 0.2 ? 'medium' : 'weak'}, ${hoverSpot.areaPct || 0}% area${typeof hoverSpot.confidence === 'number' ? `, ${Math.round(hoverSpot.confidence * 100)}% conf` : ''}${typeof hoverSpot.tailing === 'number' && hoverSpot.tailing > 1.6 ? `, tail ${hoverSpot.tailing.toFixed(1)}×` : ''})`
                               : `Rf: ${hoverSpot.rf.toFixed(2)}${hoverSpot.rfRaw != null && Math.abs(hoverSpot.rf - hoverSpot.rfRaw) >= 0.005 ? ` (${hoverSpot.rfRaw.toFixed(2)} raw)` : ''}`)
                           : `Rf: ${hoverRf.toFixed(2)}`}
                       </span>
@@ -5045,13 +5110,14 @@ export const TlcView: React.FC = () => {
                             const y = ph - sp.pos;
                             const isHovered = hoveredModalSpotIdx === idx;
                             const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                            const confStyle = getSpotConfidenceStyle(sp.confidence);
                             const spotColor = isDragged
                               ? '#facc15'
                               : sp.source === 'manual'
                               ? '#f59e0b'
                               : sp.source === 'adjusted'
                               ? '#a855f7'
-                              : '#38bdf8';
+                              : confStyle.color;
 
                             return (
                               <div
@@ -5117,7 +5183,7 @@ export const TlcView: React.FC = () => {
                                       handleDeleteSpotInModal(idx);
                                     }
                                   }}
-                                  title={`Spot #${idx + 1} (${sp.source || 'auto'}): Rf ${sp.rf.toFixed(2)}\n• Drag vertically to slide Rf\n• Alt+Click to remove spot`}
+                                  title={`Spot #${idx + 1} (${sp.source || 'auto'}${(!sp.source || sp.source === 'auto') && typeof sp.confidence === 'number' ? `, ${confStyle.pct}% ${confStyle.label}` : ''}): Rf ${sp.rf.toFixed(2)}\n• Drag vertically to slide Rf\n• Alt+Click to remove spot`}
                                   style={{
                                     position: 'absolute',
                                     left: '50%',
@@ -5128,7 +5194,7 @@ export const TlcView: React.FC = () => {
                                     padding: '0 5px',
                                     borderRadius: '8px',
                                     background: isDragged ? '#facc15' : isHovered ? '#ffffff' : spotColor,
-                                    color: isDragged || isHovered || sp.source === 'manual' ? '#000000' : '#ffffff',
+                                    color: isDragged || isHovered || sp.source === 'manual' || ((!sp.source || sp.source === 'auto') && confStyle.value >= 0.45 && confStyle.value < 0.72) ? '#000000' : '#ffffff',
                                     boxShadow: '0 2px 6px rgba(0,0,0,0.8), 0 0 0 1px rgba(0,0,0,0.4)',
                                     cursor: 'ns-resize',
                                     display: 'flex',
@@ -5163,6 +5229,9 @@ export const TlcView: React.FC = () => {
                                   }}
                                 >
                                   #{idx + 1} Rf {sp.rf.toFixed(2)}
+                                  {(!sp.source || sp.source === 'auto') && typeof sp.confidence === 'number'
+                                    ? ` · ${confStyle.pct}%`
+                                    : ''}
                                 </div>
                               </div>
                             );
@@ -5407,6 +5476,28 @@ export const TlcView: React.FC = () => {
                                     .join(' ');
                                   return (
                                     <g key="uv254">
+                                      {/* Shaded real segmented spot boundaries under the UV254 curve */}
+                                      {d.spots.map((sp, idx) => {
+                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
+                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
+                                        if (hi <= lo) return null;
+                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
+                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
+                                          const pt = pts[pIdx];
+                                          if (!pt) continue;
+                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
+                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
+                                        }
+                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
+                                        return (
+                                          <path
+                                            key={`fill254-${idx}`}
+                                            d={segPts.join(' ')}
+                                            fill="rgba(16, 185, 129, 0.18)"
+                                            stroke="none"
+                                          />
+                                        );
+                                      })}
                                       <path d={dStr} fill="none" stroke="#10b981" strokeWidth="2" />
                                       {/* Detected Peak Apex Dots with Provenance Styling */}
                                       {d.spots.map((sp, idx) => {
@@ -5414,13 +5505,16 @@ export const TlcView: React.FC = () => {
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const isAuto = !sp.source || sp.source === 'auto';
+                                        const confStyle = getSpotConfidenceStyle(sp.confidence);
+                                        const isLowConf = isAuto && confStyle.needsReview;
                                         const spotColor = isDragged
                                           ? '#facc15'
                                           : sp.source === 'manual'
                                           ? '#f59e0b'
                                           : sp.source === 'adjusted'
                                           ? '#a855f7'
-                                          : '#34d399';
+                                          : confStyle.color;
                                         return (
                                           <g key={idx}>
                                             <circle
@@ -5430,6 +5524,7 @@ export const TlcView: React.FC = () => {
                                               fill={spotColor}
                                               stroke="#ffffff"
                                               strokeWidth={isDragged ? '2' : '1'}
+                                              strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
                                             />
                                             <text
                                               x={Math.min(270, x + 6)}
@@ -5440,7 +5535,7 @@ export const TlcView: React.FC = () => {
                                               fontFamily="monospace"
                                             >
                                               {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
                                             </text>
                                           </g>
                                         );
@@ -5466,6 +5561,27 @@ export const TlcView: React.FC = () => {
                                     .join(' ');
                                   return (
                                     <g key="uv366">
+                                      {d.spots.map((sp, idx) => {
+                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
+                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
+                                        if (hi <= lo) return null;
+                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
+                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
+                                          const pt = pts[pIdx];
+                                          if (!pt) continue;
+                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
+                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
+                                        }
+                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
+                                        return (
+                                          <path
+                                            key={`fill366-${idx}`}
+                                            d={segPts.join(' ')}
+                                            fill="rgba(168, 85, 247, 0.18)"
+                                            stroke="none"
+                                          />
+                                        );
+                                      })}
                                       <path d={dStr} fill="none" stroke="#a855f7" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '4,2' : undefined} />
                                       {/* Detected Peak Apex Dots with Provenance Styling */}
                                       {d.spots.map((sp, idx) => {
@@ -5473,13 +5589,16 @@ export const TlcView: React.FC = () => {
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const isAuto = !sp.source || sp.source === 'auto';
+                                        const confStyle = getSpotConfidenceStyle(sp.confidence);
+                                        const isLowConf = isAuto && confStyle.needsReview;
                                         const spotColor = isDragged
                                           ? '#facc15'
                                           : sp.source === 'manual'
                                           ? '#f59e0b'
                                           : sp.source === 'adjusted'
                                           ? '#c084fc'
-                                          : '#a855f7';
+                                          : confStyle.color;
                                         return (
                                           <g key={idx}>
                                             <circle
@@ -5489,6 +5608,7 @@ export const TlcView: React.FC = () => {
                                               fill={spotColor}
                                               stroke="#ffffff"
                                               strokeWidth={isDragged ? '2' : '1'}
+                                              strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
                                             />
                                             <text
                                               x={Math.min(270, x + 6)}
@@ -5499,7 +5619,7 @@ export const TlcView: React.FC = () => {
                                               fontFamily="monospace"
                                             >
                                               {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
                                             </text>
                                           </g>
                                         );
@@ -5525,19 +5645,43 @@ export const TlcView: React.FC = () => {
                                     .join(' ');
                                   return (
                                     <g key="white">
+                                      {d.spots.map((sp, idx) => {
+                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
+                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
+                                        if (hi <= lo) return null;
+                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
+                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
+                                          const pt = pts[pIdx];
+                                          if (!pt) continue;
+                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
+                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
+                                        }
+                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
+                                        return (
+                                          <path
+                                            key={`fillWhite-${idx}`}
+                                            d={segPts.join(' ')}
+                                            fill="rgba(245, 158, 11, 0.18)"
+                                            stroke="none"
+                                          />
+                                        );
+                                      })}
                                       <path d={dStr} fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '2,2' : undefined} />
                                       {d.spots.map((sp, idx) => {
                                         const y = ph - sp.pos;
                                         const pt = pts[sp.pos];
                                         const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
                                         const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const isAuto = !sp.source || sp.source === 'auto';
+                                        const confStyle = getSpotConfidenceStyle(sp.confidence);
+                                        const isLowConf = isAuto && confStyle.needsReview;
                                         const spotColor = isDragged
                                           ? '#facc15'
                                           : sp.source === 'manual'
                                           ? '#f59e0b'
                                           : sp.source === 'adjusted'
                                           ? '#a855f7'
-                                          : '#fbbf24';
+                                          : confStyle.color;
                                         return (
                                           <g key={idx}>
                                             <circle
@@ -5547,6 +5691,7 @@ export const TlcView: React.FC = () => {
                                               fill={spotColor}
                                               stroke="#ffffff"
                                               strokeWidth={isDragged ? '2' : '1'}
+                                              strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
                                             />
                                             <text
                                               x={Math.min(270, x + 6)}
@@ -5557,7 +5702,7 @@ export const TlcView: React.FC = () => {
                                               fontFamily="monospace"
                                             >
                                               {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}
+                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
                                             </text>
                                           </g>
                                         );
@@ -6105,6 +6250,8 @@ export const TlcView: React.FC = () => {
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                           {modalActiveSpots.map((sp, idx) => {
                             const isSelected = hoveredModalSpotIdx === idx || (isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx);
+                            const isAuto = !sp.source || sp.source === 'auto';
+                            const confStyle = getSpotConfidenceStyle(sp.confidence);
                             const cardBg = sp.source === 'manual'
                               ? 'rgba(245, 158, 11, 0.08)'
                               : sp.source === 'adjusted'
@@ -6116,7 +6263,7 @@ export const TlcView: React.FC = () => {
                               ? '#f59e0b'
                               : sp.source === 'adjusted'
                               ? '#a855f7'
-                              : 'rgba(255, 255, 255, 0.12)';
+                              : confStyle.border;
 
                             return (
                               <div
@@ -6143,8 +6290,8 @@ export const TlcView: React.FC = () => {
                                     style={{
                                       fontWeight: 800,
                                       fontSize: '11px',
-                                      color: '#ffffff',
-                                      background: sp.source === 'manual' ? '#b45309' : sp.source === 'adjusted' ? '#7e22ce' : '#0284c7',
+                                      color: isAuto && confStyle.value >= 0.45 && confStyle.value < 0.72 ? '#0f172a' : '#ffffff',
+                                      background: sp.source === 'manual' ? '#b45309' : sp.source === 'adjusted' ? '#7e22ce' : confStyle.color,
                                       borderRadius: '4px',
                                       padding: '2px 6px',
                                     }}
@@ -6156,7 +6303,7 @@ export const TlcView: React.FC = () => {
                                     style={{
                                       fontWeight: 700,
                                       fontSize: '13px',
-                                      color: sp.source === 'manual' ? '#fbbf24' : sp.source === 'adjusted' ? '#d8b4fe' : '#38bdf8',
+                                      color: sp.source === 'manual' ? '#fbbf24' : sp.source === 'adjusted' ? '#d8b4fe' : confStyle.text,
                                     }}
                                   >
                                     Rf {sp.rf.toFixed(2)}
@@ -6172,9 +6319,26 @@ export const TlcView: React.FC = () => {
                                       ✨ Adjusted
                                     </span>
                                   )}
-                                  {(sp.source === 'auto' || !sp.source) && (
-                                    <span style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid #0284c7', padding: '1px 5px', borderRadius: '3px', fontSize: '10px', fontWeight: 600 }}>
-                                      Auto
+                                  {isAuto && (
+                                    <span
+                                      style={{
+                                        background: confStyle.bg,
+                                        color: confStyle.text,
+                                        border: `1px ${confStyle.needsReview ? 'dashed' : 'solid'} ${confStyle.border}`,
+                                        padding: '1px 6px',
+                                        borderRadius: '3px',
+                                        fontSize: '10px',
+                                        fontWeight: 700,
+                                      }}
+                                      title={
+                                        typeof sp.confidence === 'number'
+                                          ? `Detection confidence: ${confStyle.pct}% (${confStyle.label})${confStyle.needsReview ? ' — verify visually' : ''}`
+                                          : 'Auto-detected spot'
+                                      }
+                                    >
+                                      {typeof sp.confidence === 'number'
+                                        ? `${confStyle.pct}% ${confStyle.label}${confStyle.needsReview ? ' ?' : ''}`
+                                        : 'Auto'}
                                     </span>
                                   )}
                                   {sp.channels && sp.channels.length > 0 && sp.channels.map((ch) => (
@@ -6220,7 +6384,8 @@ export const TlcView: React.FC = () => {
                                     return null;
                                   })()}
                                   <span style={{ fontSize: '11px', color: 'var(--mut)', textTransform: 'capitalize' }}>
-                                    ({sp.strength > 0.5 ? 'strong' : sp.strength > 0.2 ? 'medium' : 'weak'} · {sp.areaPct || 0}% area)
+                                    ({sp.strength > 0.5 ? 'strong' : sp.strength > 0.2 ? 'medium' : 'weak'} · {sp.areaPct || 0}% area
+                                    {typeof sp.tailing === 'number' && sp.tailing > 1.6 ? ` · tail ${sp.tailing.toFixed(1)}×` : ''})
                                   </span>
                                 </div>
 

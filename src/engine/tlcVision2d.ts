@@ -5,6 +5,7 @@
 // curved solvent-front seam tracking (handling smiling/tilted fronts across 27 lanes), shared-reagent
 // cross-lane coherence, and 1-click color-signature plate-wide spot matching.
 import type { Lane2dMetrics, TlcSpot } from '../types';
+import { buildLaneSpotMap2d } from './tlcSpots2d';
 
 export type VisionChannelKey = 'UV254' | 'UV366' | 'White';
 
@@ -505,6 +506,10 @@ export function analyzeLaneStripRgb(
     }
   }
 
+  const spotMap2d = !isGutter && !offPlate && !borderStraddle
+    ? buildLaneSpotMap2d(rgba, W, L, channel, [bgR, bgG, bgB])
+    : undefined;
+
   return {
     profile,
     metrics: {
@@ -518,6 +523,7 @@ export function analyzeLaneStripRgb(
       spotWidth,
       flankProfile,
       ...(automiddleOffsets ? { automiddleOffsets } : {}),
+      ...(spotMap2d ? { spotMap2d } : {}),
     },
   };
 }
@@ -601,6 +607,8 @@ export interface CurvedFrontSeamOptions {
   maxFrontPos?: number;
   /** Safe upper silica reference bound in lane px (just before opposing half's dark front band) */
   effEndPos?: number;
+  /** Optional sibling channels (e.g. UV366, White) for cross-channel graphite pencil-line confirmation during single-channel seam runs */
+  referenceChannels?: CurvedFrontChannelInput[];
 }
 
 export interface DualHalfGapCeilingResult {
@@ -621,6 +629,10 @@ export interface CurvedFrontSeamResult {
   score: number;
   /** Whether a meaningful tilt, edge-curl, or bow was fitted (vs flat line) */
   isCurved: boolean;
+  /** True when the seam is backed by a sustained capillary front band or wet/dry step (not a thin pencil-only ridge) */
+  bandOrStepBacked?: boolean;
+  /** Median positions of straight ruler graphite pencil lines that were confirmed & erased */
+  suppressedPencilPositions?: number[];
 }
 
 function medianFilter1d(src: Float64Array, win: number): Float64Array {
@@ -785,11 +797,14 @@ export function findDualHalfGapCeiling(
   if (bestGap) {
     const gapW = bestGap.gapHi - bestGap.gapLo;
     // Allow searching into the clean gap far enough to capture wavy/slightly-overrun outer edges
-    // on this half, while stopping strictly before the opposing half's front band.
+    // on this half, while stopping strictly before the opposing half's front band (and never crossing
+    // past ~6.5% beyond the 10 cm plate midline even if the opposing half's real front is very faint).
     const safetyMargin = Math.max(4, Math.min(10, Math.round(gapW * 0.22)));
-    const rawEffEnd = Math.min(laneLen - 2, bestGap.gapHi - 2);
+    const midHardCap = Math.round(midDist + laneLen * 0.065);
+    const rawEffEnd = Math.min(laneLen - 2, bestGap.gapHi - 2, midHardCap + 6);
     const rawMaxFront = Math.min(
       laneLen - 4,
+      midHardCap,
       Math.max(
         bestGap.gapLo + Math.round(gapW * 0.5),
         bestGap.gapHi - safetyMargin
@@ -898,6 +913,7 @@ function measureLocalRidgeAndStep(
   dryOutFar: number,
   wetBackNear: number,
   wetBackFar: number,
+  sigmaS: number,
   buf: Float64Array
 ): { ridgeAmp: number; bandAmp: number; dryEdgeAmp: number; stepAmp: number } {
   const c = winMeanF(s, i - rCore, Math.min(topLim, i + rCore));
@@ -944,7 +960,7 @@ function measureLocalRidgeAndStep(
     const effDryNear = Math.min(dryOutNear, Math.max(1, topLim - i - 2));
     const dryBg = winQuantF(s, Math.min(topLim, i + effDryNear), Math.min(topLim, i + dryOutFar), cleanQ, buf);
     const bandNearVal = winMedF(s, Math.max(0, i - bandDeepStart), Math.max(0, i - bandInNear), buf);
-    const bandDeepVal = winMedF(s, Math.max(0, i - bandInFar), Math.max(0, i - bandDeepStart), buf);
+    const bandDeepVal = winMedF(s, Math.max(0, i - bandInFar), Math.max(0, i - bandDeepStart - 1), buf);
     const wetBg = winQuantF(s, Math.max(0, i - wetBackFar), Math.max(0, i - wetBackNear), cleanQ, buf);
     const nearDepthDry = sign * (bandNearVal - dryBg);
     const deepDepthDry = sign * (bandDeepVal - dryBg);
@@ -953,24 +969,44 @@ function measureLocalRidgeAndStep(
     const edgeInIdx = Math.max(0, i - Math.max(1, bandInNear));
     const nearEdgeDepth = sign * (s[edgeInIdx] - dryBg);
 
+    // Reject razor-sharp 2-4 px pencil spikes sitting right at the dry edge even if a very faint
+    // band happens to lie just behind them (a real sustained front band doesn't spike >2.6x deeper
+    // in its outermost 3 px than in its interior slice).
+    let nearPeakDepth = nearDepthDry;
+    for (let k = Math.max(0, i - bandDeepStart); k <= i; k++) {
+      const d = sign * (s[k] - dryBg);
+      if (d > nearPeakDepth) nearPeakDepth = d;
+    }
+    const notSharpEdgeSpike = nearPeakDepth <= Math.max(deepDepthDry * 2.5, deepDepthDry + 10);
+
+    const minNearDry = Math.max(2.0, 1.9 * sigmaS);
+    const minDeepDry = Math.max(1.6, 1.5 * sigmaS);
+    const minNearWet = Math.max(1.6, 1.5 * sigmaS);
+    const minDeepWet = Math.max(1.3, 1.2 * sigmaS);
+    const minLocalDrop = Math.max(1.0, 0.95 * sigmaS);
+
     if (
-      nearDepthDry > 5.0 &&
-      deepDepthDry > 4.5 &&
+      notSharpEdgeSpike &&
+      nearDepthDry > minNearDry &&
+      deepDepthDry > minDeepDry &&
       deepDepthDry >= 0.45 * nearDepthDry &&
-      nearEdgeDepth >= 0.55 * Math.max(nearDepthDry, deepDepthDry) &&
-      nearDepthWet > 4.0 &&
-      deepDepthWet > 3.5
+      nearEdgeDepth >= 0.50 * Math.max(nearDepthDry, deepDepthDry) &&
+      nearDepthWet > minNearWet &&
+      deepDepthWet > minDeepWet
     ) {
       const bandDepthDry = Math.min(nearDepthDry, deepDepthDry);
       const bandDepthWet = Math.min(nearDepthWet, deepDepthWet);
       const justIn = winMeanF(s, Math.max(0, i - dryEdgeWin), Math.max(0, i - 1));
       const justOut = winMeanF(s, Math.min(topLim, i + 1), Math.min(topLim, i + dryEdgeWin));
       const localDrop = sign * (justIn - justOut);
-      if (localDrop > 2.8 && Math.min(bandDepthDry, bandDepthWet) >= 0.28 * Math.max(bandDepthDry, bandDepthWet)) {
+      if (
+        localDrop > minLocalDrop &&
+        Math.min(bandDepthDry, bandDepthWet) >= 0.25 * Math.max(bandDepthDry, bandDepthWet)
+      ) {
         const sustained = Math.min(bandDepthDry, bandDepthWet);
         // Pinpoint right at the transition slope (downweight if still deep inside flat band or far out in dry gap)
         const midTarget = 0.5 * (bandNearVal + dryBg);
-        const halfSpan = Math.max(4, 0.5 * nearDepthDry);
+        const halfSpan = Math.max(3, 0.5 * nearDepthDry);
         const slopeCentering = Math.max(0.25, 1 - 0.55 * Math.min(1.3, Math.abs(c - midTarget) / halfSpan));
         dryEdgeAmp = (0.55 * Math.min(sustained, localDrop) + 0.45 * Math.sqrt(sustained * localDrop)) * slopeCentering;
       }
@@ -991,7 +1027,15 @@ function measureLocalRidgeAndStep(
     const macroDelta = medAfter - medBefore;
     const farDelta = medAfter - farBefore;
     const localDelta = edgeR - edgeL;
+    // Guard against dark 2-4 px graphite pencil lines sitting right between slightly darker wet silica
+    // and brighter dry middle silica: exiting a deep thin pencil trough creates a huge fake localDelta
+    // even though edgeL plunged far below the wet background medBefore.
+    const troughDepth = sign * (edgeL - medBefore);
+    const pencilTroughExit =
+      dryEdgeAmp <= 0 &&
+      troughDepth > Math.max(6.0, 1.5 * Math.abs(macroDelta));
     if (
+      !pencilTroughExit &&
       macroDelta * dirSign > 0 &&
       farDelta * dirSign > 0 &&
       localDelta * dirSign > 0 &&
@@ -1058,8 +1102,8 @@ function computeFrontEvidenceStrip(
   const eWin = Math.max(2, Math.round(n * 0.006));
   const dryEdgeWin = Math.max(2, Math.min(5, Math.round(n * 0.004)));
   const bandInNear = Math.max(2, Math.round(n * 0.002));
-  const bandDeepStart = Math.max(4, Math.round(n * 0.006));
-  const bandInFar = bandDeepStart + Math.max(3, Math.round(n * 0.005));
+  const bandDeepStart = Math.max(5, Math.round(n * 0.006));
+  const bandInFar = bandDeepStart + Math.max(4, Math.round(n * 0.005));
   const dryOutNear = Math.max(2, Math.round(n * 0.004));
   const dryOutFar = dryOutNear + Math.max(8, Math.round(n * 0.026));
   const wetBackNear = Math.max(14, Math.round(n * 0.045));
@@ -1128,6 +1172,7 @@ function computeFrontEvidenceStrip(
       dryOutFar,
       wetBackNear,
       wetBackFar,
+      sigmaS,
       buf
     );
 
@@ -1165,6 +1210,7 @@ function computeFrontEvidenceStrip(
         dryOutFar,
         wetBackNear,
         wetBackFar,
+        sigmaS,
         buf
       );
       ridgeAmp = apply2dContinuity(core.ridgeAmp, flank.ridgeAmp, i);
@@ -1180,17 +1226,21 @@ function computeFrontEvidenceStrip(
     // and over thin ridge-only pencil lines. Keep diffuse band center (0.45x) as gentle fallback.
     const dryEdgeWeight = sf ? 1.15 : 1.05;
     const bandCenterWeight = sf ? 0.48 : 0.38;
-    const bandBacked = dryEdgeAmp >= Math.max(4.5, 3.2 * sigmaS);
-    const stepBacked = stepAmp >= Math.max(1.0, 1.3 * sigmaS);
+    const bandBacked = dryEdgeAmp >= Math.max(1.8, 2.0 * sigmaS);
+    const rawStepBacked = stepAmp >= Math.max(1.0, 1.3 * sigmaS);
+    // Do not let a tiny background drift right underneath a razor-sharp graphite pencil line
+    // (ridgeAmp >> stepAmp, no sustained front band) grant full step-backed rank to the pencil line.
+    const pencilDominatedRidge = !bandBacked && ridgeAmp >= Math.max(4.0, 3.0 * sigmaS) && ridgeAmp > 2.2 * stepAmp;
+    const stepBacked = rawStepBacked && !pencilDominatedRidge;
     const effectiveLine = Math.max(dryEdgeAmp * dryEdgeWeight, ridgeAmp, bandAmp * bandCenterWeight);
     const feat = effectiveLine + 0.65 * stepAmp;
     feats[i - lo] = feat;
     if (stepBacked) hasStep[i - lo] = 1;
     if (bandBacked) hasBand[i - lo] = 1;
 
-    // A sharp thin dark ridge with neither a sustained front band behind it nor a wet/dry step
+    // A sharp thin dark ridge with neither a sustained front band behind it nor a genuine wet/dry step
     // behaves like a dry graphite ruler pencil line or handwriting stroke.
-    const thinPencil = !bandBacked && !stepBacked && ridgeAmp >= Math.max(4.0, 3.0 * sigmaS);
+    const thinPencil = pencilDominatedRidge || (!bandBacked && !stepBacked && ridgeAmp >= Math.max(4.0, 3.0 * sigmaS));
     if (thinPencil) isThinPencilLike[i - lo] = 1;
 
     // Step-backed and sustained band-edge fronts receive full rank; ridge-only marks are attenuated
@@ -1512,6 +1562,424 @@ function fitSmoothFrontSpline(
   return { laneY: flatLaneY, isCurved: false };
 }
 
+interface StraightPencilLine {
+  a: number;
+  b: number;
+  inlierFrac: number;
+  maxHalfW: number;
+  graphiteConfirmed: boolean;
+}
+
+/**
+ * Detects a razor-thin, ruler-straight graphite pencil line (e.g. 9.5/10.5 cm target line)
+ * across the outer ruler zone [78% .. hi] of dark-polarity channels (UV254/White).
+ * Uses 3 independent physical signatures:
+ *   1. Razor-sharp narrow V-trough cross-section (FWHM <= 0.8% of laneLen, strong bilateral drop),
+ *   2. Ruler-straight linear geometry across >= 65% of columns and all 3 thirds (median residual <= 1.2 px),
+ *   3. Cross-channel graphite optics (White sharp dark line OR UV366 negative dark dip — graphite
+ *      absorbs UV366 and never glows brightly like a real fluorescent solvent front).
+ */
+function detectStraightPencilLine(
+  channels: CurvedFrontChannelInput[],
+  referenceChannels: CurvedFrontChannelInput[] | undefined,
+  activeCols: number[],
+  colToLaneX: (origCol: number) => number,
+  lo: number,
+  hi: number,
+  minLen: number,
+  numLanes: number
+): StraightPencilLine | null {
+  const darkChannels = channels.filter((ch) => ch.sign < 0);
+  if (!darkChannels.length || activeCols.length < 4) return null;
+
+  // Scale ruler-line width to native camera resolution (on a 20 cm plate at 3280 px, a 0.5-0.7 mm
+  // graphite pencil line is ~6-10 px FWHM; a blunt wooden pencil is up to ~13 px FWHM, whereas a
+  // real capillary solvent front band is typically ~20-65 px wide).
+  const pencilLo = Math.max(lo + 4, Math.floor(minLen * 0.78));
+  const maxHalfW = Math.max(3, Math.round(minLen * 0.01));
+  const maxFwhmConfirmed = Math.max(6, Math.round(minLen * 0.013));
+  const maxFwhmUnconfirmed = Math.max(5, Math.round(minLen * 0.0105));
+  const searchHi = Math.min(hi + Math.max(4, Math.round(minLen * 0.006)), minLen - 4);
+  if (searchHi <= pencilLo + 4) return null;
+
+  const numActive = activeCols.length;
+  const buf = new Float64Array(24);
+  const medRange = (p: number[], sIdx: number, eIdx: number): number => {
+    const a = Math.max(0, sIdx);
+    const b = Math.min(p.length - 1, eIdx);
+    if (b < a) return p[Math.max(0, Math.min(p.length - 1, a))];
+    let k = 0;
+    for (let idx = a; idx <= b && k < buf.length; idx++) buf[k++] = p[idx];
+    return medianOfSorted(buf, k);
+  };
+
+  const allRefChannels = referenceChannels && referenceChannels.length > channels.length ? referenceChannels : channels;
+  const detectDarkChannels = allRefChannels.filter((ch) => ch.sign < 0);
+
+  // Gather razor-thin bilateral dark-trough peaks per column across dark channels (UV254/White)
+  const colPeaks: Array<
+    Array<{ y: number; depth: number; fwhm: number; fromWhite: boolean; fromUv254: boolean }>
+  > = Array.from({ length: numActive }, () => []);
+
+  for (const ch of detectDarkChannels) {
+    const isWhite = ch.channel === 'White';
+    const isUv254 = ch.channel === 'UV254';
+    for (let aIdx = 0; aIdx < numActive; aIdx++) {
+      const col = activeCols[aIdx];
+      const m = ch.metrics?.[col];
+      if (m?.offPlate || m?.borderStraddle) continue;
+      const p = ch.profiles[col];
+      if (!p || p.length < minLen || !isProfileOnPlate(p, ch.sign)) continue;
+
+      // Estimate per-column noise from 2nd differences
+      const nD2 = Math.min(120, Math.max(10, searchHi - pencilLo));
+      const d2 = new Float64Array(nD2);
+      let d2Cnt = 0;
+      const stepD2 = Math.max(1, Math.floor((searchHi - pencilLo) / nD2));
+      for (let y = pencilLo + 1; y < searchHi && d2Cnt < nD2; y += stepD2) {
+        d2[d2Cnt++] = Math.abs(p[y + 1] - 2 * p[y] + p[y - 1]);
+      }
+      const sigmaCol = Math.max(0.7, 1.4826 * medianOfSorted(d2, d2Cnt) * 0.408);
+      const minDrop = Math.max(8, 4.5 * sigmaCol);
+      const shSpan = Math.max(4, Math.round(minLen * 0.006));
+
+      const localCands: Array<{ y: number; depth: number; fwhm: number }> = [];
+      for (let y = pencilLo; y <= searchHi; y++) {
+        // Local dark minimum
+        if (p[y] > p[y - 1] || p[y] > p[y + 1]) continue;
+        const shL = medRange(p, y - maxHalfW - shSpan, y - maxHalfW);
+        const shR = medRange(p, y + maxHalfW, y + maxHalfW + shSpan);
+        const dropL = shL - p[y];
+        const dropR = shR - p[y];
+        const minSide = Math.min(dropL, dropR);
+        const maxSide = Math.max(dropL, dropR);
+        if (minSide < minDrop || minSide < 0.35 * maxSide) continue;
+
+        // Verify narrow ruler-line FWHM (0.3-0.85 mm graphite stroke, never a broad solvent band)
+        const halfThr = Math.min(shL, shR) - 0.5 * minSide;
+        let wL = 0;
+        while (wL <= maxFwhmConfirmed && y - wL - 1 >= 0 && p[y - wL - 1] <= halfThr) wL++;
+        let wR = 0;
+        while (wR <= maxFwhmConfirmed && y + wR + 1 < minLen && p[y + wR + 1] <= halfThr) wR++;
+        const fwhm = wL + wR + 1;
+        if (fwhm > maxFwhmConfirmed) continue;
+
+        localCands.push({ y, depth: minSide, fwhm });
+      }
+      // Prefer narrowest, deepest dark troughs first so a razor-sharp pencil line beats any nearby band
+      localCands.sort((u, v) => v.depth / (v.fwhm + 2) - u.depth / (u.fwhm + 2));
+      const kept: Array<{ y: number; depth: number; fwhm: number }> = [];
+      for (const c of localCands) {
+        if (kept.some((k) => Math.abs(k.y - c.y) < Math.max(7, maxHalfW + 2))) continue;
+        kept.push(c);
+        const existing = colPeaks[aIdx].find((pk) => Math.abs(pk.y - c.y) <= 2);
+        if (existing) {
+          existing.depth = Math.max(existing.depth, c.depth);
+          existing.fwhm = Math.min(existing.fwhm, c.fwhm);
+          existing.fromWhite = existing.fromWhite || isWhite;
+          existing.fromUv254 = existing.fromUv254 || isUv254;
+        } else {
+          colPeaks[aIdx].push({
+            y: c.y,
+            depth: c.depth,
+            fwhm: c.fwhm,
+            fromWhite: isWhite,
+            fromUv254: isUv254,
+          });
+        }
+        if (kept.length >= 2) break;
+      }
+    }
+  }
+
+  // Fit a ruler-straight line y(x) = a + b * x using deterministic pair consensus across well-separated columns
+  const flatPts: Array<{ aIdx: number; x: number; y: number; depth: number; fwhm: number }> = [];
+  for (let aIdx = 0; aIdx < numActive; aIdx++) {
+    const x = colToLaneX(activeCols[aIdx]);
+    for (const pk of colPeaks[aIdx]) {
+      flatPts.push({ aIdx, x, y: pk.y, depth: pk.depth, fwhm: pk.fwhm });
+    }
+  }
+  if (flatPts.length < Math.max(4, Math.ceil(numActive * 0.65))) return null;
+
+  const maxSlope = (minLen * 0.045) / Math.max(1, numLanes - 1);
+  const inlierTol = Math.max(2.2, minLen * 0.003);
+  const thirdTot = [0, 0, 0];
+  for (let aIdx = 0; aIdx < numActive; aIdx++) {
+    thirdTot[Math.min(2, Math.floor((aIdx * 3) / numActive))]++;
+  }
+
+  let bestLine: {
+    a: number;
+    b: number;
+    inliers: Array<{ aIdx: number; x: number; y: number }>;
+    score: number;
+  } | null = null;
+
+  // Deterministic pair sampling from left-half and right-half peaks for fast exact ruler fit
+  const rawLeft = flatPts.filter((p) => p.aIdx < Math.ceil(numActive * 0.45));
+  const rawRight = flatPts.filter((p) => p.aIdx >= Math.floor(numActive * 0.55));
+  const leftStep = Math.max(1, Math.ceil(rawLeft.length / 22));
+  const rightStep = Math.max(1, Math.ceil(rawRight.length / 22));
+  const leftPts = leftStep > 1 ? rawLeft.filter((_, idx) => idx % leftStep === 0) : rawLeft;
+  const rightPts = rightStep > 1 ? rawRight.filter((_, idx) => idx % rightStep === 0) : rawRight;
+  for (let i = 0; i < leftPts.length; i++) {
+    const p1 = leftPts[i];
+    for (let j = 0; j < rightPts.length; j++) {
+      const p2 = rightPts[j];
+      const dx = p2.x - p1.x;
+      if (Math.abs(dx) < Math.max(2, (numLanes - 1) * 0.25)) continue;
+      const b = (p2.y - p1.y) / dx;
+      if (Math.abs(b) > maxSlope) continue;
+      const a = p1.y - b * p1.x;
+
+      const inliers: Array<{ aIdx: number; x: number; y: number }> = [];
+      let sumDepth = 0;
+      let sumFwhm = 0;
+      let whiteHits = 0;
+      let sumY = 0;
+      for (let aIdx = 0; aIdx < numActive; aIdx++) {
+        const pks = colPeaks[aIdx];
+        if (!pks.length) continue;
+        const x = colToLaneX(activeCols[aIdx]);
+        const pred = a + b * x;
+        let bestPk: { y: number; depth: number; fwhm: number; fromWhite: boolean } | null = null;
+        let bestErr = inlierTol;
+        let hasWhite = false;
+        for (const pk of pks) {
+          const err = Math.abs(pk.y - pred);
+          if (err <= bestErr) {
+            bestErr = err;
+            bestPk = pk;
+          }
+          if (pk.fromWhite && err <= inlierTol + 1.2) hasWhite = true;
+        }
+        if (bestPk) {
+          inliers.push({ aIdx, x, y: bestPk.y });
+          sumDepth += Math.min(60, bestPk.depth);
+          sumFwhm += bestPk.fwhm;
+          sumY += bestPk.y;
+          if (hasWhite) whiteHits++;
+        }
+      }
+      if (inliers.length < Math.max(4, Math.ceil(numActive * 0.55))) continue;
+      const meanFwhm = sumFwhm / inliers.length;
+      const meanY = sumY / inliers.length;
+      // Strongly prefer full-width, White-confirmed, razor-thin, outermost ruler lines
+      const sc =
+        inliers.length * 100 +
+        whiteHits * 60 -
+        meanFwhm * 18 +
+        (meanY / minLen) * 20 +
+        sumDepth * 0.05;
+      if (!bestLine || sc > bestLine.score) {
+        bestLine = { a, b, inliers, score: sc };
+      }
+    }
+  }
+
+  if (!bestLine) return null;
+
+  // Refine line via ordinary least squares on inliers and re-evaluate tight residuals
+  let sx = 0,
+    sy = 0,
+    sxx = 0,
+    sxy = 0;
+  for (const pt of bestLine.inliers) {
+    sx += pt.x;
+    sy += pt.y;
+    sxx += pt.x * pt.x;
+    sxy += pt.x * pt.y;
+  }
+  const mCnt = bestLine.inliers.length;
+  const denom = mCnt * sxx - sx * sx;
+  const refB = Math.abs(denom) > 1e-6 ? (mCnt * sxy - sx * sy) / denom : bestLine.b;
+  const refA = (sy - refB * sx) / Math.max(1, mCnt);
+
+  const thirdIn = [0, 0, 0];
+  const residuals: number[] = [];
+  const fwhmVals: number[] = [];
+  let whiteInliers = 0;
+  let uv254Inliers = 0;
+  for (let aIdx = 0; aIdx < numActive; aIdx++) {
+    const pks = colPeaks[aIdx];
+    if (!pks.length) continue;
+    const x = colToLaneX(activeCols[aIdx]);
+    const pred = refA + refB * x;
+    let bestErr = inlierTol;
+    let bestFwhm = maxFwhmConfirmed;
+    let matched = false;
+    let matchedWhite = false;
+    let matchedUv254 = false;
+    for (const pk of pks) {
+      const err = Math.abs(pk.y - pred);
+      if (err <= bestErr) {
+        bestErr = err;
+        bestFwhm = pk.fwhm;
+        matched = true;
+      }
+      if (pk.fromWhite && err <= inlierTol + 1.2) matchedWhite = true;
+      if (pk.fromUv254 && err <= inlierTol + 1.2) matchedUv254 = true;
+    }
+    if (matched) {
+      thirdIn[Math.min(2, Math.floor((aIdx * 3) / numActive))]++;
+      residuals.push(bestErr);
+      fwhmVals.push(bestFwhm);
+    }
+    if (matchedWhite) whiteInliers++;
+    if (matchedUv254) uv254Inliers++;
+  }
+
+  const inlierFrac = residuals.length / numActive;
+  const allThirdsOk = thirdTot.every((tot, t) => tot === 0 || thirdIn[t] / tot >= 0.50);
+  if (inlierFrac < 0.65 || !allThirdsOk || residuals.length < 4) return null;
+
+  residuals.sort((u, v) => u - v);
+  const medRes = residuals[residuals.length >> 1];
+  if (medRes > Math.max(1.25, minLen * 0.0018)) return null;
+
+  fwhmVals.sort((u, v) => u - v);
+  const medFwhm = fwhmVals[fwhmVals.length >> 1];
+
+  // Cross-channel graphite confirmation using all available sibling channels:
+  // (a) White channel shows the exact same razor-thin dark ruler line (especially alongside UV254/UV366), OR
+  // (b) UV366 shows a consistent negative (dark) dip along the line (graphite blocks UV366 and never glows).
+  const hasUvRef = allRefChannels.some((ch) => ch.channel === 'UV254' || ch.channel === 'UV366');
+  let graphiteConfirmed =
+    (whiteInliers / numActive >= 0.50 && hasUvRef) ||
+    (whiteInliers / numActive >= 0.55 && uv254Inliers / numActive >= 0.50);
+  if (!graphiteConfirmed) {
+    const uv366Ch = allRefChannels.find((ch) => ch.sign > 0);
+    if (uv366Ch) {
+      const uv366Dips: number[] = [];
+      const shSpan = Math.max(4, Math.round(minLen * 0.006));
+      for (let aIdx = 0; aIdx < numActive; aIdx++) {
+        const col = activeCols[aIdx];
+        const p = uv366Ch.profiles[col];
+        if (!p || p.length < minLen) continue;
+        const yp = Math.round(refA + refB * colToLaneX(col));
+        if (yp - maxHalfW - shSpan < 0 || yp + 3 >= minLen) continue;
+        let minVal = p[yp];
+        for (let dy = -3; dy <= 3; dy++) {
+          const idx = yp + dy;
+          if (idx >= 0 && idx < minLen && p[idx] < minVal) minVal = p[idx];
+        }
+        const shL = medRange(p, yp - maxHalfW - shSpan, yp - maxHalfW);
+        const shR = medRange(p, yp + maxHalfW, yp + maxHalfW + shSpan);
+        // Positive value means UV366 dipped DARKER than its shoulders at the pencil line
+        uv366Dips.push(0.5 * (shL + shR) - minVal);
+      }
+      if (uv366Dips.length >= 4) {
+        const negCnt = uv366Dips.filter((d) => d > 0.5).length;
+        uv366Dips.sort((u, v) => u - v);
+        const medDip = uv366Dips[uv366Dips.length >> 1];
+        if (medDip >= 1.5 || (medDip >= 1.0 && negCnt / uv366Dips.length >= 0.65)) {
+          graphiteConfirmed = true;
+        }
+      }
+    }
+  }
+
+  // Without cross-channel graphite proof (White dark line or UV366 negative dip), require a razor-sharp
+  // mechanical-pencil FWHM so a medium-width straight solvent front band is never misclassified.
+  if (!graphiteConfirmed && medFwhm > maxFwhmUnconfirmed) return null;
+
+  return { a: refA, b: refB, inlierFrac, maxHalfW, graphiteConfirmed };
+}
+
+/**
+ * Surgically bridges across a detected straight graphite ruler pencil line on dark-polarity
+ * profiles (and their 2D flank profiles if present), preserving adjacent faint solvent fronts.
+ */
+function erasePencilLineFromChannels(
+  channels: CurvedFrontChannelInput[],
+  pencil: StraightPencilLine,
+  colToLaneX: (origCol: number) => number,
+  minLen: number
+): CurvedFrontChannelInput[] {
+  const hw = pencil.maxHalfW;
+  const shSpan = Math.max(4, Math.round(minLen * 0.006));
+  const buf = new Float64Array(24);
+  const medArr = (arr: ArrayLike<number>, sIdx: number, eIdx: number): number => {
+    const a = Math.max(0, sIdx);
+    const b = Math.min(arr.length - 1, eIdx);
+    if (b < a) return arr[Math.max(0, Math.min(arr.length - 1, a))];
+    let k = 0;
+    for (let idx = a; idx <= b && k < buf.length; idx++) buf[k++] = arr[idx];
+    return medianOfSorted(buf, k);
+  };
+
+  const eraseInPlace = (arr: number[] | Float32Array, yp: number): void => {
+    const n = arr.length;
+    if (yp - hw - shSpan < 0 || yp + 2 >= n) return;
+    let yMin = yp;
+    for (let dy = -3; dy <= 3; dy++) {
+      const idx = yp + dy;
+      if (idx >= 0 && idx < n && arr[idx] < arr[yMin]) yMin = idx;
+    }
+    const shL = medArr(arr, yMin - hw - shSpan, yMin - hw);
+    const shR = medArr(arr, yMin + hw, yMin + hw + shSpan);
+    const depthL = shL - arr[yMin];
+    const depthR = shR - arr[yMin];
+    if (depthL < 4 || depthR < 4) return;
+
+    // Walk all the way out to the clean shoulder baseline (within ~1.5 gray levels of shL/shR)
+    // so deep graphite troughs leave zero residual flat-bottomed trench after bridging.
+    const tolL = Math.min(1.5, 0.03 * depthL);
+    const tolR = Math.min(1.5, 0.03 * depthR);
+    const maxSpan = Math.max(hw + shSpan + 2, Math.round(hw * 1.8) + 4);
+
+    let yL = yMin - 1;
+    const limL = Math.max(0, yMin - maxSpan);
+    while (yL > limL && arr[yL] < shL - tolL) {
+      // Stop at a local shoulder crest if an adjacent darker front sits immediately behind the pencil line
+      if (yMin - yL >= hw && arr[yL] >= shL - 0.12 * depthL && yL > 1 && arr[yL - 1] < arr[yL] - 1.5) {
+        break;
+      }
+      yL--;
+    }
+
+    let yR = yMin + 1;
+    const limR = Math.min(n - 1, yMin + maxSpan);
+    while (yR < limR && arr[yR] < shR - tolR) {
+      if (yR - yMin >= hw && arr[yR] >= shR - 0.12 * depthR && yR + 1 < n && arr[yR + 1] < arr[yR] - 1.5) {
+        break;
+      }
+      yR++;
+    }
+
+    if (yR - yL <= 1) return;
+    // Anchor bridge endpoints to local shoulder medians when they didn't fully clear a deep tail
+    const vL = Math.max(arr[yL], shL - tolL);
+    const vR = Math.max(arr[yR], shR - tolR);
+    const span = yR - yL;
+    for (let k = yL + 1; k < yR; k++) {
+      arr[k] = vL + ((vR - vL) * (k - yL)) / span;
+    }
+  };
+
+  return channels.map((ch) => {
+    if (ch.sign >= 0) return ch;
+    const profiles = ch.profiles.map((prof, col) => {
+      if (!prof || prof.length < minLen) return prof;
+      const copy = prof.slice();
+      const yp = Math.round(pencil.a + pencil.b * colToLaneX(col));
+      eraseInPlace(copy, yp);
+      return copy;
+    });
+    const metrics = ch.metrics
+      ? ch.metrics.map((m, col) => {
+          if (!m || !m.flankProfile || m.flankProfile.length < minLen) return m;
+          const flankCopy = new Float32Array(m.flankProfile);
+          const yp = Math.round(pencil.a + pencil.b * colToLaneX(col));
+          eraseInPlace(flankCopy, yp);
+          return { ...m, flankProfile: flankCopy };
+        })
+      : undefined;
+    return { ...ch, profiles, metrics };
+  });
+}
+
 /**
  * 2D Curved Solvent-Front Seam Tracker:
  * Tracks a single continuous smooth curve y_front(x) across all columns (gutters or lanes)
@@ -1526,6 +1994,16 @@ export function detectCurvedFrontSeam(
   laneIds: number[],
   laneLen: number,
   options?: CurvedFrontSeamOptions
+): CurvedFrontSeamResult {
+  return detectCurvedFrontSeamCore(channels, laneIds, laneLen, options, 2);
+}
+
+function detectCurvedFrontSeamCore(
+  channels: CurvedFrontChannelInput[],
+  laneIds: number[],
+  laneLen: number,
+  options: CurvedFrontSeamOptions | undefined,
+  pencilPassesLeft: number
 ): CurvedFrontSeamResult {
   const empty: CurvedFrontSeamResult = { medianPos: 0, byLane: {}, score: 0, isCurved: false };
   if (!channels.length || laneIds.length < 4 || laneLen < 20) return empty;
@@ -1585,6 +2063,53 @@ export function detectCurvedFrontSeam(
       if (glassEdge < minLen - 4) {
         hi = Math.min(hi, glassEdge - 6);
         effEnd = Math.min(effEnd, glassEdge - 2);
+      }
+    }
+  }
+
+  // Ruler pencil-line removal: if a razor-thin, ruler-straight dark line sits in the outer 78%..hi zone,
+  // erase it (up to 2 parallel lines, e.g. 9.5 & 10.5 cm marks) and re-run front tracking whenever either
+  // (a) White/UV366 confirms graphite optics or (b) erasing it reveals a genuine sustained band/step-backed
+  // solvent front. Leaves thin hairline-meniscus-only plates (no sustained band behind them) untouched.
+  if (pencilPassesLeft > 0 && hasDarkFrontCh) {
+    const pencil = detectStraightPencilLine(
+      channels,
+      options?.referenceChannels,
+      activeCols,
+      colToLaneX,
+      lo,
+      hi,
+      minLen,
+      numLanes
+    );
+    if (pencil) {
+      const cleanedChannels = erasePencilLineFromChannels(channels, pencil, colToLaneX, minLen);
+      const nextOpts =
+        options?.referenceChannels && options.referenceChannels.length > 0
+          ? {
+              ...options,
+              referenceChannels: erasePencilLineFromChannels(
+                options.referenceChannels,
+                pencil,
+                colToLaneX,
+                minLen
+              ),
+            }
+          : options;
+      const cleanedRes = detectCurvedFrontSeamCore(
+        cleanedChannels,
+        laneIds,
+        laneLen,
+        nextOpts,
+        pencilPassesLeft - 1
+      );
+      if (pencil.graphiteConfirmed || (cleanedRes.medianPos > 0 && cleanedRes.bandOrStepBacked)) {
+        const medPencilPos = Math.round(pencil.a + pencil.b * (numLanes - 1) * 0.5);
+        const prevSuppressed = cleanedRes.suppressedPencilPositions ?? [];
+        return {
+          ...cleanedRes,
+          suppressedPencilPositions: [...prevSuppressed, medPencilPos],
+        };
       }
     }
   }
@@ -1678,154 +2203,322 @@ export function detectCurvedFrontSeam(
     }
   }
 
-  // Dynamic Programming across active on-plate columns to find the optimal continuous front seam
+  // Dynamic Programming seam solver over an arbitrary vertical slice [jStart..jEnd] of evidenceGrid
   const baseMaxStep = Math.max(2, Math.min(12, Math.round(minLen * 0.008)));
   const baseStepPenalty = 0.22 / Math.max(1, (baseMaxStep / 3) * (baseMaxStep / 3));
+  const seamTol = Math.max(2, Math.round(minLen * 0.004));
+  const curveTol = Math.max(5, Math.round(minLen * 0.012));
 
-  const dpPrev = new Float64Array(H);
-  const dpCurr = new Float64Array(H);
-  const backPtr = new Int16Array(numActive * H);
+  const solveSeam = (
+    dpGrid: Float32Array[],
+    supportGrid: Float32Array[],
+    jStart: number,
+    jEnd: number,
+    minColSnr: number,
+    minMedSnr: number,
+    minSupportFrac: number,
+    minThirdFrac: number
+  ): (CurvedFrontSeamResult & { laneY?: Float64Array }) => {
+    const sliceH = jEnd - jStart + 1;
+    if (sliceH <= 4) return empty;
 
-  for (let j = 0; j < H; j++) dpPrev[j] = E[0][j];
+    // Continuity-aware per-column DP gain: preserves full linear SNR sharpness on supported
+    // columns (zero wave flattening) while penalizing missing-evidence columns so a 100%-coverage
+    // continuous front outscores a 60%-coverage patchy spot row during dynamic programming.
+    const colGain = (v: number): number => (v < minColSnr ? v - 1.8 * minColSnr : v);
 
-  for (let aIdx = 1; aIdx < numActive; aIdx++) {
-    const eCol = E[aIdx];
-    const ptrOff = aIdx * H;
-    const dx = Math.max(
-      1,
-      Math.min(4, Math.abs(colToLaneX(activeCols[aIdx]) - colToLaneX(activeCols[aIdx - 1])))
-    );
-    const maxStep = Math.min(Math.round(minLen * 0.03), Math.round(baseMaxStep * dx));
-    const stepPenalty = baseStepPenalty / dx;
-    for (let j = 0; j < H; j++) {
-      const kLo = Math.max(0, j - maxStep);
-      const kHi = Math.min(H - 1, j + maxStep);
-      let bestVal = -Infinity;
-      let bestPrev = j;
-      for (let k = kLo; k <= kHi; k++) {
-        const dy = j - k;
-        const val = dpPrev[k] - stepPenalty * dy * dy;
-        if (val > bestVal) {
-          bestVal = val;
-          bestPrev = k;
+    const dpPrev = new Float64Array(sliceH);
+    const dpCurr = new Float64Array(sliceH);
+    const backPtr = new Int16Array(numActive * sliceH);
+
+    for (let u = 0; u < sliceH; u++) dpPrev[u] = colGain(dpGrid[0][jStart + u]);
+
+    for (let aIdx = 1; aIdx < numActive; aIdx++) {
+      const eCol = dpGrid[aIdx];
+      const ptrOff = aIdx * sliceH;
+      const dx = Math.max(
+        1,
+        Math.min(4, Math.abs(colToLaneX(activeCols[aIdx]) - colToLaneX(activeCols[aIdx - 1])))
+      );
+      const maxStep = Math.min(Math.round(minLen * 0.03), Math.round(baseMaxStep * dx));
+      const stepPenalty = baseStepPenalty / dx;
+      for (let u = 0; u < sliceH; u++) {
+        const kLo = Math.max(0, u - maxStep);
+        const kHi = Math.min(sliceH - 1, u + maxStep);
+        let bestVal = -Infinity;
+        let bestPrev = u;
+        for (let k = kLo; k <= kHi; k++) {
+          const dy = u - k;
+          const val = dpPrev[k] - stepPenalty * dy * dy;
+          if (val > bestVal) {
+            bestVal = val;
+            bestPrev = k;
+          }
+        }
+        dpCurr[u] = bestVal + colGain(eCol[jStart + u]);
+        backPtr[ptrOff + u] = bestPrev;
+      }
+      dpPrev.set(dpCurr);
+    }
+
+    let endU = 0;
+    let bestTotal = -Infinity;
+    for (let u = 0; u < sliceH; u++) {
+      if (dpPrev[u] > bestTotal) {
+        bestTotal = dpPrev[u];
+        endU = u;
+      }
+    }
+
+    const seamIdx = new Int32Array(numActive);
+    seamIdx[numActive - 1] = jStart + endU;
+    for (let aIdx = numActive - 1; aIdx >= 1; aIdx--) {
+      seamIdx[aIdx - 1] = jStart + backPtr[aIdx * sliceH + (seamIdx[aIdx] - jStart)];
+    }
+
+    const supportPts: Array<{ x: number; y: number; w: number; third: number; snr: number }> = [];
+    const thirdTot = [0, 0, 0];
+    const thirdSup = [0, 0, 0];
+    let stepBackedCols = 0;
+
+    for (let aIdx = 0; aIdx < numActive; aIdx++) {
+      const origCol = activeCols[aIdx];
+      const third = Math.min(2, Math.floor((aIdx * 3) / numActive));
+      thirdTot[third]++;
+      const j0 = seamIdx[aIdx];
+      let localPeakSnr = supportGrid[aIdx][j0];
+      let localPeakJ = j0;
+      let localStep = stepMap[aIdx][j0] > 0;
+      for (let j = Math.max(jStart, j0 - seamTol); j <= Math.min(jEnd, j0 + seamTol); j++) {
+        if (supportGrid[aIdx][j] > localPeakSnr) {
+          localPeakSnr = supportGrid[aIdx][j];
+          localPeakJ = j;
+        }
+        if (stepMap[aIdx][j] > 0) localStep = true;
+      }
+      if (localPeakSnr >= minColSnr) {
+        thirdSup[third]++;
+        if (localStep) stepBackedCols++;
+        supportPts.push({
+          x: colToLaneX(origCol),
+          y: lo + localPeakJ,
+          w: Math.min(10, localPeakSnr),
+          third,
+          snr: localPeakSnr,
+        });
+      }
+    }
+
+    const supportFrac = supportPts.length / numActive;
+    const allThirds = thirdTot.every((tot, t) => tot === 0 || thirdSup[t] / tot >= minThirdFrac);
+    if (supportFrac < minSupportFrac || !allThirds) return empty;
+
+    const curve = fitSmoothFrontSpline(supportPts, numLanes, minLen);
+    if (!curve) return empty;
+
+    let curveSupport = 0;
+    let curveStepCols = 0;
+    const curveThirdSup = [0, 0, 0];
+    const curveSnrs: number[] = [];
+
+    for (let aIdx = 0; aIdx < numActive; aIdx++) {
+      const origCol = activeCols[aIdx];
+      const x = colToLaneX(origCol);
+      const predY = Math.round(evalPiecewiseLinear(curve.laneY, x));
+      const jCenter = predY - lo;
+      const jLo = Math.max(jStart, jCenter - curveTol);
+      const jHi = Math.min(jEnd, jCenter + curveTol);
+      let maxSnr = 0;
+      let hasLocalStep = false;
+      for (let j = jLo; j <= jHi; j++) {
+        if (supportGrid[aIdx][j] > maxSnr) maxSnr = supportGrid[aIdx][j];
+        if (stepMap[aIdx][j] > 0) hasLocalStep = true;
+      }
+      if (maxSnr >= minColSnr) {
+        curveSupport++;
+        if (hasLocalStep) curveStepCols++;
+        curveThirdSup[Math.min(2, Math.floor((aIdx * 3) / numActive))]++;
+        curveSnrs.push(maxSnr);
+      }
+    }
+
+    const curveFrac = curveSupport / numActive;
+    const curveThirdsOk = thirdTot.every((tot, t) => tot === 0 || curveThirdSup[t] / tot >= minThirdFrac);
+    if (curveFrac < minSupportFrac || !curveThirdsOk || curveSnrs.length < 3) return empty;
+
+    curveSnrs.sort((a, b) => a - b);
+    const medSnr = curveSnrs[curveSnrs.length >> 1];
+    if (medSnr < minMedSnr) return empty;
+
+    const byLane: Record<number, number> = {};
+    const lanePositions: number[] = [];
+    for (let i = 0; i < numLanes; i++) {
+      const yPred = Math.round(Math.max(lo + jStart, Math.min(lo + jEnd, curve.laneY[i])));
+      byLane[sortedIds[i]] = yPred;
+      lanePositions.push(yPred);
+    }
+    lanePositions.sort((a, b) => a - b);
+    const medianPos = lanePositions[lanePositions.length >> 1];
+
+    const bandOrStepBacked = Math.max(stepBackedCols, curveStepCols) / numActive >= 0.45;
+    const stepBonus = bandOrStepBacked ? 1.15 : 0.92;
+    const score = medSnr * (0.3 + 0.7 * curveFrac) * stepBonus;
+
+    return {
+      medianPos,
+      byLane,
+      score,
+      isCurved: curve.isCurved,
+      bandOrStepBacked,
+      laneY: curve.laneY,
+    };
+  };
+
+  // Shift-aligned cross-plate median + 70%-coverage quantile stack verification for very light outer fronts:
+  // Aligns all active columns onto `laneY`, checks BOTH the cross-plate median (cuts camera noise by ~sqrt(N))
+  // AND the coverage quantile (p70 for dark UV254/White fronts, p30 for bright UV366 fronts), which stays clean
+  // on any true plate-wide solvent front while erasing patchy compound spot bands covering < 70% of lanes.
+  const verifyAlignedBandStack = (
+    laneY: Float64Array,
+    anchorPos: number
+  ): { confirmed: boolean; stackSnr: number } => {
+    const anchorIdx = Math.max(lo, Math.min(hi, Math.round(anchorPos)));
+    const stackBuf = new Float64Array(numActive + 2);
+    const checkTol = Math.max(4, Math.round(minLen * 0.008));
+    let bestStackSnr = 0;
+
+    for (const ch of channels) {
+      if (ch.sign > 0 && anchorIdx > Math.floor(minLen * 0.955)) continue;
+      const validCols: Array<{ prof: number[]; shift: number }> = [];
+      for (let aIdx = 0; aIdx < numActive; aIdx++) {
+        const origCol = activeCols[aIdx];
+        const m = ch.metrics?.[origCol];
+        if (m?.offPlate || m?.borderStraddle) continue;
+        const prof = ch.profiles[origCol];
+        if (!prof || prof.length < minLen || !isProfileOnPlate(prof, ch.sign)) continue;
+        const predY = Math.round(evalPiecewiseLinear(laneY, colToLaneX(origCol)));
+        validCols.push({ prof, shift: predY - anchorIdx });
+      }
+      if (validCols.length < 4) continue;
+
+      const stackedMed = new Array<number>(minLen);
+      const stackedCov = new Array<number>(minLen);
+      const covQ = ch.sign < 0 ? 0.70 : 0.30;
+      for (let y = 0; y < minLen; y++) {
+        let cnt = 0;
+        for (let k = 0; k < validCols.length; k++) {
+          const sy = Math.max(0, Math.min(minLen - 1, y + validCols[k].shift));
+          stackBuf[cnt++] = validCols[k].prof[sy];
+        }
+        const view = stackBuf.subarray(0, cnt);
+        view.sort();
+        stackedMed[y] = cnt & 1 ? view[cnt >> 1] : 0.5 * (view[(cnt >> 1) - 1] + view[cnt >> 1]);
+        stackedCov[y] = view[Math.min(cnt - 1, Math.max(0, Math.round(covQ * (cnt - 1))))];
+      }
+
+      const stMed = computeFrontEvidenceStrip(stackedMed, ch.sign, lo, hi, effEnd);
+      const stCov = computeFrontEvidenceStrip(stackedCov, ch.sign, lo, hi, effEnd);
+      const jA = Math.max(0, anchorIdx - lo - checkTol);
+      const jB = Math.min(H - 1, anchorIdx - lo + checkTol);
+      let localMedSnr = 0;
+      let localCovSnr = 0;
+      for (let j = jA; j <= jB; j++) {
+        if ((stMed.hasBand[j] || stMed.hasStep[j]) && !stMed.isThinPencilLike[j] && stMed.snr[j] > localMedSnr) {
+          localMedSnr = stMed.snr[j];
+        }
+        if ((stCov.hasBand[j] || stCov.hasStep[j]) && !stCov.isThinPencilLike[j] && stCov.snr[j] > localCovSnr) {
+          localCovSnr = stCov.snr[j];
         }
       }
-      dpCurr[j] = bestVal + eCol[j];
-      backPtr[ptrOff + j] = bestPrev;
-    }
-    dpPrev.set(dpCurr);
-  }
-
-  // Backtrack best seam
-  let endIdx = 0;
-  let bestTotal = -Infinity;
-  for (let j = 0; j < H; j++) {
-    if (dpPrev[j] > bestTotal) {
-      bestTotal = dpPrev[j];
-      endIdx = j;
-    }
-  }
-
-  const seamIdx = new Int32Array(numActive);
-  seamIdx[numActive - 1] = endIdx;
-  for (let aIdx = numActive - 1; aIdx >= 1; aIdx--) {
-    seamIdx[aIdx - 1] = backPtr[aIdx * H + seamIdx[aIdx]];
-  }
-
-  // Gather supported points along the seam in exact lane index coordinates x ∈ [0..numLanes-1]
-  const supportPts: Array<{ x: number; y: number; w: number; third: number; snr: number }> = [];
-  const thirdTot = [0, 0, 0];
-  const thirdSup = [0, 0, 0];
-  let stepBackedCols = 0;
-
-  const seamTol = Math.max(2, Math.round(minLen * 0.004));
-  for (let aIdx = 0; aIdx < numActive; aIdx++) {
-    const origCol = activeCols[aIdx];
-    const third = Math.min(2, Math.floor((aIdx * 3) / numActive));
-    thirdTot[third]++;
-    const j0 = seamIdx[aIdx];
-    let localPeakSnr = E[aIdx][j0];
-    let localPeakJ = j0;
-    let localStep = stepMap[aIdx][j0] > 0;
-    for (let j = Math.max(0, j0 - seamTol); j <= Math.min(H - 1, j0 + seamTol); j++) {
-      if (E[aIdx][j] > localPeakSnr) {
-        localPeakSnr = E[aIdx][j];
-        localPeakJ = j;
+      // Require BOTH the cross-plate median (>= 4.5 SNR) AND the 70%-coverage quantile (>= 3.0 SNR)
+      // to confirm a sustained band/step so 55-65% patchy spot bands are strictly rejected.
+      if (localMedSnr >= 4.5 && localCovSnr >= 3.0 && localMedSnr > bestStackSnr) {
+        bestStackSnr = localMedSnr;
       }
-      if (stepMap[aIdx][j] > 0) localStep = true;
     }
-    if (localPeakSnr >= 3.2) {
-      thirdSup[third]++;
-      if (localStep) stepBackedCols++;
-      supportPts.push({
-        x: colToLaneX(origCol),
-        y: lo + localPeakJ,
-        w: Math.min(10, localPeakSnr),
-        third,
-        snr: localPeakSnr,
-      });
+
+    return { confirmed: bestStackSnr >= 4.5, stackSnr: bestStackSnr };
+  };
+
+  // Band/step-only evidence grids for outer-most real front promotion & faint-front rescue
+  // (strictly zeros out thin ruler pencil lines where stepMap === 0).
+  // `bandPooled` gently pools neighbor columns for smooth DP tracing across very light center lanes,
+  // while `bandOnly` is used unblurred for column support counting so checkerboard spots never bleed across blanks.
+  const buildBandGrids = (): { bandOnly: Float32Array[]; bandPooled: Float32Array[] } => {
+    const bandOnly: Float32Array[] = Array.from({ length: numActive }, (_, aIdx) => {
+      const dst = new Float32Array(H);
+      const src = E[aIdx];
+      const sm = stepMap[aIdx];
+      for (let j = 0; j < H; j++) {
+        if (sm[j] > 0) dst[j] = src[j];
+      }
+      return dst;
+    });
+    const bandPooled: Float32Array[] = Array.from({ length: numActive }, (_, aIdx) => {
+      const dst = new Float32Array(H);
+      const cur = bandOnly[aIdx];
+      const prev = aIdx > 0 ? bandOnly[aIdx - 1] : cur;
+      const next = aIdx < numActive - 1 ? bandOnly[aIdx + 1] : cur;
+      for (let j = 0; j < H; j++) {
+        dst[j] = 0.25 * Math.min(6, prev[j]) + 0.50 * cur[j] + 0.25 * Math.min(6, next[j]);
+      }
+      return dst;
+    });
+    return { bandOnly, bandPooled };
+  };
+
+  let chosen = solveSeam(E, E, 0, H - 1, 3.2, 4.2, 0.65, 0.55);
+  const minOuterGap = Math.max(18, Math.round(minLen * 0.035));
+  let bandGrids: { bandOnly: Float32Array[]; bandPooled: Float32Array[] } | null = null;
+
+  // Chromatography physics: nothing can elute past the solvent front.
+  // If a bright/dark high-Rf compound spot row won the primary pass, check strictly ahead of it
+  // (still inside maxFrontPos and glassEdge) for a genuine continuous, non-pencil capillary front band.
+  if (chosen.medianPos > 0) {
+    for (let pass = 0; pass < 2; pass++) {
+      const outerJStart = Math.round(chosen.medianPos - lo) + minOuterGap;
+      if (outerJStart > H - 8) break;
+      if (!bandGrids) bandGrids = buildBandGrids();
+      const outerCand = solveSeam(bandGrids.bandPooled, bandGrids.bandOnly, outerJStart, H - 1, 2.0, 2.6, 0.50, 0.35);
+      if (outerCand.medianPos <= 0 || !outerCand.laneY) break;
+      const stackCheck = verifyAlignedBandStack(outerCand.laneY, outerCand.medianPos);
+      if (!stackCheck.confirmed) break;
+      chosen = {
+        medianPos: outerCand.medianPos,
+        byLane: outerCand.byLane,
+        score: Math.max(outerCand.score, Math.min(12.5, stackCheck.stackSnr * 0.90)),
+        isCurved: outerCand.isCurved,
+        bandOrStepBacked: true,
+        laneY: outerCand.laneY,
+      };
+    }
+  } else {
+    // Faint-front rescue on very light plates where single columns fall below 4.2 SNR but the
+    // cross-plate aligned median + 70%-coverage stack reveals a crisp sustained capillary front band.
+    bandGrids = buildBandGrids();
+    const faintCand = solveSeam(bandGrids.bandPooled, bandGrids.bandOnly, 0, H - 1, 2.0, 2.6, 0.50, 0.35);
+    if (faintCand.medianPos > 0 && faintCand.laneY) {
+      const stackCheck = verifyAlignedBandStack(faintCand.laneY, faintCand.medianPos);
+      if (stackCheck.confirmed) {
+        chosen = {
+          medianPos: faintCand.medianPos,
+          byLane: faintCand.byLane,
+          score: Math.max(faintCand.score, Math.min(11.0, stackCheck.stackSnr * 0.85)),
+          isCurved: faintCand.isCurved,
+          bandOrStepBacked: true,
+          laneY: faintCand.laneY,
+        };
+      }
     }
   }
 
-  const supportFrac = supportPts.length / numActive;
-  const allThirds = thirdTot.every((tot, t) => tot === 0 || thirdSup[t] / tot >= 0.55);
-  if (supportFrac < 0.65 || !allThirds) return empty;
-
-  const curve = fitSmoothFrontSpline(supportPts, numLanes, minLen);
-  if (!curve) return empty;
-
-  // Re-verify support along the smooth fitted curve itself (rejecting jagged paths through unrelated spots)
-  const curveTol = Math.max(5, Math.round(minLen * 0.012));
-  let curveSupport = 0;
-  const curveThirdSup = [0, 0, 0];
-  const curveSnrs: number[] = [];
-
-  for (let aIdx = 0; aIdx < numActive; aIdx++) {
-    const origCol = activeCols[aIdx];
-    const x = colToLaneX(origCol);
-    const predY = Math.round(evalPiecewiseLinear(curve.laneY, x));
-    const jCenter = predY - lo;
-    const jLo = Math.max(0, jCenter - curveTol);
-    const jHi = Math.min(H - 1, jCenter + curveTol);
-    let maxSnr = 0;
-    for (let j = jLo; j <= jHi; j++) {
-      if (E[aIdx][j] > maxSnr) maxSnr = E[aIdx][j];
-    }
-    if (maxSnr >= 3.2) {
-      curveSupport++;
-      curveThirdSup[Math.min(2, Math.floor((aIdx * 3) / numActive))]++;
-      curveSnrs.push(maxSnr);
-    }
-  }
-
-  const curveFrac = curveSupport / numActive;
-  const curveThirdsOk = thirdTot.every((tot, t) => tot === 0 || curveThirdSup[t] / tot >= 0.55);
-  if (curveFrac < 0.65 || !curveThirdsOk || curveSnrs.length < 3) return empty;
-
-  curveSnrs.sort((a, b) => a - b);
-  const medSnr = curveSnrs[curveSnrs.length >> 1];
-  if (medSnr < 4.2) return empty;
-
-  // Map smooth curve to every laneId in the half-plate
-  const byLane: Record<number, number> = {};
-  const lanePositions: number[] = [];
-  for (let i = 0; i < numLanes; i++) {
-    const yPred = Math.round(Math.max(lo, Math.min(hi, curve.laneY[i])));
-    byLane[sortedIds[i]] = yPred;
-    lanePositions.push(yPred);
-  }
-  lanePositions.sort((a, b) => a - b);
-  const medianPos = lanePositions[lanePositions.length >> 1];
-
-  // Small bonus when step-backed across >= 45% of active columns so real wet-dry fronts outrank dry marks
-  const stepBonus = stepBackedCols / numActive >= 0.45 ? 1.15 : 0.92;
-  const score = medSnr * (0.3 + 0.7 * curveFrac) * stepBonus;
-
+  if (chosen.medianPos <= 0) return empty;
   return {
-    medianPos,
-    byLane,
-    score,
-    isCurved: curve.isCurved,
+    medianPos: chosen.medianPos,
+    byLane: chosen.byLane,
+    score: chosen.score,
+    isCurved: chosen.isCurved,
+    bandOrStepBacked: chosen.bandOrStepBacked,
   };
 }
 

@@ -1347,13 +1347,26 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                         value={setSolventOverrides[overrideKey] || mp.matchedSystemId}
                                         onChange={(e) => {
                                           const val = e.target.value;
-                                          setSetSolventOverrides((prev) => ({
-                                            ...prev,
-                                            [overrideKey]: val,
-                                          }));
+                                          setSetSolventOverrides((prev) => {
+                                            const next = { ...prev };
+                                            if (
+                                              val === mp.matchedSystemId &&
+                                              !ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === val)
+                                            ) {
+                                              delete next[overrideKey];
+                                            } else {
+                                              next[overrideKey] = val;
+                                            }
+                                            return next;
+                                          });
                                         }}
                                         title="Override matched solvent system for this measured TLC plate"
                                       >
+                                        {!ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === mp.matchedSystemId) && (
+                                          <option value={mp.matchedSystemId}>
+                                            {mp.matchedSystem?.shortLabel || mp.matchedSystemName}
+                                          </option>
+                                        )}
                                         {ALL_KNOWN_SOLVENT_SYSTEMS.map((sys) => (
                                           <option key={sys.id} value={sys.id}>
                                             {sys.shortLabel}

@@ -376,6 +376,14 @@ export interface Lane2dMetrics {
   offPlate?: boolean;
   /** True when the lane straddles the vertical glass-plate edge (one flank on black void, one on silica) */
   borderStraddle?: boolean;
+  /** Cross-lane integrated spot mass (mean background deviation across interior 76% of lane width) at each row */
+  rowMass?: Float32Array;
+  /** Smooth 2D lateral spot width fraction [0..1] across interior 76% of lane width at each row (detects hourglass waists) */
+  spotWidth?: Float32Array;
+  /** Mean scalar intensity of left + right outer flanks at each row (same scale/sign as 1D profile, for 2D horizontal-continuity front detection) */
+  flankProfile?: Float32Array;
+  /** Optional signed lateral centerline offset in lane-width pixels (length = L, index 0 = bottom/origin) when curved-lane automiddle tracking is active */
+  automiddleOffsets?: Float32Array;
 }
 
 export interface TlcProfileOptions {
@@ -411,6 +419,14 @@ export interface TlcDensitogramData {
 export interface TlcImageEntry {
   name: string;
   bmp: ImageBitmap;
+  /** True when loaded from a lab-calibrated uni_linint_corrected_* file (already flat-fielded) */
+  preFlatFielded?: boolean;
+  /** True when loaded from a lab-calibrated linint_corrected_* or uni_linint_corrected_* file (linear radiance) */
+  linearized?: boolean;
+  /** Optional unclipped float32 RGB data (floatWidth * floatHeight * 3, scaled to ~0..255+ display radiance units) from direct .npy import */
+  floatRgb?: Float32Array;
+  floatWidth?: number;
+  floatHeight?: number;
 }
 
 export interface EdgePick {

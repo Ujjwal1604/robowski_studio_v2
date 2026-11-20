@@ -4,6 +4,7 @@ import {
   containerOfLane,
   wellLabel,
   tlcFront,
+  tlcHalfFrontBase,
   tlcOrigin,
   TlcChannelKey,
   findSpots,
@@ -15,6 +16,7 @@ import {
   getEffectiveLaneSpots,
   TLC_SIGNAL,
   computeFalseColorComposite,
+  enhanceWhiteLightRgba,
 } from '../../engine';
 import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
@@ -52,6 +54,11 @@ interface TlcFullPlateViewProps {
   pickGroup?: number;
   onPickGroup?: (g: number) => void;
   onClearPicks?: () => void;
+  /** Boost faint visible-light colored spots (browser port of saturate_white.py) */
+  boostWhiteSpots?: boolean;
+  onToggleBoostWhiteSpots?: (enabled: boolean) => void;
+  /** Curved-lane centerline tracking (browser port of savgol_automiddle in get_lanes.py) */
+  automiddleEnabled?: boolean;
 }
 
 const PICK_COLORS = ['#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
@@ -116,6 +123,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   pickGroup = 0,
   onPickGroup,
   onClearPicks,
+  boostWhiteSpots = false,
+  onToggleBoostWhiteSpots,
+  automiddleEnabled = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -173,9 +183,11 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   // Unified Multi-Channel False-Color Composite gain (matches Lane Details Composite default 1.4x)
   const [fluoGain, setFluoGain] = useState<number>(1.4);
 
-  // Offscreen canvas cache for false-color composite
+  // Offscreen canvas cache for false-color composite & boosted White-light view
   const compositeCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositeCacheKeyRef = useRef<string>('');
+  const whiteBoostCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const whiteBoostCacheKeyRef = useRef<string>('');
 
   const isComposite = activeChannel === 'composite';
   const imgEntry = isComposite
@@ -306,6 +318,24 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             title="Visible white light photograph"
           >
             ⚪ Visible
+          </button>
+        )}
+        {hasWhite && activeChannel === 'White' && onToggleBoostWhiteSpots && (
+          <button
+            type="button"
+            style={{
+              ...hudBtn,
+              padding: '3px 8px',
+              fontSize: '11px',
+              background: boostWhiteSpots ? '#f59e0b' : '#1e293b',
+              color: boostWhiteSpots ? '#0f172a' : '#fcd34d',
+              borderColor: boostWhiteSpots ? '#fbbf24' : '#78350f',
+              fontWeight: boostWhiteSpots ? 800 : 600,
+            }}
+            onClick={() => onToggleBoostWhiteSpots(!boostWhiteSpots)}
+            title="Subtract white silica background & boost contrast so faint colored spots pop out clearly"
+          >
+            {boostWhiteSpots ? '✓ Boost faint spots' : 'Boost faint spots'}
           </button>
         )}
         {canComposite && (
@@ -489,6 +519,35 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         if (compositeCacheCanvasRef.current) {
           ctx.drawImage(compositeCacheCanvasRef.current, 0, 0);
         }
+      } else if (activeChannel === 'White' && boostWhiteSpots) {
+        compositeCacheKeyRef.current = '';
+        const wbW = Math.min(bmp.width, 1600);
+        const wbH = Math.max(1, Math.round((bmp.height * wbW) / bmp.width));
+        const wbKey = `${currentSet.uid}_wb_${imgEntry.name}_${wbW}_${wbH}`;
+        if (whiteBoostCacheKeyRef.current !== wbKey || !whiteBoostCacheCanvasRef.current) {
+          if (!whiteBoostCacheCanvasRef.current) {
+            whiteBoostCacheCanvasRef.current = document.createElement('canvas');
+          }
+          const wbCanvas = whiteBoostCacheCanvasRef.current;
+          wbCanvas.width = wbW;
+          wbCanvas.height = wbH;
+          const wbCtx = wbCanvas.getContext('2d', { willReadFrequently: true });
+          if (wbCtx) {
+            wbCtx.clearRect(0, 0, wbW, wbH);
+            wbCtx.drawImage(bmp, 0, 0, wbW, wbH);
+            const rawImg = wbCtx.getImageData(0, 0, wbW, wbH);
+            const enhanced = enhanceWhiteLightRgba(rawImg.data, wbW, wbH, { gain: 4.6, smoothRadius: 1 });
+            const outImg = wbCtx.createImageData(wbW, wbH);
+            outImg.data.set(enhanced);
+            wbCtx.putImageData(outImg, 0, 0);
+            whiteBoostCacheKeyRef.current = wbKey;
+          }
+        }
+        if (whiteBoostCacheCanvasRef.current) {
+          ctx.drawImage(whiteBoostCacheCanvasRef.current, 0, 0, bmp.width, bmp.height);
+        } else {
+          ctx.drawImage(bmp, 0, 0);
+        }
       } else {
         compositeCacheKeyRef.current = '';
         ctx.drawImage(bmp, 0, 0);
@@ -592,13 +651,36 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
         ctx.shadowBlur = 0; // reset shadow
 
-        // Centerline with directional migration vector
+        // Centerline with directional migration vector (curves to follow tracked automiddle offsets when enabled)
+        const trackKey: TlcChannelKey =
+          activeChannel !== 'composite' && currentSet.imgs[activeChannel]?.bmp
+            ? (activeChannel as TlcChannelKey)
+            : currentSet.imgs.UV254?.bmp
+            ? 'UV254'
+            : currentSet.imgs.UV366?.bmp
+            ? 'UV366'
+            : 'White';
+        const autoOffsets = automiddleEnabled
+          ? getLane2dMetrics(currentSet, trackKey, l)?.automiddleOffsets
+          : undefined;
         ctx.beginPath();
         ctx.setLineDash([6 / scale, 4 / scale]);
         ctx.strokeStyle = '#facc15';
         ctx.lineWidth = 2 / scale;
-        ctx.moveTo(0, 0);
-        ctx.lineTo(0, -len);
+        if (autoOffsets && autoOffsets.length > 2) {
+          const step = Math.max(1, Math.floor(autoOffsets.length / 80));
+          for (let i = 0; i < autoOffsets.length; i += step) {
+            const px = autoOffsets[i] * imgScale;
+            const py = -(i / (autoOffsets.length - 1)) * len;
+            if (i === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+          }
+          const last = autoOffsets.length - 1;
+          ctx.lineTo(autoOffsets[last] * imgScale, -len);
+        } else {
+          ctx.moveTo(0, 0);
+          ctx.lineTo(0, -len);
+        }
         ctx.stroke();
         ctx.setLineDash([]);
 
@@ -902,6 +984,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     getLaneEffectiveSpots,
     isDraggingSpot,
     hoveredSpotInfo,
+    boostWhiteSpots,
+    automiddleEnabled,
   ]);
 
   // Find spot collision at mouse coordinates (for dragging, Alt+Click deletion, or tooltip)
@@ -1387,12 +1471,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const sampleLaneSide0 = lanes.find((l) => l.id < 27) || lanes[0];
   const sampleLaneSide1 = lanes.find((l) => l.id >= 27) || lanes[Math.min(27, lanes.length - 1)];
 
-  const frontSide0Val = sampleLaneSide0
-    ? Math.round(tlcFront(currentSet, sampleLaneSide0, getProfile))
-    : 920;
-  const frontSide1Val = sampleLaneSide1
-    ? Math.round(tlcFront(currentSet, sampleLaneSide1, getProfile))
-    : 920;
+  const frontSide0Val = tlcHalfFrontBase(currentSet, 0, sampleLaneSide0, getProfile);
+  const frontSide1Val = tlcHalfFrontBase(currentSet, 1, sampleLaneSide1, getProfile);
 
   const selectedSide = selectedLane ? (selectedLane.id < 27 ? 0 : 1) : null;
 

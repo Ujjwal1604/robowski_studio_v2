@@ -265,6 +265,7 @@ export interface CalibratedPlateSummary {
   plateIndex: number;
   matchedSystemId: string;
   matchedSystemName: string;
+  matchedSystem?: TlcSolventSystemDef;
   stationaryPhase: TlcStationaryPhasePreference;
   family: SolventFamily;
   matchSource: 'auto' | 'manual';
@@ -312,6 +313,8 @@ export interface TlcCalibrationPhaseFit {
   cvRmseBaseline?: number;
   /** false when the correction did not beat the uncalibrated model on held-out compounds and was switched off */
   calibrationApplied?: boolean;
+  /** families whose whole plate ran far from the prediction; demand shift taken from the plate-level estimate */
+  plateLevelFamilies?: Partial<Record<SolventFamily, number>>;
 }
 
 export interface TlcCalibrationModel {
@@ -1537,7 +1540,8 @@ function resolveCalibrationOffsets(
   const pKey = calibrationPhaseKeyForSystem(system, stationaryPhasePref);
   const fit = calibration.byPhase[pKey];
   const evidence = (fit?.pairedSpotCount ?? 0) + (fit?.frontCensoredCount ?? 0) + (fit?.baselineCensoredCount ?? 0);
-  if (!fit || evidence === 0) return { demandShift: 0, demandSlope: 1.0, sigma: RF_SIGMA };
+  const hasPlateLevel = Boolean(fit?.plateLevelFamilies && Object.keys(fit.plateLevelFamilies).length > 0);
+  if (!fit || (evidence === 0 && !hasPlateLevel)) return { demandShift: 0, demandSlope: 1.0, sigma: RF_SIGMA };
   const famShift = fit.familyDemandShifts[system.family] ?? 0;
   return {
     demandShift: fit.globalDemandShift + famShift,
@@ -2851,6 +2855,15 @@ export async function optimizePlateTlcSolvents(
     );
   }
 
+  if (activePhaseFit?.plateLevelFamilies && Object.keys(activePhaseFit.plateLevelFamilies).length > 0) {
+    const fams = Object.entries(activePhaseFit.plateLevelFamilies)
+      .map(([f, v]) => `${f} (${(v as number) >= 0 ? '+' : ''}${(v as number).toFixed(2)} demand)`)
+      .join(', ');
+    summaryNotes.push(
+      `Plate-level correction applied for ${fams}: the measured plate ran far from the predicted Rf distribution, which spot pairing alone does not catch. Confirm with the next plate in that eluent family.`
+    );
+  }
+
   // 5. Follow-up / Rescue Solvent Recommender driven directly by already-measured plate outcomes
   let followUpPlan: PlateFollowUpPlan | undefined;
   const relevantMeasuredPlates = (options.calibration?.plates || []).filter(
@@ -2861,6 +2874,9 @@ export async function optimizePlateTlcSolvents(
 
   if (relevantMeasuredPlates.length > 0 && activeWells.length > 0) {
     const testedSystemIds = new Set(relevantMeasuredPlates.map((p) => p.matchedSystemId));
+    const testedSystemNames = new Set(
+      relevantMeasuredPlates.map((p) => p.matchedSystemName.toLowerCase().trim())
+    );
     const frontCeilingByWell = new Map<number, number>(); // weakest strength that still caused front saturation
     const baseFloorByWell = new Map<number, number>(); // strongest unmodified strength that remained baseline-pinned
     const measuredResolvedWells = new Set<number>();
@@ -2880,6 +2896,7 @@ export async function optimizePlateTlcSolvents(
       for (const mp of relevantMeasuredPlates) {
         const lane = mp.lanes?.[wi];
         const sysDef =
+          mp.matchedSystem ||
           allCandidateSystems.find((s) => s.id === mp.matchedSystemId) ||
           findSolventSystemById(mp.matchedSystemId);
         if (!lane || lane.isBlank || !sysDef) continue;
@@ -2959,7 +2976,13 @@ export async function optimizePlateTlcSolvents(
         let bestGain = 0;
 
         for (const sys of searchPool) {
-          if (testedSystemIds.has(sys.id) || pickedIds.has(sys.id)) continue;
+          if (
+            testedSystemIds.has(sys.id) ||
+            testedSystemNames.has(sys.name.toLowerCase().trim()) ||
+            pickedIds.has(sys.id)
+          ) {
+            continue;
+          }
           const sysMap = evalMatrix.get(sys.id);
           if (!sysMap) continue;
 

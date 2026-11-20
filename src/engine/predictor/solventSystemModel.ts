@@ -400,6 +400,21 @@ export function validateEluentCompatibility(
 }
 
 /**
+ * Effective silanol affinity of MeOH depends on the carrier it is diluted in: a Langmuir
+ * affinity fixed per neat solvent over-saturates the surface with MeOH in aromatic carriers
+ * (where MeOH self-associates and bulk polar solvation is weaker than in dipolar DCM).
+ * Provisional pair parameter fitted to plate UJG-C0021 (94:4:2 toluene/MeOH/NH3 runs like
+ * ~25% EtOAc/Hex, not like a saturated-MeOH/DCM eluent). Scale 1 = unchanged behaviour;
+ * refit when more toluene/MeOH plates are measured.
+ */
+export const MEOH_AFFINITY_SCALE_BY_CARRIER: Partial<Record<NeatSolventId, number>> = {
+  Toluene: 0.1,
+};
+function meohAffinityScale(carrier: NeatSolventId): number {
+  return MEOH_AFFINITY_SCALE_BY_CARRIER[carrier] ?? 1;
+}
+
+/**
  * Computes mixture eluent strength, Kamlet-Taft / Abraham selectivity vectors, and Geiss beta-front ceiling
  * from neat solvent physical constants via multi-site competitive Langmuir silanol saturation.
  */
@@ -444,7 +459,7 @@ export function computeMixtureDescriptors(
 
   // Multi-site competitive Langmuir silanol adsorption (exact generalization of binary K_rel)
   const kA = Math.max(0.5, weak.silanolAffinity);
-  const kB = Math.max(kA, strong.silanolAffinity);
+  const kB = Math.max(kA, strong.silanolAffinity * (strong.id === 'MeOH' ? meohAffinityScale(spec.weakSolvent) : 1));
   const kT = ter ? Math.max(kA, ter.silanolAffinity) : kA;
   const kBar = Math.max(1e-6, vA * kA + vB * kB + vTer * kT);
   const fA = (vA * kA) / kBar;
@@ -1457,7 +1472,9 @@ export function invertLangmuirForPct(
   }
 
   const fEff = Math.max(0.01, Math.min(0.98, (neededBase - weak.epsSio2) / span));
-  const kRel = Math.max(1.0, strong.silanolAffinity / Math.max(0.5, weak.silanolAffinity));
+  const kA = Math.max(0.5, weak.silanolAffinity);
+  const kB = Math.max(kA, strong.silanolAffinity * (strong.id === 'MeOH' ? meohAffinityScale(weakSolvent) : 1));
+  const kRel = Math.max(1.0, kB / kA);
   const vB = fEff / (kRel - (kRel - 1) * fEff);
   let rawPct = vB * 100;
 
@@ -1773,4 +1790,387 @@ export function generatePrismaTernarySpecs(input: PlateSynthesisInput): DynamicE
 
   return out;
 }
+
+const NEAT_SOLVENT_ALIASES: Record<string, NeatSolventId> = {
+  hex: 'Hexanes',
+  hexane: 'Hexanes',
+  hexanes: 'Hexanes',
+  hept: 'Hexanes',
+  heptane: 'Hexanes',
+  heptanes: 'Hexanes',
+  pe: 'Hexanes',
+  'pet ether': 'Hexanes',
+  'petroleum ether': 'Hexanes',
+  pent: 'Pentane',
+  pentane: 'Pentane',
+  tol: 'Toluene',
+  toluene: 'Toluene',
+  phme: 'Toluene',
+  dcm: 'DCM',
+  ch2cl2: 'DCM',
+  dichloromethane: 'DCM',
+  'methylene chloride': 'DCM',
+  et2o: 'Et2O',
+  ether: 'Et2O',
+  'diethyl ether': 'Et2O',
+  mtbe: 'MTBE',
+  tbme: 'MTBE',
+  etoac: 'EtOAc',
+  ea: 'EtOAc',
+  'ethyl acetate': 'EtOAc',
+  acetone: 'Acetone',
+  me2co: 'Acetone',
+  mecn: 'MeCN',
+  acn: 'MeCN',
+  acetonitrile: 'MeCN',
+  meoh: 'MeOH',
+  methanol: 'MeOH',
+  h2o: 'H2O',
+  water: 'H2O',
+};
+
+function resolveNeatSolventToken(raw: string): NeatSolventId | null {
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/₂/g, '2')
+    .replace(/₃/g, '3')
+    .replace(/[()]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return NEAT_SOLVENT_ALIASES[cleaned] ?? null;
+}
+
+function pickNh3ModifierFromPct(nh3Pct: number): ModifierId {
+  if (nh3Pct <= 1.4) return 'nh3_meoh_1';
+  if (nh3Pct >= 3.0) return 'nh3_meoh_4';
+  return 'nh3_meoh_2';
+}
+
+function inferFamilyForSpec(
+  strongSolvent: NeatSolventId,
+  weakSolvent: NeatSolventId,
+  ternaryCoSolvent: { solvent: NeatSolventId; pct: number } | undefined,
+  modifierId: ModifierId,
+  stationaryPhase: TlcStationaryPhase
+): SolventFamily {
+  if (stationaryPhase === 'C18') return 'c18_rp';
+  if (ternaryCoSolvent) return 'prisma_ternary';
+  if (weakSolvent === 'Toluene') return 'meoh_toluene';
+  if (modifierId === 'acoh_1') return 'acid_mod';
+  if (
+    modifierId === 'et3n_1' ||
+    modifierId === 'nh3_meoh_1' ||
+    modifierId === 'nh3_meoh_2' ||
+    modifierId === 'nh3_meoh_4'
+  ) {
+    return 'basic_mod';
+  }
+  if (strongSolvent === 'EtOAc' && weakSolvent === 'Hexanes') return 'etoac_hex';
+  if (strongSolvent === 'MeOH' && weakSolvent === 'DCM') return 'meoh_dcm';
+  if (strongSolvent === 'Acetone' && weakSolvent === 'Hexanes') return 'acetone_hex';
+  if (strongSolvent === 'MeOH' && weakSolvent === 'EtOAc') return 'meoh_etoac';
+  if (strongSolvent === 'EtOAc' && weakSolvent === 'DCM') return 'etoac_dcm';
+  if (strongSolvent === 'Et2O' && weakSolvent === 'Pentane') return 'ether_pentane';
+  if (strongSolvent === 'MTBE' && weakSolvent === 'Hexanes') return 'mtbe_hex';
+  return strongSolvent === 'MeOH' ? 'meoh_dcm' : 'etoac_hex';
+}
+
+function buildSynthesizedSpecId(
+  strongSolvent: NeatSolventId,
+  weakSolvent: NeatSolventId,
+  strongPct: number,
+  modifierId: ModifierId,
+  stationaryPhase: TlcStationaryPhase,
+  ternaryCoSolvent?: { solvent: NeatSolventId; pct: number }
+): string {
+  if (stationaryPhase === 'C18') {
+    const modTag = modifierId === 'tfa_01' ? '_tfa' : '';
+    return `c18_${strongSolvent.toLowerCase()}_${strongPct}${modTag}`;
+  }
+  if (ternaryCoSolvent) {
+    const wkTag = weakSolvent === 'Hexanes' ? 'hex' : weakSolvent === 'Toluene' ? 'tol' : weakSolvent.toLowerCase();
+    const terTag = ternaryCoSolvent.solvent === 'Toluene' ? 'tol' : ternaryCoSolvent.solvent.toLowerCase();
+    const modTag = modifierId === 'none' ? '' : `_${modifierId}`;
+    return `prisma_${strongSolvent.toLowerCase()}_${terTag}_${wkTag}_${strongPct}_${ternaryCoSolvent.pct}${modTag}`;
+  }
+  if (strongSolvent === 'EtOAc' && weakSolvent === 'Hexanes') {
+    const modTag = modifierId === 'none' ? '' : `_${modifierId.split('_')[0]}`;
+    return `synth_etoac_hex_${strongPct}${modTag}`;
+  }
+  if (strongSolvent === 'MeOH' && weakSolvent === 'DCM') {
+    if (modifierId === 'none') return `synth_meoh_dcm_${strongPct}`;
+    if (modifierId === 'et3n_1') return `synth_meoh_dcm_${strongPct}_et3n`;
+    if (modifierId === 'acoh_1') return `synth_meoh_dcm_${strongPct}_acoh`;
+    return `synth_nh3_dcm_${strongPct}_${MODIFIER_SPECS[modifierId].volPct}pct`;
+  }
+  if (strongSolvent === 'EtOAc' && weakSolvent === 'Toluene') {
+    return `synth_etoac_tol_${strongPct}${modifierId === 'et3n_1' ? '_et3n' : modifierId === 'none' ? '' : `_${modifierId}`}`;
+  }
+  if (strongSolvent === 'MeOH' && weakSolvent === 'Toluene') {
+    return `synth_meoh_tol_${strongPct}${modifierId === 'none' ? '' : `_${modifierId}`}`;
+  }
+  return `synth_${strongSolvent.toLowerCase()}_${weakSolvent.toLowerCase()}_${strongPct}${modifierId === 'none' ? '' : `_${modifierId}`}`;
+}
+
+/**
+ * Checks whether an existing composed TlcSolventSystemDef has the exact same physical composition
+ * as a parsed DynamicEluentSpec (used to prefer canonical library IDs over newly synthesized IDs).
+ */
+export function hasSameEluentComposition(
+  sys: TlcSolventSystemDef,
+  spec: Pick<
+    DynamicEluentSpec,
+    'strongSolvent' | 'weakSolvent' | 'ternaryCoSolvent' | 'strongPct' | 'modifierId' | 'stationaryPhase'
+  >
+): boolean {
+  const c = sys.composition;
+  if (!c) return false;
+  if (sys.stationaryPhase !== spec.stationaryPhase) return false;
+  if (c.strongSolvent !== spec.strongSolvent) return false;
+  if (c.weakSolvent !== spec.weakSolvent) return false;
+  if (Math.abs(c.strongPct - spec.strongPct) > 0.01) return false;
+  if (c.modifierId !== spec.modifierId) return false;
+  if (Boolean(c.ternaryCoSolvent) !== Boolean(spec.ternaryCoSolvent)) return false;
+  if (c.ternaryCoSolvent && spec.ternaryCoSolvent) {
+    if (c.ternaryCoSolvent.solvent !== spec.ternaryCoSolvent.solvent) return false;
+    if (Math.abs(c.ternaryCoSolvent.pct - spec.ternaryCoSolvent.pct) > 0.01) return false;
+  }
+  return true;
+}
+
+function parseModifierSuffix(rawSuffix: string): ModifierId | null {
+  const s = rawSuffix.trim();
+  if (!s) return 'none';
+  if (/tfa/i.test(s)) return 'tfa_01';
+  if (/acoh|hoac|acetic/i.test(s)) return 'acoh_1';
+  if (/et3n|net3|\btea\b/i.test(s)) return 'et3n_1';
+  if (/nh3|nh4oh/i.test(s)) {
+    const pctM = /(\d+(?:\.\d+)?)\s*%/.exec(s);
+    const pct = pctM ? parseFloat(pctM[1]) : 2;
+    return pickNh3ModifierFromPct(pct);
+  }
+  return null;
+}
+
+/**
+ * Parses advisor-generated or structured TLC solvent tab names (including dynamically synthesized
+ * Langmuir blends, PRISMA ternaries with or without modifiers, and 2M NH3/MeOH ternary systems like
+ * "Toluene / MeOH / (2M NH₃ in MeOH) (94:4:2)") directly into a validated DynamicEluentSpec.
+ */
+export function parseStructuredSolventName(rawName: string): DynamicEluentSpec | null {
+  if (!rawName || !rawName.trim()) return null;
+
+  const isC18Hint = /\bc18\b|rp[-\s]*18|reverse[-\s]*phase/i.test(rawName);
+  const norm = rawName
+    .toLowerCase()
+    .replace(/₂/g, '2')
+    .replace(/₃/g, '3')
+    .replace(/[–—]/g, '-')
+    .replace(/\((?:neutral\s*al2o3|basic\s*al2o3|sio2|c18[^)]*)\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!norm) return null;
+
+  const buildSpec = (
+    strongSolvent: NeatSolventId,
+    weakSolvent: NeatSolventId,
+    strongPct: number,
+    modifierId: ModifierId,
+    stationaryPhase: TlcStationaryPhase,
+    ternaryCoSolvent?: { solvent: NeatSolventId; pct: number }
+  ): DynamicEluentSpec | null => {
+    const cleanStrongPct = Math.round(strongPct * 10) / 10;
+    const cleanTer = ternaryCoSolvent
+      ? { solvent: ternaryCoSolvent.solvent, pct: Math.round(ternaryCoSolvent.pct * 10) / 10 }
+      : undefined;
+    const spec: DynamicEluentSpec = {
+      id: buildSynthesizedSpecId(
+        strongSolvent,
+        weakSolvent,
+        cleanStrongPct,
+        modifierId,
+        stationaryPhase,
+        cleanTer
+      ),
+      strongSolvent,
+      weakSolvent,
+      ...(cleanTer ? { ternaryCoSolvent: cleanTer } : {}),
+      strongPct: cleanStrongPct,
+      modifierId,
+      stationaryPhase,
+      family: inferFamilyForSpec(strongSolvent, weakSolvent, cleanTer, modifierId, stationaryPhase),
+      preferenceTier:
+        strongSolvent === 'EtOAc' && weakSolvent === 'Hexanes' && !cleanTer
+          ? 'primary'
+          : strongSolvent === 'MeOH' && weakSolvent === 'DCM' && !cleanTer
+          ? 'primary'
+          : 'secondary',
+      isSynthesized: true,
+    };
+    return validateEluentCompatibility(spec).valid ? spec : null;
+  };
+
+  // 1. 3-part NH3-in-MeOH systems:
+  //    "Toluene / MeOH / (2M NH3 in MeOH) (94:4:2)"
+  //    "DCM / MeOH / (2M NH3 in MeOH) (95:3:2)"
+  //    "94:4:2 Toluene/MeOH/NH3"
+  //    "95:3:2 DCM:MeOH:NH3 in MeOH"
+  //    "94:4:2 v/v/v Toluene / MeOH / (2M NH3 in MeOH)"
+  const nh3TernaryTrailing =
+    /^([a-z0-9 ]+?)\s*[/:]\s*(?:meoh|methanol)\s*[/:]\s*\(?\s*(?:\d+\s*[mn]\s*)?(?:nh3|nh4oh)(?:\s*in\s*(?:meoh|methanol)|[-/\s]*meoh)?\s*\)?\s*\(?\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*\)?(?:\s*\+\s*.*)?$/.exec(
+      norm
+    );
+  const nh3TernaryLeading =
+    /^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*(?:v\/v\/v\s*)?([a-z0-9 ]+?)\s*[/:]\s*(?:meoh|methanol)\s*[/:]\s*\(?\s*(?:\d+\s*[mn]\s*)?(?:nh3|nh4oh)(?:\s*in\s*(?:meoh|methanol)|[-/\s]*meoh)?\s*\)?(?:\s*\+\s*.*)?$/.exec(
+      norm
+    );
+
+  if (nh3TernaryTrailing || nh3TernaryLeading) {
+    const wkRaw = nh3TernaryTrailing ? nh3TernaryTrailing[1] : nh3TernaryLeading![4];
+    const wVal = parseFloat(nh3TernaryTrailing ? nh3TernaryTrailing[2] : nh3TernaryLeading![1]);
+    const mVal = parseFloat(nh3TernaryTrailing ? nh3TernaryTrailing[3] : nh3TernaryLeading![2]);
+    const nVal = parseFloat(nh3TernaryTrailing ? nh3TernaryTrailing[4] : nh3TernaryLeading![3]);
+    const weakSolvent = resolveNeatSolventToken(wkRaw);
+    const total = wVal + mVal + nVal;
+    if (weakSolvent && weakSolvent !== 'MeOH' && total > 0) {
+      const mPct = Math.round((mVal / total) * 100);
+      const nPct = (nVal / total) * 100;
+      const modId = pickNh3ModifierFromPct(nPct);
+      return buildSpec('MeOH', weakSolvent, mPct, modId, 'SiO2');
+    }
+  }
+
+  // 2. 2-part NH3-in-MeOH systems:
+  //    "DCM / (2M NH3 in MeOH) (98:2)"
+  //    "Toluene / (2M NH3 in MeOH) (98:2)"
+  //    "98:2 DCM/NH3-MeOH"
+  //    "98:2 v/v DCM / (2M NH3 in MeOH)"
+  const nh3BinaryTrailing =
+    /^([a-z0-9 ]+?)\s*[/:]\s*\(?\s*(?:\d+\s*[mn]\s*)?(?:nh3|nh4oh)(?:\s*in\s*(?:meoh|methanol)|[-/\s]*meoh)?\s*\)?\s*\(?\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*\)?(?:\s*\+\s*.*)?$/.exec(
+      norm
+    );
+  const nh3BinaryLeading =
+    /^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*(?:v\/v\s*)?([a-z0-9 ]+?)\s*[/:]\s*\(?\s*(?:\d+\s*[mn]\s*)?(?:nh3|nh4oh)(?:\s*in\s*(?:meoh|methanol)|[-/\s]*meoh)?\s*\)?(?:\s*\+\s*.*)?$/.exec(
+      norm
+    );
+
+  if (nh3BinaryTrailing || nh3BinaryLeading) {
+    const wkRaw = nh3BinaryTrailing ? nh3BinaryTrailing[1] : nh3BinaryLeading![3];
+    const wVal = parseFloat(nh3BinaryTrailing ? nh3BinaryTrailing[2] : nh3BinaryLeading![1]);
+    const nVal = parseFloat(nh3BinaryTrailing ? nh3BinaryTrailing[3] : nh3BinaryLeading![2]);
+    const weakSolvent = resolveNeatSolventToken(wkRaw);
+    const total = wVal + nVal;
+    if (weakSolvent && weakSolvent !== 'MeOH' && total > 0) {
+      const nPct = (nVal / total) * 100;
+      const modId = pickNh3ModifierFromPct(nPct);
+      return buildSpec('MeOH', weakSolvent, 0, modId, 'SiO2');
+    }
+  }
+
+  // 2b. 3-part binary + Et3N/AcOH ratio formats:
+  //     "DCM:MeOH:NEt3 94:5:1", "94:5:1 DCM/MeOH/Et3N", "5:94:1 v/v/v MeOH / DCM / Et3N", "Hexanes / EtOAc / Et3N (49:50:1)"
+  const modTernaryTrailing =
+    /^([a-z0-9 ]+?)\s*[/:]\s*([a-z0-9 ]+?)\s*[/:]\s*\(?\s*(et3n|net3|tea|acoh|hoac|acetic(?:\s+acid)?)\s*\)?\s*\(?\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*\)?$/.exec(
+      norm
+    );
+  const modTernaryLeading =
+    /^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*(?:v\/v\/v\s*)?([a-z0-9 ]+?)\s*[/:]\s*([a-z0-9 ]+?)\s*[/:]\s*\(?\s*(et3n|net3|tea|acoh|hoac|acetic(?:\s+acid)?)\s*\)?$/.exec(
+      norm
+    );
+
+  if (modTernaryTrailing || modTernaryLeading) {
+    const s1Raw = modTernaryTrailing ? modTernaryTrailing[1] : modTernaryLeading![4];
+    const s2Raw = modTernaryTrailing ? modTernaryTrailing[2] : modTernaryLeading![5];
+    const modRaw = modTernaryTrailing ? modTernaryTrailing[3] : modTernaryLeading![6];
+    const v1 = parseFloat(modTernaryTrailing ? modTernaryTrailing[4] : modTernaryLeading![1]);
+    const v2 = parseFloat(modTernaryTrailing ? modTernaryTrailing[5] : modTernaryLeading![2]);
+    const v3 = parseFloat(modTernaryTrailing ? modTernaryTrailing[6] : modTernaryLeading![3]);
+    const sol1 = resolveNeatSolventToken(s1Raw);
+    const sol2 = resolveNeatSolventToken(s2Raw);
+    const modId = parseModifierSuffix(modRaw);
+    const total = v1 + v2 + v3;
+    if (sol1 && sol2 && sol1 !== sol2 && modId && modId !== 'none' && total > 0) {
+      if (NEAT_SOLVENTS[sol1].epsSio2 >= NEAT_SOLVENTS[sol2].epsSio2) {
+        return buildSpec(sol1, sol2, Math.round((v1 / total) * 100), modId, 'SiO2');
+      }
+      return buildSpec(sol2, sol1, Math.round((v2 / total) * 100), modId, 'SiO2');
+    }
+  }
+
+  // 3. PRISMA ternary formats:
+  //    "15% EtOAc / 35% DCM / Hexanes" or "15% EtOAc / 35% DCM / Hexanes + 1% Et3N"
+  //    "15/35/50 EtOAc/DCM/Hex + Et3N"
+  //    "15:35:50 v/v/v EtOAc / DCM / Hexanes" or "15:35:49:1 v/v/v/v EtOAc / DCM / Hexanes / Et3N"
+  const prismaPctMatch =
+    /^(\d+(?:\.\d+)?)\s*%\s*([a-z0-9 ]+?)\s*\/\s*(\d+(?:\.\d+)?)\s*%\s*([a-z0-9 ]+?)\s*\/\s*([a-z0-9 ]+?)(?:\s*\+\s*(.+))?$/.exec(
+      norm
+    );
+  if (prismaPctMatch) {
+    const p1 = parseFloat(prismaPctMatch[1]);
+    const s1 = resolveNeatSolventToken(prismaPctMatch[2]);
+    const p2 = parseFloat(prismaPctMatch[3]);
+    const s2 = resolveNeatSolventToken(prismaPctMatch[4]);
+    const s3 = resolveNeatSolventToken(prismaPctMatch[5]);
+    const modId = parseModifierSuffix(prismaPctMatch[6] || '');
+    if (s1 && s2 && s3 && modId) {
+      return buildSpec(s1, s3, p1, modId, 'SiO2', { solvent: s2, pct: p2 });
+    }
+  }
+
+  const prismaShortMatch =
+    /^(\d+(?:\.\d+)?)\s*[/:]\s*(\d+(?:\.\d+)?)\s*[/:]\s*(\d+(?:\.\d+)?)(?:\s*:\s*\d+(?:\.\d+)?)?\s+(?:v\/v\/v(?:\/v)?\s+)?([a-z0-9 ]+?)\s*[/:]\s*([a-z0-9 ]+?)\s*[/:]\s*([a-z0-9 ]+?)(?:\s*(?:[+/]|with)\s*(.+)|\s+(et3n|net3|acoh|hoac))?$/.exec(
+      norm
+    );
+  if (prismaShortMatch) {
+    const v1 = parseFloat(prismaShortMatch[1]);
+    const v2 = parseFloat(prismaShortMatch[2]);
+    const v3 = parseFloat(prismaShortMatch[3]);
+    const s1 = resolveNeatSolventToken(prismaShortMatch[4]);
+    const s2 = resolveNeatSolventToken(prismaShortMatch[5]);
+    const s3 = resolveNeatSolventToken(prismaShortMatch[6]);
+    const modId = parseModifierSuffix(prismaShortMatch[7] || prismaShortMatch[8] || '');
+    const total = v1 + v2 + v3;
+    if (s1 && s2 && s3 && modId && total > 0) {
+      const modVol = MODIFIER_SPECS[modId].volPct;
+      const scale = Math.abs(total + modVol - 100) <= 2 ? 1 : (100 - modVol) / total;
+      return buildSpec(s1, s3, Math.round(v1 * scale), modId, 'SiO2', {
+        solvent: s2,
+        pct: Math.round(v2 * scale),
+      });
+    }
+  }
+
+  // 4. Standard binary percentage format (normal-phase or C18):
+  //    "20% EtOAc / Hexanes", "40% EtOAc / Hexanes + 1% Et3N", "30% EtOAc / Toluene + 1% Et3N",
+  //    "4% MeOH / Toluene", "45% MeCN / H2O + 0.1% TFA"
+  const binaryPctMatch =
+    /^(\d+(?:\.\d+)?)\s*%\s*([a-z0-9 ]+?)\s*\/\s*([a-z0-9 ]+?)(?:\s*(?:\+|with)\s*(.+)|\s+(et3n|acoh|tfa))?$/.exec(
+      norm
+    );
+  if (binaryPctMatch) {
+    const pct = parseFloat(binaryPctMatch[1]);
+    const s1 = resolveNeatSolventToken(binaryPctMatch[2]);
+    const s2 = resolveNeatSolventToken(binaryPctMatch[3]);
+    const modRaw = binaryPctMatch[4] || binaryPctMatch[5] || '';
+    const modId = parseModifierSuffix(modRaw);
+    if (s1 && s2 && s1 !== s2 && modId && pct >= 0 && pct <= 100) {
+      if (s2 === 'H2O' || isC18Hint) {
+        if (s2 === 'H2O' && (s1 === 'MeCN' || s1 === 'MeOH')) {
+          return buildSpec(s1, 'H2O', pct, modId, 'C18');
+        }
+      } else {
+        // Handle inverted weak-first percentage such as "70% Hexanes / EtOAc"
+        if (NEAT_SOLVENTS[s1].epsSio2 < NEAT_SOLVENTS[s2].epsSio2) {
+          const strongPct = Math.max(0, 100 - pct - MODIFIER_SPECS[modId].volPct);
+          return buildSpec(s2, s1, strongPct, modId, 'SiO2');
+        }
+        return buildSpec(s1, s2, pct, modId, 'SiO2');
+      }
+    }
+  }
+
+  return null;
+}
+
 

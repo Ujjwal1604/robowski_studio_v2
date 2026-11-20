@@ -4,6 +4,7 @@ import {
   applyFlatFieldCorrection,
   detectCurvedFrontSeam,
   detectGlassTopEdge,
+  findDualHalfGapCeiling,
   findSimilarSpotsByColor,
   isProfileOnPlate,
   rescueSharedReagentSpots,
@@ -13,6 +14,7 @@ import {
   detectChannelOrigin,
   findSpots,
   tlcFront,
+  tlcHalfFrontBase,
   tlcOrigin,
 } from '../src/engine/tlcLanes';
 import type { TlcLane, TlcSet } from '../src/types';
@@ -299,6 +301,492 @@ describe('tlcVision2d: 2D smooth curved solvent-front seam tracking', () => {
     expect(Math.abs(seam.byLane[0] - trueY(0))).toBeLessThanOrEqual(5);
     expect(Math.abs(seam.byLane[13] - trueY(13))).toBeLessThanOrEqual(5);
     expect(Math.abs(seam.byLane[26] - trueY(26))).toBeLessThanOrEqual(5);
+  });
+
+  it('tracks an aluminium-plate flat interior + sharp outer edge curl without bowing the center', () => {
+    const L = 980;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(404);
+    // Flat interior across lanes 4..22 at 860 px; outer 4 lanes curl upward by +4, +10, +17, +24 px
+    const curlOffset = [24, 17, 10, 4];
+    const trueY = (col: number) => {
+      const distEdge = Math.min(col, 26 - col);
+      return 860 + (distEdge < curlOffset.length ? curlOffset[distEdge] : 0);
+    };
+
+    const profiles = laneIds.map((col) => {
+      const fp = trueY(col);
+      return Array.from({ length: L }, (_, i) => {
+        const wetDry = i < fp ? 178 : 189;
+        const ridge = Math.abs(i - fp) <= 1 ? -13 : 0;
+        return wetDry + ridge + rand() * 1.2;
+      });
+    });
+
+    const seam = detectCurvedFrontSeam([{ profiles, sign: -1 }], laneIds, L);
+    expect(seam.medianPos).toBeGreaterThan(0);
+    expect(seam.isCurved).toBe(true);
+    // Interior lanes 5..21 must stay flat near 860 (a rigid global parabola would bow the center!)
+    for (const midCol of [6, 10, 13, 16, 20]) {
+      expect(Math.abs(seam.byLane[midCol] - 860)).toBeLessThanOrEqual(3);
+    }
+    // Outer curled edge lanes must track the +24 px edge upturn accurately
+    expect(Math.abs(seam.byLane[0] - trueY(0))).toBeLessThanOrEqual(4);
+    expect(Math.abs(seam.byLane[1] - trueY(1))).toBeLessThanOrEqual(4);
+    expect(Math.abs(seam.byLane[25] - trueY(25))).toBeLessThanOrEqual(4);
+    expect(Math.abs(seam.byLane[26] - trueY(26))).toBeLessThanOrEqual(4);
+  });
+
+  it('uses 2D horizontal continuity (core + flanks) to ignore strong aligned high-Rf spots and lock onto the true solvent front', () => {
+    const W = 44;
+    const L = 500;
+    const cx = (W - 1) / 2;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(405);
+
+    const trueFrontY = (col: number) => Math.round(442 + 10 * ((2 * col) / 26 - 1));
+    const fakeSpotY = 392; // Strong center-peaked high-Rf spot present in EVERY lane!
+
+    const profiles: number[][] = [];
+    const metrics = [];
+    for (let col = 0; col < 27; col++) {
+      const fp = trueFrontY(col);
+      const rgba = makeLaneStrip(W, L, [20, 210, 20], (x, pos) => {
+        const n = rand() * 1.0;
+        // Full-width faint solvent front (affects both core AND outer flanks identically)
+        const wetDry = pos < fp ? 202 : 212;
+        const frontRidge = Math.abs(pos - fp) <= 1 ? -11 : 0;
+        // Center-peaked dark high-Rf spot (stronger than front in core, absent in outer flanks!)
+        const dx = (x - cx) / 5.5;
+        const dy = (pos - fakeSpotY) / 2.2;
+        const spotDrop = 55 * Math.exp(-(dx * dx + dy * dy));
+        const g = Math.max(0, Math.min(255, wetDry + frontRidge - spotDrop + n));
+        return [20, g, 20];
+      });
+      const res = analyzeLaneStripRgb(rgba, W, L, 'UV254', 0.35, false);
+      profiles.push(res.profile);
+      metrics.push(res.metrics);
+    }
+
+    const seam2d = detectCurvedFrontSeam(
+      [{ profiles, sign: -1, metrics, colPositions: laneIds }],
+      laneIds,
+      L
+    );
+    expect(seam2d.medianPos).toBeGreaterThan(0);
+    expect(Math.abs(seam2d.byLane[0] - trueFrontY(0))).toBeLessThanOrEqual(4);
+    expect(Math.abs(seam2d.byLane[13] - trueFrontY(13))).toBeLessThanOrEqual(4);
+    expect(Math.abs(seam2d.byLane[26] - trueFrontY(26))).toBeLessThanOrEqual(4);
+  });
+
+  it('aligns N-1 gutter midpoint coordinates accurately to lane 0 and lane N-1 without half-lane stretch error', () => {
+    const L = 980;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(406);
+    // Steep linear tilt: +2 px per lane (lane 0 = 830, lane 13 = 856, lane 26 = 882)
+    const trueY = (x: number) => 830 + 2 * x;
+    const gutterPositions = Array.from({ length: 26 }, (_, i) => i + 0.5);
+
+    const profiles = gutterPositions.map((gx) => {
+      const fp = Math.round(trueY(gx));
+      return Array.from({ length: L }, (_, i) => {
+        const wetDry = i < fp ? 176 : 188;
+        const ridge = Math.abs(i - fp) <= 1 ? -14 : 0;
+        return wetDry + ridge + rand() * 1.0;
+      });
+    });
+
+    const seam = detectCurvedFrontSeam(
+      [{ profiles, sign: -1, colPositions: gutterPositions }],
+      laneIds,
+      L
+    );
+    expect(seam.isCurved).toBe(true);
+    expect(Math.abs(seam.byLane[0] - trueY(0))).toBeLessThanOrEqual(2);
+    expect(Math.abs(seam.byLane[13] - trueY(13))).toBeLessThanOrEqual(2);
+    expect(Math.abs(seam.byLane[26] - trueY(26))).toBeLessThanOrEqual(2);
+  });
+
+  it('preserves the 2D per-lane curved front shape when nudging manually via frontHalfPx / tlcHalfFrontBase', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(407);
+    const halfLanes = cfg.lanes.filter((l) => l.id < 27);
+    const xMin = halfLanes[0].x0;
+    const xMax = halfLanes[halfLanes.length - 1].x0;
+    const trueFrontAtX = (x0: number) => {
+      const u = (2 * (x0 - xMin)) / Math.max(1, xMax - xMin) - 1;
+      return Math.round(845 + 26 * u * u);
+    };
+
+    const set: TlcSet = {
+      uid: 'nudge-curve-set',
+      name: 'nudge-curve',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg,
+    };
+
+    const getProfile = (_s: TlcSet, _key: string, lane: TlcLane) => {
+      const fp = trueFrontAtX(lane.x0);
+      return Array.from({ length: lane.length }, (_, i) => {
+        const wetDry = i < fp ? 175 : 186;
+        const ridge = Math.abs(i - fp) <= 1 ? -14 : 0;
+        return wetDry + ridge + rand() * 1.1;
+      });
+    };
+
+    const autoLeft = tlcFront(set, halfLanes[0], getProfile as any);
+    const autoMid = tlcFront(set, halfLanes[13], getProfile as any);
+    const autoRight = tlcFront(set, halfLanes[26], getProfile as any);
+    const baseBefore = tlcHalfFrontBase(set, 0, halfLanes[0], getProfile as any);
+    expect(Math.abs(baseBefore - (set.frontAuto?.[0] ?? 0))).toBeLessThanOrEqual(1);
+    expect(autoLeft - autoMid).toBeGreaterThanOrEqual(18);
+
+    // Manually nudge side 0 up by +12 px while preserving frontAuto / frontAutoByLane
+    set.frontHalfPx = { 0: baseBefore + 12 };
+    expect(tlcHalfFrontBase(set, 0, halfLanes[0], getProfile as any)).toBe(baseBefore + 12);
+    expect(tlcFront(set, halfLanes[0], getProfile as any)).toBe(autoLeft + 12);
+    expect(tlcFront(set, halfLanes[13], getProfile as any)).toBe(autoMid + 12);
+    expect(tlcFront(set, halfLanes[26], getProfile as any)).toBe(autoRight + 12);
+  });
+
+  it('tracks a one-sided 4-lane right-edge bend (up to 97% of lane box) even on crisp high-contrast UV254 plates', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(408);
+    const halfLanes = cfg.lanes.filter((l) => l.id < 27).sort((a, b) => a.id - b.id);
+    const L = halfLanes[0].length;
+    const baseY = Math.round(L * 0.935);
+    const xMin = halfLanes[0].x0;
+    const xMax = halfLanes[halfLanes.length - 1].x0;
+    // Flat across 85% of the plate (lanes 0..22); ONLY the rightmost 4 lanes bend by +3, +8, +14, +20 px (reaching ~96.5%)
+    const bendAtX = (x0: number) => {
+      const colF = (26 * (x0 - xMin)) / Math.max(1, xMax - xMin);
+      if (colF <= 22) return baseY;
+      const t = (colF - 22) / 4; // 0..1 across last 4 lanes
+      return Math.round(baseY + 20 * t * t);
+    };
+
+    const set: TlcSet = {
+      uid: 'one-sided-bend',
+      name: 'one-sided-bend',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg,
+    };
+
+    // High-contrast crisp meniscus (produces bestFlat.score >> 30 on 26-gutter median!)
+    const getProfile = (_s: TlcSet, _key: string, lane: TlcLane) => {
+      const fp = bendAtX(lane.x0);
+      return Array.from({ length: lane.length }, (_, i) => {
+        const wetDry = i < fp ? 170 : 196;
+        const ridge = -48 * Math.exp(-Math.pow((i - fp) / 2.2, 2));
+        return wetDry + ridge + rand() * 0.8;
+      });
+    };
+
+    const f0 = tlcFront(set, halfLanes[0], getProfile as any);
+    const f13 = tlcFront(set, halfLanes[13], getProfile as any);
+    const f24 = tlcFront(set, halfLanes[24], getProfile as any);
+    const f25 = tlcFront(set, halfLanes[25], getProfile as any);
+    const f26 = tlcFront(set, halfLanes[26], getProfile as any);
+
+    expect(Math.abs(f0 - baseY)).toBeLessThanOrEqual(3);
+    expect(Math.abs(f13 - baseY)).toBeLessThanOrEqual(3);
+    expect(Math.abs(f24 - bendAtX(halfLanes[24].x0))).toBeLessThanOrEqual(4);
+    expect(Math.abs(f25 - bendAtX(halfLanes[25].x0))).toBeLessThanOrEqual(4);
+    expect(Math.abs(f26 - bendAtX(halfLanes[26].x0))).toBeLessThanOrEqual(5);
+    expect(f26 - f13).toBeGreaterThanOrEqual(14);
+  });
+
+  it('stays cleanly flat when only a single isolated lane has an outlier front shift', () => {
+    const L = 980;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(409);
+    const profiles = laneIds.map((col) => {
+      const fp = col === 26 ? 882 : 860; // single isolated outlier on last lane only
+      return Array.from({ length: L }, (_, i) => {
+        const wetDry = i < fp ? 178 : 189;
+        const ridge = Math.abs(i - fp) <= 1 ? -14 : 0;
+        return wetDry + ridge + rand() * 1.1;
+      });
+    });
+
+    const seam = detectCurvedFrontSeam([{ profiles, sign: -1 }], laneIds, L);
+    expect(seam.medianPos).toBeGreaterThan(0);
+    expect(seam.isCurved).toBe(false);
+    expect(Math.abs(seam.byLane[26] - 860)).toBeLessThanOrEqual(2);
+  });
+
+  it('tracks a broad asymmetric dried-plate solvent-front accumulation band (4-5% width, no wet/dry step) bending on one side', () => {
+    const W = 20;
+    const L = 400;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(410);
+    // Dried UV254 aluminium plate: same silica brightness before & after front (no wet-dry step),
+    // asymmetric dark solvent-front band (gradual ~14 px wet-side tail, crisp ~4 px dry-side edge)
+    // bending smoothly downward on the right half (360 -> 374 px).
+    const trueY = (col: number) => (col <= 14 ? 360 : Math.round(360 + ((col - 14) / 12) * 14));
+
+    const profiles: number[][] = [];
+    const metrics = [];
+    for (let col = 0; col < 27; col++) {
+      const fp = trueY(col);
+      const rgba = makeLaneStrip(W, L, [20, 178, 20], (_x, pos) => {
+        const d = pos - fp;
+        const sigma = d < 0 ? 6.5 : 2.5; // asymmetric broad wet-side tail + crisp dry-side edge
+        const bandDrop = 85 * Math.exp(-0.5 * Math.pow(d / sigma, 2));
+        const g = Math.max(0, Math.min(255, 178 - bandDrop + rand() * 2.5));
+        return [20, g, 20];
+      });
+      const res = analyzeLaneStripRgb(rgba, W, L, 'UV254', 0.35, true);
+      profiles.push(res.profile);
+      metrics.push(res.metrics);
+    }
+
+    const seam = detectCurvedFrontSeam(
+      [{ profiles, sign: -1, metrics, colPositions: laneIds }],
+      laneIds,
+      L
+    );
+    expect(seam.medianPos).toBeGreaterThan(0);
+    expect(seam.isCurved).toBe(true);
+    expect(Math.abs(seam.byLane[2] - 360)).toBeLessThanOrEqual(3);
+    expect(Math.abs(seam.byLane[13] - 360)).toBeLessThanOrEqual(3);
+    expect(Math.abs(seam.byLane[25] - trueY(25))).toBeLessThanOrEqual(4);
+    expect(seam.byLane[26] - seam.byLane[12]).toBeGreaterThanOrEqual(10);
+  });
+
+  it('tracks outer (dry-side) edge of wavy dark fronts on a 20x20 cm dual-half overlapping plate while ignoring 9.5/10.5 cm pencil lines, middle handwriting, high-Rf blobs, and drips', () => {
+    // 20x20 cm head-to-head Merck plate geometry in 2000px vertical coordinates:
+    // Lower half (ids 0..26, angle=0): starts at y0=1980 running UP (dy=-1), laneLen=1060 -> extends to y=920 (PAST the 10cm midline at y=1000!)
+    // Upper half (ids 27..53, angle=180): starts at y0=20 running DOWN (dy=+1), laneLen=1060 -> extends to y=1080 (PAST the 10cm midline!)
+    // Middle 1 cm gap sits between y=950 (9.5 cm pencil line) and y=1050 (10.5 cm pencil line) with handwritten label text.
+    const L = 1060;
+    const pairDist = 1960; // y0_lower (1980) - y0_upper (20) -> geometric midline at pos = 980 in each half
+    const rand = rng(411);
+
+    const lanes: TlcLane[] = [];
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: i, x0: 260 + i * 100, y0: 1980, length: L, width: 64, angle: 0, zeroRf: null });
+    }
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: 27 + i, x0: 260 + i * 100, y0: 20, length: L, width: 64, angle: 180, zeroRf: null });
+    }
+
+    // True wavy OUTER (dry-side) edges in plate Y coordinates:
+    // Upper half runs DOWN toward y~950 (with left wave dipping down to 964 on cols 0..2 and rising to 944 on cols 4..6)
+    const upperOuterPlateY = (x: number) => {
+      const col = (x - 260) / 100;
+      const wave =
+        col <= 2.5
+          ? 14 * Math.cos((col / 2.5) * (Math.PI / 2))
+          : col <= 6.5
+          ? -8 * Math.sin(((col - 2.5) / 4) * Math.PI)
+          : 4 * Math.sin(((col - 6.5) / 20) * Math.PI);
+      return Math.round(952 + wave);
+    };
+    // Lower half runs UP toward y~1048 (wavy: higher at left ~1038, lower at right ~1056)
+    const lowerOuterPlateY = (x: number) => {
+      const col = (x - 260) / 100;
+      const wave = -10 * Math.cos((col / 26) * Math.PI) + 5 * Math.sin((col / 5) * Math.PI);
+      return Math.round(1047 + wave);
+    };
+
+    // Synthesize plate intensity at any (x, plateY): bright green silica (240)
+    const plateValAt = (x: number, py: number): number => {
+      let g = 240 + rand() * 1.6;
+      const uEdge = upperOuterPlateY(x);
+      const lEdge = lowerOuterPlateY(x);
+      const col = Math.round((x - 260) / 100);
+
+      // Upper dark solvent-front band (24 px thick behind its outer dry-side edge uEdge)
+      if (py <= uEdge && py >= uEdge - 24) {
+        const t = Math.min(1, (uEdge - py) / 3.5);
+        g -= 185 * t;
+      } else if (py > uEdge && py <= uEdge + 3) {
+        g -= 185 * Math.max(0, 1 - (py - uEdge) / 3.5);
+      }
+      // High-Rf sample blobs piling up on the WET side of upper front (cols 11..13, 17..19)
+      if (((col >= 11 && col <= 13) || (col >= 17 && col <= 19)) && py < uEdge - 18 && py >= uEdge - 48) {
+        g -= 160;
+      }
+
+      // Lower dark solvent-front band (24 px thick behind its outer dry-side edge lEdge)
+      if (py >= lEdge && py <= lEdge + 24) {
+        const t = Math.min(1, (py - lEdge) / 3.5);
+        g -= 185 * t;
+      } else if (py < lEdge && py >= lEdge - 3) {
+        g -= 185 * Math.max(0, 1 - (lEdge - py) / 3.5);
+      }
+      // Messy drips hanging off the WET side of lower front (cols 0..5, 22..26)
+      if ((col <= 5 || col >= 22) && py > lEdge + 20 && py <= lEdge + 52) {
+        g -= 140;
+      }
+
+      // Two razor-thin straight ruler pencil lines at y=935 and y=1065
+      if (Math.abs(py - 935) <= 1 || Math.abs(py - 1065) <= 1) {
+        g -= 155;
+      }
+
+      // Handwritten date/eluent text inside the 1 cm bright middle gap (y=985..1015, sparse across ~30% of columns)
+      if (py >= 985 && py <= 1015 && (col % 3 === 1) && Math.abs(py - (995 + (col % 5) * 3)) <= 2) {
+        g -= 130;
+      }
+
+      return Math.max(10, Math.min(250, g));
+    };
+
+    const set: TlcSet = {
+      uid: 'dual-20x20',
+      name: 'dual-20x20',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      imgs: { UV254: { name: 'uni_linint_corrected_uv254.png', url: '', bmp: {} as any } },
+      cfg: { lanes, hasZeroRf: false, warnings: [] },
+    };
+
+    const getProfile = (_s: TlcSet, _key: string, lane: TlcLane) => {
+      const th = (lane.angle * Math.PI) / 180;
+      const dy = -Math.cos(th);
+      return Array.from({ length: lane.length }, (_, pos) => plateValAt(lane.x0, Math.round(lane.y0 + dy * pos)));
+    };
+
+    // Confirm dual-half gap ceiling stays strictly inside the clean middle gap
+    const lowerProfs = lanes.slice(0, 27).map((l) => getProfile(set, 'UV254', l));
+    const upperProfs = lanes.slice(27, 54).map((l) => getProfile(set, 'UV254', l));
+    const gapCeil = findDualHalfGapCeiling(
+      [{ profiles: lowerProfs, sign: -1 }],
+      [{ profiles: upperProfs, sign: -1 }],
+      pairDist,
+      L
+    );
+    expect(gapCeil?.gapConfirmed).toBe(true);
+    // Lower half: outer edge is around pos = 1980 - 1047 = 933; opposing upper band starts around pos = 1980 - 952 = 1028
+    expect(gapCeil!.maxFrontPos).toBeGreaterThan(950);
+    expect(gapCeil!.maxFrontPos).toBeLessThan(1025);
+
+    // Check LOWER half tracks wavy outer (dry-side) edge across left, middle, right
+    for (const idx of [0, 3, 8, 13, 20, 26]) {
+      const l = lanes[idx];
+      const expectedPos = l.y0 - lowerOuterPlateY(l.x0);
+      const detected = tlcFront(set, l, getProfile as any);
+      expect(Math.abs(detected - expectedPos)).toBeLessThanOrEqual(6);
+    }
+
+    // Check UPPER half tracks wavy outer (dry-side) edge across left wave (cols 0, 5), high-Rf blob cols (12, 18), and right (26)
+    for (const idx of [0, 5, 12, 18, 26]) {
+      const l = lanes[27 + idx];
+      const expectedPos = upperOuterPlateY(l.x0) - l.y0;
+      const detected = tlcFront(set, l, getProfile as any);
+      expect(Math.abs(detected - expectedPos)).toBeLessThanOrEqual(6);
+    }
+  });
+
+  it('steps over a dark 2-px ruler pencil line ahead of the front and locks onto the outer edge of the real solvent-front band', () => {
+    const L = 980;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(412);
+    // Solvent stopped 24 px SHORT of the 9.5 cm ruler pencil line (pencil at 915, real front band 870..891)
+    const pencilPos = 915;
+    const trueOuterEdge = 891;
+
+    const profiles = laneIds.map(() =>
+      Array.from({ length: L }, (_, i) => {
+        let v = 235 + rand() * 1.4;
+        // Real dark solvent-front accumulation band (22 px wide, crisp outer edge at 891)
+        if (i >= 869 && i <= trueOuterEdge) {
+          v -= 110 * Math.min(1, (trueOuterEdge - i + 1) / 3);
+        }
+        // Stronger dark 2-px ruler pencil line sitting in dry silica 24 px ahead
+        if (Math.abs(i - pencilPos) <= 1) {
+          v -= 165;
+        }
+        return Math.max(10, v);
+      })
+    );
+
+    const seam = detectCurvedFrontSeam([{ profiles, sign: -1, channel: 'UV254' }], laneIds, L);
+    expect(seam.medianPos).toBeGreaterThan(0);
+    expect(Math.abs(seam.medianPos - trueOuterEdge)).toBeLessThanOrEqual(5);
+
+    // Also verify a narrower 9-px medium solvent-front band still beats a heavier 2-px pencil line
+    const mediumProfs = laneIds.map(() =>
+      Array.from({ length: L }, (_, i) => {
+        let v = 235 + rand() * 1.4;
+        if (i >= trueOuterEdge - 9 && i <= trueOuterEdge) {
+          v -= 95 * Math.min(1, (trueOuterEdge - i + 1) / 2.5);
+        }
+        if (Math.abs(i - pencilPos) <= 1) {
+          v -= 165;
+        }
+        return Math.max(10, v);
+      })
+    );
+    const mediumSeam = detectCurvedFrontSeam([{ profiles: mediumProfs, sign: -1, channel: 'UV254' }], laneIds, L);
+    expect(mediumSeam.medianPos).toBeGreaterThan(0);
+    expect(Math.abs(mediumSeam.medianPos - trueOuterEdge)).toBeLessThanOrEqual(5);
+  });
+
+  it('uses UV366 glowing wavy front band when UV254 is faint and suppresses White-light graphite pencil line', () => {
+    const L = 900;
+    const laneIds = Array.from({ length: 27 }, (_, i) => i);
+    const rand = rng(413);
+    const pencilPos = 825;
+    const trueOuterEdge = (col: number) => Math.round(792 + 12 * Math.sin((col / 26) * Math.PI));
+
+    // UV254: front invisible, only the ruler pencil line is dark
+    const uv254Profs = laneIds.map(() =>
+      Array.from({ length: L }, (_, i) => 220 - (Math.abs(i - pencilPos) <= 1 ? 95 : 0) + rand() * 1.5)
+    );
+    // White: ruler pencil line is strongly dark (no solvent front)
+    const whiteProfs = laneIds.map(() =>
+      Array.from({ length: L }, (_, i) => 230 - (Math.abs(i - pencilPos) <= 1 ? 120 : 0) + rand() * 1.5)
+    );
+    // UV366: bright glowing wavy solvent-front band (20 px wide behind trueOuterEdge)
+    const uv366Profs = laneIds.map((col) => {
+      const edge = trueOuterEdge(col);
+      return Array.from({ length: L }, (_, i) => {
+        let v = 18 + rand() * 1.0;
+        if (i >= edge - 20 && i <= edge) {
+          v += 95 * Math.min(1, (edge - i + 1) / 3);
+        }
+        return v;
+      });
+    });
+
+    const seam = detectCurvedFrontSeam(
+      [
+        { profiles: uv254Profs, sign: -1, channel: 'UV254' },
+        { profiles: uv366Profs, sign: +1, channel: 'UV366' },
+        { profiles: whiteProfs, sign: -1, channel: 'White' },
+      ],
+      laneIds,
+      L
+    );
+    expect(seam.medianPos).toBeGreaterThan(0);
+    expect(Math.abs(seam.byLane[0] - trueOuterEdge(0))).toBeLessThanOrEqual(5);
+    expect(Math.abs(seam.byLane[13] - trueOuterEdge(13))).toBeLessThanOrEqual(5);
+    expect(Math.abs(seam.byLane[26] - trueOuterEdge(26))).toBeLessThanOrEqual(5);
   });
 });
 
@@ -627,5 +1115,492 @@ describe('tlcVision2d: real-plate regressions (coalesced spots, off-plate/glass-
     // Fluorescent spot at spotPos preserved at full strength
     expect(flat366Prof[spotPos] - flat366Prof[340]).toBeGreaterThan(120);
   });
+
+  it('resolves touching figure-8 overlapping UV254 spots with lighter middle waist into 2 spots while keeping monotonic streaks as 1 spot', () => {
+    const W = 32;
+    const L = 460;
+    const origin = 50;
+    const front = 410; // span = 360
+    const cx = (W - 1) / 2;
+
+    // 1. Touching figure-8 doublet just above origin (matches real zoomed-in doublet geometry):
+    //    Lower dark oval at pos=68 (Rf=0.050), upper dark oval at pos=95 (Rf=0.125),
+    //    overlapping heavily so the middle waist at pos=82 only lightens by ~10-15% in 1D
+    //    while pinching inward laterally in 2D.
+    const doubletRgba = makeLaneStrip(W, L, [8, 240, 22], (x, pos) => {
+      const dx = (x - cx) / 9.2;
+      const dy1 = (pos - 68) / 11.5;
+      const dy2 = (pos - 95) / 11.5;
+      const s1 = 172 * Math.exp(-(dx * dx + dy1 * dy1));
+      const s2 = 148 * Math.exp(-(dx * dx + dy2 * dy2));
+      // Saturated UV254 quenching combines sub-additively like real dark overlapping spots
+      const quench = Math.min(182, s1 + s2 - 0.35 * Math.min(s1, s2));
+      return [8, Math.max(48, 240 - quench), 22];
+    });
+    const { profile: dProf, metrics: dMetrics } = analyzeLaneStripRgb(doubletRgba, W, L, 'UV254', 0.35, false);
+    expect(dMetrics.rowMass).toBeDefined();
+    expect(dMetrics.spotWidth).toBeDefined();
+
+    const stdDoublet = findSpots(dProf, {
+      sign: -1,
+      origin,
+      front,
+      radius: 22,
+      minProminence: 0.28,
+      lane2d: dMetrics,
+    });
+    expect(stdDoublet.length).toBe(2);
+    expect(Math.abs(stdDoublet[0].pos - 68)).toBeLessThanOrEqual(5);
+    expect(Math.abs(stdDoublet[1].pos - 95)).toBeLessThanOrEqual(5);
+
+    // Broad Spots mode (minProminence = 0.55) still respects user request to merge broad touching bands
+    const broadDoublet = findSpots(dProf, {
+      sign: -1,
+      origin,
+      front,
+      radius: 22,
+      minProminence: 0.55,
+      lane2d: dMetrics,
+    });
+    expect(broadDoublet.length).toBe(1);
+
+    // 2. Single monotonically tapering polar streak/tail with tiny noise ripples -> MUST remain 1 spot
+    const rand = rng(912);
+    const streakRgba = makeLaneStrip(W, L, [8, 240, 22], (x, pos) => {
+      const dx = (x - cx) / 8.5;
+      let quench = 0;
+      if (pos >= 110 && pos <= 220) {
+        const core = 155 * Math.exp(-(dx * dx + ((pos - 130) / 11) ** 2));
+        const tail = pos > 130 ? 95 * Math.exp(-((pos - 130) / 38)) * Math.exp(-(dx * dx * 1.3)) : 0;
+        quench = Math.max(core, tail) + (rand() - 0.5) * 4;
+      }
+      return [8, Math.max(45, Math.min(245, 240 - quench)), 22];
+    });
+    const { profile: sProf, metrics: sMetrics } = analyzeLaneStripRgb(streakRgba, W, L, 'UV254', 0.35, false);
+    const streakSpots = findSpots(sProf, {
+      sign: -1,
+      origin,
+      front,
+      radius: 22,
+      minProminence: 0.28,
+      lane2d: sMetrics,
+    });
+    expect(streakSpots.length).toBe(1);
+    expect(Math.abs(streakSpots[0].pos - 130)).toBeLessThanOrEqual(8);
+  });
+
+  it('rejects full-width dark solvent-front meniscus bands and tiny green-silica ripples while keeping real spots', () => {
+    const W = 32;
+    const L = 460;
+    const origin = 50;
+    const front = 410; // span = 360
+    const cx = (W - 1) / 2;
+    const rand = rng(913);
+
+    const rgba = makeLaneStrip(W, L, [8, 240, 22], (x, pos) => {
+      // Dark black glass gap / handwriting bar immediately past front (pos >= 402)
+      if (pos >= 408) return [6, 35, 10];
+      // Dark full-width solvent-front meniscus band right below front (pos 397..408, Rf ~ 0.965..0.995)
+      if (pos >= 397) {
+        const t = (pos - 397) / 11;
+        return [8, Math.max(42, 240 - 165 * Math.min(1, t * 1.4)), 22];
+      }
+      // One genuine interior spot at pos = 230 (Rf = 0.50)
+      const dx = (x - cx) / 7.5;
+      const dy = (pos - 230) / 9;
+      const realSpot = 135 * Math.exp(-(dx * dx + dy * dy));
+      // Invisible 3.5-unit green-silica ripple at pos = 310
+      const tinyRipple = 3.5 * Math.exp(-(((pos - 310) / 7) ** 2));
+      const g = Math.max(40, Math.min(245, 240 - realSpot - tinyRipple + (rand() - 0.5) * 2.5));
+      return [8, g, 22];
+    });
+
+    const { profile, metrics } = analyzeLaneStripRgb(rgba, W, L, 'UV254', 0.35, false);
+    const spots = findSpots(profile, {
+      sign: -1,
+      origin,
+      front,
+      radius: 20,
+      minProminence: 0.28,
+      lane2d: metrics,
+    });
+
+    // Must detect ONLY the real interior spot at Rf = 0.50 (no meniscus fake at Rf ~0.97, no 3.5-unit green ripple)
+    expect(spots.length).toBe(1);
+    expect(spots[0].rf).toBeCloseTo(0.50, 2);
+  });
+
+  it('resolves wide low-Rf doublets (~150 px tall) at native high camera resolution (L=1000, span=850) without rolling-baseline collapse or origin-dot false positives', () => {
+    const W = 60;
+    const L = 1000;
+    const origin = 50;
+    const front = 900; // span = 850 (native 3280px plate camera scale)
+    const cx = (W - 1) / 2;
+
+    // 1. Native-scale low-Rf doublet spanning pos=50..185 (135 px tall — wider than legacy win=100!):
+    //    Origin deposit at pos=50, lower dark spot at pos=90 (Rf=0.047), lighter waist at pos=128,
+    //    upper dark spot at pos=158 (Rf=0.127).
+    const doubletRgba = makeLaneStrip(W, L, [8, 244, 22], (x, pos) => {
+      const dx = (x - cx) / 18;
+      const orig = 152 * Math.exp(-(dx * dx + ((pos - 50) / 16) ** 2));
+      const lo = 175 * Math.exp(-(dx * dx + ((pos - 90) / 24) ** 2));
+      const hi = 156 * Math.exp(-(dx * dx + ((pos - 158) / 24) ** 2));
+      const q = Math.min(182, Math.max(orig, lo + hi - 0.35 * Math.min(lo, hi)));
+      return [8, Math.max(52, 244 - q), 22];
+    });
+    const { profile: dProf, metrics: dMetrics } = analyzeLaneStripRgb(doubletRgba, W, L, 'UV254', 0.35, false);
+    const dSpots = findSpots(dProf, {
+      sign: -1,
+      origin,
+      front,
+      radius: 24,
+      minProminence: 0.28,
+      lane2d: dMetrics,
+    });
+    expect(dSpots.length).toBe(2);
+    expect(Math.abs(dSpots[0].pos - 90)).toBeLessThanOrEqual(10);
+    expect(Math.abs(dSpots[1].pos - 158)).toBeLessThanOrEqual(10);
+
+    // 2. Native-scale single upper spot + uneluted origin dot (radius ~14 px) -> MUST NOT put a fake dot on origin
+    const singleRgba = makeLaneStrip(W, L, [8, 244, 22], (x, pos) => {
+      const dx = (x - cx) / 17;
+      const orig = 100 * Math.exp(-(dx * dx + ((pos - 50) / 13) ** 2));
+      const upper = 135 * Math.exp(-(dx * dx + ((pos - 165) / 22) ** 2));
+      return [8, Math.max(55, 244 - orig - upper), 22];
+    });
+    const { profile: sProf, metrics: sMetrics } = analyzeLaneStripRgb(singleRgba, W, L, 'UV254', 0.35, false);
+    const sSpots = findSpots(sProf, {
+      sign: -1,
+      origin,
+      front,
+      radius: 24,
+      minProminence: 0.28,
+      lane2d: sMetrics,
+    });
+    expect(sSpots.length).toBe(1);
+    expect(Math.abs(sSpots[0].pos - 165)).toBeLessThanOrEqual(10);
+  });
 });
+
+describe('tlcVision2d: Step 2 origin detection (plate-space CSV alignment, huge/tailing dots, dust specks, multi-channel composites)', () => {
+  it('centers huge saturated dots, preserves experimental spotting jitter, and keeps blank lanes dead-smooth in plate-space even with uneven CSV y0 offsets', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const upperLanes = cfg.lanes.filter((l) => l.id >= 27);
+    const y0Offsets = [
+      -10, 4, -6, 2, -8, 6, 14, -4, 10, 0, -5, 3, 15, 6, -2, -4, 5, 11, -7, 4, -9, 2, 8, -3, 12, 16, -12,
+    ];
+    for (let col = 0; col < 27; col++) {
+      upperLanes[col].angle = 180;
+      upperLanes[col].y0 = 140 + y0Offsets[col];
+    }
+
+    const hugeCols = new Set([3, 9, 15, 21]);
+    const medCols = new Set([1, 4, 10, 16, 22, 23]);
+    const faintCols = new Set([7, 11]);
+    const jitter = new Map<number, number>([
+      [4, 3],
+      [7, -2],
+      [10, 2],
+      [11, -5],
+      [16, 3],
+      [22, 2],
+    ]);
+    // Physical plate-space origin Y line (slight natural plate tilt)
+    const truePlateY = (col: number) => 272 - 0.35 * col;
+
+    const set: TlcSet = {
+      uid: 'step2-plate-space-csv',
+      name: 'Step 2 Plate-Space CSV',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: { UV254: { name: 'uv254.png', bmp: {} as any } },
+      cfg,
+    };
+
+    const getProfile = (_s: TlcSet, _key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const dy = -Math.cos((l.angle * Math.PI) / 180); // +1 for upper half (angle=180)
+      const dotY = truePlateY(col) + (jitter.get(col) ?? 0);
+      const localC = (dotY - l.y0) / dy;
+      return Array.from({ length: l.length }, (_, i) => {
+        if (hugeCols.has(col)) {
+          // Huge saturated black circular dot (radius ~22 px) + moderate downward elution smear
+          const d = Math.abs(i - localC) / 22;
+          let dark = d < 0.62 ? 240 : d < 1.3 ? 240 * Math.exp(-(((d - 0.62) / 0.32) ** 2)) : 0;
+          if (i > localC) dark = Math.max(dark, 110 * Math.exp(-(i - localC) / 38));
+          return Math.max(4, 248 - dark);
+        }
+        if (medCols.has(col) || faintCols.has(col)) {
+          const depth = faintCols.has(col) ? 62 : 150;
+          return 248 - depth * Math.exp(-(((i - localC) / 10) ** 2));
+        }
+        return 248;
+      });
+    };
+
+    const detectedPlateY = upperLanes.map((l) => {
+      const localOrigin = tlcOrigin(set, l, getProfile as any);
+      const dy = -Math.cos((l.angle * Math.PI) / 180);
+      return l.y0 + dy * localOrigin;
+    });
+
+    // Huge saturated dots stay dead-center on their circular core (not shifted forward!)
+    for (const col of hugeCols) {
+      expect(Math.abs(detectedPlateY[col] - truePlateY(col))).toBeLessThanOrEqual(3);
+    }
+    // Clean spotted lanes keep their individual experimental spotting deviation (e.g. col 11 at -5 px)
+    expect(Math.abs(detectedPlateY[11] - (truePlateY(11) - 5))).toBeLessThanOrEqual(3);
+    expect(Math.abs(detectedPlateY[4] - (truePlateY(4) + 3))).toBeLessThanOrEqual(3);
+
+    // Blank lanes align smoothly in physical plate-space Y despite +/-16 px uneven CSV y0 offsets
+    const blankCols = [0, 2, 5, 6, 8, 12, 13, 14, 17, 18, 19, 20, 24, 25, 26];
+    for (const col of blankCols) {
+      expect(Math.abs(detectedPlateY[col] - truePlateY(col))).toBeLessThanOrEqual(3);
+    }
+    for (let k = 0; k < blankCols.length - 1; k++) {
+      const a = blankCols[k];
+      const b = blankCols[k + 1];
+      if (b === a + 1) {
+        expect(Math.abs(detectedPlateY[b] - detectedPlateY[a])).toBeLessThanOrEqual(2);
+      }
+    }
+  });
+
+  it('centers 2D heavy vertical comets on their circular base and ignores lane-border dust specks on blank lanes', () => {
+    const W = 64;
+    const L = 800;
+    const cx = (W - 1) / 2;
+    const trueOrigin = 115;
+
+    const entries = Array.from({ length: 16 }, (_, id) => {
+      const rgba = makeLaneStrip(W, L, [10, 244, 18], (x, pos) => {
+        if (id === 2) {
+          // Heavy upward-tailing comet: round circular base (r=14 px) at pos=115 + saturated vertical streak up to 180
+          const rBase = Math.hypot(x - cx, pos - trueOrigin) / 14;
+          let dark = rBase < 0.65 ? 235 : rBase < 1.35 ? 235 * Math.exp(-(((rBase - 0.65) / 0.35) ** 2)) : 0;
+          if (pos > trueOrigin) {
+            const dx = (x - cx) / 11;
+            const streak = 215 * Math.exp(-(dx * dx)) * Math.exp(-(pos - trueOrigin) / 42);
+            dark = Math.max(dark, streak);
+          }
+          return [10, Math.max(5, 244 - dark), 18];
+        }
+        if (id === 5) {
+          // Blank lane with a dark 3-px dust speck on the right lane border at pos=128 (like real plate!)
+          const dSpeck = Math.hypot(x - (W - 4), pos - 128);
+          const speck = dSpeck <= 3.5 ? 190 * Math.exp(-((dSpeck / 2.0) ** 2)) : 0;
+          return [10, Math.max(5, 244 - speck), 18];
+        }
+        if (id === 8 || id === 12) {
+          // Pure blank lanes
+          return [10, 244, 18];
+        }
+        // Normal clean round origin dots with +/-2 px spotting jitter
+        const c = trueOrigin + (id % 3 === 0 ? 2 : id % 3 === 1 ? -2 : 0);
+        const r = Math.hypot(x - cx, pos - c) / 12;
+        const dark = 175 * Math.exp(-(r * r) / 2);
+        return [10, Math.max(10, 244 - dark), 18];
+      });
+      const { profile, metrics } = analyzeLaneStripRgb(rgba, W, L, 'UV254', 0.35, false);
+      return {
+        laneId: id,
+        profile,
+        lane: { x0: 500 + id * 76, y0: 2200, angle: 0, width: W, length: L },
+        metrics,
+      };
+    });
+
+    const res = detectChannelOrigin(entries, -1, L);
+    expect(res.byLane).toBeDefined();
+    // Lane 2 (heavy vertical comet) stays dead-center on its circular base (~115), NOT pulled up into the streak!
+    expect(Math.abs((res.byLane?.[2] ?? 0) - trueOrigin)).toBeLessThanOrEqual(5);
+    // Lane 5 (blank with right-border dust speck at 128) ignores the speck and stays strictly on baseline (~115)!
+    expect(Math.abs((res.byLane?.[5] ?? 0) - trueOrigin)).toBeLessThanOrEqual(2);
+    expect(Math.abs((res.byLane?.[8] ?? 0) - trueOrigin)).toBeLessThanOrEqual(2);
+  });
+
+  it('fuses UV254 + UV366 + White composites for split-channel plates, upgrades tailing lanes from clean channels, and keeps blanks flat despite White ripples', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(903);
+    const basePos = 118;
+
+    const set: TlcSet = {
+      uid: 'step2-multichannel-composite',
+      name: 'Step 2 Multi-Channel Composite',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        UV366: { name: 'uv366.png', bmp: {} as any },
+        White: { name: 'white.png', bmp: {} as any },
+      },
+      cfg,
+    };
+
+    // Split visibility across ALL 3 channels:
+    // - Lanes 0..6: visible ONLY in UV254 (with lane 3 heavily smearing forward on UV254, but clean on White!)
+    // - Lanes 7..13: visible ONLY in UV366 (bright fluorescent dots at basePos + 4)
+    // - Lanes 14..20: visible ONLY in White (stained dots at basePos - 3)
+    // - Lanes 21..26: BLANK in all channels, with weak White-light silica ripples (amp ~7) at basePos + 11
+    const getProfile = (_s: TlcSet, key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const L = l.length;
+      if (key === 'UV254') {
+        return Array.from({ length: L }, (_, i) => {
+          let dark = 0;
+          if (col === 3) {
+            const core = 180 * Math.exp(-(((i - (basePos + 8)) / 15) ** 2));
+            const tail = i > basePos ? 130 * Math.exp(-(i - basePos) / 40) : 0;
+            dark = Math.max(core, tail);
+          } else if (col <= 6) {
+            dark = 130 * Math.exp(-(((i - basePos) / 8) ** 2));
+          }
+          return Math.max(10, 235 - dark + rand() * 0.8);
+        });
+      }
+      if (key === 'UV366') {
+        return Array.from({ length: L }, (_, i) => {
+          const glow = col >= 7 && col <= 13 ? 120 * Math.exp(-(((i - (basePos + 4)) / 8) ** 2)) : 0;
+          return Math.min(255, 16 + glow + rand() * 0.8);
+        });
+      }
+      // White channel
+      return Array.from({ length: L }, (_, i) => {
+        let drop = 0;
+        if (col === 3) {
+          // Clean un-smeared dot on White at exact true origin (basePos)
+          drop = 75 * Math.exp(-(((i - basePos) / 7) ** 2));
+        } else if (col >= 14 && col <= 20) {
+          drop = 70 * Math.exp(-(((i - (basePos - 3)) / 8) ** 2));
+        } else if (col >= 21) {
+          // Weak paper/silica ripple on blank lanes -> must NOT pull blank lanes off baseline!
+          drop = 7 * Math.exp(-(((i - (basePos + 11)) / 9) ** 2));
+        }
+        return Math.max(10, 225 - drop + rand() * 0.9);
+      });
+    };
+
+    const oUv254 = tlcOrigin(set, cfg.lanes[1], getProfile as any);
+    const oTailingUpgraded = tlcOrigin(set, cfg.lanes[3], getProfile as any);
+    const oUv366 = tlcOrigin(set, cfg.lanes[10], getProfile as any);
+    const oWhite = tlcOrigin(set, cfg.lanes[17], getProfile as any);
+    const oBlank23 = tlcOrigin(set, cfg.lanes[23], getProfile as any);
+    const oBlank25 = tlcOrigin(set, cfg.lanes[25], getProfile as any);
+
+    expect(Math.abs(oUv254 - basePos)).toBeLessThanOrEqual(3);
+    expect(Math.abs(oTailingUpgraded - basePos)).toBeLessThanOrEqual(3);
+    expect(Math.abs(oUv366 - (basePos + 4))).toBeLessThanOrEqual(4);
+    expect(Math.abs(oWhite - (basePos - 3))).toBeLessThanOrEqual(4);
+    // Blank lanes must NOT jump to the +11 px White ripple!
+    expect(Math.abs(oBlank23 - basePos)).toBeLessThanOrEqual(4);
+    expect(Math.abs(oBlank25 - basePos)).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps faint fuzzy UV366 halos centered/aligned on the baseline instead of jumping to their upper rim on noisy dark-teal backgrounds', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(1366);
+    const basePos = 114;
+
+    const set: TlcSet = {
+      uid: 'step2-uv366-faint-halos',
+      name: 'Step 2 UV366 Faint Halos',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: {
+        UV366: { name: 'uv366.png', bmp: {} as any },
+        UV254: { name: 'uv254.png', bmp: {} as any },
+      },
+      cfg,
+    };
+
+    const brightCols = new Set([0, 1, 6, 7, 10, 11, 14, 15, 19, 20, 24]);
+    const faintHaloCols = new Set([2, 3, 4]);
+    const coffeeRingCols = new Set([5, 9]); // col 5: dim ring (amp ~24), col 9: moderate ring (amp ~42) with brighter upper rim
+
+    const getProfile = (_s: TlcSet, key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const L = l.length;
+      if (key === 'UV366') {
+        return Array.from({ length: L }, (_, i) => {
+          const noise = (rand() - 0.5) * 7.5; // granular dark-teal camera noise
+          let glow = 0;
+          if (brightCols.has(col)) {
+            const jitter = col === 1 ? 1 : col === 10 ? -2 : 0;
+            glow = 135 * Math.exp(-(((i - (basePos + jitter)) / 11) ** 2));
+            if (col === 1) {
+              glow = Math.max(glow, 60 * Math.exp(-(((i - (basePos + 28)) / 5) ** 2)));
+            }
+          } else if (faintHaloCols.has(col)) {
+            // Very faint broad fuzzy halo with slightly brighter upper rim (+13 px)
+            const halo = 9.5 * Math.exp(-(((i - basePos) / 17) ** 2));
+            const upperRim = 5.5 * Math.exp(-(((i - (basePos + 13)) / 6.5) ** 2));
+            glow = halo + upperRim;
+            if (col === 3) {
+              glow = Math.max(glow, 115 * Math.exp(-(((i - (basePos + 52)) / 8) ** 2)));
+            }
+          } else if (coffeeRingCols.has(col)) {
+            // Realistic UV366 coffee-ring halo centered on basePos (hollow middle, brighter upper rim at +14 px)
+            const scale = col === 5 ? 24 : 42;
+            const body = scale * 0.72 * Math.exp(-(((i - basePos) / 19) ** 2));
+            const upperRim = scale * 0.42 * Math.exp(-(((i - (basePos + 14)) / 6.5) ** 2));
+            const lowerRim = scale * 0.25 * Math.exp(-(((i - (basePos - 14)) / 6.5) ** 2));
+            glow = body + upperRim + lowerRim;
+          }
+          return Math.max(2, Math.min(255, 68 + glow + noise));
+        });
+      }
+      // UV254: silent on faintHaloCols & coffeeRingCols, clean dots on brightCols & extra lanes
+      return Array.from({ length: L }, (_, i) => {
+        const noise = (rand() - 0.5) * 3.0;
+        let dark = 0;
+        if (brightCols.has(col) || col === 8 || col === 17) {
+          dark = 140 * Math.exp(-(((i - basePos) / 9) ** 2));
+        }
+        return Math.max(8, Math.min(255, 240 - dark + noise));
+      });
+    };
+
+    const oBright1 = tlcOrigin(set, cfg.lanes[1], getProfile as any);
+    const oHalo2 = tlcOrigin(set, cfg.lanes[2], getProfile as any);
+    const oHalo3 = tlcOrigin(set, cfg.lanes[3], getProfile as any);
+    const oHalo4 = tlcOrigin(set, cfg.lanes[4], getProfile as any);
+    const oRing5 = tlcOrigin(set, cfg.lanes[5], getProfile as any);
+    const oRing9 = tlcOrigin(set, cfg.lanes[9], getProfile as any);
+
+    expect(Math.abs(oBright1 - (basePos + 1))).toBeLessThanOrEqual(3);
+    expect(Math.abs(oHalo2 - basePos)).toBeLessThanOrEqual(4);
+    expect(Math.abs(oHalo3 - basePos)).toBeLessThanOrEqual(4);
+    expect(Math.abs(oHalo4 - basePos)).toBeLessThanOrEqual(4);
+    // Coffee-ring halos must stay centered on basePos instead of locking onto their +14 px upper rim!
+    expect(Math.abs(oRing5 - basePos)).toBeLessThanOrEqual(4);
+    expect(Math.abs(oRing9 - basePos)).toBeLessThanOrEqual(4);
+  });
+});
+
+
+
 

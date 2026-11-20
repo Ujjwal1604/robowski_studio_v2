@@ -39,6 +39,8 @@ import {
   composeSolventSystem,
   generateExtendedDynamicSpecs,
   generatePrismaTernarySpecs,
+  hasSameEluentComposition,
+  parseStructuredSolventName,
 } from './solventSystemModel';
 import { PredictedSpecies, WellPredictionResult } from './types';
 
@@ -151,8 +153,10 @@ export function matchTlcSetNameToSolvent(
     return null;
   }
 
+  const knownSystems = [...TLC_SOLVENT_LIBRARY, ...DYNAMIC_SOLVENT_SYSTEMS];
+
   // 1. Exact or normalized match on canonical or dynamic composed name / shortLabel
-  for (const sys of [...TLC_SOLVENT_LIBRARY, ...DYNAMIC_SOLVENT_SYSTEMS]) {
+  for (const sys of knownSystems) {
     const sysName = normalizeSolventText(sys.name).replace(/\(c18 rp\)/g, '').trim();
     const sysShort = normalizeSolventText(sys.shortLabel).replace(/\(c18\)/g, '').trim();
     if (rawNorm === sysName || rawNorm === sysShort || rawNorm === normalizeSolventText(sys.name)) {
@@ -164,15 +168,41 @@ export function matchTlcSetNameToSolvent(
     }
   }
 
+  // 1b. Exact structured parser for advisor-synthesized eluents (Langmuir-tailored binary/ternary,
+  //     PRISMA ternaries with modifiers, and 2M NH3-in-MeOH systems like "Toluene / MeOH / (2M NH₃ in MeOH) (94:4:2)")
+  const parsedSpec = parseStructuredSolventName(name);
+  if (parsedSpec) {
+    const exactKnown = knownSystems.find((sys) => hasSameEluentComposition(sys, parsedSpec));
+    const resolvedSys = exactKnown || composeSolventSystem(parsedSpec);
+    const resolvedPhase: TlcStationaryPhasePreference =
+      resolvedSys.stationaryPhase === 'C18'
+        ? 'C18'
+        : parsedPhase === 'Al2O3_neutral' || parsedPhase === 'Al2O3_basic'
+        ? parsedPhase
+        : 'SiO2';
+    if (
+      (resolvedPhase === 'Al2O3_neutral' || resolvedPhase === 'Al2O3_basic') &&
+      (resolvedSys.acidModifier || resolvedSys.baseModifier)
+    ) {
+      return null;
+    }
+    return {
+      system: resolvedSys,
+      stationaryPhase: resolvedPhase,
+      matchSource: 'auto',
+    };
+  }
+
   // 2. Heuristic parser for common shorthand solvent names
-  const hasEt3N = /et3n|tea\b/.test(rawNorm);
+  const hasEt3N = /et3n|net3|\btea\b/.test(rawNorm);
   const hasNh3 = /nh3|nh4oh/.test(rawNorm);
   const hasAcOH = /acoh|hoac|acetic/.test(rawNorm);
   const hasTfa = /tfa/.test(rawNorm);
 
-  // Extract percentage or ratio A:B
+  // Extract percentage or ratio A:B (or ternary A:B:C)
   let pct: number | null = null;
   const pctMatch = /(\d+(?:\.\d+)?)\s*%/.exec(rawNorm);
+  const ratio3Match = /(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)/.exec(rawNorm);
   const ratioMatch = /(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)/.exec(rawNorm);
   const isNeatHexanes = /^(?:100%\s*|neat\s*)?(?:hex|hexanes?|hept|heptane)\s*$/.test(rawNorm);
   const isNeatEtOAc = /(?:^|\b)(?:100%\s*|neat\s*)?(?:etoac|ea|ethyl acetate)\s*$/.test(rawNorm);
@@ -180,14 +210,28 @@ export function matchTlcSetNameToSolvent(
 
   if (pctMatch) {
     pct = parseFloat(pctMatch[1]);
+  } else if (ratio3Match) {
+    const a = parseFloat(ratio3Match[1]);
+    const b = parseFloat(ratio3Match[2]);
+    const c = parseFloat(ratio3Match[3]);
+    const sum = a + b + c;
+    if (sum > 0) {
+      const weakFirst = /^(?:\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:v\/v\/v\s*)?)?(?:hex|hexanes?|pentane|dcm|ch2cl2|tol|toluene)\b/.test(rawNorm);
+      if (weakFirst) {
+        pct = ((hasNh3 ? b + c : b) / sum) * 100;
+      } else {
+        pct = ((hasNh3 ? a + c : a) / sum) * 100;
+      }
+    }
   } else if (ratioMatch) {
     const a = parseFloat(ratioMatch[1]);
     const b = parseFloat(ratioMatch[2]);
     if (a + b > 0) {
-      // Handle inverted hex:ea order such as "2:1 Hex/EtOAc" -> 33% EtOAc
-      const hexFirst = /^\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:hex|hexanes|pentane)\s*\/\s*(?:etoac|ea|acetone|et2o)/.test(rawNorm);
-      const dcmFirst = /^\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:dcm|ch2cl2)\s*\/\s*(?:meoh|nh3)/.test(rawNorm);
-      pct = (hexFirst || dcmFirst ? (b / (a + b)) : (a / (a + b))) * 100;
+      // Handle inverted weak:strong order such as "2:1 Hex/EtOAc", "95:5 DCM/MeOH", "95:5 Toluene/MeOH"
+      const hexFirst = /^\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:hex|hexanes|pentane)\s*[/:]\s*(?:etoac|ea|acetone|et2o|mtbe)/.test(rawNorm);
+      const dcmFirst = /^\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:dcm|ch2cl2)\s*[/:]\s*(?:meoh|nh3|etoac|ea)/.test(rawNorm);
+      const tolFirst = /^\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:tol|toluene)\s*[/:]\s*(?:meoh|nh3|etoac|ea)/.test(rawNorm);
+      pct = (hexFirst || dcmFirst || tolFirst ? (b / (a + b)) : (a / (a + b))) * 100;
     }
   } else if (isNeatHexanes) {
     pct = 0;
@@ -234,9 +278,9 @@ export function matchTlcSetNameToSolvent(
     parsedPhase === 'Al2O3_neutral' || parsedPhase === 'Al2O3_basic' ? parsedPhase : 'SiO2';
 
   const isEtoacHex = /(etoac|\bea\b|ethyl acetate).*(hex|hept)|(?:hex|hept).*(etoac|\bea\b)|^100%\s*etoac|^neat\s*(?:etoac|ea)/.test(rawNorm);
-  const isMeohDcm = /(meoh|methanol).*(dcm|ch2cl2|nh3)|(dcm|ch2cl2).*(meoh|nh3)/.test(rawNorm);
+  const isMeohDcm = /(meoh|methanol).*(dcm|ch2cl2)|(dcm|ch2cl2).*(meoh|methanol|nh3)/.test(rawNorm);
   const isAcetoneHex = /acetone.*hex|hex.*acetone/.test(rawNorm);
-  const isMeohTol = /meoh.*tol|tol.*meoh/.test(rawNorm);
+  const isMeohTol = /(meoh|methanol|nh3).*(tol|toluene)|(tol|toluene).*(meoh|methanol|nh3)/.test(rawNorm);
   const isEtoacTol = /(etoac|\bea\b|ethyl acetate).*tol|tol.*(etoac|\bea\b|ethyl acetate)/.test(rawNorm);
   const isMeohEtoac = /meoh.*etoac|etoac.*meoh|meoh.*\bea\b/.test(rawNorm);
   const isEtoacDcm = /(etoac|\bea\b).*(dcm|ch2cl2)|(dcm|ch2cl2).*(etoac|\bea\b)/.test(rawNorm);
@@ -283,11 +327,28 @@ export function matchTlcSetNameToSolvent(
       0.12 + (p / 100) * 0.34
     );
   } else if (isMeohTol) {
-    const p = pct ?? 6;
-    const tolPool = hasEt3N
-      ? DYNAMIC_SOLVENT_SYSTEMS.filter((s) => s.family === 'meoh_toluene' && Boolean(s.baseModifier?.includes('Et₃N')))
-      : TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'meoh_toluene');
-    candidate = pickClosest(tolPool, 0.40 + p * 0.035);
+    const p = clamp(pct ?? 6, 0, 18);
+    if (hasNh3) {
+      const modId = /4%\s*\(?2m\s*nh3|4%\s*nh3/.test(rawNorm) ? 'nh3_meoh_4' : 'nh3_meoh_2';
+      const modVol = modId === 'nh3_meoh_4' ? 4 : 2;
+      const neatMeoh = Math.max(0, Math.round(p - modVol));
+      candidate = composeSolventSystem({
+        id: `synth_meoh_tol_${neatMeoh}_${modId}`,
+        strongSolvent: 'MeOH',
+        weakSolvent: 'Toluene',
+        strongPct: neatMeoh,
+        modifierId: modId,
+        stationaryPhase: 'SiO2',
+        family: 'meoh_toluene',
+        preferenceTier: 'secondary',
+        isSynthesized: true,
+      });
+    } else {
+      const tolPool = hasEt3N
+        ? DYNAMIC_SOLVENT_SYSTEMS.filter((s) => s.family === 'meoh_toluene' && Boolean(s.baseModifier?.includes('Et₃N')))
+        : TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'meoh_toluene');
+      candidate = pickClosest(tolPool, 0.23 + p * 0.012);
+    }
   } else if (isEtoacTol) {
     const p = pct ?? 25;
     const etTolPool = DYNAMIC_SOLVENT_SYSTEMS.filter(
@@ -471,6 +532,32 @@ export function extractMeasuredWellSpotsForSet(
 function logitRf(rf: number): number {
   const p = clamp(rf, 0.02, 0.97);
   return Math.log(p / (1 - p));
+}
+
+/**
+ * Plate-level distribution check, independent of spot pairing. Pairing can miss a drastic eluent
+ * error (a predicted Rf 0.95–0.99 never pairs with a measured 0.65, so the pair never enters the fit).
+ * Comparing the median logit-Rf of measured interior spots with that of the predicted starting materials
+ * on the same plate exposes it. Returns a demand shift (positive = runs lower than predicted), or null
+ * when there is too little evidence to say anything.
+ */
+export function estimatePlateLevelDemandShift(
+  observedRf: number[],
+  predictedRf: number[],
+  kPhase: number
+): { shift: number; n: number } | null {
+  const obs = observedRf.filter((r) => Number.isFinite(r) && r > 0.05 && r < 0.92);
+  const pred = predictedRf.filter((r) => Number.isFinite(r) && r >= 0.02 && r <= 0.99);
+  if (obs.length < 8 || pred.length < 8) return null;
+  const medianLogit = (a: number[]) => {
+    const b = a.map((r) => logitRf(r)).sort((x, y) => x - y);
+    const m = b.length >> 1;
+    return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+  };
+  const raw = (medianLogit(pred) - medianLogit(obs)) / kPhase;
+  const n = Math.min(obs.length, pred.length);
+  const shrunk = (raw * n) / (n + 10);
+  return { shift: Math.max(-0.45, Math.min(0.45, shrunk)), n };
 }
 
 export function applyCalibrationShiftToRf(
@@ -721,6 +808,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
   const pairsByPhase = new Map<TlcStationaryPhasePreference, RawPairRecord[]>();
   const censoredByPhase = new Map<TlcStationaryPhasePreference, CensoredBoundaryRecord[]>();
   const plateAnchorProfiles = new Map<number, Map<number, TlcMolProfile[]>>();
+  const plateLevelByPhase = new Map<
+    TlcStationaryPhasePreference,
+    Array<{ family: SolventFamily; shift: number; n: number }>
+  >();
 
   for (const set of tlcSets) {
     // Check each plate index stored inside `set` (0 top-level + >0 in set.plateData)
@@ -761,6 +852,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         pair: Omit<TlcCalibrationSpotPair, 'predictedRfAfter'>;
         profile: TlcMolProfile;
       }> = [];
+      const plateObsRf: number[] = [];
+      const platePredSmRf: number[] = [];
       const laneCompMap = new Map<number, CalibratedLaneComparison>();
       const laneProfilesMap = new Map<number, TlcMolProfile[]>();
 
@@ -882,6 +975,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         laneProfilesMap.set(wIdx, anchors.map((a) => a.profile));
 
         const obsSpots = measuredWell?.spots || [];
+        for (const sp of obsSpots) plateObsRf.push(sp.rf);
+        for (const a of anchors) if (a.kind === 'substrate') platePredSmRf.push(a.rf);
         const matchedPairs = pairMeasuredAndPredictedSpots(obsSpots, anchors);
         const pairedByObs = new Map<TlcSpot, PredAnchor>();
         const pairedByPred = new Map<PredAnchor, TlcSpot>();
@@ -1055,6 +1150,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         plateIndex: pIdx,
         matchedSystemId: matched.system.id,
         matchedSystemName: matched.system.name,
+        matchedSystem: matched.system,
         stationaryPhase: matched.stationaryPhase,
         family: matched.system.family,
         matchSource: matched.matchSource,
@@ -1070,6 +1166,18 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         pairs: [],
         lanes: lanesOut,
       });
+
+      {
+        const est = estimatePlateLevelDemandShift(plateObsRf, platePredSmRf, isC18 ? 4.8 : 6.2);
+        if (est) {
+          let pl = plateLevelByPhase.get(matched.stationaryPhase);
+          if (!pl) {
+            pl = [];
+            plateLevelByPhase.set(matched.stationaryPhase, pl);
+          }
+          pl.push({ family: matched.system.family, shift: est.shift, n: est.n });
+        }
+      }
 
       if (platePairs.length > 0) {
         let arr = pairsByPhase.get(matched.stationaryPhase);
@@ -1103,12 +1211,14 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
   const allPhases = new Set<TlcStationaryPhasePreference>([
     ...pairsByPhase.keys(),
     ...censoredByPhase.keys(),
+    ...plateLevelByPhase.keys(),
   ]);
 
   for (const phase of allPhases) {
     const records = pairsByPhase.get(phase) || [];
     const censRecords = censoredByPhase.get(phase) || [];
-    if (records.length === 0 && censRecords.length === 0) continue;
+    const plateLevel = plateLevelByPhase.get(phase) || [];
+    if (records.length === 0 && censRecords.length === 0 && plateLevel.length === 0) continue;
     const isC18 = phase === 'C18';
     const kPhase = isC18 ? 4.8 : 6.2;
 
@@ -1370,6 +1480,27 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       featureWeights = undefined;
     }
 
+    // Plate-level backstop: if a family's whole plate runs far from the prediction but the pair-based fit
+    // (which can only see spots that pair within +/-0.24 Rf) misses it, use the pairing-independent estimate.
+    const plateLevelFamilies: Partial<Record<SolventFamily, number>> = {};
+    {
+      const byFam = new Map<SolventFamily, { w: number; ws: number }>();
+      for (const pl of plateLevel) {
+        const cur = byFam.get(pl.family) || { w: 0, ws: 0 };
+        cur.w += pl.n;
+        cur.ws += pl.n * pl.shift;
+        byFam.set(pl.family, cur);
+      }
+      for (const [fam, st] of byFam.entries()) {
+        const est = st.ws / st.w;
+        const pairBased = globalDemandShift + (familyDemandShifts[fam] ?? 0);
+        if (Math.abs(est - pairBased) > 0.15) {
+          familyDemandShifts[fam] = Math.round(clamp(est - globalDemandShift, -0.45, 0.45) * 10000) / 10000;
+          plateLevelFamilies[fam] = Math.round(est * 10000) / 10000;
+        }
+      }
+    }
+
     // Re-evaluate all pairs after calibration to fill parity points & RMSE
     let wSum = 0;
     let sqErrBefore = 0;
@@ -1500,7 +1631,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       validated,
       ...(cvRmse !== undefined ? { cvRmse: Math.round(cvRmse * 1000) / 1000 } : {}),
       ...(cvRmseBaseline !== undefined ? { cvRmseBaseline: Math.round(cvRmseBaseline * 1000) / 1000 } : {}),
-      calibrationApplied: calibrationHelps,
+      calibrationApplied: calibrationHelps || Object.keys(plateLevelFamilies).length > 0,
+      ...(Object.keys(plateLevelFamilies).length > 0 ? { plateLevelFamilies } : {}),
     };
     model.byPhase[phase] = fit;
   }

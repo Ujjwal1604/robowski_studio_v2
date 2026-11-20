@@ -18,6 +18,7 @@ import {
   matchTlcSetNameToSolvent,
   eluentReactivityWarnings,
 } from '../src/engine/predictor';
+import { MEOH_AFFINITY_SCALE_BY_CARRIER } from '../src/engine/predictor/solventSystemModel';
 import { exampleState } from '../src/context/runPayload';
 import { RunResult } from '../src/types';
 
@@ -1055,3 +1056,41 @@ describe('eluent reactivity warnings', () => {
     expect(eluentReactivityWarnings(rdkit, ['O=C(Cl)c1ccccc1'], [etoac])).toHaveLength(0);
   });
 });
+
+describe('toluene/MeOH/NH3 strength (plate UJG-C0021 regression)', () => {
+  it('runs like ~25% EtOAc/Hex for weakly polar compounds, as measured, and weaker than DCM/MeOH/NH3', () => {
+    const et = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_25')!;
+    const tol = composeSolventSystem({
+      strongSolvent: 'MeOH',
+      weakSolvent: 'Toluene',
+      strongPct: 4,
+      modifierId: 'nh3_meoh_2',
+      stationaryPhase: 'SiO2',
+    } as any);
+    const dcm = composeSolventSystem({
+      strongSolvent: 'MeOH',
+      weakSolvent: 'DCM',
+      strongPct: 4,
+      modifierId: 'nh3_meoh_2',
+      stationaryPhase: 'SiO2',
+    } as any);
+    expect(MEOH_AFFINITY_SCALE_BY_CARRIER.Toluene).toBeLessThan(1);
+    expect(tol.strength).toBeLessThan(dcm.strength - 0.2);
+    for (const smi of [
+      'O=C(c1ccc[nH]1)C(Cl)(Cl)Cl',
+      'CC(C)(O)CCCC1=CCC(C=O)CC1',
+      'CC(=O)c1ccccc1O',
+    ]) {
+      const p = profileMoleculeForTlc(rdkit, smi);
+      const rEt = predictNormalPhaseRf(p, et).rf;
+      const rTol = predictNormalPhaseRf(p, tol).rf;
+      expect(Math.abs(rTol - rEt)).toBeLessThan(0.25);
+    }
+
+    // Forward & inverse Langmuir consistency for MeOH in Toluene
+    const invPct = invertLangmuirForPct('MeOH', 'Toluene', 'nh3_meoh_2', tol.strength);
+    expect(invPct).toBeGreaterThanOrEqual(3);
+    expect(invPct).toBeLessThanOrEqual(5);
+  });
+});
+

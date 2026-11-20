@@ -20,10 +20,17 @@ import {
   applyFlatFieldCorrection,
   detectCurvedFrontSeam,
   detectGlassTopEdge,
+  findDualHalfGapCeiling,
   isProfileOnPlate,
   CurvedFrontChannelInput,
+  CurvedFrontSeamOptions,
   CurvedFrontSeamResult,
 } from './tlcVision2d';
+import {
+  computeAutomiddleOffsets,
+  inspectLabTlcFilename,
+  sampleFloatRgbLaneStrip,
+} from './tlcLabPipeline';
 
 export const LANE_FRAME_WIDTH = 3280;
 export const TLC_ROWS = 6;
@@ -73,11 +80,62 @@ export function parseLaneConfig(text: string): TlcLaneConfig {
   if (lanes.some((l) => l.length <= 0 || l.width <= 0)) {
     throw new Error('Every lane needs a length and width above zero.');
   }
+
+  const warnings: string[] = [];
+  if (lanes.length > 54) {
+    warnings.push(`${lanes.length} lanes found; only the first 54 fit a 6 x 9 plate.`);
+  }
+
+  // Detect Merck TLC Explorer / Hamilton Vantage alternating parallel lane numbering
+  // (e.g., lab PC calibration/lanes.csv & microadjusted_lane_config.csv where even IDs 0,2,4..52
+  // are bottom-half A1..C5 at angle≈0° and odd IDs 1,3,5..53 are top-half D5..F9 at angle≈180°).
+  // Normalize to our grouped convention (0..26 = lower half A1..C5, 27..53 = upper half D5..F9)
+  // so every well coordinate A1..F9 matches the physical Hamilton spotting layout!
+  let normalizedLanes = lanes;
+  if (lanes.length >= 10 && lanes.length % 2 === 0 && lanes.length <= 54) {
+    const isUp = (ang: number) => {
+      const a = (((ang % 360) + 540) % 360) - 180; // [-180, 180)
+      return Math.abs(a) < 45;
+    };
+    const isDown = (ang: number) => {
+      const a = (((ang % 360) + 540) % 360) - 180;
+      return Math.abs(Math.abs(a) - 180) < 45;
+    };
+    const evens = lanes.filter((l) => l.id % 2 === 0);
+    const odds = lanes.filter((l) => l.id % 2 !== 0);
+    const halfN = lanes.length / 2;
+    if (evens.length === halfN && odds.length === halfN) {
+      const evenUp = evens.filter((l) => isUp(l.angle)).length;
+      const evenDown = evens.filter((l) => isDown(l.angle)).length;
+      const oddUp = odds.filter((l) => isUp(l.angle)).length;
+      const oddDown = odds.filter((l) => isDown(l.angle)).length;
+      const evenY = evens.reduce((s, l) => s + l.y0, 0) / halfN;
+      const oddY = odds.reduce((s, l) => s + l.y0, 0) / halfN;
+
+      const interleavedEvenLower =
+        (evenUp >= halfN * 0.85 && oddDown >= halfN * 0.85) ||
+        (evenUp >= halfN * 0.85 && oddUp >= halfN * 0.85 && evenY > oddY + 250);
+      const interleavedOddLower =
+        oddUp >= halfN * 0.85 && evenDown >= halfN * 0.85;
+
+      if (interleavedEvenLower || interleavedOddLower) {
+        const lower = (interleavedEvenLower ? evens : odds).slice().sort((a, b) => a.id - b.id);
+        const upper = (interleavedEvenLower ? odds : evens).slice().sort((a, b) => a.id - b.id);
+        normalizedLanes = [
+          ...lower.map((l, idx) => ({ ...l, id: idx })),
+          ...upper.map((l, idx) => ({ ...l, id: halfN + idx })),
+        ];
+        warnings.push(
+          'Detected lab PC alternating lane numbering (even=A1–C5, odd=D5–F9) and remapped to A1–F9 automatically.'
+        );
+      }
+    }
+  }
+
   return {
-    lanes,
-    hasZeroRf: lanes.every((l) => l.zeroRf != null),
-    warnings:
-      lanes.length > 54 ? [`${lanes.length} lanes found; only the first 54 fit a 6 x 9 plate.`] : [],
+    lanes: normalizedLanes,
+    hasZeroRf: normalizedLanes.every((l) => l.zeroRf != null),
+    warnings,
   };
 }
 
@@ -291,6 +349,24 @@ const blankSilicaRefs: Partial<Record<TlcChannelKey, BlankSilicaEntry>> = {};
 let blankSilicaEnabled = true;
 let blankSilicaVersion = 0;
 
+let automiddleEnabled = false;
+let automiddleVersion = 0;
+
+export function setAutomiddleEnabled(enabled: boolean): void {
+  if (automiddleEnabled !== enabled) {
+    automiddleEnabled = enabled;
+    automiddleVersion++;
+  }
+}
+
+export function isAutomiddleEnabled(): boolean {
+  return automiddleEnabled;
+}
+
+export function getAutomiddleSignature(): string {
+  return `autoMid:${automiddleVersion}:${automiddleEnabled ? 'on' : 'off'}`;
+}
+
 export function setBlankSilicaRef(key: TlcChannelKey, entry: BlankSilicaEntry): void {
   blankSilicaRefs[key] = entry;
   blankSilicaVersion++;
@@ -333,14 +409,52 @@ export function getBlankSilicaSignature(): string {
         .map((k) => `${k}:${blankSilicaRefs[k]!.name}`)
         .join(',')
     : 'off';
-  return `blank:${blankSilicaVersion}:${active}`;
+  return `blank:${blankSilicaVersion}:${active}|${getAutomiddleSignature()}`;
+}
+
+/**
+ * Helper to extract a raw W x L RGBA strip (Float32Array if unclipped .npy floatRgb is loaded,
+ * otherwise Uint8ClampedArray via Canvas2D) for a given channel & lane.
+ */
+function extractRawChannelStrip(
+  set: TlcSet,
+  key: TlcChannelKey,
+  lane: TlcLane,
+  W: number,
+  L: number
+): Float32Array | Uint8ClampedArray | null {
+  const im = set.imgs?.[key];
+  if (!im) return null;
+
+  // Prefer unclipped float32 radiance array directly from .npy when available
+  if (im.floatRgb && im.floatWidth && im.floatHeight) {
+    const imgScale = im.floatWidth / (set.frameW || LANE_FRAME_WIDTH);
+    return sampleFloatRgbLaneStrip(im.floatRgb, im.floatWidth, im.floatHeight, lane, imgScale, W, L);
+  }
+
+  if (!im.bmp || typeof document === 'undefined') return null;
+  if (!sharedLaneScratchCanvas) {
+    sharedLaneScratchCanvas = document.createElement('canvas');
+  }
+  sharedLaneScratchCanvas.width = W;
+  sharedLaneScratchCanvas.height = L;
+  const ctx = sharedLaneScratchCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, L);
+  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+  ctx.drawImage(im.bmp, 0, 0);
+  return ctx.getImageData(0, 0, W, L).data;
 }
 
 /**
  * Extracts a full-RGB 1D chromatographic profile AND caches 2D lateral strip metrics
- * (`lateralExcess`, `edgeRatio`, `coreRgb`, `bgRgb`, `offPlate`, `borderStraddle`) on the TlcSet.
- * When a blank silica flat-field reference photo is loaded & enabled for `key`, divides out uneven
- * UV lamp shading / lens vignetting (or subtracts UV366 stray chamber glare) automatically.
+ * (`lateralExcess`, `edgeRatio`, `coreRgb`, `bgRgb`, `offPlate`, `borderStraddle`, `automiddleOffsets`) on the TlcSet.
+ * - Uses unclipped float32 sampling when a lab `.npy` image is loaded.
+ * - Automatically skips duplicate blank-silica flat-fielding on pre-flat-fielded `uni_linint_corrected_*` images.
+ * - Optionally follows curved/drifting lanes when `automiddleEnabled` is turned on.
  */
 export function extractLaneProfile2d(
   set: TlcSet,
@@ -350,7 +464,7 @@ export function extractLaneProfile2d(
 ): number[] {
   const bSig = getBlankSilicaSignature();
   if ((set as any)._blankSig !== bSig) {
-    if (set.imgs?.[key]?.bmp) {
+    if (set.imgs?.[key]?.bmp || set.imgs?.[key]?.floatRgb) {
       set.prof = {};
       (set as any)._prof2d = {};
     }
@@ -359,40 +473,26 @@ export function extractLaneProfile2d(
 
   const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
   const cached2d = (set as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
-  if (set.prof && set.prof[ck] && (cached2d?.[ck] || !set.imgs?.[key]?.bmp)) {
+  if (set.prof && set.prof[ck] && (cached2d?.[ck] || (!set.imgs?.[key]?.bmp && !set.imgs?.[key]?.floatRgb))) {
     return set.prof[ck];
   }
 
   const im = set.imgs?.[key];
-  if (!im || !im.bmp || typeof document === 'undefined') {
+  if (!im || (!im.bmp && !im.floatRgb)) {
     return set.prof?.[ck] || [];
   }
 
   const W = Math.max(1, Math.round(lane.width));
   const L = Math.max(1, Math.round(lane.length));
 
-  if (!sharedLaneScratchCanvas) {
-    sharedLaneScratchCanvas = document.createElement('canvas');
-  }
-  sharedLaneScratchCanvas.width = W;
-  sharedLaneScratchCanvas.height = L;
+  let stripRgba = extractRawChannelStrip(set, key, lane, W, L);
+  if (!stripRgba) return set.prof?.[ck] || [];
 
-  const ctx = sharedLaneScratchCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return set.prof?.[ck] || [];
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, W, L);
-  let stripRgba: Uint8ClampedArray = imgData.data;
-
-  // Apply once-per-camera blank silica flat-field calibration when available & enabled
-  const blankRef = blankSilicaEnabled ? blankSilicaRefs[key] : undefined;
-  if (blankRef?.bmp) {
+  // Apply once-per-camera blank silica flat-field calibration when available & enabled,
+  // EXCEPT on lab-calibrated `uni_linint_corrected_*` images (which are already flat-fielded!).
+  const isPreFlatFielded = im.preFlatFielded ?? inspectLabTlcFilename(im.name).isPreFlatFielded;
+  const blankRef = blankSilicaEnabled && !isPreFlatFielded ? blankSilicaRefs[key] : undefined;
+  if (blankRef?.bmp && typeof document !== 'undefined') {
     if (!sharedBlankScratchCanvas) {
       sharedBlankScratchCanvas = document.createElement('canvas');
     }
@@ -406,8 +506,31 @@ export function extractLaneProfile2d(
       bCtx.setTransform(bm[0], bm[1], bm[2], bm[3], bm[4], bm[5]);
       bCtx.drawImage(blankRef.bmp, 0, 0);
       const blankData = bCtx.getImageData(0, 0, W, L);
-      stripRgba = applyFlatFieldCorrection(imgData.data, blankData.data, W, L, key);
+      stripRgba = applyFlatFieldCorrection(stripRgba, blankData.data, W, L, key);
     }
+  }
+
+  // Optional curved-lane centerline tracking (savgol_automiddle) on real lanes (never on gutters)
+  let centerOffsets: Float32Array | undefined;
+  if (automiddleEnabled && lane.id < 1000 && W >= 7 && L >= 24) {
+    // Copy primary strip before optionally reading UV366 on the shared scratch canvas
+    const primaryCopy = stripRgba instanceof Float32Array ? stripRgba : new Uint8ClampedArray(stripRgba);
+    let uv366Strip: Float32Array | Uint8ClampedArray | undefined;
+    if (key === 'UV254' && set.imgs?.UV366 && (set.imgs.UV366.floatRgb || set.imgs.UV366.bmp)) {
+      uv366Strip = extractRawChannelStrip(set, 'UV366', lane, W, L) || undefined;
+    }
+    const approxOrigin =
+      lane.zeroRf != null
+        ? lane.zeroRf
+        : set.originPx != null
+        ? set.originPx
+        : set.originAutoByLane?.[lane.id] ?? set.originAuto?.[tlcHalf(lane)] ?? Math.round(L * 0.08);
+    centerOffsets = computeAutomiddleOffsets(primaryCopy, W, L, key, {
+      uv366Rgba: uv366Strip,
+      originPx: approxOrigin,
+      spotRadiusPx: lane.spotRadius ?? Math.max(6, Math.round(L * 0.02)),
+    });
+    stripRgba = primaryCopy;
   }
 
   const { profile, metrics } = analyzeLaneStripRgb(
@@ -416,7 +539,8 @@ export function extractLaneProfile2d(
     L,
     key,
     coreFraction,
-    lane.id >= 1000
+    lane.id >= 1000,
+    centerOffsets
   );
 
   set.prof = set.prof || {};
@@ -427,7 +551,7 @@ export function extractLaneProfile2d(
 }
 
 /**
- * Returns cached 2D lateral strip metrics for a lane/channel (extracting on demand if a bitmap is loaded).
+ * Returns cached 2D lateral strip metrics for a lane/channel (extracting on demand if a bitmap or floatRgb is loaded).
  */
 export function getLane2dMetrics(
   set: TlcSet,
@@ -436,7 +560,7 @@ export function getLane2dMetrics(
   coreFraction: number = 0.35
 ): Lane2dMetrics | undefined {
   const bSig = getBlankSilicaSignature();
-  if ((set as any)._blankSig !== bSig && set.imgs?.[key]?.bmp) {
+  if ((set as any)._blankSig !== bSig && (set.imgs?.[key]?.bmp || set.imgs?.[key]?.floatRgb)) {
     set.prof = {};
     (set as any)._prof2d = {};
     (set as any)._blankSig = bSig;
@@ -444,11 +568,32 @@ export function getLane2dMetrics(
   const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
   const map2d = (set as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
   if (map2d?.[ck]) return map2d[ck];
-  if (set.imgs?.[key]?.bmp && typeof document !== 'undefined') {
+  if (set.imgs?.[key]?.floatRgb || (set.imgs?.[key]?.bmp && typeof document !== 'undefined')) {
     extractLaneProfile2d(set, key, lane, coreFraction);
     return ((set as any)._prof2d as Record<string, Lane2dMetrics> | undefined)?.[ck];
   }
   return undefined;
+}
+
+/**
+ * Returns already-cached 2D strip metrics for a lane/channel regardless of coreFraction,
+ * falling back to default getLane2dMetrics extraction if a bitmap is loaded.
+ */
+function getCachedLane2dMetrics(
+  set: TlcSet,
+  key: TlcChannelKey,
+  lane: TlcLane
+): Lane2dMetrics | undefined {
+  const map2d = (set as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
+  if (map2d) {
+    const exact = map2d[`${key}:${lane.id}:0.35`];
+    if (exact) return exact;
+    const prefix = `${key}:${lane.id}:`;
+    for (const k in map2d) {
+      if (k.startsWith(prefix)) return map2d[k];
+    }
+  }
+  return getLane2dMetrics(set, key, lane);
 }
 
 // Moving average box filter for signal smoothing
@@ -910,35 +1055,106 @@ export function detectFront(profile: number[], sign: number = 1): number {
 
 const MIN_ORIGIN_SNR = 3.5;
 
-function refineOriginCoreCenter(s: number[], idx: number, sign: number): number {
+interface OriginCoreRefinement {
+  pos: number;
+  fwhm: number;
+  coreMax: number;
+  isTailing: boolean;
+  backEdge50: number;
+  bg: number;
+}
+
+interface OriginRefineOptions {
+  metrics?: Lane2dMetrics;
+  laneWidthPx?: number;
+  plateMedianDiam?: number;
+}
+
+function refineOriginCoreDetailed(
+  s: number[],
+  idx: number,
+  sign: number,
+  opts?: OriginRefineOptions
+): OriginCoreRefinement {
   const n = s.length;
-  if (idx <= 2 || idx >= n - 3) return idx;
+  if (idx <= 2 || idx >= n - 3) {
+    return { pos: idx, fwhm: 0, coreMax: 0, isTailing: false, backEdge50: idx, bg: s[idx] ?? 0 };
+  }
 
   const flankIn = Math.max(6, Math.round(n * 0.024));
   const flankOut = flankIn + Math.max(8, Math.round(n * 0.030));
-  const buf = new Float64Array(32);
+  const buf = new Float64Array(48);
   const mBelow = windowMedian(s, Math.max(0, idx - flankOut), Math.max(0, idx - flankIn), buf);
   const mAbove = windowMedian(s, Math.min(n - 1, idx + flankIn), Math.min(n - 1, idx + flankOut), buf);
-  const bg = sign < 0 ? Math.max(mBelow, mAbove) : Math.min(mBelow, mAbove);
+  const bg0 = sign < 0 ? Math.max(mBelow, mAbove) : Math.min(mBelow, mAbove);
+
+  const sig0 = (k: number) => Math.max(0, sign * (s[k] - bg0));
+  const idxSig0 = sig0(idx);
+  // Generous search radius (~5% of lane) so huge saturated circular dots are never clipped.
+  const searchR = Math.max(14, Math.round(n * 0.050));
+
+  // Walk backward/forward across the connected deposit core.
+  // Stop backward walk if we cross a bright silica valley into a dark plate border.
+  let loConn = idx;
+  let coreMax0 = idxSig0;
+  let minBackSig = idxSig0;
+  while (loConn > Math.max(1, idx - searchR)) {
+    const prevSig = sig0(loConn - 1);
+    if (prevSig < 0.35 * idxSig0) break;
+    // Only break on a deep valley (<42% peak, e.g., bright silica gap before a dark plate border)
+    // so hollow "coffee-ring" origin halos (which dip to ~65-80% in the center) stay whole.
+    if (minBackSig < 0.42 * coreMax0 && prevSig > minBackSig + Math.max(2.5, 0.06 * coreMax0)) break;
+    loConn--;
+    if (prevSig > coreMax0) coreMax0 = prevSig;
+    if (prevSig < minBackSig) minBackSig = prevSig;
+  }
+  let hiConn = idx;
+  while (hiConn < Math.min(n - 2, idx + searchR) && sig0(hiConn + 1) >= 0.35 * idxSig0) {
+    hiConn++;
+    const v = sig0(hiConn);
+    if (v > coreMax0) coreMax0 = v;
+  }
+
+  // Recompute clean silica background strictly OUTSIDE the connected dot core so a huge dot's
+  // own rim can never contaminate the background estimate.
+  const bgGap = Math.max(3, Math.round(n * 0.008));
+  const bgSpan = Math.max(8, Math.round(n * 0.024));
+  const backBgA = Math.max(0, loConn - bgGap - bgSpan);
+  const backBgB = Math.max(0, loConn - Math.min(bgGap, Math.max(1, loConn)));
+  const fwdBgA = Math.min(n - 1, hiConn + bgGap);
+  const fwdBgB = Math.min(n - 1, hiConn + bgGap + bgSpan);
+
+  // Near the plate edge (loConn < 8% of lane), use a mild 65th/35th quantile behind loConn so a
+  // nearby dark plate border cannot drag cleanBackBg down; elsewhere use the unbiased median so
+  // noisy dark UV366 channels don't underestimate background on faint halos.
+  const nearBorder = loConn < Math.max(24, Math.round(n * 0.08));
+  let cleanBackBg = mBelow;
+  if (backBgB >= backBgA) {
+    const cnt = backBgB - backBgA + 1;
+    const tmp = new Float64Array(cnt);
+    for (let k = 0; k < cnt; k++) tmp[k] = s[backBgA + k];
+    tmp.sort();
+    const qFrac = nearBorder ? (sign < 0 ? 0.65 : 0.35) : 0.50;
+    const qIdx = Math.max(0, Math.min(cnt - 1, Math.floor(cnt * qFrac)));
+    cleanBackBg = tmp[qIdx];
+  }
+  const cleanFwdBg = fwdBgB >= fwdBgA ? windowMedian(s, fwdBgA, fwdBgB, buf) : mAbove;
+  const bg =
+    sign < 0
+      ? Math.max(cleanBackBg, cleanFwdBg)
+      : Math.min(cleanBackBg, cleanFwdBg);
 
   const sigAt = (k: number) => Math.max(0, sign * (s[k] - bg));
-  const idxSig = sigAt(idx);
-  const searchR = Math.max(8, Math.round(n * 0.032));
-
-  // Stay connected to `idx` so a nearby eluted spot or dark border cannot hijack centering.
-  let loConn = idx;
-  while (loConn > Math.max(1, idx - searchR) && sigAt(loConn - 1) >= 0.45 * idxSig) loConn--;
-  let hiConn = idx;
-  while (hiConn < Math.min(n - 2, idx + searchR) && sigAt(hiConn + 1) >= 0.45 * idxSig) hiConn++;
-
-  let coreMax = idxSig;
+  let coreMax = 0;
   for (let k = loConn; k <= hiConn; k++) {
     const v = sigAt(k);
     if (v > coreMax) coreMax = v;
   }
-  if (coreMax < 4) return idx;
+  if (coreMax < 3.5) return { pos: idx, fwhm: 0, coreMax, isTailing: false, backEdge50: idx, bg };
 
-  // Pick midpoint of the >=90% top plateau so flat saturated dots start in their geometric middle
+  // Find the >=90% core plateau within [loConn .. hiConn].
+  // Because solvent elutes strictly forward (+k), pLo (the back onset of the plateau) and
+  // backEdge50/backEdge64 are ALWAYS crisp and un-smeared!
   let pLo = -1;
   let pHi = -1;
   for (let k = loConn; k <= hiConn; k++) {
@@ -949,84 +1165,174 @@ function refineOriginCoreCenter(s: number[], idx: number, sign: number): number 
   }
   if (pLo === -1) {
     for (let k = loConn; k <= hiConn; k++) {
-      if (sigAt(k) >= 0.86 * coreMax) {
+      if (sigAt(k) >= 0.85 * coreMax) {
         if (pLo === -1) pLo = k;
         pHi = k;
       }
     }
   }
-  const seedFloat = pLo !== -1 ? 0.5 * (pLo + pHi) : idx;
-  const seed = Math.round(seedFloat);
-
-  // Walk outward to the 64% peak contour, then clamp the smeared flank against the clean flank
-  // so tailing dots stay centered on their round deposit core rather than shifting toward the front.
-  const thr = 0.64 * coreMax;
-  const maxHalf = Math.max(14, Math.round(n * 0.042));
-
-  let l = seed;
-  while (l > Math.max(0, seed - maxHalf) && sigAt(l - 1) >= thr) l--;
-  let leftX = l;
-  if (l > 0 && sigAt(l - 1) < thr && sigAt(l) >= thr) {
-    const v0 = sigAt(l - 1);
-    const v1 = sigAt(l);
-    leftX = l - (v1 - thr) / Math.max(1e-6, v1 - v0);
+  if (pLo === -1) {
+    pLo = idx;
+    pHi = idx;
   }
 
-  let r = seed;
-  while (r < Math.min(n - 1, seed + maxHalf) && sigAt(r + 1) >= thr) r++;
-  let rightX = r;
-  if (r < n - 1 && sigAt(r + 1) < thr && sigAt(r) >= thr) {
-    const v0 = sigAt(r);
-    const v1 = sigAt(r + 1);
-    rightX = r + (v0 - thr) / Math.max(1e-6, v0 - v1);
+  const maxHalf = Math.max(16, Math.round(n * 0.055));
+  const walkBackEdge = (start: number, thr: number): number => {
+    let l = start;
+    const minK = Math.max(0, start - maxHalf);
+    let bestLow = sigAt(l);
+    while (l > minK) {
+      const nextV = sigAt(l - 1);
+      if (nextV < thr) break;
+      if (bestLow < 0.42 * coreMax && nextV > bestLow + Math.max(2.5, 0.06 * coreMax)) break;
+      l--;
+      if (nextV < bestLow) bestLow = nextV;
+    }
+    if (l > 0 && sigAt(l - 1) < thr && sigAt(l) >= thr) {
+      const v0 = sigAt(l - 1);
+      const v1 = sigAt(l);
+      return l - (v1 - thr) / Math.max(1e-6, v1 - v0);
+    }
+    return l;
+  };
+  const walkFwdEdge = (start: number, thr: number): number => {
+    let r = start;
+    const maxK = Math.min(n - 1, start + maxHalf);
+    while (r < maxK && sigAt(r + 1) >= thr) r++;
+    if (r < n - 1 && sigAt(r + 1) < thr && sigAt(r) >= thr) {
+      const v0 = sigAt(r);
+      const v1 = sigAt(r + 1);
+      return r + (v0 - thr) / Math.max(1e-6, v0 - v1);
+    }
+    return r;
+  };
+
+  const thr50 = 0.50 * coreMax;
+  const thr64 = 0.64 * coreMax;
+  const backEdge50 = walkBackEdge(pLo, thr50);
+  const backEdge64 = walkBackEdge(pLo, thr64);
+  const fwdEdge50 = walkFwdEdge(pHi, thr50);
+  const fwdEdge64 = walkFwdEdge(pHi, thr64);
+
+  const backSlope50 = Math.max(1.0, pLo - backEdge50);
+  const fwdSlope50 = Math.max(1.0, fwdEdge50 - pHi);
+  const backSlope64 = Math.max(0.8, pLo - backEdge64);
+  const fwdSlope64 = Math.max(0.8, fwdEdge64 - pHi);
+
+  // Measure sustained forward elution smear ahead of the clean back half of the core.
+  const fwdProbeA = Math.min(n - 1, Math.round(pLo) + Math.max(12, Math.round(n * 0.024)));
+  const fwdProbeB = Math.min(n - 1, fwdProbeA + Math.max(12, Math.round(n * 0.028)));
+  const nearFwdMed = fwdProbeB >= fwdProbeA ? windowMedian(s, fwdProbeA, fwdProbeB, buf) : cleanFwdBg;
+  const fwdTailSig = Math.max(0, sign * (nearFwdMed - bg));
+
+  // Trim 1 (faint/moderate forward tail): solvent never elutes backward, so NEVER clamp
+  // backEdge forward; trim ONLY an asymmetric forward slope tail beyond pHi.
+  let usedFwd50 = fwdEdge50;
+  let usedFwd64 = fwdEdge64;
+  if (fwdSlope50 > 1.12 * backSlope50 + 0.5) {
+    usedFwd50 = Math.min(usedFwd50, pHi + 1.10 * backSlope50 + 0.5);
+  }
+  if (fwdSlope64 > 1.12 * backSlope64 + 0.5) {
+    usedFwd64 = Math.min(usedFwd64, pHi + 1.10 * backSlope64 + 0.5);
   }
 
-  const rBelow = Math.max(1, seedFloat - leftX);
-  const rAbove = Math.max(1, rightX - seedFloat);
-  const nearIn = Math.max(4, Math.round(n * 0.014));
-  const nearOut = nearIn + Math.max(6, Math.round(n * 0.018));
-  const nearBelow = windowMedian(s, Math.max(0, seed - nearOut), Math.max(0, seed - nearIn), buf);
-  const nearAbove = windowMedian(s, Math.min(n - 1, seed + nearIn), Math.min(n - 1, seed + nearOut), buf);
-  const flankAsym =
-    sign < 0
-      ? 0.5 * (mBelow - mAbove + (nearBelow - nearAbove))
-      : 0.5 * (mAbove - mBelow + (nearAbove - nearBelow));
+  let isTailing =
+    fwdTailSig > 0.20 * coreMax ||
+    (fwdTailSig > 0.14 * coreMax && fwdSlope50 > 1.25 * backSlope50 + 2.5);
 
-  let usedLeftX = leftX;
-  let usedRightX = rightX;
-  const cleanIsBelow = flankAsym > 2.5 || (flankAsym >= -2 && rAbove > 1.22 * rBelow + 1);
-  const cleanIsAbove = flankAsym < -2.5 || (flankAsym <= 2 && rBelow > 1.22 * rAbove + 1);
-  if (cleanIsBelow && rAbove > 1.12 * rBelow + 0.5) {
-    usedRightX = Math.min(rightX, seedFloat + Math.max(3, 1.12 * rBelow + 0.6));
-  } else if (cleanIsAbove && rBelow > 1.12 * rAbove + 0.5) {
-    usedLeftX = Math.max(leftX, seedFloat - Math.max(3, 1.12 * rAbove + 0.6));
+  // Trim 2 (heavy saturated comet tail where even pHi stretched forward):
+  // Compare vertical span against the dot's 2D circular horizontal diameter (solvent elutes
+  // vertically and does not widen the origin deposit sideways!).
+  let cappedByCircular = false;
+  if (opts?.metrics && opts.laneWidthPx && opts.laneWidthPx > 0) {
+    const sw = opts.metrics.spotWidth;
+    const swLo = Math.max(0, Math.round(backEdge50 + 1));
+    const swHi = Math.min(
+      sw.length - 1,
+      Math.round(Math.min(hiConn, pLo + Math.max(6, backSlope50 * 1.6)))
+    );
+    let maxSw = 0;
+    for (let k = swLo; k <= swHi; k++) {
+      if (sw[k] > maxSw) maxSw = sw[k];
+    }
+    if (maxSw >= 0.12) {
+      const dHorizPx = maxSw * (0.76 * opts.laneWidthPx);
+      const diamFactor = maxSw >= 0.90 ? 1.18 : 1.08;
+      const expectedVert50 = diamFactor * dHorizPx;
+      if (
+        dHorizPx >= 6 &&
+        usedFwd50 - backEdge50 > 1.18 * expectedVert50 &&
+        (fwdTailSig > 0.16 * coreMax || usedFwd50 - backEdge50 > 1.45 * dHorizPx)
+      ) {
+        usedFwd50 = Math.min(usedFwd50, backEdge50 + expectedVert50);
+        usedFwd64 = Math.min(usedFwd64, backEdge64 + 0.92 * expectedVert50);
+        isTailing = true;
+        cappedByCircular = true;
+      }
+    }
   }
 
-  const lClamp = Math.max(0, Math.floor(usedLeftX));
-  const rClamp = Math.min(n - 1, Math.ceil(usedRightX));
-  const mid = 0.5 * (usedLeftX + usedRightX);
-  let sumW = 0;
-  let sumPos = 0;
-  for (let k = lClamp; k <= rClamp; k++) {
-    const w = Math.max(0, sigAt(k) - thr);
-    sumW += w;
-    sumPos += k * w;
+  // 1D-only fallback for heavy saturated comets when 2D metrics are unavailable.
+  if (
+    !cappedByCircular &&
+    opts?.plateMedianDiam &&
+    opts.plateMedianDiam >= 6 &&
+    fwdTailSig > 0.30 * coreMax &&
+    usedFwd50 - backEdge50 > Math.max(1.50 * opts.plateMedianDiam, 2.0 * backSlope50)
+  ) {
+    usedFwd50 = Math.min(usedFwd50, backEdge50 + 1.18 * opts.plateMedianDiam);
+    usedFwd64 = Math.min(usedFwd64, backEdge64 + 1.05 * opts.plateMedianDiam);
+    isTailing = true;
   }
-  const centroid = sumW > 0 ? sumPos / sumW : mid;
-  const refined = Math.round(0.65 * mid + 0.35 * centroid);
-  if (Math.abs(refined - idx) > searchR || refined < 4 || refined >= n - 4) return idx;
+
+  const mid50 = 0.5 * (backEdge50 + usedFwd50);
+  const mid64 = 0.5 * (backEdge64 + usedFwd64);
+  const fwhm = Math.max(0, usedFwd50 - backEdge50);
+
+  let refinedFloat: number;
+  if (isTailing) {
+    refinedFloat = 0.55 * mid64 + 0.45 * mid50;
+  } else {
+    const lClamp = Math.max(0, Math.floor(backEdge64));
+    const rClamp = Math.min(n - 1, Math.ceil(usedFwd64));
+    let sumW = 0;
+    let sumPos = 0;
+    for (let k = lClamp; k <= rClamp; k++) {
+      const w = Math.max(0, sigAt(k) - thr64);
+      sumW += w;
+      sumPos += k * w;
+    }
+    const centroid = sumW > 0 ? sumPos / sumW : mid64;
+    refinedFloat = 0.50 * mid64 + 0.35 * mid50 + 0.15 * centroid;
+  }
+
+  const refined = Math.round(refinedFloat);
+  if (Math.abs(refined - idx) > searchR || refined < 4 || refined >= n - 4) {
+    return { pos: idx, fwhm, coreMax, isTailing, backEdge50, bg };
+  }
   if (Math.abs(refined - idx) > Math.max(4, Math.round(n * 0.020))) {
     const aPath = Math.min(idx, refined);
     const bPath = Math.max(idx, refined);
     for (let k = aPath; k <= bPath; k++) {
-      if (sigAt(k) < 0.25 * coreMax) return idx;
+      if (sigAt(k) < 0.22 * coreMax) return { pos: idx, fwhm, coreMax, isTailing, backEdge50, bg };
     }
   }
-  return refined;
+  return { pos: refined, fwhm, coreMax, isTailing, backEdge50, bg };
+}
+
+function refineOriginCoreCenter(
+  s: number[],
+  idx: number,
+  sign: number,
+  opts?: OriginRefineOptions
+): number {
+  return refineOriginCoreDetailed(s, idx, sign, opts).pos;
 }
 
 interface OriginCandidate extends FrontDetectionResult {
   feat: number;
+  fwhm?: number;
+  isTailing?: boolean;
 }
 
 // Detect up to `maxPeaks` separated compact deposit peaks in the lower 3%-25% of a lane.
@@ -1035,7 +1341,8 @@ function detectOriginCandidates(
   sign: number = -1,
   maxPeaks: number = 3,
   relaxed: boolean = false,
-  histBgSigma?: number
+  histBgSigma?: number,
+  refineOpts?: OriginRefineOptions
 ): OriginCandidate[] {
   const n = profile.length;
   if (n < 20) return [];
@@ -1110,9 +1417,10 @@ function detectOriginCandidates(
   const out: OriginCandidate[] = [];
   for (const pk of localPeaks) {
     if (out.some((kept) => Math.abs(kept.pos - pk.idx) < minSep)) continue;
-    const pos = refineOriginCoreCenter(s, pk.idx, sign);
+    const ref = refineOriginCoreDetailed(s, pk.idx, sign, refineOpts);
+    const pos = ref.pos;
     if (pos <= 0 || out.some((kept) => Math.abs(kept.pos - pos) < minSep)) continue;
-    out.push({ pos, score: pk.feat / noiseFloor, feat: pk.feat });
+    out.push({ pos, score: pk.feat / noiseFloor, feat: pk.feat, fwhm: ref.fwhm, isTailing: ref.isTailing });
     if (out.length >= maxPeaks) break;
   }
   return out;
@@ -1252,14 +1560,27 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const smWin = span < 450 ? 5 : 7;
   const sm1 = movingAvg(boundedProf, smWin);
 
-  // Restrict rolling baseline estimation strictly to chromatographic interior [origin + 3, front]
+  // Origin buffer: scale cleanly with lane span (~1.8% Rf, min 3 px) so high-res ~900px lanes clear
+  // the origin dot radius while still resolving polar products from Rf ~0.025 upwards.
+  const originBuffer = Math.max(
+    3,
+    Math.min(
+      Math.round(0.022 * span),
+      Math.max(Math.round(r * 0.20), Math.round(0.018 * span))
+    )
+  );
+
+  // Restrict rolling baseline estimation strictly to chromatographic interior [origin + originBuffer, front]
   // so dark outer plate borders (< origin or > front) do not drag the baseline down near Rf ~0.04 or Rf ~0.95.
-  const baseLo = Math.max(0, Math.round(o.origin + Math.max(3, Math.min(8, r * 0.18))));
+  const baseLo = Math.max(0, Math.round(o.origin + originBuffer));
   const baseHi = Math.min(n - 1, Math.round(o.front));
   const useRestrictedBase = baseHi - baseLo >= 16;
 
   const step = 5;
-  const win = 100;
+  // Scale rolling baseline half-window with span (~28% Rf, min 100 px) so a broad low-Rf doublet
+  // (~120-180 px tall on a 900 px high-res camera lane) never traps the 90th-percentile baseline
+  // inside dark spots and inverts/erases the lower spot.
+  const win = Math.max(100, Math.round(0.28 * span));
   const base = new Array(n);
   const q = o.sign < 0 ? 0.9 : 0.1;
   const pts: [number, number][] = [];
@@ -1298,8 +1619,6 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const smoothHalf = Math.max(1, Math.round((1.0 + 5.2 * t) * spanScale));
   const d = movingAvg(rawDiff, smoothHalf * 2 + 1);
 
-  // Origin buffer: allow detecting resolved polar products from Rf ~0.025 upwards
-  const originBuffer = Math.max(3, Math.min(8, Math.round(r * 0.18)));
   const start = Math.round(o.origin + originBuffer);
 
   // Front buffer: extend reach up to Rf ~0.988 so fast nonpolar spots right before the solvent front are still detected
@@ -1333,14 +1652,41 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     ? Math.min(rawMadNoise, Math.max(0.5, 1.35 * h.bgSigma))
     : rawMadNoise;
   // Histogram-calibrated physical minimum floor:
-  // - Adapts to quiet-side silica noise (2.8 * bgSigma) & plate dynamic range (0.016 * contrastSpan)
-  // - Lets faint spots on clean, low-exposure Merck TLC Explorer plates resolve down to ~2.0 units
-  // - Prevents blank-well camera noise from triggering when plate contrast is high
-  const histFloor = h.sampleCount >= 8 ? Math.max(2.0, 2.8 * h.bgSigma, 0.016 * h.contrastSpan) : 4.5;
-  const minAbsFloor = Math.max(histFloor, 0.018 * dynSpan);
+  // - On bright-silica channels (UV254/White, sign < 0), require a human-visible contrast floor so
+  //   camera compression / silica grain (2-5 units on a 240-green plate) never triggers phantom spots.
+  // - On dark-background UV366 (sign > 0), keep sensitive down to ~2.0 units for faint fluorophores.
+  const histFloor =
+    o.sign < 0
+      ? h.sampleCount >= 8
+        ? Math.max(4.0, 3.2 * h.bgSigma, 0.034 * h.contrastSpan)
+        : 5.5
+      : h.sampleCount >= 8
+      ? Math.max(2.0, 2.8 * h.bgSigma, 0.016 * h.contrastSpan)
+      : 4.5;
+  const minAbsFloor = Math.max(histFloor, (o.sign < 0 ? 0.030 : 0.018) * dynSpan);
 
   // Robust chromatographic signal threshold
   const thr = Math.max(2.6 * noise, 0.035 * dmax, minAbsFloor);
+
+  // Precompute lightly-smoothed 2D hourglass curves (rowMass & lateral spotWidth) when available
+  const hasHourglass2d = Boolean(
+    o.lane2d?.rowMass &&
+      o.lane2d?.spotWidth &&
+      o.lane2d.rowMass.length === n &&
+      o.lane2d.spotWidth.length === n
+  );
+  const m2d = hasHourglass2d
+    ? movingAvg(
+        Array.from(o.lane2d!.rowMass!, (v, i) => (useChromClamp && (i < chromLo - 1 || i > chromHi) ? 0 : v)),
+        5
+      )
+    : null;
+  const w2d = hasHourglass2d
+    ? movingAvg(
+        Array.from(o.lane2d!.spotWidth!, (v, i) => (useChromClamp && (i < chromLo - 1 || i > chromHi) ? 0 : v)),
+        5
+      )
+    : null;
 
   // 1. Initial Candidate Peaks via local maximum search
   const halfWin = Math.max(3, Math.round(r * (0.14 + 0.38 * t)));
@@ -1367,10 +1713,131 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     }
   }
 
+  // 1b. 2D Hourglass Doublet Lobe Rescue (Sensitive & Standard modes only, t < 0.72):
+  //     When two dark circular/oval spots overlap closely (figure-8 silhouette), double 1D smoothing can
+  //     smear across their lighter middle waist, hiding the secondary lobe from the 1D local-max scan.
+  //     Scanning the 2D cross-lane integrated spot mass (m2d) rescues genuine bimodal lobes while
+  //     ignoring monotonic streaks/tails and faint noise.
+  if (hasHourglass2d && m2d && w2d && t < 0.72) {
+    const mHalfWin = Math.max(3, Math.round(halfWin * 0.85));
+    const minSepFromExisting = Math.max(5, Math.round(halfWin * 0.85));
+    const minPairSep = Math.max(7, Math.round(0.022 * span));
+    const maxPairSep = Math.max(24, Math.round(0.20 * span));
+    const rescued: Array<{ pos: number; val: number; extentStart: number; extentEnd: number }> = [];
+
+    for (let i = Math.max(start, 1); i < Math.min(end, n - 1); i++) {
+      const peakAmp = Math.max(d[i], rawDiff[i]);
+      if (peakAmp < Math.max(thr * 1.6, 22)) continue;
+      if (m2d[i] < Math.max(12, 0.12 * dmax)) continue;
+      if (m2d[i] < m2d[i - 1] || m2d[i] < m2d[i + 1]) continue;
+
+      let mTop = true;
+      for (let k = Math.max(start, i - mHalfWin); k <= Math.min(end, i + mHalfWin); k++) {
+        if (m2d[k] > m2d[i] || (m2d[k] === m2d[i] && k < i)) {
+          mTop = false;
+          break;
+        }
+      }
+      if (!mTop) continue;
+      if (candidates.some((c) => Math.abs(c.pos - i) < minSepFromExisting)) continue;
+      if (rescued.some((c) => Math.abs(c.pos - i) < minSepFromExisting)) continue;
+
+      // Require a neighboring strong candidate separated by a genuine 2D hourglass waist
+      let confirmedHourglass = false;
+      for (const c of candidates) {
+        const pairDist = Math.abs(c.pos - i);
+        if (pairDist < minPairSep || pairDist > maxPairSep) continue;
+        const lo = Math.min(c.pos, i);
+        const hi = Math.max(c.pos, i);
+        let mVMin = Infinity;
+        let wVMin = Infinity;
+        let rawVMin = Infinity;
+        for (let k = lo; k <= hi; k++) {
+          if (m2d[k] < mVMin) mVMin = m2d[k];
+          if (w2d[k] < wVMin) wVMin = w2d[k];
+          if (rawDiff[k] < rawVMin) rawVMin = rawDiff[k];
+        }
+        const mLower = Math.min(m2d[lo], m2d[hi]);
+        const wLower = Math.min(w2d[lo], w2d[hi]);
+        const rawLower = Math.min(rawDiff[lo], rawDiff[hi]);
+        const mDrop = mLower > 0 ? (mLower - mVMin) / mLower : 0;
+        const wPinch = wLower > 0 ? (wLower - wVMin) / wLower : 0;
+        const rawDrop = rawLower - rawVMin;
+        if (mDrop >= 0.10 + 0.12 * t && (rawDrop >= Math.max(4.5, 2.4 * noise) || wPinch >= 0.10 + 0.10 * t)) {
+          confirmedHourglass = true;
+          break;
+        }
+      }
+      if (confirmedHourglass) {
+        rescued.push({
+          pos: i,
+          val: peakAmp,
+          extentStart: Math.max(start, i - mHalfWin),
+          extentEnd: Math.min(end, i + mHalfWin),
+        });
+      }
+    }
+
+    // Also handle low-Rf spots that sit right on/touching the origin (Rf ~0.025..0.055) below a
+    // distinct lighter waist and upper spot: unlike a decaying origin tail (which plunges >55% by
+    // Rf ~0.035), a real saturated low-Rf spot maintains >=82% of origin darkness out to Rf ~0.035..0.05
+    // before dropping cleanly into the lighter waist between the two spots.
+    const firstCand = [...candidates, ...rescued].sort((a, b) => a.pos - b.pos)[0];
+    const originAnchor = Math.max(0, Math.min(n - 1, Math.round(o.origin)));
+    const originSig = Math.max(rawDiff[originAnchor], d[originAnchor], rawDiff[Math.min(n - 1, originAnchor + 2)]);
+    const shelfLo = Math.max(start + 2, Math.round(o.origin + Math.max(8, 0.025 * span)));
+    const shelfHi = Math.min(end - 2, Math.round(o.origin + Math.max(18, 0.065 * span)));
+    if (
+      firstCand &&
+      firstCand.pos > shelfHi + 4 &&
+      firstCand.pos <= o.origin + Math.max(32, Math.round(0.22 * span)) &&
+      originSig >= 55 &&
+      !candidates.some((c) => c.pos <= shelfHi + 3) &&
+      !rescued.some((c) => c.pos <= shelfHi + 3)
+    ) {
+      let bestShelfPos = -1;
+      let bestShelfVal = -Infinity;
+      for (let k = shelfLo; k <= Math.min(shelfHi, firstCand.pos - 6); k++) {
+        const sVal = rawDiff[k];
+        if (sVal >= Math.max(55, 0.82 * originSig) && sVal >= bestShelfVal - 2) {
+          // Prefer the outermost position still at >=82% of origin darkness (core of the low-Rf lobe)
+          bestShelfPos = k;
+          if (sVal > bestShelfVal) bestShelfVal = sVal;
+        }
+      }
+      if (bestShelfPos >= shelfLo) {
+        let rawVMin = Infinity;
+        let mVMin = Infinity;
+        for (let k = bestShelfPos; k <= firstCand.pos; k++) {
+          if (rawDiff[k] < rawVMin) rawVMin = rawDiff[k];
+          if (m2d[k] < mVMin) mVMin = m2d[k];
+        }
+        const upperAmp = Math.max(rawDiff[firstCand.pos], d[firstCand.pos]);
+        const lowerAmp = Math.min(bestShelfVal, upperAmp);
+        const waistDrop = lowerAmp - rawVMin;
+        const mLower = Math.min(m2d[bestShelfPos], m2d[firstCand.pos]);
+        const mDrop = mLower > 0 ? (mLower - mVMin) / mLower : 0;
+        if (waistDrop >= Math.max(8, 3.5 * noise) && mDrop >= 0.065 + 0.10 * t) {
+          rescued.push({
+            pos: bestShelfPos,
+            val: Math.max(d[bestShelfPos], bestShelfVal),
+            extentStart: Math.max(start, bestShelfPos - mHalfWin),
+            extentEnd: Math.min(end, bestShelfPos + mHalfWin),
+          });
+        }
+      }
+    }
+
+    if (rescued.length > 0) {
+      candidates.push(...rescued);
+      candidates.sort((a, b) => a.pos - b.pos);
+    }
+  }
+
   // Failsafe Artifact Rejection Filters:
   // (a) Reject single-pixel dust specks (< 3 raw px persistence + smoothed support check)
   // (b) Near-origin: require clear chromatographic valley from o.origin (not an uneluted/tailing origin dot)
-  // (c) Near-front (Rf >= 0.88): reject monotonic ramps climbing into dark plate borders past o.front,
+  // (c) Near-front (Rf >= 0.88): reject monotonic ramps climbing into dark plate borders/meniscus past o.front,
   //     and require a genuine left chromatographic valley separating the spot from baseline noise
   // (d) Interior: require bilateral local prominence on both sides so gentle illumination gradients don't trigger
   const nearOriginLimit = o.origin + Math.max(Math.round(0.055 * span), Math.round(r * 1.15));
@@ -1444,7 +1911,27 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
             originPeakIdx = k;
           }
         }
-        if (originPeak >= Math.max(thr, 0.45 * p.val)) {
+        // A monotonically decaying origin tail can never grow darker than the origin itself;
+        // preserve low-Rf compounds that rise above originPeak OR form a full-darkness lobe (>=82%
+        // of originPeak at Rf >=0.025) followed immediately by a sharp waist drop into an upper spot.
+        const darkerThanOrigin = Math.max(p.val, rawDiff[p.pos]) >= originPeak + Math.max(2.0, noise);
+        let strongLowRfLobe = false;
+        if (
+          !darkerThanOrigin &&
+          hasHourglass2d &&
+          p.pos >= o.origin + Math.max(8, Math.round(0.025 * span)) &&
+          Math.max(p.val, rawDiff[p.pos]) >= Math.max(55, 0.82 * originPeak)
+        ) {
+          const lookHi = Math.min(end, p.pos + Math.max(14, Math.round(0.06 * span)));
+          let afterMin = Infinity;
+          for (let k = p.pos + 1; k <= lookHi; k++) {
+            if (rawDiff[k] < afterMin) afterMin = rawDiff[k];
+          }
+          if (Math.max(p.val, rawDiff[p.pos]) - afterMin >= Math.max(12, 4 * noise)) {
+            strongLowRfLobe = true;
+          }
+        }
+        if (!darkerThanOrigin && !strongLowRfLobe && originPeak >= Math.max(thr, 0.45 * p.val)) {
           let valleyMin = Infinity;
           for (let k = originPeakIdx; k <= p.pos; k++) {
             if (d[k] < valleyMin) valleyMin = d[k];
@@ -1456,7 +1943,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       }
     }
 
-    // (c) Near-front guard against exterior plate border artifacts & baseline drift
+    // (c) Near-front guard against exterior plate border & solvent-front meniscus artifacts
     if (p.pos >= nearFrontLimit) {
       // Check left chromatographic valley
       const lStart = Math.max(start, p.pos - flankRadius);
@@ -1470,22 +1957,37 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
         return false;
       }
 
-      // Check raw profile at front edge: only reject if a dark glass border continues monotonically from p.pos past o.front without dipping back toward baseline
+      // Check raw profile at front edge: reject peaks sitting on a dark solvent-front meniscus or
+      // dark glass cut gap that stays dark right into o.front without dipping cleanly back to silica.
       const outStart = Math.min(n - 1, Math.round(o.front + 2));
-      if (frontCoreEnd > outStart && p.pos > o.origin + 0.93 * span) {
+      if (p.pos > o.origin + 0.93 * span) {
         const refBase = base[chromHi];
         let minInsideDev = Infinity;
         for (let k = p.pos; k <= chromHi; k++) {
           const dev = o.sign < 0 ? refBase - profile[k] : profile[k] - refBase;
           if (dev < minInsideDev) minInsideDev = dev;
         }
-        let outMaxDev = -Infinity;
-        for (let k = outStart; k <= frontCoreEnd; k++) {
-          const dev = o.sign < 0 ? refBase - profile[k] : profile[k] - refBase;
-          if (dev > outMaxDev) outMaxDev = dev;
+        if (frontCoreEnd > outStart) {
+          let outMaxDev = -Infinity;
+          for (let k = outStart; k <= frontCoreEnd; k++) {
+            const dev = o.sign < 0 ? refBase - profile[k] : profile[k] - refBase;
+            if (dev > outMaxDev) outMaxDev = dev;
+          }
+          if (outMaxDev >= p.val * 0.65 && p.val - minInsideDev < Math.max(0.32 * p.val, 2.5 * noise)) {
+            return false;
+          }
         }
-        if (outMaxDev > p.val * 1.15 && p.val - minInsideDev < Math.max(0.25 * p.val, 2 * noise)) {
-          return false;
+        // Full-width horizontal meniscus ridge pressed directly against the solvent front (Rf >= 0.94)
+        if (hasLane2d && o.lane2d && p.pos >= o.origin + 0.94 * span) {
+          const l2Lo = Math.max(0, p.pos - 2);
+          const l2Hi = Math.min(n - 1, p.pos + 2);
+          let maxLat = -Infinity;
+          for (let k = l2Lo; k <= l2Hi; k++) {
+            if (o.lane2d.lateralExcess[k] > maxLat) maxLat = o.lane2d.lateralExcess[k];
+          }
+          if (maxLat < Math.max(2.5, 0.14 * p.val) && p.val - minInsideDev < Math.max(0.45 * p.val, 3 * noise)) {
+            return false;
+          }
         }
       }
       return true;
@@ -1504,7 +2006,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
         if (d[k] < rMin) rMin = d[k];
       }
       const bilatProm = Math.min(p.val - lMin, p.val - rMin);
-      if (bilatProm < Math.max(2.0 * noise, minAbsFloor * 0.45)) {
+      if (bilatProm < Math.max(2.2 * noise, minAbsFloor * 0.55)) {
         return false;
       }
     }
@@ -1516,8 +2018,9 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
 
   // 2. Iterative Chromatographic Basin & Prominence Consolidation
   // In chromatography, two peaks in the same continuous band only represent separate compounds
-  // if the valley drops significantly towards baseline (achieving chromatographic resolution).
-  // If the valley is shallow or the peaks are physically close, they MUST be merged into one single spot.
+  // if the valley drops significantly towards baseline (achieving chromatographic resolution),
+  // OR if 2D hourglass silhouette analysis confirms two touching round/oval spots getting lighter
+  // and pinching narrower in the middle (figure-8 doublet, NOT a monotonic streak or flat dome).
   let merged = [...filteredCandidates];
   let changed = true;
   let iterations = 0;
@@ -1543,6 +2046,54 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       const valleyDrop = lowerVal - vMin;
       const dropRatio = lowerVal > 0 ? valleyDrop / lowerVal : 0;
 
+      // 2D Hourglass Doublet check (Sensitive & Standard modes, t < 0.72):
+      // Two strong touching spots get visibly lighter in the middle AND pinch inward in 2D mass/width.
+      let isHourglassDoublet = false;
+      if (
+        hasHourglass2d &&
+        m2d &&
+        w2d &&
+        t < 0.72 &&
+        dist >= Math.max(7, Math.round(0.022 * span)) &&
+        lowerVal >= Math.max(thr * 1.7, 20)
+      ) {
+        let rawVMin = Infinity;
+        let mVMin = Infinity;
+        let wVMin = Infinity;
+        for (let k = p1.pos; k <= p2.pos; k++) {
+          if (rawDiff[k] < rawVMin) rawVMin = rawDiff[k];
+          if (m2d[k] < mVMin) mVMin = m2d[k];
+          if (w2d[k] < wVMin) wVMin = w2d[k];
+        }
+        const rawLower = Math.min(rawDiff[p1.pos], rawDiff[p2.pos]);
+        const rawDrop = rawLower - rawVMin;
+        const rawDropRatio = rawLower > 0 ? rawDrop / rawLower : 0;
+
+        const mLower = Math.min(m2d[p1.pos], m2d[p2.pos]);
+        const mDropRatio = mLower > 0 ? (mLower - mVMin) / mLower : 0;
+
+        const wLower = Math.min(w2d[p1.pos], w2d[p2.pos]);
+        const wPinchRatio = wLower > 0 ? (wLower - wVMin) / wLower : 0;
+
+        const reqMassDrop = 0.05 + 0.10 * t;
+        const reqWidthPinch = 0.06 + 0.14 * t;
+        const reqRawDropRatio = 0.036 + 0.07 * t;
+
+        const clearLightWaist =
+          rawDrop >= Math.max(6.5, 3.0 * noise) &&
+          rawDropRatio >= reqRawDropRatio &&
+          (mDropRatio >= reqMassDrop || wPinchRatio >= reqWidthPinch);
+        const strongHourglassPinch =
+          rawDrop >= Math.max(4.5, 2.4 * noise) &&
+          rawDropRatio >= 0.030 + 0.05 * t &&
+          mDropRatio >= reqMassDrop * 1.3 &&
+          wPinchRatio >= reqWidthPinch * 1.2;
+
+        if (clearLightWaist || strongHourglassPinch) {
+          isHourglassDoublet = true;
+        }
+      }
+
       // Two adjacent peaks are one spot when the valley between them is shallow.
       // mergeDrop scales continuously with the slider (8% -> 0.13, 12% -> 0.17, 28% -> 0.31, 55% -> 0.56);
       // well-separated peaks (>= 0.075 Rf apart) with distinct height asymmetry (a genuine secondary band
@@ -1555,9 +2106,10 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       const mergeDrop = baseMergeDrop * distDiscount;
       const closeDist = Math.max(10, Math.round(span * (0.01 + 0.10 * t)));
       const shouldMerge =
-        dropRatio < mergeDrop ||
-        (dist < closeDist && dropRatio < Math.min(0.95, baseMergeDrop + 0.15)) ||
-        valleyDrop < Math.max(2.5 * noise, 0.45 * minAbsFloor);
+        !isHourglassDoublet &&
+        (dropRatio < mergeDrop ||
+          (dist < closeDist && dropRatio < Math.min(0.95, baseMergeDrop + 0.15)) ||
+          valleyDrop < Math.max(2.8 * noise, 0.60 * minAbsFloor));
 
       if (shouldMerge) {
         if (dropRatio < minValleyRatio) {
@@ -2135,7 +2687,12 @@ function detectOtsuWetDryFront(
   };
 }
 
-function detectChannelFront(rawProfiles: number[][], sign: number, laneLen: number): FrontDetectionResult {
+function detectChannelFront(
+  rawProfiles: number[][],
+  sign: number,
+  laneLen: number,
+  dualHalfCeiling?: { maxFrontPos: number; effEndPos: number }
+): FrontDetectionResult {
   if (!rawProfiles.length) return { pos: 0, score: 0 };
 
   // Filter out off-plate pitch-black profiles so unaligned outer lanes don't corrupt median/voting
@@ -2146,10 +2703,16 @@ function detectChannelFront(rawProfiles: number[][], sign: number, laneLen: numb
   const minLen = Math.min(...profiles.map((p) => p.length));
   if (minLen < 20) return { pos: 0, score: 0 };
 
-  // Clamp upper search ceiling strictly inside physical top glass edge when lane boxes extend into black void
+  // Clamp upper search ceiling strictly inside physical top glass edge and dual-half center gap
   const glassEdge = detectGlassTopEdge(profiles, sign);
-  const maxHi = glassEdge < minLen - 4 ? Math.max(Math.floor(minLen * 0.55), glassEdge - 6) : undefined;
-  const effEnd = glassEdge < minLen - 4 ? glassEdge - 2 : undefined;
+  let maxHi = glassEdge < minLen - 4 ? Math.max(Math.floor(minLen * 0.55), glassEdge - 6) : undefined;
+  let effEnd = glassEdge < minLen - 4 ? glassEdge - 2 : undefined;
+  if (dualHalfCeiling) {
+    const capHi = Math.max(Math.floor(minLen * 0.55), Math.min(minLen - 4, Math.round(dualHalfCeiling.maxFrontPos)));
+    const capEnd = Math.max(Math.floor(minLen * 0.57), Math.min(minLen - 2, Math.round(dualHalfCeiling.effEndPos)));
+    maxHi = maxHi != null ? Math.min(maxHi, capHi) : capHi;
+    effEnd = effEnd != null ? Math.min(effEnd, capEnd) : capEnd;
+  }
 
   let medProfile: number[];
   if (profiles.length === 1) {
@@ -2261,17 +2824,31 @@ export function gutterLanes(halfLanes: TlcLane[]): TlcLane[] {
   return out;
 }
 
-// Solvent front resolution: explicit side override -> explicit global manual override -> clearest-channel detection -> fallback 93% of lane length
+// Solvent front resolution: explicit side override -> explicit global manual override
+// (preserving any detected 2D per-lane curve offset) -> 2D seam + clearest-channel detection -> fallback 93% of lane length
 export function tlcFront(
   set: TlcSet,
   lane: TlcLane,
   getProfile?: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
 ): number {
   const h = tlcHalf(lane);
-  if (set.frontHalfPx && set.frontHalfPx[h] != null && set.frontHalfPx[h]! > 0) {
-    return set.frontHalfPx[h]!;
+  const manualBase =
+    set.frontHalfPx && set.frontHalfPx[h] != null && set.frontHalfPx[h]! > 0
+      ? set.frontHalfPx[h]!
+      : set.frontPx && set.frontPx > 0
+      ? set.frontPx
+      : null;
+  if (manualBase != null) {
+    const autoMed = set.frontAuto?.[h];
+    const autoLane = set.frontAutoByLane?.[lane.id];
+    if (autoMed != null && autoMed > 0 && autoLane != null && autoLane > 0) {
+      const delta = autoLane - autoMed;
+      if (delta !== 0) {
+        return Math.round(Math.max(20, Math.min(lane.length - 2, manualBase + delta)));
+      }
+    }
+    return manualBase;
   }
-  if (set.frontPx && set.frontPx > 0) return set.frontPx;
 
   const channels = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter((k) => !!set.imgs?.[k]);
   if (!channels.length || !getProfile) return Math.round(lane.length * 0.93);
@@ -2293,18 +2870,111 @@ export function tlcFront(
   if (set.frontAuto[h] == null && set.cfg) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h).sort((a, b) => a.id - b.id);
     const halfLaneIds = halfLanes.map((l) => l.id);
+    const laneIndexById = new Map<number, number>();
+    halfLanes.forEach((l, idx) => laneIndexById.set(l.id, idx));
+
     let bestFlat: FrontDetectionResult = { pos: 0, score: 0 };
     let bestSeam: CurvedFrontSeamResult = { medianPos: 0, byLane: {}, score: 0, isCurved: false };
 
     // Strips of bare silica between the lanes carry no spots or smears, so a front or meniscus
-    // is far cleaner there than down the lanes; sample them first and fall back to the lane centres.
+    // is far cleaner there than down the lanes; sample them first at their exact midpoint
+    // coordinates (i + 0.5) and fall back to (or compete with) 2D-filtered reaction lanes.
     const gutters = gutterLanes(halfLanes);
-    const laneSets = gutters.length >= 4 ? [gutters, halfLanes] : [halfLanes];
+    const laneSets: Array<{ lanes: TlcLane[]; isGutterSet: boolean }> =
+      gutters.length >= 4
+        ? [
+            { lanes: gutters, isGutterSet: true },
+            { lanes: halfLanes, isGutterSet: false },
+          ]
+        : [{ lanes: halfLanes, isGutterSet: false }];
     let physicalGlassCeiling = lane.length - 1;
-    for (const lanesToUse of laneSets) {
+    let saw2dMetrics = false;
+
+    // On head-to-head dual-sided plates (e.g. 20x20 cm plates running from top & bottom toward a
+    // 1 cm center writing gap), find the clean middle gap first so this half's search stops strictly
+    // before the opposing half's solvent front and never wanders across the center handwriting strip.
+    let dualHalfCeil: { maxFrontPos: number; effEndPos: number } | undefined;
+    const otherHalfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) !== h);
+    if (halfLanes.length >= 4 && otherHalfLanes.length >= 4) {
+      const pairDists: number[] = [];
+      for (const l of halfLanes) {
+        const th = (l.angle * Math.PI) / 180;
+        const dx = Math.sin(th);
+        const dy = -Math.cos(th);
+        const nx = Math.cos(th);
+        const ny = Math.sin(th);
+        let bestOther: TlcLane | null = null;
+        let bestLat = Infinity;
+        for (const o of otherHalfLanes) {
+          const oth = (o.angle * Math.PI) / 180;
+          const dot = dx * Math.sin(oth) + dy * -Math.cos(oth);
+          if (dot > -0.5) continue; // must run opposite (head-to-head)
+          const lat = Math.abs((o.x0 - l.x0) * nx + (o.y0 - l.y0) * ny);
+          if (lat < bestLat) {
+            bestLat = lat;
+            bestOther = o;
+          }
+        }
+        if (bestOther && bestLat <= Math.max(l.width * 3.5, 160)) {
+          const d = (bestOther.x0 - l.x0) * dx + (bestOther.y0 - l.y0) * dy;
+          if (d > 0) pairDists.push(d);
+        }
+      }
+      if (pairDists.length >= 4) {
+        pairDists.sort((a, b) => a - b);
+        const medPairDist = pairDists[pairDists.length >> 1];
+        const thisProbe = gutters.length >= 4 ? gutters : halfLanes;
+        const otherGutters = gutterLanes(otherHalfLanes);
+        const otherProbe = otherGutters.length >= 4 ? otherGutters : otherHalfLanes;
+        const thisGapCh: Array<{ profiles: number[][]; sign: number }> = [];
+        const otherGapCh: Array<{ profiles: number[][]; sign: number }> = [];
+        let profScale = 1;
+        for (const ch of channels) {
+          const chSign = TLC_SIGNAL[ch]?.sign ?? 1;
+          const tp = thisProbe.map((l) => getProfile(set, ch, l)).filter((p) => p && p.length > 0);
+          const op = otherProbe.map((l) => getProfile(set, ch, l)).filter((p) => p && p.length > 0);
+          if (tp.length >= 4) {
+            if (lane.length > 0) profScale = tp[0].length / lane.length;
+            thisGapCh.push({ profiles: tp, sign: chSign });
+            otherGapCh.push({ profiles: op, sign: chSign });
+          }
+        }
+        if (thisGapCh.length > 0) {
+          const effLaneLen = Math.round(lane.length * profScale);
+          const gapRes = findDualHalfGapCeiling(thisGapCh, otherGapCh, medPairDist * profScale, effLaneLen);
+          if (gapRes) {
+            dualHalfCeil = { maxFrontPos: gapRes.maxFrontPos, effEndPos: gapRes.effEndPos };
+            physicalGlassCeiling = Math.min(physicalGlassCeiling, gapRes.maxFrontPos);
+          }
+        }
+      }
+    }
+    const seamOpts: CurvedFrontSeamOptions | undefined = dualHalfCeil
+      ? { maxFrontPos: dualHalfCeil.maxFrontPos, effEndPos: dualHalfCeil.effEndPos }
+      : undefined;
+
+    for (const { lanes: lanesToUse, isGutterSet } of laneSets) {
       const seamInputs: CurvedFrontChannelInput[] = [];
       for (const ch of channels) {
-        const profiles = lanesToUse.map((l) => getProfile(set, ch, l)).filter((p) => p.length > 0);
+        const profiles: number[][] = [];
+        const metricsArr: Array<Lane2dMetrics | undefined> = [];
+        const colPositions: number[] = [];
+        for (let i = 0; i < lanesToUse.length; i++) {
+          const l = lanesToUse[i];
+          const p = getProfile(set, ch, l);
+          if (!p || !p.length) continue;
+          profiles.push(p);
+          const m = getCachedLane2dMetrics(set, ch, l);
+          if (m) saw2dMetrics = true;
+          metricsArr.push(m);
+          if (isGutterSet) {
+            const leftIdx = laneIndexById.get(l.id - 1000);
+            colPositions.push(leftIdx != null ? leftIdx + 0.5 : i + 0.5);
+          } else {
+            const idx = laneIndexById.get(l.id);
+            colPositions.push(idx != null ? idx : i);
+          }
+        }
         if (!profiles.length) continue;
         const chSign = TLC_SIGNAL[ch]?.sign ?? 1;
         if (chSign < 0) {
@@ -2313,26 +2983,34 @@ export function tlcFront(
             physicalGlassCeiling = Math.min(physicalGlassCeiling, ge - 8);
           }
         }
-        const res = detectChannelFront(profiles, chSign, lane.length);
+        const res = detectChannelFront(profiles, chSign, lane.length, dualHalfCeil);
         if (res.score > bestFlat.score && res.pos > 0) {
           bestFlat = res;
         }
         if (profiles.length >= 4) {
-          seamInputs.push({ profiles, sign: chSign });
+          const hasAnyMetrics = metricsArr.some((m) => m !== undefined);
+          seamInputs.push({
+            profiles,
+            sign: chSign,
+            channel: ch,
+            metrics: hasAnyMetrics ? metricsArr : undefined,
+            colPositions,
+          });
         }
       }
 
       // 2D smooth curved solvent-front seam tracker (single-channel & multi-channel fused):
-      // Tracks smiling/frowning/tilted fronts that smear out under 1D flat median aggregation
-      // and fuses faint agreeing channels (UV254 + UV366 + White) into one confident curve.
+      // Uses 2D horizontal-continuity strip metrics, outer dry-side band edges, White-light pencil
+      // suppression, and a penalized smoothing spline across exact lane/gutter coordinates so wavy
+      // fronts, edge-curled aluminium plates, bows, and tilts are tracked per lane.
       if (seamInputs.length > 0 && halfLaneIds.length >= 4) {
-        const fused = detectCurvedFrontSeam(seamInputs, halfLaneIds, lane.length);
+        const fused = detectCurvedFrontSeam(seamInputs, halfLaneIds, lane.length, seamOpts);
         if (fused.medianPos > 0 && fused.score > bestSeam.score) {
           bestSeam = fused;
         }
         if (seamInputs.length > 1) {
           for (const single of seamInputs) {
-            const singleRes = detectCurvedFrontSeam([single], halfLaneIds, lane.length);
+            const singleRes = detectCurvedFrontSeam([single], halfLaneIds, lane.length, seamOpts);
             if (singleRes.medianPos > 0 && singleRes.score > bestSeam.score) {
               bestSeam = singleRes;
             }
@@ -2340,16 +3018,25 @@ export function tlcFront(
         }
       }
 
-      if (bestFlat.pos > 0 || bestSeam.medianPos > 0) break;
+      // Stop after gutters if a confident front was found (or if no 2D metrics are loaded for lane competition)
+      const gutterStrongEnough =
+        bestSeam.medianPos > 0 && (bestSeam.score >= 5.5 || bestSeam.isCurved || !saw2dMetrics);
+      if (gutterStrongEnough || (bestFlat.pos > 0 && !saw2dMetrics)) break;
     }
 
-    // Prefer curved seam when a genuine bow/tilt is detected (flat median smears edge lanes)
-    // or when multi-channel seam fusion beats single-channel flat detection.
+    // Prefer curved/outer-edge 2D seam whenever it finds a strong, continuous front (2D seam handles
+    // wavy fronts, outer dry-side band edges, and pencil-line suppression far better than 1D flat median).
+    const flatScoreCapped = Math.min(16, bestFlat.score);
+    const sameFrontAsFlat =
+      bestFlat.pos > 0 &&
+      Math.abs(bestSeam.medianPos - bestFlat.pos) <= Math.max(35, lane.length * 0.06);
     const useSeam =
       bestSeam.medianPos > 0 &&
       (bestFlat.pos <= 0 ||
-        (bestSeam.isCurved && bestSeam.score >= Math.max(4.5, bestFlat.score * 0.72)) ||
-        bestSeam.score > bestFlat.score);
+        bestSeam.score >= 8.0 ||
+        (bestSeam.isCurved && sameFrontAsFlat && bestSeam.score >= 4.5) ||
+        (bestSeam.isCurved && bestSeam.score >= Math.max(4.5, flatScoreCapped * 0.72)) ||
+        bestSeam.score >= flatScoreCapped);
 
     const detected = useSeam || bestFlat.pos > 0;
     const defaultFront = Math.max(
@@ -2377,21 +3064,144 @@ export function tlcFront(
   return set.frontAutoByLane?.[lane.id] ?? set.frontAuto?.[h] ?? Math.round(lane.length * 0.93);
 }
 
+/**
+ * Returns the canonical half-plate base (median) solvent-front coordinate in px for side-level
+ * sliders and Vision QC shifts, so nudging a side slider shifts all lanes smoothly without
+ * jumping to an edge-curled lane's offset.
+ */
+export function tlcHalfFrontBase(
+  set: TlcSet,
+  half: number,
+  sampleLane: TlcLane | undefined,
+  getProfile?: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): number {
+  if (set.frontHalfPx && set.frontHalfPx[half] != null && set.frontHalfPx[half]! > 0) {
+    return Math.round(set.frontHalfPx[half]!);
+  }
+  if (set.frontPx && set.frontPx > 0) return Math.round(set.frontPx);
+  if (sampleLane) {
+    // Ensure auto-detection has populated frontAuto[half]
+    const laneVal = tlcFront(set, sampleLane, getProfile);
+    if (set.frontAuto?.[half] != null && set.frontAuto[half]! > 0) {
+      return Math.round(set.frontAuto[half]!);
+    }
+    return Math.round(laneVal);
+  }
+  return 920;
+}
+
+export interface OriginLaneEntry {
+  laneId: number;
+  profile: number[];
+  lane?: Pick<TlcLane, 'x0' | 'y0' | 'angle' | 'width' | 'length'>;
+  metrics?: Lane2dMetrics;
+}
+
 interface ChannelOriginResult extends FrontDetectionResult {
   byLane?: Record<number, number>;
   lockedLanes?: number[];
+  tailingLanes?: number[];
   validFrac?: number;
   medFeat?: number;
+}
+
+interface OriginPlateFrame {
+  hasGeometry: boolean;
+  uByLane: Map<number, number>;
+  allLaneIds: number[];
+  toPlatePos: (laneId: number, lanePos: number) => number;
+  toLanePos: (laneId: number, platePos: number) => number;
+}
+
+function buildOriginPlateFrame(entries: OriginLaneEntry[], laneLen: number): OriginPlateFrame {
+  const allLaneIds = entries.map((e) => e.laneId);
+  const withGeom = entries.filter(
+    (e): e is OriginLaneEntry & { lane: NonNullable<OriginLaneEntry['lane']> } =>
+      !!e.lane && Math.abs(Math.cos((e.lane.angle * Math.PI) / 180)) > 0.3
+  );
+  if (withGeom.length < Math.min(3, entries.length) || withGeom.length === 0) {
+    return {
+      hasGeometry: false,
+      uByLane: new Map(allLaneIds.map((id) => [id, ((id % 27) - 13) / 13])),
+      allLaneIds,
+      toPlatePos: (_id, pos) => pos,
+      toLanePos: (_id, pos) => pos,
+    };
+  }
+
+  const dyList = withGeom.map((e) => -Math.cos((e.lane.angle * Math.PI) / 180)).sort((a, b) => a - b);
+  const y0List = withGeom.map((e) => e.lane.y0).sort((a, b) => a - b);
+  const halfDirY = dyList[dyList.length >> 1];
+  const sgn = halfDirY >= 0 ? 1 : -1;
+  const refY0 = y0List[y0List.length >> 1];
+
+  const approxOrigin = Math.max(12, laneLen * 0.12);
+  const geomById = new Map<number, { x0: number; y0: number; dx: number; dy: number; maxLen: number; xOrig: number }>();
+  let xMin = Infinity;
+  let xMax = -Infinity;
+  for (const e of withGeom) {
+    const th = (e.lane.angle * Math.PI) / 180;
+    const dx = Math.sin(th);
+    const dy = -Math.cos(th);
+    const xOrig = e.lane.x0 + dx * approxOrigin;
+    if (xOrig < xMin) xMin = xOrig;
+    if (xOrig > xMax) xMax = xOrig;
+    geomById.set(e.laneId, {
+      x0: e.lane.x0,
+      y0: e.lane.y0,
+      dx,
+      dy,
+      maxLen: Math.max(20, e.profile.length || e.lane.length || laneLen),
+      xOrig,
+    });
+  }
+
+  const xMid = 0.5 * (xMin + xMax);
+  const xHalfSpan = Math.max(1, 0.5 * (xMax - xMin));
+  const uByLane = new Map<number, number>();
+  for (const id of allLaneIds) {
+    const g = geomById.get(id);
+    if (g && xMax > xMin + 1) {
+      uByLane.set(id, (g.xOrig - xMid) / xHalfSpan);
+    } else {
+      uByLane.set(id, ((id % 27) - 13) / 13);
+    }
+  }
+
+  return {
+    hasGeometry: true,
+    uByLane,
+    allLaneIds,
+    toPlatePos: (laneId: number, lanePos: number) => {
+      const g = geomById.get(laneId);
+      if (!g) return lanePos;
+      const yImg = g.y0 + g.dy * lanePos;
+      return (yImg - refY0) * sgn;
+    },
+    toLanePos: (laneId: number, platePos: number) => {
+      const g = geomById.get(laneId);
+      if (!g) return platePos;
+      const yImg = refY0 + platePos * sgn;
+      const raw = (yImg - g.y0) / g.dy;
+      return Math.max(4, Math.min(g.maxLen - 4, raw));
+    },
+  };
 }
 
 function fitOriginQuadCurve(
   hits: Array<{ laneId: number; pos: number }>,
   medPos: number,
-  laneLen: number
+  laneLen: number,
+  uByLane?: Map<number, number>,
+  targetLaneIds?: number[]
 ): Record<number, number> | undefined {
   if (hits.length < 4) return undefined;
-  const uOf = (laneId: number) => ((laneId % 27) - 13) / 13;
+  const uOf = (laneId: number) => uByLane?.get(laneId) ?? ((laneId % 27) - 13) / 13;
   const baseHalf = hits[0].laneId < 27 ? 0 : 27;
+  const outIds =
+    targetLaneIds && targetLaneIds.length > 0
+      ? targetLaneIds
+      : Array.from({ length: 27 }, (_, i) => baseHalf + i);
   const maxShift = Math.max(14, Math.round(laneLen * 0.05));
 
   const fitLinearFallback = (): { map: Record<number, number>; medRes: number } | undefined => {
@@ -2411,13 +3221,13 @@ function fitOriginQuadCurve(
     const tol = Math.max(8, laneLen * 0.022);
     const inliers = hits.filter((h) => Math.abs(h.pos - (c0Lin + c1Lin * uOf(h.laneId))) <= tol);
     if (inliers.length < 4) return undefined;
-    const cols = inliers.map((h) => h.laneId % 27);
-    if (Math.max(...cols) - Math.min(...cols) < 6) return undefined;
+    const uVals = inliers.map((h) => uOf(h.laneId));
+    if (Math.max(...uVals) - Math.min(...uVals) < 6 / 13) return undefined;
     const resSorted = hits.map((h) => Math.abs(h.pos - (c0Lin + c1Lin * uOf(h.laneId)))).sort((a, b) => a - b);
     const out: Record<number, number> = {};
-    for (let i = 0; i < 27; i++) {
-      const pred = Math.round(c0Lin + c1Lin * ((i - 13) / 13));
-      out[baseHalf + i] = Math.max(medPos - maxShift, Math.min(medPos + maxShift, pred));
+    for (const id of outIds) {
+      const pred = c0Lin + c1Lin * uOf(id);
+      out[id] = Math.max(medPos - maxShift, Math.min(medPos + maxShift, pred));
     }
     return { map: out, medRes: resSorted[resSorted.length >> 1] };
   };
@@ -2477,16 +3287,19 @@ function fitOriginQuadCurve(
   const tol = Math.max(7, laneLen * 0.012);
   const inliers = hits.filter((h) => {
     const u = uOf(h.laneId);
-    return Math.abs(h.pos - (c0 + c1 * u + c2 * u * u)) <= tol;
+    return Math.abs(h.pos - (c0 + c1 * u + c2 * u2Or(u))) <= tol;
   });
+  function u2Or(u: number) {
+    return u * u;
+  }
   if (inliers.length < 10) return linFit?.map;
-  const cols = inliers.map((h) => h.laneId % 27);
-  const minCol = Math.min(...cols);
-  const maxCol = Math.max(...cols);
-  if (maxCol - minCol < 18 || minCol > 4 || maxCol < 22) return linFit?.map;
-  const nLeft = cols.filter((c) => c < 9).length;
-  const nMid = cols.filter((c) => c >= 9 && c <= 17).length;
-  const nRight = cols.filter((c) => c > 17).length;
+  const uIn = inliers.map((h) => uOf(h.laneId));
+  const minU = Math.min(...uIn);
+  const maxU = Math.max(...uIn);
+  if (maxU - minU < 18 / 13 || minU > -9 / 13 || maxU < 9 / 13) return linFit?.map;
+  const nLeft = uIn.filter((u) => u < -4 / 13).length;
+  const nMid = uIn.filter((u) => u >= -4 / 13 && u <= 4 / 13).length;
+  const nRight = uIn.filter((u) => u > 4 / 13).length;
   if (nLeft < 2 || nMid < 2 || nRight < 2) return linFit?.map;
 
   const quadResSorted = hits
@@ -2501,25 +3314,35 @@ function fitOriginQuadCurve(
   }
 
   const out: Record<number, number> = {};
-  for (let i = 0; i < 27; i++) {
-    const u = (i - 13) / 13;
-    const pred = Math.round(c0 + c1 * u + c2 * u * u);
-    out[baseHalf + i] = Math.max(medPos - maxShift, Math.min(medPos + maxShift, pred));
+  for (const id of outIds) {
+    const u = uOf(id);
+    const pred = c0 + c1 * u + c2 * u * u;
+    out[id] = Math.max(medPos - maxShift, Math.min(medPos + maxShift, pred));
   }
   return out;
 }
 
-function detectOriginNear(
+interface OriginNearResult {
+  pos: number;
+  isTailing: boolean;
+  fwhm: number;
+  rawFeat: number;
+}
+
+function detectOriginNearDetailed(
   profile: number[],
   sign: number,
   refPos: number,
   localRadius: number,
   minFeat: number = 3.0,
   minSnr: number = 3.2,
-  minBi: number = 8.0
-): number {
+  minBi: number = 8.0,
+  opts?: OriginRefineOptions
+): OriginNearResult {
+  const empty: OriginNearResult = { pos: 0, isTailing: false, fwhm: 0, rawFeat: 0 };
   const n = profile.length;
-  if (n < 20) return 0;
+  if (n < 20) return empty;
+  if (opts?.metrics?.offPlate || opts?.metrics?.borderStraddle) return empty;
 
   const smWin = n >= 250 ? 5 : 3;
   const s = movingAvg(profile, smWin);
@@ -2539,7 +3362,7 @@ function detectOriginNear(
 
   const wLo = Math.max(4, Math.floor(n * 0.025), Math.round(refPos - localRadius));
   const wHi = Math.min(n - 5, Math.floor(n * 0.30), Math.round(refPos + localRadius));
-  if (wHi <= wLo) return 0;
+  if (wHi <= wLo) return empty;
 
   const buf = new Float64Array(24);
   let bestIdx = 0;
@@ -2561,8 +3384,8 @@ function detectOriginNear(
       const biMin = Math.min(dBelow, dAbove);
       if (biMin < Math.max(biFloor, 0.32 * rawFeat)) continue;
       const distFrac = Math.abs(i - refPos) / Math.max(1, localRadius);
-      // Stronger distance bias so stray smears/grain far from the baseline cannot pull missing-dot lanes
-      const weight = 1 - (i > refPos ? 0.30 : 0.16) * distFrac;
+      // Stronger forward distance bias so elution smears/dust ahead of baseline cannot pull blank lanes
+      const weight = 1 - (i > refPos ? 0.32 : 0.16) * distFrac;
       const sc = rawFeat * weight;
       if (sc > bestScore) {
         bestScore = sc;
@@ -2575,30 +3398,113 @@ function detectOriginNear(
 
   const snr = bestRawFeat / Math.max(sigmaS, 1.0);
   if (snr < Math.max(minSnr, 5.5) || bestRawFeat < minFeat || bestBilateral < minBi || bestIdx <= 0) {
-    return 0;
+    return empty;
   }
-  const refined = refineOriginCoreCenter(s, bestIdx, sign);
+
+  const refRes = refineOriginCoreDetailed(s, bestIdx, sign, opts);
+  const refined = refRes.pos;
+
+  // Reject tiny 1-3 px dust specks (real spotted origin deposits always have physical width >= 0.5% lane).
+  const minFwhm = Math.max(3, Math.round(n * 0.005));
+  if (refRes.fwhm < minFwhm) return empty;
+
+  // 2D lateral centering & edge-speck guard: reject dust specks sitting on lane borders and
+  // horizontal illumination/silica streaks that lack center-vs-flank contrast.
+  if (opts?.metrics && refined >= 0 && refined < opts.metrics.edgeRatio.length) {
+    const m = opts.metrics;
+    const latMid = m.lateralExcess[refined];
+    if (latMid < 900) {
+      const erWin: number[] = [];
+      const leWin: number[] = [];
+      for (let k = Math.max(0, refined - 2); k <= Math.min(m.edgeRatio.length - 1, refined + 2); k++) {
+        erWin.push(m.edgeRatio[k]);
+        leWin.push(m.lateralExcess[k]);
+      }
+      erWin.sort((a, b) => a - b);
+      leWin.sort((a, b) => a - b);
+      const medEr = erWin[erWin.length >> 1];
+      const medLe = leWin[leWin.length >> 1];
+      if (medEr > 1.35) return empty;
+      if (medLe < Math.max(2.0, 0.12 * bestRawFeat) && bestRawFeat < 45) return empty;
+    }
+  }
+
+  const devFromRef = Math.abs(refined - refPos);
+  const fwdShift = refined - refPos;
+  // Faint / fuzzy halos have wide centering uncertainty and tend to peak on their upper rim:
+  // reject weak or forward-drifting halos far from the smooth baseline while preserving strong
+  // genuine spotted dots with experimental spotting error.
   if (
-    Math.abs(refined - refPos) > 0.45 * localRadius &&
-    (bestRawFeat < Math.max(22, 1.55 * minFeat) || snr < Math.max(7.0, 1.35 * minSnr))
+    devFromRef > 3 &&
+    (bestRawFeat < Math.max(28, minFeat) ||
+      bestBilateral < Math.max(16, minBi) ||
+      snr < Math.max(7.5, minSnr) ||
+      (bestRawFeat < 45 && bestBilateral < 0.58 * bestRawFeat))
   ) {
-    return 0;
+    return empty;
   }
-  return refined;
+  // Baseline-anchored broad halo / coffee-ring guard: if a peak sits forward of refPos (>4 px)
+  // yet the same connected deposit already spans across & behind refPos with strong signal at
+  // refPos, it is a wide halo/ring/smear rooted at the baseline whose upper rim peaked forward,
+  // not a distinct dot spotted ahead of the baseline.
+  if (fwdShift > 4 && refRes.coreMax > 0) {
+    const refIdx = Math.max(0, Math.min(n - 1, Math.round(refPos)));
+    const sigAtRef = Math.max(0, sign * (s[refIdx] - refRes.bg));
+    if (
+      refRes.backEdge50 <= refPos - 2 &&
+      sigAtRef >= 0.62 * refRes.coreMax &&
+      (refRes.coreMax < 70 || fwdShift > 7)
+    ) {
+      return empty;
+    }
+  }
+  if (
+    fwdShift > Math.max(5, 0.36 * localRadius) &&
+    refRes.isTailing &&
+    bestRawFeat < Math.max(45, minFeat * 1.2)
+  ) {
+    return empty;
+  }
+  return { pos: refined, isTailing: refRes.isTailing, fwhm: refRes.fwhm, rawFeat: bestRawFeat };
+}
+
+function detectOriginNear(
+  profile: number[],
+  sign: number,
+  refPos: number,
+  localRadius: number,
+  minFeat: number = 3.0,
+  minSnr: number = 3.2,
+  minBi: number = 8.0,
+  opts?: OriginRefineOptions
+): number {
+  return detectOriginNearDetailed(profile, sign, refPos, localRadius, minFeat, minSnr, minBi, opts).pos;
 }
 
 // Faint-origin fallback: when no dot passes normal thresholds, accept weaker features only if a
 // substantial share of lanes agree on one height (a consistent row is strong evidence on its own).
 function detectFaintOriginRow(
-  laneEntries: Array<{ laneId: number; profile: number[] }>,
+  laneEntries: OriginLaneEntry[],
   sign: number,
   laneLen: number,
+  frame: OriginPlateFrame,
   histBgSigma?: number
 ): ChannelOriginResult {
-  const hits: Array<{ laneId: number; pos: number; score: number }> = [];
+  const hits: Array<{ laneId: number; pos: number; platePos: number; score: number }> = [];
   for (const e of laneEntries) {
-    for (const cand of detectOriginCandidates(e.profile, sign, 3, true, histBgSigma)) {
-      if (cand.pos > laneLen * 0.06) hits.push({ laneId: e.laneId, pos: cand.pos, score: cand.score });
+    if (e.metrics?.offPlate || e.metrics?.borderStraddle) continue;
+    for (const cand of detectOriginCandidates(e.profile, sign, 3, true, histBgSigma, {
+      metrics: e.metrics,
+      laneWidthPx: e.lane?.width,
+    })) {
+      if (cand.pos > laneLen * 0.06) {
+        hits.push({
+          laneId: e.laneId,
+          pos: cand.pos,
+          platePos: frame.toPlatePos(e.laneId, cand.pos),
+          score: cand.score,
+        });
+      }
     }
   }
   const minNeeded = Math.max(3, Math.ceil(laneEntries.length * 0.4));
@@ -2608,13 +3514,13 @@ function detectFaintOriginRow(
   for (const anchor of hits) {
     const byLane = new Map<number, (typeof hits)[number]>();
     for (const r of hits) {
-      if (Math.abs(r.pos - anchor.pos) > tol) continue;
+      if (Math.abs(r.platePos - anchor.platePos) > tol) continue;
       const prev = byLane.get(r.laneId);
       if (!prev || r.score > prev.score) byLane.set(r.laneId, r);
     }
     const cl = Array.from(byLane.values());
     if (cl.length < minNeeded) continue;
-    const sortedPos = cl.map((r) => r.pos).sort((a, b) => a - b);
+    const sortedPos = cl.map((r) => r.platePos).sort((a, b) => a - b);
     const pos = sortedPos[sortedPos.length >> 1];
     if (pos < laneLen * 0.06 || pos > laneLen * 0.30) continue;
     const agg = cl.length / laneEntries.length;
@@ -2625,18 +3531,22 @@ function detectFaintOriginRow(
   }
   if (!chosen) return { pos: 0, score: 0 };
   const backbone = fitOriginQuadCurve(
-    chosen.cl.map((r) => ({ laneId: r.laneId, pos: r.pos })),
+    chosen.cl.map((r) => ({ laneId: r.laneId, pos: r.platePos })),
     chosen.pos,
-    laneLen
+    laneLen,
+    frame.uByLane,
+    frame.allLaneIds
   );
   const byLane: Record<number, number> = {};
   for (const e of laneEntries) {
     const own = chosen.cl.find((r) => r.laneId === e.laneId);
-    byLane[e.laneId] = own ? own.pos : Math.round(backbone?.[e.laneId] ?? chosen.pos);
+    byLane[e.laneId] = own
+      ? own.pos
+      : Math.round(frame.toLanePos(e.laneId, backbone?.[e.laneId] ?? chosen.pos));
   }
   const medScore = chosen.cl.map((r) => r.score).sort((a, b) => a - b)[chosen.cl.length >> 1];
   return {
-    pos: chosen.pos,
+    pos: Math.round(chosen.pos),
     // Deliberately modest so UI / multi-channel comparison still treats stronger channels as higher confidence
     score: Math.min(6, medScore) * (0.4 + 0.6 * chosen.agg),
     byLane,
@@ -2646,15 +3556,18 @@ function detectFaintOriginRow(
 }
 
 export function detectChannelOrigin(
-  rawLaneEntries: Array<{ laneId: number; profile: number[] }>,
+  rawLaneEntries: OriginLaneEntry[],
   sign: number,
   laneLen: number,
   hist?: ProfileHistogramStats
 ): ChannelOriginResult {
   if (!rawLaneEntries.length) return { pos: 0, score: 0 };
 
-  const onPlateEntries = rawLaneEntries.filter((e) => isProfileOnPlate(e.profile, sign));
+  const onPlateEntries = rawLaneEntries.filter(
+    (e) => !e.metrics?.offPlate && !e.metrics?.borderStraddle && isProfileOnPlate(e.profile, sign)
+  );
   const laneEntries = onPlateEntries.length >= Math.min(3, rawLaneEntries.length) ? onPlateEntries : rawLaneEntries;
+  const frame = buildOriginPlateFrame(rawLaneEntries, laneLen);
 
   const h = hist ?? analyzeProfileHistogram(laneEntries.map((e) => e.profile), sign, 0.06, 0.90);
   const histBgSigma = h.sampleCount >= 16 ? h.bgSigma : undefined;
@@ -2676,10 +3589,31 @@ export function detectChannelOrigin(
   let best: ChannelOriginResult = detectOriginDetailed(medProfile, sign, h);
 
   if (laneEntries.length >= 3) {
-    const laneHits: Array<{ laneId: number; pos: number; score: number; feat: number }> = [];
+    const laneHits: Array<{
+      laneId: number;
+      pos: number;
+      platePos: number;
+      score: number;
+      feat: number;
+      fwhm: number;
+      isTailing: boolean;
+    }> = [];
     for (const e of laneEntries) {
-      for (const cand of detectOriginCandidates(e.profile, sign, 3, false, histBgSigma)) {
-        if (cand.pos > 10) laneHits.push({ laneId: e.laneId, pos: cand.pos, score: cand.score, feat: cand.feat });
+      for (const cand of detectOriginCandidates(e.profile, sign, 3, false, histBgSigma, {
+        metrics: e.metrics,
+        laneWidthPx: e.lane?.width,
+      })) {
+        if (cand.pos > 10) {
+          laneHits.push({
+            laneId: e.laneId,
+            pos: cand.pos,
+            platePos: frame.toPlatePos(e.laneId, cand.pos),
+            score: cand.score,
+            feat: cand.feat,
+            fwhm: cand.fwhm ?? 0,
+            isTailing: !!cand.isTailing,
+          });
+        }
       }
     }
     const minNeeded = Math.max(2, Math.ceil(laneEntries.length * 0.22));
@@ -2689,13 +3623,13 @@ export function detectChannelOrigin(
       for (const anchor of laneHits) {
         const byLane = new Map<number, (typeof laneHits)[number]>();
         for (const r of laneHits) {
-          if (Math.abs(r.pos - anchor.pos) > tol) continue;
+          if (Math.abs(r.platePos - anchor.platePos) > tol) continue;
           const prev = byLane.get(r.laneId);
           if (!prev || r.score > prev.score) byLane.set(r.laneId, r);
         }
         const cl = Array.from(byLane.values());
         if (cl.length < minNeeded) continue;
-        const cPos = cl.map((r) => r.pos).sort((a, b) => a - b);
+        const cPos = cl.map((r) => r.platePos).sort((a, b) => a - b);
         const cScore = cl.map((r) => r.score).sort((a, b) => a - b);
         const cPosMed = cPos[cPos.length >> 1];
         if (clusters.some((existing) => Math.abs(existing.pos - cPosMed) <= tol * 0.6)) continue;
@@ -2735,10 +3669,23 @@ export function detectChannelOrigin(
         if (outerCandidates.length > 0) {
           chosen = outerCandidates[0];
         }
-        const pos = chosen.pos;
+        const pos = Math.round(chosen.pos);
         const inCluster = chosen.inCluster;
         const aggScore = chosen.aggScore;
-        const backbone = fitOriginQuadCurve(inCluster, pos, laneLen);
+
+        // Fit initial smooth plate-space baseline preferring non-tailing clean dots
+        const cleanPass1 = inCluster.filter((r) => !r.isTailing);
+        const fitSrc1 = cleanPass1.length >= 4 ? cleanPass1 : inCluster;
+        const backbonePlate = fitOriginQuadCurve(
+          fitSrc1.map((r) => ({ laneId: r.laneId, pos: r.platePos })),
+          pos,
+          laneLen,
+          frame.uByLane,
+          frame.allLaneIds
+        );
+
+        const cleanDiams = fitSrc1.map((r) => r.fwhm).filter((w) => w >= 5).sort((a, b) => a - b);
+        const plateMedianDiam = cleanDiams.length ? cleanDiams[cleanDiams.length >> 1] : undefined;
 
         const cFeats = inCluster.map((r) => r.feat).sort((a, b) => a - b);
         const cScores = inCluster.map((r) => r.score).sort((a, b) => a - b);
@@ -2751,31 +3698,58 @@ export function detectChannelOrigin(
             : 14.0;
         const histBiFloor = Math.min(8.0, Math.max(2.5, 0.55 * histFeatFloor));
         const minFeat = Math.max(histFeatFloor, 0.28 * medFeat);
+        const minBi = Math.max(histBiFloor, Math.min(14.0, 0.14 * medFeat));
         const minSnr = Math.max(5.5, 0.25 * medScore);
 
         // Second pass: lock spotted lanes onto their sharp origin peak within experimental spotting
-        // error around the smooth backbone; missing-spot lanes stay smoothly on the backbone.
+        // error around the smooth plate-space backbone; missing-spot lanes stay smoothly on the backbone.
         const localRadius = Math.max(12, Math.round(laneLen * 0.016));
-        const sortedEntries = laneEntries.slice().sort((a, b) => a.laneId - b.laneId);
+        const sortedEntries = rawLaneEntries.slice().sort((a, b) => a.laneId - b.laneId);
         const detected = sortedEntries.map((e) => {
-          const refPos = backbone?.[e.laneId] ?? pos;
-          const p = detectOriginNear(e.profile, sign, refPos, localRadius, minFeat, minSnr, histBiFloor);
-          return { laneId: e.laneId, refPos, pos: p };
+          const refPlatePos = backbonePlate?.[e.laneId] ?? pos;
+          const refLanePos = frame.toLanePos(e.laneId, refPlatePos);
+          const near = detectOriginNearDetailed(
+            e.profile,
+            sign,
+            refLanePos,
+            localRadius,
+            minFeat,
+            minSnr,
+            minBi,
+            {
+              metrics: e.metrics,
+              laneWidthPx: e.lane?.width,
+              plateMedianDiam,
+            }
+          );
+          return {
+            laneId: e.laneId,
+            refPlatePos,
+            refLanePos,
+            pos: near.pos,
+            platePos: near.pos > 0 ? frame.toPlatePos(e.laneId, near.pos) : 0,
+            isTailing: near.isTailing,
+          };
         });
 
         const validDetected = detected.filter((d) => d.pos > 0);
-        const refinedBackbone =
-          validDetected.length >= 4
+        const cleanDetected = validDetected.filter((d) => !d.isTailing);
+        const fitSrc2 = cleanDetected.length >= 4 ? cleanDetected : validDetected;
+        const refinedBackbonePlate =
+          fitSrc2.length >= 4
             ? fitOriginQuadCurve(
-                validDetected.map((d) => ({ laneId: d.laneId, pos: d.pos })),
+                fitSrc2.map((d) => ({ laneId: d.laneId, pos: d.platePos })),
                 pos,
-                laneLen
-              ) ?? backbone
-            : backbone;
+                laneLen,
+                frame.uByLane,
+                frame.allLaneIds
+              ) ?? backbonePlate
+            : backbonePlate;
 
         let validCount = 0;
         const byLane: Record<number, number> = {};
         const lockedLanes: number[] = [];
+        const tailingLanes: number[] = [];
         const smearTol = Math.max(6, Math.round(laneLen * 0.010));
         const smFlankIn = Math.max(6, Math.round(laneLen * 0.022));
         const smFlankOut = smFlankIn + Math.max(8, Math.round(laneLen * 0.030));
@@ -2783,26 +3757,31 @@ export function detectChannelOrigin(
         const profileById = new Map<number, number[]>(sortedEntries.map((e) => [e.laneId, e.profile]));
 
         for (const entry of detected) {
-          const refLine = Math.round(refinedBackbone?.[entry.laneId] ?? entry.refPos);
+          const refPlate = refinedBackbonePlate?.[entry.laneId] ?? entry.refPlatePos;
+          const refLine = Math.round(frame.toLanePos(entry.laneId, refPlate));
           if (entry.pos > 0) {
             let finalPos = entry.pos;
-            // Smear-proof upward-tailing guard: if a polar compound tails upward from the origin
-            // and drags the detected peak well above the smooth plate backbone, snap back to the backbone.
+            let flaggedTail = entry.isTailing;
+            // Smear-proof upward-tailing guard: if a polar compound rooted at refLine tails forward
+            // and drags the detected peak well ahead of the smooth plate backbone, snap back to refLine.
             if (finalPos > refLine + smearTol) {
               const prof = profileById.get(entry.laneId);
               if (prof && prof.length > refLine + smFlankOut + 1 && refLine - smFlankOut >= 0) {
                 const mBelow = windowMedian(prof, refLine - smFlankOut, refLine - smFlankIn, smBuf);
                 const mAbove = windowMedian(prof, refLine + smFlankIn, refLine + smFlankOut, smBuf);
-                // Positive upwardTail means the region above refLine is stained/quenched relative to below
+                const sigAtRef = sign * (prof[refLine] - mBelow);
+                // Positive upwardTail means the region ahead of refLine is stained/quenched relative to behind
                 const upwardTail = sign * (mAbove - mBelow);
-                if (upwardTail > Math.max(4.0, 0.15 * medFeat)) {
+                if (upwardTail > Math.max(4.0, 0.14 * medFeat) && sigAtRef > Math.max(8.0, 0.25 * medFeat)) {
                   finalPos = refLine;
+                  flaggedTail = true;
                 }
               }
             }
             validCount++;
             byLane[entry.laneId] = finalPos;
             lockedLanes.push(entry.laneId);
+            if (flaggedTail) tailingLanes.push(entry.laneId);
           } else {
             byLane[entry.laneId] = refLine;
           }
@@ -2814,7 +3793,8 @@ export function detectChannelOrigin(
             score: Math.max(best.score, aggScore),
             byLane,
             lockedLanes,
-            validFrac: validCount / laneEntries.length,
+            tailingLanes,
+            validFrac: validCount / Math.max(1, laneEntries.length),
             medFeat,
           };
         }
@@ -2823,14 +3803,151 @@ export function detectChannelOrigin(
   }
 
   if (best.pos <= 10 && laneEntries.length >= 6) {
-    const faint = detectFaintOriginRow(laneEntries, sign, laneLen, histBgSigma);
+    const faint = detectFaintOriginRow(laneEntries, sign, laneLen, frame, histBgSigma);
     if (faint.pos > 10) best = faint;
   }
 
   return best;
 }
 
-// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> multi-channel joint origin peak -> fallback ~10% lane length
+/**
+ * Builds a normalized multi-channel composite origin dataset combining positive dot signals
+ * across all supplied unclipped channels (UV254 darkening + UV366 fluorescence + White stain),
+ * preserving dominant-channel 2D metrics so edge dust specks stay rejected in composite mode.
+ */
+function buildCompositeOriginEntries(
+  halfLanes: TlcLane[],
+  channelInputs: Array<{
+    ch: TlcChannelKey;
+    sign: number;
+    entriesById: Map<number, OriginLaneEntry>;
+    hist: ProfileHistogramStats;
+  }>
+): { entries: OriginLaneEntry[]; hist: ProfileHistogramStats } | null {
+  if (channelInputs.length < 2) return null;
+  const outEntries: OriginLaneEntry[] = [];
+
+  for (const l of halfLanes) {
+    const perCh: Array<{
+      norm: Float32Array;
+      metrics?: Lane2dMetrics;
+    }> = [];
+    let minLen = Infinity;
+
+    for (const ci of channelInputs) {
+      const e = ci.entriesById.get(l.id);
+      if (!e || e.profile.length < 20) continue;
+      if (e.profile.length < minLen) minLen = e.profile.length;
+    }
+    if (!Number.isFinite(minLen) || minLen < 20) continue;
+
+    for (const ci of channelInputs) {
+      const e = ci.entriesById.get(l.id);
+      if (!e || e.profile.length < minLen) continue;
+      // Estimate clean silica background in the origin region [3%..35%] using median-biased clean quantile
+      const zLo = Math.max(2, Math.floor(minLen * 0.03));
+      const zHi = Math.min(minLen - 2, Math.floor(minLen * 0.35));
+      const zLen = Math.max(1, zHi - zLo + 1);
+      const zBuf = new Float64Array(zLen);
+      for (let k = 0; k < zLen; k++) zBuf[k] = e.profile[zLo + k];
+      zBuf.sort();
+      const bgIdx =
+        ci.sign < 0
+          ? Math.min(zLen - 1, Math.floor(zLen * 0.72))
+          : Math.max(0, Math.floor(zLen * 0.28));
+      const laneBg = zBuf[bgIdx];
+      // Preserve real background noise floor and NEVER amplify low-contrast channels above 1.0x
+      // so faint noisy UV366/White halos stay at their true physical contrast instead of getting
+      // inflated into fake high-SNR dots.
+      const bgSig = ci.hist.sampleCount >= 16 ? ci.hist.bgSigma : 1.5;
+      const scale = Math.max(180, ci.hist.sampleCount >= 16 ? ci.hist.contrastSpan : 180);
+      const gain = Math.min(1.0, 180 / scale);
+      const negFloor = -3.0 * bgSig * gain;
+      const norm = new Float32Array(minLen);
+      for (let i = 0; i < minLen; i++) {
+        const signedDev = ci.sign * (e.profile[i] - laneBg) * gain;
+        norm[i] = Math.max(negFloor, Math.min(255, signedDev));
+      }
+      perCh.push({ norm, metrics: e.metrics });
+    }
+    if (perCh.length < 2) continue;
+
+    const compProfile = new Array<number>(minLen);
+    const has2d = perCh.some((c) => !!c.metrics);
+    let compMetrics: Lane2dMetrics | undefined;
+    const latArr = has2d ? new Float32Array(minLen) : undefined;
+    const erArr = has2d ? new Float32Array(minLen) : undefined;
+    const swArr = has2d ? new Float32Array(minLen) : undefined;
+    const rmArr = has2d ? new Float32Array(minLen) : undefined;
+    const fpArr = has2d ? new Float32Array(minLen) : undefined;
+    const rgbArr = has2d ? new Float32Array(minLen * 3) : undefined;
+
+    for (let i = 0; i < minLen; i++) {
+      let max1 = -Infinity;
+      let max2 = -Infinity;
+      let domIdx = 0;
+      for (let c = 0; c < perCh.length; c++) {
+        const v = perCh[c].norm[i];
+        if (v > max1) {
+          max2 = max1;
+          max1 = v;
+          domIdx = c;
+        } else if (v > max2) {
+          max2 = v;
+        }
+      }
+      const boost = max2 > 0 ? 0.25 * max2 : 0;
+      compProfile[i] = Math.max(0, Math.min(255, 20 + max1 + boost));
+      if (has2d && latArr && erArr && swArr && rmArr && fpArr) {
+        const dm = perCh[domIdx].metrics ?? perCh.find((c) => c.metrics)?.metrics;
+        if (dm && i < dm.edgeRatio.length) {
+          latArr[i] = dm.lateralExcess[i];
+          erArr[i] = dm.edgeRatio[i];
+          swArr[i] = dm.spotWidth[i];
+          rmArr[i] = dm.rowMass[i];
+          fpArr[i] = dm.flankProfile[i];
+        } else {
+          latArr[i] = 999;
+          erArr[i] = 0;
+        }
+      }
+    }
+
+    if (has2d && latArr && erArr && swArr && rmArr && fpArr && rgbArr) {
+      const anyOff = perCh.every((c) => c.metrics?.offPlate);
+      const anyStraddle = perCh.every((c) => c.metrics?.borderStraddle);
+      compMetrics = {
+        lateralExcess: latArr,
+        edgeRatio: erArr,
+        coreRgb: rgbArr,
+        bgRgb: [0, 0, 0],
+        offPlate: anyOff,
+        borderStraddle: anyStraddle,
+        rowMass: rmArr,
+        spotWidth: swArr,
+        flankProfile: fpArr,
+      };
+    }
+
+    outEntries.push({
+      laneId: l.id,
+      profile: compProfile,
+      lane: l,
+      metrics: compMetrics,
+    });
+  }
+
+  if (outEntries.length < 3) return null;
+  const compHist = analyzeProfileHistogram(
+    outEntries.map((e) => e.profile),
+    1,
+    0.06,
+    0.90
+  );
+  return { entries: outEntries, hist: compHist };
+}
+
+// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> multi-channel + composite joint origin peak -> fallback ~10% lane length
 export function tlcOrigin(
   set: TlcSet,
   lane: TlcLane,
@@ -2863,20 +3980,58 @@ export function tlcOrigin(
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
     let best: ChannelOriginResult = { pos: 0, score: 0 };
     let bestClipped = false;
-    let bestChannel: TlcChannelKey | null = null;
-    const perChannelData: Array<{
-      ch: TlcChannelKey;
+    let bestSourceId: string | null = null;
+
+    interface OriginSourceData {
+      id: string;
       sign: number;
-      entries: Array<{ laneId: number; profile: number[] }>;
+      entries: OriginLaneEntry[];
+      entriesById: Map<number, OriginLaneEntry>;
       hist: ProfileHistogramStats;
       clipped: boolean;
+      isComposite: boolean;
       res: ChannelOriginResult;
+    }
+
+    const perSourceData: OriginSourceData[] = [];
+    const singleUnclippedForComp: Array<{
+      ch: TlcChannelKey;
+      sign: number;
+      entriesById: Map<number, OriginLaneEntry>;
+      hist: ProfileHistogramStats;
     }> = [];
+
+    const considerCandidate = (src: OriginSourceData) => {
+      const res = src.res;
+      if (res.pos <= 10) return;
+      const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
+      if (!bestSolid) {
+        if (res.score > best.score) {
+          best = res;
+          bestClipped = src.clipped;
+          bestSourceId = src.id;
+        }
+      } else if (
+        (bestClipped && !src.clipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
+        ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
+          (src.isComposite || (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1) &&
+          res.score >= (src.isComposite ? best.score * 0.85 : best.score * 1.25))
+      ) {
+        best = res;
+        bestClipped = src.clipped;
+        bestSourceId = src.id;
+      }
+    };
 
     for (const ch of channels) {
       const chSign = TLC_SIGNAL[ch]?.sign ?? -1;
-      const entries = halfLanes
-        .map((l) => ({ laneId: l.id, profile: getProfile(set, ch, l) }))
+      const entries: OriginLaneEntry[] = halfLanes
+        .map((l) => ({
+          laneId: l.id,
+          profile: getProfile(set, ch, l),
+          lane: l,
+          metrics: getCachedLane2dMetrics(set, ch, l),
+        }))
         .filter((e) => e.profile.length > 0);
       if (!entries.length) continue;
       const chHist =
@@ -2884,92 +4039,145 @@ export function tlcOrigin(
         analyzeProfileHistogram(entries.map((e) => e.profile), chSign, 0.06, 0.90);
       const resClipped = chSign < 0 ? chHist.clipHighFrac > 0.25 : chHist.clipLowFrac > 0.25;
       const res = detectChannelOrigin(entries, chSign, lane.length, chHist);
-      perChannelData.push({ ch, sign: chSign, entries, hist: chHist, clipped: resClipped, res });
-      if (res.pos <= 10) continue;
-      const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
-      if (!bestSolid) {
-        if (res.score > best.score) {
-          best = res;
-          bestClipped = resClipped;
-          bestChannel = ch;
-        }
-      } else if (
-        (bestClipped && !resClipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
-        ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
-          (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1 &&
-          res.score > best.score * 1.25)
-      ) {
-        best = res;
-        bestClipped = resClipped;
-        bestChannel = ch;
+      const entriesById = new Map<number, OriginLaneEntry>(entries.map((e) => [e.laneId, e]));
+      const src: OriginSourceData = {
+        id: ch,
+        sign: chSign,
+        entries,
+        entriesById,
+        hist: chHist,
+        clipped: resClipped,
+        isComposite: false,
+        res,
+      };
+      perSourceData.push(src);
+      considerCandidate(src);
+      if (!resClipped) {
+        singleUnclippedForComp.push({ ch, sign: chSign, entriesById, hist: chHist });
       }
     }
 
-    // Multi-channel joint origin refinement:
-    // If lanes are UV-silent in the primary channel (not individually locked), rescue their
-    // exact origin deposit dot from any agreeing unclipped secondary channel (e.g., White stain
-    // or UV366 fluorescence) and refit the smooth plate backbone across all locked anchors.
-    if (best.pos > 10 && best.byLane && perChannelData.length > 1) {
+    // Build and evaluate multi-channel composite origin views (all unclipped channels, plus UV-only
+    // when UV254 + UV366 + White are all loaded) so split-channel plates & faint multi-channel dots
+    // are detected just like the composite solvent front.
+    const compositeGroups: Array<{ id: string; group: typeof singleUnclippedForComp }> = [];
+    if (singleUnclippedForComp.length >= 2) {
+      compositeGroups.push({ id: 'CompositeAll', group: singleUnclippedForComp });
+      const uvOnly = singleUnclippedForComp.filter((c) => c.ch === 'UV254' || c.ch === 'UV366');
+      if (singleUnclippedForComp.length >= 3 && uvOnly.length === 2) {
+        compositeGroups.push({ id: 'CompositeUV', group: uvOnly });
+      }
+    }
+    for (const cg of compositeGroups) {
+      const built = buildCompositeOriginEntries(halfLanes, cg.group);
+      if (!built) continue;
+      const res = detectChannelOrigin(built.entries, 1, lane.length, built.hist);
+      const src: OriginSourceData = {
+        id: cg.id,
+        sign: 1,
+        entries: built.entries,
+        entriesById: new Map(built.entries.map((e) => [e.laneId, e])),
+        hist: built.hist,
+        clipped: false,
+        isComposite: true,
+        res,
+      };
+      perSourceData.push(src);
+      considerCandidate(src);
+    }
+
+    // Multi-channel & composite joint origin refinement (in physical plate-space!):
+    // 1. Rescue UV-silent lanes from any agreeing unclipped secondary channel or composite.
+    // 2. If a lane is heavily tailing on the primary channel, upgrade it if another unclipped
+    //    channel shows a clean, non-tailing origin dot near the same position.
+    // 3. Refit the smooth physical plate-space baseline across clean locked anchors so all blank
+    //    lanes stay aligned on one smooth curve even when lane.y0 varies in a microadjusted CSV.
+    if (best.pos > 10 && best.byLane && perSourceData.length > 1) {
+      const primarySrc = perSourceData.find((s) => s.id === bestSourceId) ?? perSourceData[0];
+      const frame = buildOriginPlateFrame(primarySrc.entries, lane.length);
       const agreeTol = Math.max(16, Math.round(lane.length * 0.035));
       const localRadius = Math.max(12, Math.round(lane.length * 0.016));
       const locked = new Set<number>(best.lockedLanes || []);
+      const tailingSet = new Set<number>(best.tailingLanes || []);
       const fusedByLane: Record<number, number> = { ...best.byLane };
 
-      const secondaryChannels = perChannelData.filter(
+      const secondarySources = perSourceData.filter(
         (c) =>
-          c.ch !== bestChannel &&
+          c.id !== bestSourceId &&
           !c.clipped &&
           (c.res.pos <= 10 || Math.abs(c.res.pos - best.pos) <= agreeTol)
       );
 
-      let rescuedAny = false;
+      let updatedAny = false;
       for (const l of halfLanes) {
-        if (locked.has(l.id)) continue;
-        const refPos = fusedByLane[l.id] ?? best.pos;
-        for (const sec of secondaryChannels) {
-          // If the secondary channel already locked this lane cleanly near refPos, use it directly
+        const refPos = fusedByLane[l.id] ?? Math.round(frame.toLanePos(l.id, best.pos));
+        const isLocked = locked.has(l.id);
+        const isTailing = tailingSet.has(l.id);
+
+        if (isLocked && !isTailing) continue;
+
+        for (const sec of secondarySources) {
+          const secTailing = sec.res.tailingLanes?.includes(l.id) ?? false;
+          // If the secondary channel/composite already locked this lane cleanly right on refPos:
           if (sec.res.lockedLanes?.includes(l.id) && sec.res.byLane?.[l.id]) {
             const secPos = sec.res.byLane[l.id];
-            if (Math.abs(secPos - refPos) <= localRadius) {
+            if (Math.abs(secPos - refPos) <= 3 && (!isLocked || !secTailing)) {
               fusedByLane[l.id] = secPos;
               locked.add(l.id);
-              rescuedAny = true;
+              if (!secTailing) tailingSet.delete(l.id);
+              updatedAny = true;
               break;
             }
           }
-          // Otherwise probe strictly around refPos on the secondary channel
-          const entry = sec.entries.find((e) => e.laneId === l.id);
+          // Otherwise probe strictly around refPos on the secondary source with blank-safe & halo-safe floors
+          const entry = sec.entriesById.get(l.id);
           if (!entry) continue;
           const secFeatFloor =
             sec.hist.sampleCount >= 16
-              ? Math.min(14.0, Math.max(5.0, 4.0 * sec.hist.bgSigma, 0.12 * sec.hist.contrastSpan))
-              : 14.0;
-          const secBiFloor = Math.min(8.0, Math.max(3.0, 0.55 * secFeatFloor));
-          const p = detectOriginNear(
+              ? Math.min(26.0, Math.max(16.0, 5.0 * sec.hist.bgSigma, 0.16 * sec.hist.contrastSpan))
+              : 18.0;
+          const secBiFloor = Math.min(15.0, Math.max(9.0, 0.55 * secFeatFloor));
+          const near = detectOriginNearDetailed(
             entry.profile,
             sec.sign,
             refPos,
             localRadius,
             secFeatFloor,
-            6.0,
-            secBiFloor
+            6.5,
+            secBiFloor,
+            {
+              metrics: entry.metrics,
+              laneWidthPx: l.width,
+            }
           );
-          if (p > 0) {
-            fusedByLane[l.id] = p;
+          if (near.pos > 0 && (!isLocked || !near.isTailing)) {
+            fusedByLane[l.id] = near.pos;
             locked.add(l.id);
-            rescuedAny = true;
+            if (!near.isTailing) tailingSet.delete(l.id);
+            updatedAny = true;
             break;
           }
         }
       }
 
-      if (rescuedAny && locked.size >= 4) {
-        const lockedPts = Array.from(locked).map((id) => ({ laneId: id, pos: fusedByLane[id] }));
-        const jointBackbone = fitOriginQuadCurve(lockedPts, best.pos, lane.length);
-        if (jointBackbone) {
+      if (updatedAny && locked.size >= 4) {
+        const cleanIds = Array.from(locked).filter((id) => !tailingSet.has(id));
+        const fitIds = cleanIds.length >= 4 ? cleanIds : Array.from(locked);
+        const lockedPts = fitIds.map((id) => ({
+          laneId: id,
+          pos: frame.toPlatePos(id, fusedByLane[id]),
+        }));
+        const jointBackbonePlate = fitOriginQuadCurve(
+          lockedPts,
+          best.pos,
+          lane.length,
+          frame.uByLane,
+          frame.allLaneIds
+        );
+        if (jointBackbonePlate) {
           for (const l of halfLanes) {
-            if (!locked.has(l.id) && jointBackbone[l.id] != null) {
-              fusedByLane[l.id] = Math.round(jointBackbone[l.id]);
+            if (!locked.has(l.id) && jointBackbonePlate[l.id] != null) {
+              fusedByLane[l.id] = Math.round(frame.toLanePos(l.id, jointBackbonePlate[l.id]));
             }
           }
         }
@@ -2978,6 +4186,7 @@ export function tlcOrigin(
         ...best,
         byLane: fusedByLane,
         lockedLanes: Array.from(locked),
+        tailingLanes: Array.from(tailingSet),
         validFrac: halfLanes.length > 0 ? locked.size / halfLanes.length : best.validFrac,
       };
     }

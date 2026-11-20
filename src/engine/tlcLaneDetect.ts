@@ -764,11 +764,16 @@ interface DotCoreInfo {
   y: number;
   contrast: number;
   bilateral: number;
+  fwhm: number;
+  isTailing: boolean;
+  edgeCentered: boolean;
 }
 
 /**
- * Refine a coarse blob peak `yHit` on the raw intensity strip along `(cx, y)` by finding the
- * symmetric 60%-peak connected dot core, returning refined center plus contrast & bilateral drop.
+ * Refine a coarse blob peak `yHit` on the raw intensity strip along `(cx, y)` using crisp
+ * plate-edge back-side anchoring and 2D circular horizontal width clamping so big saturated dots
+ * and heavily tailing comets stay centered on their round origin deposit rather than shifting
+ * in the solvent-elution direction.
  */
 function refineDotCoreInfo(
   ch: Float32Array[],
@@ -777,7 +782,8 @@ function refineDotCoreInfo(
   cx: number,
   yHit: number,
   p: number,
-  expectedSign?: -1 | 1
+  expectedSign?: -1 | 1,
+  outer?: 1 | -1
 ): DotCoreInfo | null {
   const halfH = Math.max(10, Math.round(0.95 * p));
   const yMin = Math.max(0, Math.round(yHit - halfH));
@@ -796,6 +802,7 @@ function refineDotCoreInfo(
   const peakR = Math.max(4, Math.round(0.38 * p));
 
   let bestChanProf: number[] | null = null;
+  let bestChanData: Float32Array | null = null;
   let bestSign: -1 | 1 = expectedSign ?? -1;
   let bestBg = 0;
   let bestMedUp = 0;
@@ -860,6 +867,7 @@ function refineDotCoreInfo(
       bestMedLo = medLo;
       bestPeakIdx = minIdx;
       bestChanProf = sm;
+      bestChanData = c;
     }
     if (expectedSign !== -1 && cBright > bestScore && biBright > 0) {
       bestScore = cBright;
@@ -869,22 +877,60 @@ function refineDotCoreInfo(
       bestMedLo = medLo;
       bestPeakIdx = maxIdx;
       bestChanProf = sm;
+      bestChanData = c;
     }
   }
 
-  if (!bestChanProf || bestScore < 8) return null;
+  if (!bestChanProf || !bestChanData || bestScore < 8) return null;
 
   const sm = bestChanProf;
-  const sigAt = (k: number) => Math.max(0, bestSign * (sm[k] - bestBg));
-  const peakSig = sigAt(bestPeakIdx);
-  const searchR = Math.max(5, Math.round(0.45 * p));
+  const sig0 = (k: number) => Math.max(0, bestSign * (sm[k] - bestBg));
+  const peakSig0 = sig0(bestPeakIdx);
+  const searchR = Math.max(6, Math.round(0.55 * p));
 
   let loConn = bestPeakIdx;
-  while (loConn > Math.max(1, bestPeakIdx - searchR) && sigAt(loConn - 1) >= 0.45 * peakSig) loConn--;
+  let minLoSig = peakSig0;
+  while (loConn > Math.max(1, bestPeakIdx - searchR)) {
+    const v = sig0(loConn - 1);
+    if (v < 0.35 * peakSig0) break;
+    if (minLoSig < 0.42 * peakSig0 && v > minLoSig + Math.max(2.5, 0.06 * peakSig0)) break;
+    loConn--;
+    if (v < minLoSig) minLoSig = v;
+  }
   let hiConn = bestPeakIdx;
-  while (hiConn < Math.min(len - 2, bestPeakIdx + searchR) && sigAt(hiConn + 1) >= 0.45 * peakSig) hiConn++;
+  let minHiSig = peakSig0;
+  while (hiConn < Math.min(len - 2, bestPeakIdx + searchR)) {
+    const v = sig0(hiConn + 1);
+    if (v < 0.35 * peakSig0) break;
+    if (minHiSig < 0.42 * peakSig0 && v > minHiSig + Math.max(2.5, 0.06 * peakSig0)) break;
+    hiConn++;
+    if (v < minHiSig) minHiSig = v;
+  }
 
-  let coreMax = peakSig;
+  // Recompute clean silica background strictly OUTSIDE [loConn .. hiConn]
+  const bgGap = Math.max(2, Math.round(0.08 * p));
+  const bgSpan = Math.max(3, Math.round(0.20 * p));
+  const upBgB = Math.max(0, loConn - bgGap);
+  const upBgA = Math.max(0, upBgB - bgSpan);
+  const loBgA = Math.min(len - 1, hiConn + bgGap);
+  const loBgB = Math.min(len - 1, loBgA + bgSpan);
+  const cleanQuantile = (a: number, b: number, isPlateEdgeSide: boolean): number => {
+    if (b < a) return bestBg;
+    const arr = sm.slice(a, b + 1).sort((x, y) => x - y);
+    if (!arr.length) return bestBg;
+    if (!isPlateEdgeSide) return arr[arr.length >> 1];
+    const q = bestSign < 0 ? Math.min(arr.length - 1, Math.floor(arr.length * 0.65)) : Math.floor(arr.length * 0.35);
+    return arr[q];
+  };
+  const cleanUpBg = cleanQuantile(upBgA, upBgB, outer === -1 && upBgA <= 4);
+  const cleanLoBg = cleanQuantile(loBgA, loBgB, outer === 1 && loBgB >= len - 5);
+  const cleanBg =
+    bestSign < 0
+      ? Math.max(cleanUpBg, cleanLoBg)
+      : Math.min(cleanUpBg, cleanLoBg);
+
+  const sigAt = (k: number) => Math.max(0, bestSign * (sm[k] - cleanBg));
+  let coreMax = 0;
   for (let k = loConn; k <= hiConn; k++) {
     const v = sigAt(k);
     if (v > coreMax) coreMax = v;
@@ -901,69 +947,187 @@ function refineDotCoreInfo(
   }
   if (pLo === -1) {
     for (let k = loConn; k <= hiConn; k++) {
-      if (sigAt(k) >= 0.86 * coreMax) {
+      if (sigAt(k) >= 0.85 * coreMax) {
         if (pLo === -1) pLo = k;
         pHi = k;
       }
     }
   }
-  const seedFloat = pLo !== -1 ? 0.5 * (pLo + pHi) : bestPeakIdx;
-  const seed = Math.round(seedFloat);
-  const thr = 0.64 * coreMax;
-  const maxHalf = Math.max(5, Math.round(0.48 * p));
-
-  let l = seed;
-  while (l > Math.max(0, seed - maxHalf) && sigAt(l - 1) >= thr) l--;
-  let leftY = l;
-  if (l > 0 && sigAt(l - 1) < thr && sigAt(l) >= thr) {
-    const v0 = sigAt(l - 1);
-    const v1 = sigAt(l);
-    leftY = l - (v1 - thr) / Math.max(1e-6, v1 - v0);
+  if (pLo === -1) {
+    pLo = bestPeakIdx;
+    pHi = bestPeakIdx;
   }
 
-  let r = seed;
-  while (r < Math.min(len - 1, seed + maxHalf) && sigAt(r + 1) >= thr) r++;
-  let rightY = r;
-  if (r < len - 1 && sigAt(r + 1) < thr && sigAt(r) >= thr) {
-    const v0 = sigAt(r);
-    const v1 = sigAt(r + 1);
-    rightY = r + (v0 - thr) / Math.max(1e-6, v0 - v1);
+  const maxHalf = Math.max(6, Math.round(0.55 * p));
+  const walkEdge = (start: number, dir: -1 | 1, thr: number, stopOnRise: boolean): number => {
+    let k = start;
+    const limit = dir < 0 ? Math.max(0, start - maxHalf) : Math.min(len - 1, start + maxHalf);
+    let bestLow = sigAt(k);
+    while (k !== limit) {
+      const next = k + dir;
+      const nv = sigAt(next);
+      if (nv < thr) break;
+      if (stopOnRise && bestLow < 0.42 * coreMax && nv > bestLow + Math.max(2.5, 0.06 * coreMax)) break;
+      k = next;
+      if (nv < bestLow) bestLow = nv;
+    }
+    const next = k + dir;
+    if (next >= 0 && next < len && sigAt(next) < thr && sigAt(k) >= thr) {
+      const v0 = sigAt(k);
+      const v1 = sigAt(next);
+      return k + dir * ((v0 - thr) / Math.max(1e-6, v0 - v1));
+    }
+    return k;
+  };
+
+  const thr50 = 0.50 * coreMax;
+  const thr64 = 0.64 * coreMax;
+  const leftY50 = walkEdge(pLo, -1, thr50, outer === -1);
+  const leftY64 = walkEdge(pLo, -1, thr64, outer === -1);
+  const rightY50 = walkEdge(pHi, 1, thr50, outer === 1);
+  const rightY64 = walkEdge(pHi, 1, thr64, outer === 1);
+
+  let usedLeft50 = leftY50;
+  let usedRight50 = rightY50;
+  let usedLeft64 = leftY64;
+  let usedRight64 = rightY64;
+  let isTailing = false;
+
+  // Measure 2D horizontal circular diameter & lateral centering directly on bestChanData
+  // across the clean core plateau so elliptical dots are not underestimated while vertical comets
+  // are accurately clamped to their circular base.
+  const backP = outer === 1 ? pHi : outer === -1 ? pLo : Math.round(0.5 * (pLo + pHi));
+  const fwdDir: -1 | 1 = outer === 1 ? -1 : 1;
+  const hxRad = Math.max(4, Math.round(0.45 * p));
+  const hxA = Math.max(0, Math.round(cx - hxRad));
+  const hxB = Math.min(w - 1, Math.round(cx + hxRad));
+  const yMidIdx = Math.max(0, Math.min(len - 1, Math.round(0.5 * (pLo + pHi))));
+  const ySample = Math.max(0, Math.min(h - 1, yMin + yMidIdx));
+  const rowOff = ySample * w;
+  let dHoriz = 0;
+  const scanLo = Math.max(0, Math.min(pLo, pHi));
+  const scanHi = Math.min(len - 1, Math.max(pLo, pHi));
+  for (let k = scanLo; k <= scanHi; k++) {
+    const yy = Math.max(0, Math.min(h - 1, yMin + k));
+    const rOff = yy * w;
+    let hPeak = 0;
+    let hPeakX = Math.round(cx);
+    for (let x = Math.max(hxA, Math.round(cx - 0.20 * p)); x <= Math.min(hxB, Math.round(cx + 0.20 * p)); x++) {
+      const v = Math.max(0, bestSign * (bestChanData[rOff + x] - cleanBg));
+      if (v > hPeak) {
+        hPeak = v;
+        hPeakX = x;
+      }
+    }
+    if (hPeak >= 0.45 * coreMax) {
+      const hThr = 0.50 * hPeak;
+      let xl = hPeakX;
+      while (xl > hxA && Math.max(0, bestSign * (bestChanData[rOff + xl - 1] - cleanBg)) >= hThr) xl--;
+      let xr = hPeakX;
+      while (xr < hxB && Math.max(0, bestSign * (bestChanData[rOff + xr + 1] - cleanBg)) >= hThr) xr++;
+      if (xr - xl > dHoriz) dHoriz = xr - xl;
+    }
   }
 
-  // Clamp one-sided elution smear tails against the clean opposite flank's half-width
-  // so tailing dots stay centered on their round deposit core rather than shifting toward the front.
-  const rUp = Math.max(0.5, seedFloat - leftY);
-  const rLo = Math.max(0.5, rightY - seedFloat);
-  const nearA = Math.max(0, seed - Math.round(0.62 * p));
-  const nearB = Math.max(0, seed - Math.round(0.28 * p));
-  const nearC = Math.min(len - 1, seed + Math.round(0.28 * p));
-  const nearD = Math.min(len - 1, seed + Math.round(0.62 * p));
-  const nearUp = nearB >= nearA ? sm.slice(nearA, nearB + 1).sort((a, b) => a - b)[(nearB - nearA + 1) >> 1] : bestMedUp;
-  const nearLo = nearD >= nearC ? sm.slice(nearC, nearD + 1).sort((a, b) => a - b)[(nearD - nearC + 1) >> 1] : bestMedLo;
-  const flankAsym = bestSign < 0 ? 0.5 * ((bestMedUp - bestMedLo) + (nearUp - nearLo)) : 0.5 * ((bestMedLo - bestMedUp) + (nearLo - nearUp));
-
-  let usedLeftY = leftY;
-  let usedRightY = rightY;
-  const cleanIsUp = flankAsym > 3 || (flankAsym >= -2 && rLo > 1.25 * rUp + 0.5);
-  const cleanIsLo = flankAsym < -3 || (flankAsym <= 2 && rUp > 1.25 * rLo + 0.5);
-  if (cleanIsUp && rLo > 1.12 * rUp + 0.3) {
-    usedRightY = Math.min(rightY, seedFloat + Math.max(1.2, 1.12 * rUp + 0.3));
-  } else if (cleanIsLo && rUp > 1.12 * rLo + 0.3) {
-    usedLeftY = Math.max(leftY, seedFloat - Math.max(1.2, 1.12 * rLo + 0.3));
+  // Lateral centering check: compare core vs left/right lane-border flanks at ySample
+  let edgeCentered = true;
+  if (p >= 12) {
+    const fOffA = Math.max(2, Math.round(0.28 * p));
+    const fOffB = Math.max(fOffA + 1, Math.round(0.42 * p));
+    const avgSig = (xa: number, xb: number) => {
+      const a = Math.max(0, Math.min(w - 1, xa));
+      const b = Math.max(a, Math.min(w - 1, xb));
+      let s = 0;
+      for (let x = a; x <= b; x++) s += Math.max(0, bestSign * (bestChanData![rowOff + x] - cleanBg));
+      return s / Math.max(1, b - a + 1);
+    };
+    const coreSig2d = avgSig(Math.round(cx - 0.14 * p), Math.round(cx + 0.14 * p));
+    const leftEdgeSig = avgSig(Math.round(cx - fOffB), Math.round(cx - fOffA));
+    const rightEdgeSig = avgSig(Math.round(cx + fOffA), Math.round(cx + fOffB));
+    const maxEdgeSig = Math.max(leftEdgeSig, rightEdgeSig);
+    if (maxEdgeSig > 1.35 * Math.max(coreSig2d, 1.0) && maxEdgeSig > 12) {
+      edgeCentered = false;
+    }
   }
 
-  const lClamp = Math.max(0, Math.floor(usedLeftY));
-  const rClamp = Math.min(len - 1, Math.ceil(usedRightY));
-  const mid = 0.5 * (usedLeftY + usedRightY);
-  let sumW = 0;
-  let sumPos = 0;
-  for (let k = lClamp; k <= rClamp; k++) {
-    const wt = Math.max(0, sigAt(k) - thr);
-    sumW += wt;
-    sumPos += k * wt;
+  if (outer != null) {
+    // We know the exact elution direction (-outer): NEVER clamp the crisp outer (plate-edge) side!
+    const backSlope50 = outer < 0 ? Math.max(0.8, pLo - leftY50) : Math.max(0.8, rightY50 - pHi);
+    const fwdSlope50 = outer < 0 ? Math.max(0.8, rightY50 - pHi) : Math.max(0.8, pLo - leftY50);
+    const backSlope64 = outer < 0 ? Math.max(0.6, pLo - leftY64) : Math.max(0.6, rightY64 - pHi);
+    const fwdSlope64 = outer < 0 ? Math.max(0.6, rightY64 - pHi) : Math.max(0.6, pLo - leftY64);
+
+    // Trim 1: trim asymmetric forward slope tail beyond plateau
+    if (outer < 0) {
+      if (fwdSlope50 > 1.12 * backSlope50 + 0.4) usedRight50 = Math.min(usedRight50, pHi + 1.10 * backSlope50 + 0.4);
+      if (fwdSlope64 > 1.12 * backSlope64 + 0.4) usedRight64 = Math.min(usedRight64, pHi + 1.10 * backSlope64 + 0.4);
+    } else {
+      if (fwdSlope50 > 1.12 * backSlope50 + 0.4) usedLeft50 = Math.max(usedLeft50, pLo - 1.10 * backSlope50 - 0.4);
+      if (fwdSlope64 > 1.12 * backSlope64 + 0.4) usedLeft64 = Math.max(usedLeft64, pLo - 1.10 * backSlope64 - 0.4);
+    }
+
+    // Measure forward smear strength ahead of the clean back edge
+    const probeA = Math.max(0, Math.min(len - 1, Math.round(backP + fwdDir * Math.max(4, Math.round(0.28 * p)))));
+    const probeB = Math.max(0, Math.min(len - 1, Math.round(backP + fwdDir * Math.max(7, Math.round(0.58 * p)))));
+    const pStart = Math.min(probeA, probeB);
+    const pEnd = Math.max(probeA, probeB);
+    const fwdSlice = sm.slice(pStart, pEnd + 1).sort((a, b) => a - b);
+    const nearFwdMed = fwdSlice.length ? fwdSlice[fwdSlice.length >> 1] : cleanBg;
+    const fwdTailSig = Math.max(0, bestSign * (nearFwdMed - cleanBg));
+
+    isTailing =
+      fwdTailSig > 0.24 * coreMax && rightY50 - leftY50 > 1.25 * (usedRight50 - usedLeft50) + 2.0;
+
+    // Trim 2: heavy saturated comet whose plateau stretched vertically far beyond its 2D horizontal diameter
+    if (dHoriz >= 3 && usedRight50 - usedLeft50 > 1.38 * dHoriz && fwdTailSig > 0.25 * coreMax) {
+      const cap50 = 1.15 * dHoriz;
+      const cap64 = 1.04 * dHoriz;
+      if (outer < 0) {
+        usedRight50 = Math.min(usedRight50, usedLeft50 + cap50);
+        usedRight64 = Math.min(usedRight64, usedLeft64 + cap64);
+      } else {
+        usedLeft50 = Math.max(usedLeft50, usedRight50 - cap50);
+        usedLeft64 = Math.max(usedLeft64, usedRight64 - cap64);
+      }
+      isTailing = true;
+    }
+  } else {
+    // Symmetric fallback when outer direction is unknown
+    const seedFloat = 0.5 * (pLo + pHi);
+    const rUp = Math.max(0.5, seedFloat - leftY64);
+    const rLo = Math.max(0.5, rightY64 - seedFloat);
+    const flankAsym = bestSign < 0 ? bestMedUp - bestMedLo : bestMedLo - bestMedUp;
+    if ((flankAsym > 3 || (flankAsym >= -2 && rLo > 1.25 * rUp + 0.5)) && rLo > 1.12 * rUp + 0.3) {
+      usedRight64 = Math.min(rightY64, seedFloat + Math.max(1.2, 1.12 * rUp + 0.3));
+      usedRight50 = Math.min(rightY50, seedFloat + Math.max(1.5, 1.15 * (seedFloat - leftY50) + 0.4));
+    } else if ((flankAsym < -3 || (flankAsym <= 2 && rUp > 1.25 * rLo + 0.5)) && rUp > 1.12 * rLo + 0.3) {
+      usedLeft64 = Math.max(leftY64, seedFloat - Math.max(1.2, 1.12 * rLo + 0.3));
+      usedLeft50 = Math.max(leftY50, seedFloat - Math.max(1.5, 1.15 * (rightY50 - seedFloat) + 0.4));
+    }
   }
-  const centroid = sumW > 0 ? sumPos / sumW : mid;
-  const refined = yMin + 0.65 * mid + 0.35 * centroid;
+
+  const mid50 = 0.5 * (usedLeft50 + usedRight50);
+  const mid64 = 0.5 * (usedLeft64 + usedRight64);
+  const fwhm = Math.max(0, usedRight50 - usedLeft50);
+
+  let refinedLocal: number;
+  if (isTailing) {
+    refinedLocal = 0.55 * mid64 + 0.45 * mid50;
+  } else {
+    const lClamp = Math.max(0, Math.floor(usedLeft64));
+    const rClamp = Math.min(len - 1, Math.ceil(usedRight64));
+    let sumW = 0;
+    let sumPos = 0;
+    for (let k = lClamp; k <= rClamp; k++) {
+      const wt = Math.max(0, sigAt(k) - thr64);
+      sumW += wt;
+      sumPos += k * wt;
+    }
+    const centroid = sumW > 0 ? sumPos / sumW : mid64;
+    refinedLocal = 0.50 * mid64 + 0.35 * mid50 + 0.15 * centroid;
+  }
+
+  const refined = yMin + refinedLocal;
   const shift = Math.abs(refined - yHit);
   let y = refined;
   if (shift > 0.36 * p) {
@@ -975,29 +1139,29 @@ function refineDotCoreInfo(
       const sv = sigAt(k);
       if (sv < minPathSig) minPathSig = sv;
     }
-    // Allow moving across a huge flat dot's connected core up to 0.48*p, only bouncing on disjoint jumps
-    if (shift > 0.48 * p || minPathSig < 0.25 * coreMax) {
+    // Allow moving across a huge flat dot's connected core up to 0.52*p, only bouncing on disjoint jumps
+    if (shift > 0.52 * p || minPathSig < 0.22 * coreMax) {
       y = yHit;
     }
   }
 
   // Measure true bilateral contrast cleanly outside the refined dot contour
   const flankGap = Math.max(2, Math.round(0.08 * p));
-  const fUpEnd = Math.max(0, l - flankGap);
+  const fUpEnd = Math.max(0, Math.floor(usedLeft50) - flankGap);
   const fUpStart = Math.max(0, fUpEnd - Math.max(3, Math.round(0.18 * p)));
-  const fLoStart = Math.min(len - 1, r + flankGap);
+  const fLoStart = Math.min(len - 1, Math.ceil(usedRight50) + flankGap);
   const fLoEnd = Math.min(len - 1, fLoStart + Math.max(3, Math.round(0.18 * p)));
   const upSlice = sm.slice(fUpStart, fUpEnd + 1).sort((a, b) => a - b);
   const loSlice = sm.slice(fLoStart, fLoEnd + 1).sort((a, b) => a - b);
   const fMedUp = upSlice.length ? upSlice[upSlice.length >> 1] : sm[0];
   const fMedLo = loSlice.length ? loSlice[loSlice.length >> 1] : sm[len - 1];
-  const cVal = sm[Math.max(0, Math.min(len - 1, Math.round(mid)))];
+  const cVal = sm[Math.max(0, Math.min(len - 1, Math.round(mid64)))];
   const dUp = bestSign * (cVal - fMedUp);
   const dLo = bestSign * (cVal - fMedLo);
   const contrast = Math.max(dUp, dLo);
   const bilateral = Math.min(dUp, dLo);
 
-  return { y, contrast, bilateral };
+  return { y, contrast, bilateral, fwhm, isTailing, edgeCentered };
 }
 
 function refineDotCoreY(
@@ -1151,7 +1315,16 @@ function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: n
   // experimental spotting error (+/-0.24*p) around the smooth backbone; missing-spot lanes stay
   // cleanly on the backbone rather than latching onto faint streaks or zig-zagging.
   const localThr = 0.28 * medianRef;
-  const pass2Hits: Array<{ i: number; x: number; y: number; v: number; contrast: number; bilateral: number }> = [];
+  const pass2Hits: Array<{
+    i: number;
+    x: number;
+    y: number;
+    v: number;
+    contrast: number;
+    bilateral: number;
+    isTailing: boolean;
+  }> = [];
+  const minDotFwhm = Math.max(2.2, 0.06 * p);
 
   for (let i = 0; i < LANES_PER_HALF; i++) {
     const px = x0 + Math.cos(ang) * p * i;
@@ -1202,16 +1375,29 @@ function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: n
       }
       hitX = bestX;
       hitY = bestY;
-      info = refineDotCoreInfo(ch, w, h, hitX, hitY, p, expectedSign);
+      info = refineDotCoreInfo(ch, w, h, hitX, hitY, p, expectedSign, outer);
     } else {
       // Fallback: if blobResponse missed or weakened a wide/faint dot near pyBackbone, check raw strip directly
-      const direct = refineDotCoreInfo(ch, w, h, px, pyBackbone, p, expectedSign);
-      if (direct && direct.contrast >= 26 && direct.bilateral >= 18 && Math.abs(direct.y - pyBackbone) <= 0.18 * p) {
+      const direct = refineDotCoreInfo(ch, w, h, px, pyBackbone, p, expectedSign, outer);
+      if (
+        direct &&
+        direct.contrast >= 26 &&
+        direct.bilateral >= 18 &&
+        direct.fwhm >= minDotFwhm &&
+        direct.edgeCentered &&
+        Math.abs(direct.y - pyBackbone) <= 0.18 * p
+      ) {
         info = direct;
         bestV = 0.5 * medianRef;
       }
     }
-    if (info && info.bilateral >= 14 && info.contrast >= 20) {
+    if (
+      info &&
+      info.bilateral >= 14 &&
+      info.contrast >= 20 &&
+      info.fwhm >= minDotFwhm &&
+      (info.edgeCentered || info.contrast >= 65)
+    ) {
       pass2Hits.push({
         i,
         x: px,
@@ -1219,6 +1405,7 @@ function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: n
         v: bestV,
         contrast: info.contrast,
         bilateral: info.bilateral,
+        isTailing: info.isTailing,
       });
     }
   }
@@ -1236,11 +1423,27 @@ function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: n
       if (h2.contrast < minCon || h2.bilateral < minBi) continue;
       const pyBack = y0 + Math.sin(ang) * p * h2.i + backboneOff[h2.i] * cosA;
       const dev = Math.abs(h2.y - pyBack) / cosA;
+      const fwdDev = ((h2.y - pyBack) * -outer) / cosA;
+      // Faint fuzzy halos (e.g. dim UV366 glow) must sit close to the baseline; never let a dim
+      // halo rim jump 8-20 px away from the plate baseline.
       if (
-        dev > 0.08 * p &&
-        (h2.contrast < Math.max(24, 0.35 * medCon) ||
-          h2.bilateral < Math.max(18, 0.28 * medCon) ||
-          h2.bilateral < 0.45 * h2.contrast)
+        dev > 0.06 * p &&
+        (h2.contrast < Math.max(34, 0.40 * medCon) ||
+          h2.bilateral < Math.max(22, 0.30 * medCon) ||
+          h2.bilateral < 0.48 * h2.contrast)
+      ) {
+        continue;
+      }
+      if (
+        fwdDev > 0.06 * p &&
+        h2.contrast < Math.max(48, 0.48 * medCon)
+      ) {
+        continue;
+      }
+      if (
+        fwdDev > 0.07 * p &&
+        h2.isTailing &&
+        h2.contrast < Math.max(48, 0.50 * medCon)
       ) {
         continue;
       }
@@ -1248,10 +1451,12 @@ function refineRowHeight(resp: Float32Array, ch: Float32Array[], w: number, h: n
     }
   }
 
-  // Re-fit straight/bowed backbone directly to Pass 2's core-refined dot centers so blank
-  // lanes sit dead-center along the real origin dots without inheriting Pass 1 rim offsets.
-  if (acceptedHits.length >= 6) {
-    const pass2Fit = fitRowBaselineAndBow(acceptedHits, x0, a0, p);
+  // Re-fit straight/bowed backbone directly to Pass 2's clean core-refined dot centers so blank
+  // lanes sit dead-center along the real origin dots without inheriting Pass 1 rim offsets or comet pull.
+  const cleanAccepted = acceptedHits.filter((h2) => !h2.isTailing);
+  const fitSource = cleanAccepted.length >= 6 ? cleanAccepted : acceptedHits;
+  if (fitSource.length >= 6) {
+    const pass2Fit = fitRowBaselineAndBow(fitSource, x0, a0, p);
     const useQuad2 = pass2Fit.quad !== null && pass2Fit.quad.agree >= 10 && pass2Fit.quad.medRes <= 0.16 * p;
     if (useQuad2 || pass2Fit.agree >= 6) {
       ang = pass2Fit.ang;

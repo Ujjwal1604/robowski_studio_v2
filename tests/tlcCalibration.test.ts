@@ -7,6 +7,7 @@ import {
   predictTlcRf,
   profileMoleculeForTlc,
 } from '../src/engine/predictor';
+import { estimatePlateLevelDemandShift } from '../src/engine/predictor/tlcCalibration';
 import { containerOfLane } from '../src/engine/tlcLanes';
 import { LANE_FRAME_WIDTH } from '../src/engine/constants';
 import { exampleState } from '../src/context/runPayload';
@@ -66,6 +67,84 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
     expect(mOverride?.matchSource).toBe('manual');
 
     expect(matchTlcSetNameToSolvent('25% EtOAc / Hexanes', 'ignore')).toBeNull();
+  });
+
+  it('recognizes Toluene / MeOH / (2M NH₃ in MeOH) (94:4:2), pencil-style ratios, and every advisor-synthesized / PRISMA ternary solvent name', async () => {
+    const {
+      CORE_ELUENT_SPECS,
+      composeSolventSystem,
+      generateExtendedDynamicSpecs,
+      generatePrismaTernarySpecs,
+      synthesizePlateTailoredSpecs,
+    } = await import('../src/engine/predictor/solventSystemModel');
+
+    // Exact regression case from user screenshot
+    for (const tabName of [
+      'Toluene / MeOH / (2M NH₃ in MeOH) (94:4:2)',
+      'Toluene / MeOH / (2M NH3 in MeOH) (94:4:2)',
+      'Toluene / MeOH / (2M NH₃ in MeOH) (94:4:2) (SiO₂)',
+      '94:4:2 Toluene/MeOH/NH3',
+      '94:4:2 Toluene:MeOH:NH3 in MeOH',
+    ]) {
+      const m = matchTlcSetNameToSolvent(tabName);
+      expect(m, `Expected "${tabName}" to match`).not.toBeNull();
+      expect(m!.system.composition?.weakSolvent).toBe('Toluene');
+      expect(m!.system.composition?.strongSolvent).toBe('MeOH');
+      expect(m!.system.composition?.strongPct).toBe(4);
+      expect(m!.system.composition?.modifierId).toBe('nh3_meoh_2');
+      expect(m!.system.alcoholPct).toBe(6); // 4% neat MeOH + 2% MeOH carrier from 2M NH3/MeOH
+      expect(m!.system.baseModifier).toContain('NH₃');
+      expect(m!.stationaryPhase).toBe('SiO2');
+    }
+
+    // Chemist plate-pencil shorthand
+    const pencilNh3 = matchTlcSetNameToSolvent('95:3:2 DCM:MeOH:NH3 in MeOH');
+    expect(pencilNh3?.system.id).toBe('nh3_meoh_dcm_5');
+    expect(pencilNh3?.system.alcoholPct).toBe(5);
+
+    const pencilEt3n = matchTlcSetNameToSolvent('DCM:MeOH:NEt3 94:5:1');
+    expect(pencilEt3n?.system.id).toBe('meoh_dcm_5_et3n');
+    expect(pencilEt3n?.system.baseModifier).toContain('Et₃N');
+
+    const tolNh3Bin = matchTlcSetNameToSolvent('Toluene / (2M NH₃ in MeOH) (98:2)');
+    expect(tolNh3Bin?.system.composition?.weakSolvent).toBe('Toluene');
+    expect(tolNh3Bin?.system.alcoholPct).toBe(2);
+
+    // Exhaustive round-trip invariant: EVERY advisor-generated system must be auto-recognized
+    const allGeneratedSpecs = [
+      ...CORE_ELUENT_SPECS,
+      ...generateExtendedDynamicSpecs({
+        hasStrongWellAcid: true,
+        needsBasicMod: true,
+        needsAcidMod: true,
+        aromaticHeavyPlate: true,
+      }),
+    ];
+    for (const flags of [
+      { aromaticHeavyPlate: false, hasStrongWellAcid: false, maxAcidStress: 0, needsBasicMod: false, needsAcidMod: false },
+      { aromaticHeavyPlate: true, hasStrongWellAcid: false, maxAcidStress: 0, needsBasicMod: true, needsAcidMod: false },
+      { aromaticHeavyPlate: true, hasStrongWellAcid: true, maxAcidStress: 1.2, needsBasicMod: true, needsAcidMod: false },
+      { aromaticHeavyPlate: true, hasStrongWellAcid: false, maxAcidStress: 0, needsBasicMod: false, needsAcidMod: true },
+    ]) {
+      const input = { targetStrengths: [0.12, 0.25, 0.38, 0.5, 0.62, 0.74], ...flags };
+      allGeneratedSpecs.push(...synthesizePlateTailoredSpecs(input));
+      allGeneratedSpecs.push(...generatePrismaTernarySpecs(input));
+    }
+
+    for (const spec of allGeneratedSpecs) {
+      const sys = composeSolventSystem(spec);
+      const byName = matchTlcSetNameToSolvent(sys.name);
+      expect(byName, `Advisor system name "${sys.name}" (${sys.id}) was unrecognized`).not.toBeNull();
+      expect(byName!.system.strength).toBeCloseTo(sys.strength, 2);
+      expect(byName!.system.alcoholPct).toBe(sys.alcoholPct);
+      expect(byName!.system.stationaryPhase).toBe(sys.stationaryPhase);
+      expect(byName!.system.baseModifier).toBe(sys.baseModifier);
+      expect(byName!.system.acidModifier).toBe(sys.acidModifier);
+
+      const byShort = matchTlcSetNameToSolvent(sys.shortLabel);
+      expect(byShort, `Advisor system shortLabel "${sys.shortLabel}" (${sys.id}) was unrecognized`).not.toBeNull();
+      expect(byShort!.system.strength).toBeCloseTo(sys.strength, 2);
+    }
   });
 
   it('fits positive mid-plate Rf shift when measured TLC spots elute consistently higher than uncalibrated predictions, and respects stationary-phase isolation + OFF toggle', async () => {
@@ -798,5 +877,28 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
     expect(wSumPairs).toBeLessThanOrEqual(10.05);
   });
 });
+
+describe('plate-level distribution check', () => {
+  it('detects a plate that runs far lower than predicted even when spots never pair or predictions clamp at 0.99', () => {
+    const pred = Array.from({ length: 40 }, (_, i) => 0.88 + (i % 3) * 0.02); // predicted ~0.9
+    const obs = Array.from({ length: 40 }, (_, i) => 0.6 + (i % 4) * 0.03); // measured ~0.65
+    const est = estimatePlateLevelDemandShift(obs, pred, 6.2)!;
+    expect(est.shift).toBeGreaterThan(0.15); // positive = runs lower than predicted
+    const none = estimatePlateLevelDemandShift(pred, pred, 6.2)!;
+    expect(Math.abs(none.shift)).toBeLessThan(0.05);
+
+    // Worst-case over-prediction where all predicted Rfs clamp at 0.99
+    const predClamped = Array.from({ length: 20 }, () => 0.99);
+    const obsMid = Array.from({ length: 20 }, () => 0.6);
+    const estClamped = estimatePlateLevelDemandShift(obsMid, predClamped, 6.2)!;
+    expect(estClamped).not.toBeNull();
+    expect(estClamped.shift).toBeGreaterThan(0.25);
+  });
+
+  it('stays silent with too little evidence', () => {
+    expect(estimatePlateLevelDemandShift([0.5, 0.6], [0.9, 0.9], 6.2)).toBeNull();
+  });
+});
+
 
 

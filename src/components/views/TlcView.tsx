@@ -31,12 +31,19 @@ import {
   getBlankSilicaMeta,
   setBlankSilicaEnabled,
   isBlankSilicaEnabled,
+  setAutomiddleEnabled,
+  isAutomiddleEnabled,
+  inspectLabTlcFilename,
+  parseNpyBuffer,
+  npyToRgbaAndFloatRgb,
+  enhanceWhiteLightRgba,
   findSimilarSpotsByColor,
   rescueSharedReagentSpots,
   hasCompositeChannels,
   extractDensitogram,
   tlcHalf,
   tlcFront,
+  tlcHalfFrontBase,
   tlcOrigin,
   tlcRfCsv,
   exportTlcAnalysisCsv,
@@ -120,10 +127,75 @@ function tlcNewSet(n: number): TlcSet {
 }
 
 function tlcKeyOf(name: string, assigned: Record<string, any>): TlcChannelKey | null {
-  if (/(?:^|[^0-9])254(?:[^0-9]|$)/i.test(name)) return 'UV254';
-  if (/(?:^|[^0-9])36[56](?:[^0-9]|$)|uv.?3/i.test(name)) return 'UV366';
-  if (/(?:^|[^a-z])(?:white|visible|vis)(?:[^a-z]|$)/i.test(name)) return 'White';
+  const lab = inspectLabTlcFilename(name);
+  if (lab.detectedChannel) return lab.detectedChannel;
   return (TLC_KEYS as TlcChannelKey[]).find((k) => !assigned[k]) || null;
+}
+
+/**
+ * Decodes either a standard image (PNG/JPEG/WebP) OR a Merck TLC Explorer NumPy `.npy` float32 file
+ * into a TlcImageEntry, automatically tagging `preFlatFielded` (uni_linint_corrected_*) and `linearized`.
+ */
+async function decodeTlcImageBlob(
+  blob: Blob,
+  name: string,
+  channelHint?: TlcChannelKey
+): Promise<TlcImageEntry> {
+  const meta = inspectLabTlcFilename(name);
+  if (meta.isNpy) {
+    const buf = await blob.arrayBuffer();
+    const parsed = parseNpyBuffer(buf);
+    const decoded = npyToRgbaAndFloatRgb(parsed, channelHint ?? meta.detectedChannel, name, true);
+    const cv = document.createElement('canvas');
+    cv.width = decoded.width;
+    cv.height = decoded.height;
+    const ctx = cv.getContext('2d');
+    if (!ctx) throw new Error('Could not initialize 2D canvas for .npy decoding.');
+    const imgData = ctx.createImageData(decoded.width, decoded.height);
+    imgData.data.set(decoded.rgba8);
+    ctx.putImageData(imgData, 0, 0);
+    const bmp = await createImageBitmap(cv);
+    return {
+      name,
+      bmp,
+      preFlatFielded: meta.isPreFlatFielded,
+      linearized: meta.isLinearized || true,
+      floatRgb: decoded.floatRgb,
+      floatWidth: decoded.width,
+      floatHeight: decoded.height,
+    };
+  }
+  const bmp = await createImageBitmap(blob);
+  return {
+    name,
+    bmp,
+    preFlatFielded: meta.isPreFlatFielded,
+    linearized: meta.isLinearized,
+  };
+}
+
+// Per-ImageBitmap cache for contrast-boosted White-light canvas (computed once per plate photo)
+const boostedWhiteCanvasCache = new WeakMap<ImageBitmap, HTMLCanvasElement>();
+
+function getBoostedWhiteCanvas(bmp: ImageBitmap): HTMLCanvasElement | ImageBitmap {
+  const cached = boostedWhiteCanvasCache.get(bmp);
+  if (cached) return cached;
+  if (typeof document === 'undefined') return bmp;
+  const wbW = Math.min(bmp.width, 1600);
+  const wbH = Math.max(1, Math.round((bmp.height * wbW) / bmp.width));
+  const cv = document.createElement('canvas');
+  cv.width = wbW;
+  cv.height = wbH;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return bmp;
+  ctx.drawImage(bmp, 0, 0, wbW, wbH);
+  const raw = ctx.getImageData(0, 0, wbW, wbH);
+  const enhanced = enhanceWhiteLightRgba(raw.data, wbW, wbH, { gain: 4.6, smoothRadius: 1 });
+  const out = ctx.createImageData(wbW, wbH);
+  out.data.set(enhanced);
+  ctx.putImageData(out, 0, 0);
+  boostedWhiteCanvasCache.set(bmp, cv);
+  return cv;
 }
 
 export interface ImageFilters {
@@ -165,7 +237,8 @@ function drawLanePanels(
   k: number,
   filters?: ImageFilters,
   showSpots: boolean = true,
-  compositeFalseColor: boolean = false
+  compositeFalseColor: boolean = false,
+  boostWhiteSpots: boolean = false
 ) {
   if (!panels.length) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -206,7 +279,8 @@ function drawLanePanels(
     }
 
     if (!renderedFalseColor && im?.bmp) {
-      const m = laneMatrix(l, im.bmp.width / (p.s.frameW || LANE_FRAME_WIDTH), k);
+      const srcImg = p.key === 'White' && boostWhiteSpots ? getBoostedWhiteCanvas(im.bmp) : im.bmp;
+      const m = laneMatrix(l, srcImg.width / (p.s.frameW || LANE_FRAME_WIDTH), k);
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.beginPath();
@@ -222,7 +296,7 @@ function drawLanePanels(
         dpr * (m[5] + top)
       );
 
-      ctx.drawImage(im.bmp, 0, 0);
+      ctx.drawImage(srcImg, 0, 0);
       ctx.restore();
     }
 
@@ -277,6 +351,7 @@ interface TlcWellCellProps {
   hasCfg: boolean;
   filters: ImageFilters;
   markSpots: boolean;
+  boostWhiteSpots?: boolean;
   onOpenModal: (wellIndex: number) => void;
 }
 
@@ -289,6 +364,7 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
   hasCfg,
   filters,
   markSpots,
+  boostWhiteSpots = false,
   onOpenModal,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -300,9 +376,9 @@ const TlcWellCell: React.FC<TlcWellCellProps> = React.memo(({
 
   useEffect(() => {
     if (canvasRef.current && panels.length > 0) {
-      drawLanePanels(canvasRef.current, panels, zoom, undefined, markSpots);
+      drawLanePanels(canvasRef.current, panels, zoom, undefined, markSpots, false, boostWhiteSpots);
     }
-  }, [panels, zoom, markSpots]);
+  }, [panels, zoom, markSpots, boostWhiteSpots]);
 
   const nf = (v: any, d = 1) =>
     Number.isFinite(+v) ? (+v).toLocaleString('en-US', { maximumFractionDigits: d }) : '-';
@@ -497,6 +573,9 @@ export const TlcView: React.FC = () => {
     getBlankSilicaMeta()
   );
   const [blankEnabled, setBlankEnabled] = useState<boolean>(() => isBlankSilicaEnabled());
+  // Lab PC pipeline toggles: curved-lane tracking (savgol_automiddle) & White-light faint-spot boost (saturate_white)
+  const [automiddle, setAutomiddle] = useState<boolean>(() => isAutomiddleEnabled());
+  const [boostWhiteSpots, setBoostWhiteSpots] = useState<boolean>(false);
 
   // AI Vision Final Plate QC Audit state
   const [qcLoading, setQcLoading] = useState(false);
@@ -584,13 +663,17 @@ export const TlcView: React.FC = () => {
             const slice = getTlcPlateSlice(s, pIdx);
             if (!slice.imgs?.[channel]) {
               try {
-                const bmp = await createImageBitmap(cached.blob);
+                const entry = await decodeTlcImageBlob(
+                  cached.blob,
+                  cached.name,
+                  channel as TlcChannelKey
+                );
                 if (!cancelled) {
                   loadedBySetPlate.push({
                     sIdx,
                     pIdx,
                     channel,
-                    entry: { name: cached.name, bmp },
+                    entry,
                   });
                   anyLoaded = true;
                 }
@@ -723,6 +806,12 @@ export const TlcView: React.FC = () => {
     invalidateAllPlateCaches();
   };
 
+  const handleToggleAutomiddle = (enabled: boolean) => {
+    setAutomiddleEnabled(enabled);
+    setAutomiddle(enabled);
+    invalidateAllPlateCaches();
+  };
+
   // Load Lane Config CSV (scoped to active plate)
   const handleLoadCsv = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -754,28 +843,45 @@ export const TlcView: React.FC = () => {
     e.target.value = '';
   };
 
-  // Load Plate Images (UV254, White, UV366) scoped to active plate
+  // Load Plate Images (UV254, White, UV366 — PNG/JPEG/WebP or lab PC .npy float32, plus optional lane CSV)
   const handleLoadImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
     if (!files.length) return;
-    toast(`Reading Plate ${plate + 1} images…`);
+    toast(`Reading Plate ${plate + 1} files…`);
 
     let loadedCount = 0;
+    let npyCount = 0;
+    let preFlatCount = 0;
+    let loadedCfg: { cfg: TlcLaneConfig; name: string; text: string } | null = null;
     const newImgs: Record<string, TlcImageEntry> = { ...activePlateSet.imgs };
 
     for (const f of files) {
+      // Allow dropping microadjusted_lane_config.csv / lane_config.csv right alongside plate images!
+      if (/\.csv$/i.test(f.name)) {
+        try {
+          const text = await f.text();
+          const cfg = parseLaneConfig(text);
+          loadedCfg = { cfg, name: f.name, text };
+        } catch (err: any) {
+          toast(`Could not read lane CSV ${f.name}: ${err.message || err}`);
+        }
+        continue;
+      }
+
       const key = tlcKeyOf(f.name, newImgs);
       if (!key) {
         toast(`Could not allocate channel for ${f.name}. All 3 channels (UV254, UV366, White) are already filled on Plate ${plate + 1}.`);
         continue;
       }
       try {
-        const bmp = await createImageBitmap(f);
+        const entry = await decodeTlcImageBlob(f, f.name, key);
         if (newImgs[key]?.bmp?.close) {
           newImgs[key].bmp.close();
         }
-        newImgs[key] = { name: f.name, bmp };
+        newImgs[key] = entry;
         loadedCount++;
+        if (entry.floatRgb) npyCount++;
+        if (entry.preFlatFielded) preFlatCount++;
         // Persist to IndexedDB under plate-scoped key
         putTlcImage(currentSet.uid, tlcStorageKey(key, plate), f.name, f);
       } catch (err: any) {
@@ -783,24 +889,38 @@ export const TlcView: React.FC = () => {
       }
     }
 
-    if (loadedCount > 0) {
+    if (loadedCount > 0 || loadedCfg) {
       setSets((prev) => {
         const next = [...prev];
         next[cur] = updateTlcPlateSlice(next[cur], plate, {
-          imgs: newImgs,
+          ...(loadedCount > 0 ? { imgs: newImgs } : {}),
+          ...(loadedCfg ? { cfg: loadedCfg.cfg, cfgName: loadedCfg.name, cfgText: loadedCfg.text } : {}),
           prof: {},
           frontAuto: {},
+          frontAutoByLane: {},
           originAuto: {},
           originAutoByLane: {},
         });
         return next;
       });
       setShow((prev) => ({ ...prev, UV254: true, UV366: true, White: true }));
-      toast(
-        activePlateSet.cfg
-          ? `Loaded ${loadedCount} image${loadedCount === 1 ? '' : 's'} into Plate ${plate + 1}.`
-          : `Loaded ${loadedCount} image${loadedCount === 1 ? '' : 's'} into Plate ${plate + 1}. Run Auto-detect lanes, Copy Lanes from Plate 1, or load a Lane CSV.`
-      );
+      const notes: string[] = [];
+      if (loadedCount > 0) {
+        notes.push(`Loaded ${loadedCount} ${npyCount === loadedCount ? '.npy float32' : 'plate'} file${loadedCount === 1 ? '' : 's'} into Plate ${plate + 1}`);
+      }
+      if (preFlatCount > 0) {
+        notes.push('already flat-fielded (skipped duplicate blank-silica correction)');
+      }
+      if (loadedCfg) {
+        notes.push(
+          `${loadedCfg.cfg.lanes.length} lanes from ${loadedCfg.name}${
+            loadedCfg.cfg.warnings.length ? ' — ' + loadedCfg.cfg.warnings[0] : ''
+          }`
+        );
+      } else if (!activePlateSet.cfg && loadedCount > 0) {
+        notes.push('run Auto-detect lanes or load a Lane CSV');
+      }
+      toast(notes.join(' · ') + '.');
     }
     e.target.value = '';
   };
@@ -813,26 +933,152 @@ export const TlcView: React.FC = () => {
       return;
     }
     try {
-      let best: { det: ReturnType<typeof detectLaneRows>; key: TlcChannelKey } | null = null;
+      let best: { det: ReturnType<typeof detectLaneRows>; label: string } | null = null;
+      const renderedImages: Array<{ key: TlcChannelKey; img: ImageData }> = [];
+      let compW = 0;
+      let compH = 0;
+
       for (const k of keys) {
         const bmp = activePlateSet.imgs[k]!.bmp;
-        const w = Math.min(bmp.width, 1300);
-        const h = Math.max(1, Math.round((bmp.height * w) / bmp.width));
+        const w = compW || Math.min(bmp.width, 1300);
+        const h = compH || Math.max(1, Math.round((bmp.height * w) / bmp.width));
+        if (!compW) {
+          compW = w;
+          compH = h;
+        }
         const cv = document.createElement('canvas');
         cv.width = w;
         cv.height = h;
         const ctx = cv.getContext('2d', { willReadFrequently: true });
         if (!ctx) continue;
         ctx.drawImage(bmp, 0, 0, w, h);
-        const det = detectLaneRows(ctx.getImageData(0, 0, w, h), w);
-        if (!best || det.confidence > best.det.confidence) best = { det, key: k };
+        const imgData = ctx.getImageData(0, 0, w, h);
+        renderedImages.push({ key: k, img: imgData });
+        const det = detectLaneRows(imgData, w);
+        if (!best || det.confidence > best.det.confidence) {
+          best = { det, label: TLC_LABEL[k] };
+        }
       }
+
+      // Also test a fused multi-channel Composite image (UV254 + UV366 + White) so plates whose
+      // origin dots are split across channels still get full comb & origin detection.
+      if (renderedImages.length >= 2 && compW > 0 && compH > 0) {
+        const nPx = compW * compH;
+        const compData = new Uint8ClampedArray(nPx * 4);
+        const chNorms = renderedImages.map(({ key, img }) => {
+          const d = img.data;
+          // Estimate clean plate background from interior samples
+          const samples: number[] = [];
+          const yA = Math.floor(compH * 0.2);
+          const yB = Math.ceil(compH * 0.8);
+          const xA = Math.floor(compW * 0.2);
+          const xB = Math.ceil(compW * 0.8);
+          const st = Math.max(1, Math.floor((yB - yA) / 24));
+          const sx = Math.max(1, Math.floor((xB - xA) / 24));
+          for (let y = yA; y < yB; y += st) {
+            for (let x = xA; x < xB; x += sx) {
+              const o = (y * compW + x) * 4;
+              const v =
+                key === 'UV254'
+                  ? d[o + 1]
+                  : key === 'UV366'
+                  ? Math.max(d[o], d[o + 1], d[o + 2])
+                  : 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+              samples.push(v);
+            }
+          }
+          samples.sort((a, b) => a - b);
+          const bg =
+            key === 'UV366'
+              ? samples[Math.floor(samples.length * 0.25)] ?? 18
+              : samples[Math.floor(samples.length * 0.75)] ?? 220;
+          return { key, data: d, bg };
+        });
+
+        for (let i = 0; i < nPx; i++) {
+          const o = i * 4;
+          let max1 = 0;
+          let max2 = 0;
+          for (let c = 0; c < chNorms.length; c++) {
+            const cn = chNorms[c];
+            let dev = 0;
+            if (cn.key === 'UV254') {
+              dev = Math.max(0, cn.bg - cn.data[o + 1]);
+            } else if (cn.key === 'UV366') {
+              dev = Math.max(0, Math.max(cn.data[o], cn.data[o + 1], cn.data[o + 2]) - cn.bg);
+            } else {
+              const luma = 0.299 * cn.data[o] + 0.587 * cn.data[o + 1] + 0.114 * cn.data[o + 2];
+              dev = Math.max(0, cn.bg - luma);
+            }
+            if (dev > max1) {
+              max2 = max1;
+              max1 = dev;
+            } else if (dev > max2) {
+              max2 = dev;
+            }
+          }
+          const fusedDrop = Math.min(220, max1 + 0.25 * max2);
+          compData[o] = 18;
+          compData[o + 1] = Math.max(0, Math.round(230 - fusedDrop));
+          compData[o + 2] = 18;
+          compData[o + 3] = 255;
+        }
+
+        const compDet = detectLaneRows({ data: compData, width: compW, height: compH }, compW);
+        const compSeen = (compDet.lower?.seen ?? 0) + (compDet.upper?.seen ?? 0);
+        const bestSeen = best ? (best.det.lower?.seen ?? 0) + (best.det.upper?.seen ?? 0) : 0;
+        if (
+          !best ||
+          compDet.confidence > best.det.confidence ||
+          (compDet.ok && compSeen > bestSeen + 2 && compDet.confidence >= best.det.confidence - 0.05)
+        ) {
+          best = { det: compDet, label: 'Composite' };
+        }
+      }
+
       if (!best || (!best.det.lower && !best.det.upper)) {
         toast('Could not find the origin dots. Try a plate image where they show clearly (UV 254 works best).');
         return;
       }
       const frameW = activePlateSet.frameW || LANE_FRAME_WIDTH;
-      const cfg = laneConfigFromDetection(best.det, frameW);
+      let cfg = laneConfigFromDetection(best.det, frameW);
+
+      // When multiple channels are loaded, let multi-channel + composite tlcOrigin refine the
+      // origin line across all loaded channels for any half where it succeeds cleanly.
+      if (keys.length >= 2) {
+        const probeCfg = { ...cfg, lanes: cfg.lanes.map((l) => ({ ...l, zeroRf: null })) };
+        const probeSet: TlcSet = {
+          ...activePlateSet,
+          cfg: probeCfg,
+          frontPx: null,
+          frontHalfPx: undefined,
+          originPx: null,
+          prof: {},
+          frontAuto: {},
+          frontAutoByLane: {},
+          originAuto: {},
+          originAutoByLane: {},
+          autoConf: {},
+        };
+        const getProf = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
+        const halfMultiOk = new Set<number>();
+        for (const hIdx of [0, 1]) {
+          const sample = probeCfg.lanes.find((l) => tlcHalf(l) === hIdx);
+          if (!sample) continue;
+          tlcOrigin(probeSet, sample, getProf);
+          if (probeSet.autoConf?.[`origin${hIdx}`]?.detected && (probeSet.originAuto?.[hIdx] ?? 0) > 10) {
+            halfMultiOk.add(hIdx);
+          }
+        }
+        if (halfMultiOk.size > 0) {
+          cfg = {
+            ...cfg,
+            hasZeroRf: false,
+            lanes: cfg.lanes.map((l) => (halfMultiOk.has(tlcHalf(l)) ? { ...l, zeroRf: null } : l)),
+          };
+        }
+      }
+
       const prev = activePlateSet.cfg;
       const pKey = `${currentSet.uid}:p${plate}`;
       if (prev) {
@@ -864,8 +1110,8 @@ export const TlcView: React.FC = () => {
       const note = best.det.warnings[0] ? ' ' + best.det.warnings[0] : '';
       toast(
         best.det.ok
-          ? `Plate ${plate + 1} lanes detected from ${TLC_LABEL[best.key]} (confidence ${pct}%).${note}`
-          : `Plate ${plate + 1} lanes placed from ${TLC_LABEL[best.key]}, but confidence is low (${pct}%). Check them by eye.${note}`
+          ? `Plate ${plate + 1} lanes detected from ${best.label} (confidence ${pct}%).${note}`
+          : `Plate ${plate + 1} lanes placed from ${best.label}, but confidence is low (${pct}%). Check them by eye.${note}`
       );
     } catch (err: any) {
       toast('Lane detection failed: ' + (err?.message || err));
@@ -1052,7 +1298,7 @@ export const TlcView: React.FC = () => {
       const emptyMap = new Map<number, TlcSpot[]>();
       if (!run?.rows?.length || !set.cfg?.lanes?.length || !set.imgs?.[key]?.bmp) return emptyMap;
       const cacheId = `${set.uid}:p${plate}:${key}`;
-      const sig = `${spotProminence}|${coreFraction}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${set.originPx ?? ''}`;
+      const sig = `${spotProminence}|${coreFraction}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${JSON.stringify(set.frontHalfPx || '')}|${set.originPx ?? ''}`;
       const hit = coherenceCache.current.get(cacheId);
       if (hit && hit.key === sig) return hit.map;
 
@@ -1498,7 +1744,7 @@ export const TlcView: React.FC = () => {
 
   useEffect(() => {
     if (inspectWell !== null && bigCanvasRef.current && inspectPanels.length > 0) {
-      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, false);
+      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, false, boostWhiteSpots);
 
       // Extract distinct densitograms for all available channels
       const newDens: { UV254?: TlcDensitogramData; UV366?: TlcDensitogramData; White?: TlcDensitogramData } = {};
@@ -1544,7 +1790,7 @@ export const TlcView: React.FC = () => {
       }
       setChannelDensitograms(newDens);
     }
-  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction, spotProminence, edgeSettingFor, getEdgeFits]);
+  }, [inspectWell, inspectPanels, filters, markSpots, coreFraction, spotProminence, edgeSettingFor, getEdgeFits, boostWhiteSpots]);
 
   // Keyboard listener inside well inspection modal for instant nudging and tilt
   useEffect(() => {
@@ -1945,7 +2191,7 @@ export const TlcView: React.FC = () => {
     toast(`Reset all Plate ${plate + 1} lanes to original configuration.`);
   };
 
-  // Solvent front update (moves meniscus baseline across the plate or for a specific side)
+  // Solvent front update (shifts meniscus baseline across the plate or for a specific side while preserving any 2D per-lane curve shape)
   const handleUpdateSetFront = (frontPx: number | null, side?: number) => {
     setSets((prev) => {
       const next = [...prev];
@@ -1955,19 +2201,31 @@ export const TlcView: React.FC = () => {
           const nextHalfFront = { ...(slice.frontHalfPx || {}) };
           if (frontPx != null && frontPx > 0) {
             nextHalfFront[side] = frontPx;
-          } else {
-            delete nextHalfFront[side];
+            return {
+              frontHalfPx: nextHalfFront,
+            };
+          }
+          delete nextHalfFront[side];
+          const nextFrontAuto = { ...(slice.frontAuto || {}) };
+          delete nextFrontAuto[side];
+          const nextFrontAutoByLane = { ...(slice.frontAutoByLane || {}) };
+          for (const k of Object.keys(nextFrontAutoByLane)) {
+            const lid = Number(k);
+            if ((lid < 27 ? 0 : 1) === side) delete nextFrontAutoByLane[lid];
           }
           return {
             frontHalfPx: nextHalfFront,
-            prof: {},
-            frontAuto: {},
-            frontAutoByLane: {},
+            frontAuto: nextFrontAuto,
+            frontAutoByLane: nextFrontAutoByLane,
+          };
+        }
+        if (frontPx != null && frontPx > 0) {
+          return {
+            frontPx,
           };
         }
         return {
-          frontPx: frontPx != null && frontPx > 0 ? frontPx : null,
-          prof: {},
+          frontPx: null,
           frontAuto: {},
           frontAutoByLane: {},
         };
@@ -2586,7 +2844,7 @@ export const TlcView: React.FC = () => {
       const sampleLane = activePlateSet.cfg.lanes.find((l) => tlcHalf(l) === fs.half);
       if (!sampleLane) continue;
       const curO = tlcOrigin(activePlateSet, sampleLane, get);
-      const curF = tlcFront(activePlateSet, sampleLane, get);
+      const curF = tlcHalfFrontBase(activePlateSet, fs.half, sampleLane, get);
       const span = Math.max(20, curF - curO);
       const nextF = Math.round(
         Math.max(sampleLane.length * 0.50, Math.min(sampleLane.length * 0.98, curF + fs.suggestedShiftRf * span))
@@ -3101,19 +3359,24 @@ export const TlcView: React.FC = () => {
             </button>
           )}
 
-          <button type="button" className="btn pri" onClick={() => fileImgRef.current?.click()}>
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => fileImgRef.current?.click()}
+            title="Upload PNG/JPEG photos, Merck TLC Explorer .npy float32 files (uni_linint_corrected_*), or select microadjusted_lane_config.csv together with your images"
+          >
             {hasImages
               ? selectablePlatesCount > 1
-                ? `Add / Replace Plate ${plate + 1} Photos`
-                : 'Add / Replace Plate Photos'
+                ? `Add / Replace Plate ${plate + 1} Photos / .npy`
+                : 'Add / Replace Plate Photos / .npy'
               : selectablePlatesCount > 1
-              ? `Upload Plate ${plate + 1} Photos`
-              : 'Upload Plate Photos'}
+              ? `Upload Plate ${plate + 1} Photos / .npy`
+              : 'Upload Plate Photos / .npy'}
           </button>
           <input
             ref={fileImgRef}
             type="file"
-            accept="image/png,image/jpeg,image/webp"
+            accept="image/png,image/jpeg,image/webp,.npy,.csv"
             multiple
             style={{ display: 'none' }}
             onChange={handleLoadImages}
@@ -3453,6 +3716,36 @@ export const TlcView: React.FC = () => {
                     ? '…' + activePlateSet.imgs[k].name.slice(-18)
                     : activePlateSet.imgs[k].name}
                 </span>
+                {activePlateSet.imgs[k].floatRgb && (
+                  <span
+                    style={{
+                      fontSize: '9px',
+                      fontWeight: 700,
+                      color: '#38bdf8',
+                      background: 'rgba(56, 189, 248, 0.14)',
+                      padding: '0 4px',
+                      borderRadius: '3px',
+                    }}
+                    title="Loaded directly from float32 .npy radiance array (unclipped precision)"
+                  >
+                    .npy
+                  </span>
+                )}
+                {activePlateSet.imgs[k].preFlatFielded && (
+                  <span
+                    style={{
+                      fontSize: '9px',
+                      fontWeight: 700,
+                      color: '#10b981',
+                      background: 'rgba(16, 185, 129, 0.14)',
+                      padding: '0 4px',
+                      borderRadius: '3px',
+                    }}
+                    title="Already lighting-corrected by your lab PC (uni_linint_corrected); duplicate blank-silica correction is skipped automatically"
+                  >
+                    Flat ✓
+                  </span>
+                )}
                 <button
                   type="button"
                   title={`Remove ${TLC_LABEL[k]} photo from Plate ${plate + 1}`}
@@ -3652,13 +3945,48 @@ export const TlcView: React.FC = () => {
             )}
           </div>
 
+          <div style={{ height: '16px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
+
+          {/* Lab PC Pipeline Toggles: Curved-Lane Tracking & Faint White-Spot Boost */}
+          <label
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontSize: '11px' }}
+            title="Follow gently curving or drifting lanes automatically using a smooth centerline spline (from your lab PC's savgol_automiddle method)"
+          >
+            <input
+              type="checkbox"
+              checked={automiddle}
+              onChange={(e) => handleToggleAutomiddle(e.target.checked)}
+            />
+            <span style={{ fontWeight: automiddle ? 700 : 500, color: automiddle ? '#f59e0b' : 'var(--fg)' }}>
+              Follow curved lanes
+            </span>
+          </label>
+
+          {Boolean(activePlateSet.imgs?.White?.bmp) && (
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontSize: '11px' }}
+              title="Subtract white silica background and boost contrast so very pale colored spots on the White-light image pop out clearly"
+            >
+              <input
+                type="checkbox"
+                checked={boostWhiteSpots}
+                onChange={(e) => setBoostWhiteSpots(e.target.checked)}
+              />
+              <span style={{ fontWeight: boostWhiteSpots ? 700 : 500, color: boostWhiteSpots ? '#f59e0b' : 'var(--fg)' }}>
+                Boost faint White spots
+              </span>
+            </label>
+          )}
+
           <button
             type="button"
             className="btn sm"
             onClick={() => {
               setFilters({ brightness: 100, contrast: 100, invert: false });
               setCoreFraction(0.35);
-              invalidateAllPlateCaches();
+              setBoostWhiteSpots(false);
+              if (automiddle) handleToggleAutomiddle(false);
+              else invalidateAllPlateCaches();
             }}
             style={{ marginLeft: 'auto', fontSize: '11px' }}
           >
@@ -4141,6 +4469,9 @@ export const TlcView: React.FC = () => {
             pickGroup={pickGroup}
             onPickGroup={setPickGroup}
             onClearPicks={handleClearPicks}
+            boostWhiteSpots={boostWhiteSpots}
+            onToggleBoostWhiteSpots={setBoostWhiteSpots}
+            automiddleEnabled={automiddle}
           />
         </div>
       ) : (
@@ -4204,6 +4535,7 @@ export const TlcView: React.FC = () => {
                 hasCfg={hasConfig}
                 filters={filters}
                 markSpots={markSpots}
+                boostWhiteSpots={boostWhiteSpots}
                 onOpenModal={(w) => {
                   setInspectWell(w);
                   setPinnedMarkers([]);

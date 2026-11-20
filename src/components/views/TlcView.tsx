@@ -57,6 +57,7 @@ import {
   getTlcPlateSlice,
   updateTlcPlateSlice,
   tlcStorageKey,
+  tlcPreRunStorageKey,
   parseTlcStorageKey,
   tlcSetPlateImageCount,
   tlcSetPlateHasImages,
@@ -566,6 +567,7 @@ export const TlcView: React.FC = () => {
   const fileCsvRef = useRef<HTMLInputElement>(null);
   const fileImgRef = useRef<HTMLInputElement>(null);
   const fileBlankRef = useRef<HTMLInputElement>(null);
+  const filePreRunRef = useRef<HTMLInputElement>(null);
   const bigCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Blank Silica Flat-Field Calibration (persisted once per camera/channel in IndexedDB)
@@ -651,7 +653,13 @@ export const TlcView: React.FC = () => {
     let cancelled = false;
     const restoreCachedImages = async () => {
       let anyLoaded = false;
-      const loadedBySetPlate: Array<{ sIdx: number; pIdx: number; channel: string; entry: TlcImageEntry }> = [];
+      const loadedBySetPlate: Array<{
+        sIdx: number;
+        pIdx: number;
+        channel: string;
+        isPreRun: boolean;
+        entry: TlcImageEntry;
+      }> = [];
 
       for (let sIdx = 0; sIdx < sets.length; sIdx++) {
         const s = sets[sIdx];
@@ -659,9 +667,10 @@ export const TlcView: React.FC = () => {
           const cachedAll = await getAllSetImages(s.uid);
           for (const cached of cachedAll) {
             if (cancelled) return;
-            const { plateIndex: pIdx, channel } = parseTlcStorageKey(cached.key);
+            const { plateIndex: pIdx, channel, isPreRun } = parseTlcStorageKey(cached.key);
             const slice = getTlcPlateSlice(s, pIdx);
-            if (!slice.imgs?.[channel]) {
+            const targetMap = isPreRun ? slice.preRunImgs : slice.imgs;
+            if (!targetMap?.[channel]) {
               try {
                 const entry = await decodeTlcImageBlob(
                   cached.blob,
@@ -673,6 +682,7 @@ export const TlcView: React.FC = () => {
                     sIdx,
                     pIdx,
                     channel,
+                    isPreRun,
                     entry,
                   });
                   anyLoaded = true;
@@ -692,9 +702,11 @@ export const TlcView: React.FC = () => {
           const next = [...prev];
           for (const item of loadedBySetPlate) {
             if (next[item.sIdx]) {
-              next[item.sIdx] = updateTlcPlateSlice(next[item.sIdx], item.pIdx, (slice) => ({
-                imgs: { ...(slice.imgs || {}), [item.channel]: item.entry },
-              }));
+              next[item.sIdx] = updateTlcPlateSlice(next[item.sIdx], item.pIdx, (slice) =>
+                item.isPreRun
+                  ? { preRunImgs: { ...(slice.preRunImgs || {}), [item.channel]: item.entry } }
+                  : { imgs: { ...(slice.imgs || {}), [item.channel]: item.entry } }
+              );
             }
           }
           return next;
@@ -810,6 +822,118 @@ export const TlcView: React.FC = () => {
     setAutomiddleEnabled(enabled);
     setAutomiddle(enabled);
     invalidateAllPlateCaches();
+  };
+
+  // Upload spotted-but-undeveloped pre-run reference photos (UV254, UV366, White) for the active plate.
+  // Used to detect clean un-eluted origin dots and rigidly merge them with the developed plate.
+  const handleLoadPreRunImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files ? Array.from(e.target.files) : [];
+    if (!files.length) return;
+    toast(`Reading Plate ${plate + 1} undeveloped origin reference…`);
+
+    const assigned: TlcChannelKey[] = [];
+    const nextPre: Record<string, TlcImageEntry> = { ...(activePlateSet.preRunImgs || {}) };
+    const usedThisBatch: Record<string, TlcImageEntry> = {};
+
+    for (const f of files) {
+      const detected =
+        tlcKeyOf(f.name, usedThisBatch) ||
+        (fullPlateChannel !== 'composite' ? fullPlateChannel : 'UV254');
+      try {
+        const entry = await decodeTlcImageBlob(f, f.name, detected);
+        if (nextPre[detected]?.bmp?.close) {
+          nextPre[detected].bmp.close();
+        }
+        nextPre[detected] = entry;
+        usedThisBatch[detected] = entry;
+        await putTlcImage(currentSet.uid, tlcPreRunStorageKey(detected, plate), f.name, f);
+        if (!assigned.includes(detected)) assigned.push(detected);
+      } catch (err: any) {
+        toast(`Could not open undeveloped photo ${f.name}: ${err?.message || err}`);
+      }
+    }
+
+    if (assigned.length > 0) {
+      setSets((prev) => {
+        const next = [...prev];
+        if (!next[cur]) return next;
+        next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => ({
+          preRunImgs: nextPre,
+          preRunEnabled: true,
+          preRunAlignment: {},
+          cfg: slice.cfg
+            ? {
+                ...slice.cfg,
+                hasZeroRf: false,
+                lanes: slice.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+              }
+            : slice.cfg,
+          originPx: null,
+          originAuto: {},
+          originAutoByLane: {},
+        }));
+        return next;
+      });
+      toast(
+        `Loaded Plate ${plate + 1} undeveloped origin reference (${assigned.join(', ')}). Merging with developed plate origins automatically.`
+      );
+    }
+    e.target.value = '';
+  };
+
+  const handleClearPreRunImage = async (key?: TlcChannelKey) => {
+    const keysToDelete = key
+      ? [tlcPreRunStorageKey(key, plate)]
+      : TLC_KEYS.map((k) => tlcPreRunStorageKey(k, plate));
+    await deleteTlcSetImages(currentSet.uid, keysToDelete);
+    setSets((prev) => {
+      const next = [...prev];
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        const updatedPre: Record<string, TlcImageEntry> = { ...(slice.preRunImgs || {}) };
+        if (key) {
+          if (updatedPre[key]?.bmp?.close) updatedPre[key].bmp.close();
+          delete updatedPre[key];
+        } else {
+          Object.values(updatedPre).forEach((im) => im?.bmp?.close?.());
+          for (const k of Object.keys(updatedPre)) delete updatedPre[k];
+        }
+        return {
+          preRunImgs: updatedPre,
+          preRunAlignment: {},
+          originAuto: {},
+          originAutoByLane: {},
+        };
+      });
+      return next;
+    });
+    toast(
+      key
+        ? `Removed Plate ${plate + 1} undeveloped ${key} reference (using developed-plate fallback).`
+        : `Cleared Plate ${plate + 1} undeveloped origin references.`
+    );
+  };
+
+  const handleTogglePreRun = (enabled: boolean) => {
+    setSets((prev) => {
+      const next = [...prev];
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => ({
+        preRunEnabled: enabled,
+        preRunAlignment: {},
+        cfg: slice.cfg
+          ? {
+              ...slice.cfg,
+              hasZeroRf: false,
+              lanes: slice.cfg.lanes.map((l) => ({ ...l, zeroRf: null })),
+            }
+          : slice.cfg,
+        originPx: null,
+        originAuto: {},
+        originAutoByLane: {},
+      }));
+      return next;
+    });
   };
 
   // Load Lane Config CSV (scoped to active plate)
@@ -1043,9 +1167,12 @@ export const TlcView: React.FC = () => {
       const frameW = activePlateSet.frameW || LANE_FRAME_WIDTH;
       let cfg = laneConfigFromDetection(best.det, frameW);
 
-      // When multiple channels are loaded, let multi-channel + composite tlcOrigin refine the
-      // origin line across all loaded channels for any half where it succeeds cleanly.
-      if (keys.length >= 2) {
+      // When multiple channels OR pre-run undeveloped photos are loaded, let multi-channel + composite
+      // (and pre-run merged) tlcOrigin refine the origin line across all loaded channels.
+      const hasActivePreRun =
+        activePlateSet.preRunEnabled !== false &&
+        TLC_KEYS.some((k) => Boolean(activePlateSet.preRunImgs?.[k]?.bmp || activePlateSet.preRunImgs?.[k]?.floatRgb));
+      if (keys.length >= 2 || hasActivePreRun) {
         const probeCfg = { ...cfg, lanes: cfg.lanes.map((l) => ({ ...l, zeroRf: null })) };
         const probeSet: TlcSet = {
           ...activePlateSet,
@@ -3944,6 +4071,90 @@ export const TlcView: React.FC = () => {
               </>
             )}
           </div>
+
+          <div style={{ height: '16px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
+
+          {/* Per-Plate Spotted Undeveloped Reference (exact origin registration merged with developed plate) */}
+          {(() => {
+            const loadedPreKeys = TLC_KEYS.filter((k) =>
+              Boolean(activePlateSet.preRunImgs?.[k]?.bmp || activePlateSet.preRunImgs?.[k]?.floatRgb)
+            );
+            const preOn = activePlateSet.preRunEnabled !== false;
+            const align0 = activePlateSet.preRunAlignment?.[0];
+            const align1 = activePlateSet.preRunAlignment?.[1];
+            const alignSummary = [align0, align1]
+              .map((a, idx) =>
+                a
+                  ? `${idx === 0 ? 'Lower' : 'Upper'}: ${a.dyPx >= 0 ? '+' : ''}${a.dyPx} px shift (${a.matchedAnchors} anchors)`
+                  : null
+              )
+              .filter(Boolean)
+              .join(' · ');
+            return (
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => filePreRunRef.current?.click()}
+                  title={`Upload spotted-but-undeveloped pre-run photos (UV254, UV366, White) for Plate ${plate + 1}. Origins are detected cleanly before elution and rigidly aligned with your developed plate.`}
+                  style={{ fontSize: '11px' }}
+                >
+                  Undeveloped Origin Ref
+                </button>
+                <input
+                  ref={filePreRunRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,.npy"
+                  multiple
+                  style={{ display: 'none' }}
+                  onChange={handleLoadPreRunImages}
+                />
+                {loadedPreKeys.length > 0 && (
+                  <>
+                    <label
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '11px' }}
+                      title={alignSummary || 'Toggle merging undeveloped pre-run origins with the developed plate'}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={preOn}
+                        onChange={(e) => handleTogglePreRun(e.target.checked)}
+                      />
+                      <span style={{ color: preOn ? '#f59e0b' : 'var(--mut)', fontWeight: 600 }}>
+                        Active
+                      </span>
+                    </label>
+                    {loadedPreKeys.map((k) => (
+                      <span
+                        key={k}
+                        className="chip"
+                        style={{
+                          fontSize: '10px',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                          padding: '1px 6px',
+                          background: preOn ? 'rgba(245, 158, 11, 0.14)' : 'var(--panel)',
+                          borderColor: preOn ? 'rgba(245, 158, 11, 0.45)' : 'var(--line)',
+                        }}
+                        title={`Plate ${plate + 1} undeveloped ${k} reference: ${activePlateSet.preRunImgs?.[k]?.name || k}${alignSummary ? ' — ' + alignSummary : ''}`}
+                      >
+                        <span>{k}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleClearPreRunImage(k)}
+                          style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--mut)', padding: 0, fontSize: '11px' }}
+                          title={`Remove Plate ${plate + 1} undeveloped ${k} reference`}
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    ))}
+                  </>
+                )}
+              </div>
+            );
+          })()}
 
           <div style={{ height: '16px', width: '1px', background: 'var(--line)', margin: '0 4px' }} />
 

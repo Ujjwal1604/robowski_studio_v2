@@ -6,6 +6,7 @@ import { wellLabel } from '../tlcLanes';
 import { RunResult, RunState } from '../../types';
 import {
   CORE_ELUENT_SPECS,
+  MODIFIER_SPECS,
   MixturePhysicalDescriptors,
   composeSolventSystem,
   generateExtendedDynamicSpecs,
@@ -207,6 +208,8 @@ export interface RecommendedPlateSolvent {
   lanes: SimulatedWellLane[];
   /** Et₃N <-> NH₃/MeOH swap that resolves (almost) the same wells: use whichever base you have at hand */
   alternatives?: TlcSolventSystemDef[];
+  /** why the alternative is offered when it is more than a swap (e.g. fewer streak warnings) */
+  alternativeNote?: string;
 }
 
 export interface PlateSolventGroup {
@@ -422,6 +425,8 @@ export interface PlateSolventPlanOptions {
   includeSpeculative?: boolean;
   /** weight of Low-confidence products relative to High/Medium (0..1, default 0.2); only matters when they are included */
   lowTierWeight?: number;
+  /** weight of the clean-spot coverage term in eluent selection (default 0.10; 0 disables) */
+  cleanSpotWeight?: number;
   calibration?: TlcCalibrationModel;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
@@ -2365,6 +2370,42 @@ export async function optimizePlateTlcSolvents(
     return activeWells.map((w) => sysMap.get(w.wellIndex)!.prodReadability);
   });
 
+  // Clean-spot coverage (goal 3): a spot is "clean" in an eluent when it is not predicted to tail or streak
+  // and sits in the usable window. Each chosen set should give every spot at least one clean eluent.
+  // Only spots that can run clean in SOME candidate count, so inherently streaking species do not skew the search.
+  const CLEAN_SPOT_CAP = 30;
+  const CLEAN_SPOT_WEIGHT = options.cleanSpotWeight ?? 0.10;
+  const cleanMask: Int32Array[] = searchPool.map((sys) => {
+    const sysMap = evalMatrix.get(sys.id)!;
+    const arr = new Int32Array(numActive);
+    for (let wi = 0; wi < numActive; wi++) {
+      const spots = sysMap.get(activeWells[wi].wellIndex)!.spots || [];
+      let m = 0;
+      for (let i = 0; i < spots.length && i < CLEAN_SPOT_CAP; i++) {
+        const sp = spots[i];
+        const counted = sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium';
+        if (!counted) continue;
+        const flagged = sp.tailing || (sp.mildStreak && Boolean(sp.tailingReason));
+        if (!flagged && sp.rf >= 0.06 && sp.rf <= 0.94) m |= 1 << i;
+      }
+      arr[wi] = m;
+    }
+    return arr;
+  });
+  const countedSpotCount = new Int32Array(numActive);
+  if (searchPool.length > 0) {
+    const first = evalMatrix.get(searchPool[0].id)!;
+    for (let wi = 0; wi < numActive; wi++) {
+      const spots = first.get(activeWells[wi].wellIndex)!.spots || [];
+      let n = 0;
+      for (let i = 0; i < spots.length && i < CLEAN_SPOT_CAP; i++) {
+        const sp = spots[i];
+        if (sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium') n++;
+      }
+      countedSpotCount[wi] = n;
+    }
+  }
+
   const famIndexMap = new Map<string, number>();
   const bandIndexMap = new Map<string, number>();
   const famBit = new Int32Array(poolLen);
@@ -2430,6 +2471,18 @@ export async function optimizePlateTlcSolvents(
 
   // Best combination of effK systems from the pool using cross-plate SM + product species set coverage,
   // skipping any system index in `excluded`.
+  const achievableClean = new Int32Array(numActive);
+  for (let wi = 0; wi < numActive; wi++) {
+    let m = 0;
+    for (let si = 0; si < poolLen; si++) m |= cleanMask[si][wi];
+    achievableClean[wi] = popCount(m);
+  }
+  const cleanCountForPoolIdx = (idxs: number[], wi: number): number => {
+    let m = 0;
+    for (const si of idxs) m |= cleanMask[si][wi];
+    return popCount(m);
+  };
+
   const searchBestCombo = async (excluded: Set<number>): Promise<{ combo: number[]; objective: number }> => {
     let bestComboIdx: number[] = [];
     let bestObjective = -1e9;
@@ -2519,6 +2572,17 @@ export async function optimizePlateTlcSolvents(
         if (wellJointScore > 0) weightedSum += importanceArr[wi] * wellJointScore;
       }
 
+      if (CLEAN_SPOT_WEIGHT > 0) {
+        let cleanSum = 0;
+        for (let wi = 0; wi < numActive; wi++) {
+          cleanSum +=
+            achievableClean[wi] > 0
+              ? (importanceArr[wi] * cleanCountForPoolIdx(combo, wi)) / achievableClean[wi]
+              : importanceArr[wi];
+        }
+        weightedSum += CLEAN_SPOT_WEIGHT * cleanSum;
+      }
+
       let activeSystemsUsed = 0;
       let famMask = 0;
       let bandMask = 0;
@@ -2590,13 +2654,26 @@ export async function optimizePlateTlcSolvents(
   const minUniqueGain = activeWells.length <= 2 ? 1 : Math.max(2, Math.ceil(activeWells.length * 0.05));
   let droppedForSmallGain = 0;
   while (chosenSystems.length > 1) {
-    const full = resolvedCountFor(chosenSystems);
+    const withAllIdx = chosenSystems.map((c) => searchPool.indexOf(c));
+    const hasCleanIdx = CLEAN_SPOT_WEIGHT > 0 && withAllIdx.every((x) => x >= 0);
     let weakest = -1;
     let weakestLoss = Infinity;
     let weakestMean = Infinity;
     for (let i = 0; i < chosenSystems.length; i++) {
       const sys = chosenSystems[i];
-      const loss = full - resolvedCountFor(chosenSystems.filter((_, j) => j !== i));
+      const reduced = chosenSystems.filter((_, j) => j !== i);
+      const withoutIdx = hasCleanIdx ? withAllIdx.filter((_, j) => j !== i) : [];
+      // Count distinct wells that lose resolution OR lose clean-spot coverage when removing this eluent
+      // (avoiding double-counting a single well that loses both).
+      let loss = 0;
+      for (let wi = 0; wi < numActive; wi++) {
+        const lostResolved =
+          evaluateSystemsOnWell(chosenSystems, wi) >= RESOLVED_SCORE &&
+          evaluateSystemsOnWell(reduced, wi) < RESOLVED_SCORE;
+        const lostClean =
+          hasCleanIdx && cleanCountForPoolIdx(withoutIdx, wi) < cleanCountForPoolIdx(withAllIdx, wi);
+        if (lostResolved || lostClean) loss++;
+      }
       const sMap = evalMatrix.get(sys.id)!;
       let scSum = 0;
       for (const w of activeWells) scSum += sMap.get(w.wellIndex)!.score;
@@ -2656,27 +2733,48 @@ export async function optimizePlateTlcSolvents(
     })
     .map((entry, idx) => ({ ...entry, rank: idx + 1 }));
 
-  // "Either/or": an Et3N eluent and an NH3/MeOH eluent that resolve (nearly) the same wells are interchangeable.
+  // "Either/or": an Et3N eluent and an NH3/MeOH eluent that resolve (nearly) the same wells are interchangeable,
+  // or a higher-capacity rung of the same base when the recommended eluent has streak warnings.
   const baseKind = (sys: TlcSolventSystemDef): 'et3n' | 'nh3' | null =>
     sys.baseModifier?.includes('Et₃N') ? 'et3n' : sys.baseModifier?.includes('NH₃') ? 'nh3' : null;
   const recIds = new Set(recommendedSystems.map((r) => r.system.id));
+  const modCapacity = (sys: TlcSolventSystemDef): number => {
+    const id = sys.composition?.modifierId;
+    return id && MODIFIER_SPECS[id] ? MODIFIER_SPECS[id].neutralizingCapacity ?? 0 : 0;
+  };
+  const wellFlagged = (sysId: string, wi: number): boolean =>
+    (evalMatrix.get(sysId)!.get(wi)!.spots || []).some(
+      (sp) => sp.tailing || (sp.mildStreak && Boolean(sp.tailingReason))
+    );
   for (const rec of recommendedSystems) {
     const kind = baseKind(rec.system);
     if (!kind || rec.assignedWellIndices.length === 0) continue;
     const need = Math.ceil(rec.assignedWellIndices.length * 0.9);
+    const recFlagged = rec.assignedWellIndices.filter((wi) => wellFlagged(rec.system.id, wi)).length;
+    const recCap = modCapacity(rec.system);
     const alts = allCandidateSystems
       .filter((c) => c.stationaryPhase === rec.system.stationaryPhase && !recIds.has(c.id))
-      .filter((c) => {
-        const k = baseKind(c);
-        return k !== null && k !== kind;
-      })
       .map((c) => {
+        const k = baseKind(c);
+        if (k === null) return null;
+        const flagged = rec.assignedWellIndices.filter((wi) => wellFlagged(c.id, wi)).length;
+        // other base (Et3N <-> NH3), or the same base with headroom: a higher-capacity rung that streaks less
+        const crossKind = k !== kind;
+        const upgrade = !crossKind && modCapacity(c) > recCap && recFlagged > 0 && flagged < recFlagged;
+        if (!crossKind && !upgrade) return null;
         const ok = rec.assignedWellIndices.filter((wi) => evalMatrix.get(c.id)!.get(wi)!.score >= RESOLVED_SCORE).length;
-        return { c, ok };
+        return { c, ok, flagged, upgrade };
       })
-      .filter((x) => x.ok >= need)
-      .sort((a, b) => b.ok - a.ok);
-    if (alts.length > 0) rec.alternatives = alts.slice(0, 1).map((x) => x.c);
+      .filter((x): x is { c: TlcSolventSystemDef; ok: number; flagged: number; upgrade: boolean } => !!x && x.ok >= need)
+      .sort((a, b) => a.flagged - b.flagged || b.ok - a.ok);
+    if (alts.length > 0) {
+      const best = alts[0];
+      rec.alternatives = [best.c];
+      if (best.upgrade || best.flagged < recFlagged) {
+        const reasonSuffix = modCapacity(best.c) > recCap ? ' (more base capacity)' : '';
+        rec.alternativeNote = `${best.c.name} resolves the same wells with ${best.flagged} streak warning${best.flagged === 1 ? '' : 's'} instead of ${recFlagged}${reasonSuffix}.`;
+      }
+    }
   }
 
   // Expose every core system in this stationary phase plus high-performing dynamic candidates for plate inspection
@@ -2756,6 +2854,25 @@ export async function optimizePlateTlcSolvents(
     summaryNotes.push(
       `${recommendedSystems.length} eluent${recommendedSystems.length > 1 ? 's are' : ' is'} enough: ${droppedForSmallGain} more would each rescue fewer than ${minUniqueGain} extra wells.`
     );
+  }
+  {
+    const finalIdx = chosenSystems.map((c) => searchPool.indexOf(c)).filter((x) => x >= 0);
+    let lostClean = 0;
+    let alwaysStreaking = 0;
+    for (let wi = 0; wi < numActive; wi++) {
+      if (cleanCountForPoolIdx(finalIdx, wi) < achievableClean[wi]) lostClean++;
+      if (achievableClean[wi] < countedSpotCount[wi]) alwaysStreaking++;
+    }
+    if (lostClean > 0) {
+      summaryNotes.push(
+        `${lostClean} well${lostClean > 1 ? 's have' : ' has'} a spot that would run clean in another candidate eluent but streaks in every chosen one — check the OR alternatives or the modifier.`
+      );
+    }
+    if (alwaysStreaking > 0) {
+      summaryNotes.push(
+        `${alwaysStreaking} well${alwaysStreaking > 1 ? 's have' : ' has'} spots predicted to streak in every eluent tried (charged or poly-functional species); expect smears whatever you pick.`
+      );
+    }
   }
   if (unresolvedWellIndices.length > 0) {
     summaryNotes.push(

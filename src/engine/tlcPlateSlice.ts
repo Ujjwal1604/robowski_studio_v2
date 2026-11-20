@@ -13,6 +13,8 @@ export function emptyTlcPlateData(frameW: number = LANE_FRAME_WIDTH): TlcPlateDa
     originPx: null,
     originAuto: {},
     imgs: {},
+    preRunImgs: {},
+    preRunEnabled: true,
   };
 }
 
@@ -26,12 +28,30 @@ export function tlcStorageKey(channel: string, plateIndex: number = 0): string {
   return p === 0 ? channel : `p${p}_${channel}`;
 }
 
-export function parseTlcStorageKey(storageKey: string): { plateIndex: number; channel: string } {
-  const m = /^p(\d+)_(.+)$/.exec(String(storageKey || ''));
-  if (m) {
-    return { plateIndex: parseInt(m[1], 10), channel: m[2] };
+export function tlcPreRunStorageKey(channel: string, plateIndex: number = 0): string {
+  const p = Math.max(0, Math.floor(plateIndex || 0));
+  return p === 0 ? `pre_${channel}` : `p${p}_pre_${channel}`;
+}
+
+export function parseTlcStorageKey(storageKey: string): {
+  plateIndex: number;
+  channel: string;
+  isPreRun: boolean;
+} {
+  const raw = String(storageKey || '');
+  const mp = /^p(\d+)_pre_(.+)$/.exec(raw);
+  if (mp) {
+    return { plateIndex: parseInt(mp[1], 10), channel: mp[2], isPreRun: true };
   }
-  return { plateIndex: 0, channel: storageKey };
+  const p0Pre = /^pre_(.+)$/.exec(raw);
+  if (p0Pre) {
+    return { plateIndex: 0, channel: p0Pre[1], isPreRun: true };
+  }
+  const m = /^p(\d+)_(.+)$/.exec(raw);
+  if (m) {
+    return { plateIndex: parseInt(m[1], 10), channel: m[2], isPreRun: false };
+  }
+  return { plateIndex: 0, channel: raw, isPreRun: false };
 }
 
 /**
@@ -114,12 +134,18 @@ export function getAllTlcImageKeysForSet(set: TlcSet): string[] {
   for (const ch of Object.keys(set.imgs || {})) {
     keys.push(tlcStorageKey(ch, 0));
   }
+  for (const ch of Object.keys(set.preRunImgs || {})) {
+    keys.push(tlcPreRunStorageKey(ch, 0));
+  }
   if (set.plateData) {
     for (const [pStr, pd] of Object.entries(set.plateData)) {
       const p = Number(pStr);
-      if (!Number.isFinite(p) || p <= 0 || !pd?.imgs) continue;
-      for (const ch of Object.keys(pd.imgs)) {
+      if (!Number.isFinite(p) || p <= 0 || !pd) continue;
+      for (const ch of Object.keys(pd.imgs || {})) {
         keys.push(tlcStorageKey(ch, p));
+      }
+      for (const ch of Object.keys(pd.preRunImgs || {})) {
+        keys.push(tlcPreRunStorageKey(ch, p));
       }
     }
   }
@@ -146,6 +172,11 @@ function serializePlateData(pd: TlcPlateData, defaultProminence?: number) {
       key: k,
       name: im.name,
     })),
+    preRunEnabled: pd.preRunEnabled !== false,
+    preRunImgMeta: Object.entries(pd.preRunImgs || {}).map(([k, im]) => ({
+      key: k,
+      name: im.name,
+    })),
   };
 }
 
@@ -166,6 +197,8 @@ function deserializePlateData(raw: any): TlcPlateData {
     edgeSettings: raw?.edgeSettings || {},
     spotProminence: raw?.spotProminence,
     imgs: {},
+    preRunImgs: {},
+    preRunEnabled: raw?.preRunEnabled !== false,
     prof: {},
   };
 }

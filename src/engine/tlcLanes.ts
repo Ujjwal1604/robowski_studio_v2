@@ -8,6 +8,8 @@ import {
   TlcProfileOptions,
   TlcDensitogramData,
   TlcSet,
+  TlcImageEntry,
+  TlcPreRunAlignment,
   ProfileHistogramStats,
   Lane2dMetrics,
 } from '../types';
@@ -510,9 +512,14 @@ export function extractLaneProfile2d(
     }
   }
 
-  // Optional curved-lane centerline tracking (savgol_automiddle) on real lanes (never on gutters)
+  const isPreRunProbe = Boolean((set as any)._isPreRunProbe);
+  // Undeveloped plates have compact circular spots with zero elution bleed: use a wider core
+  // fraction (60%) so ±1–2 mm horizontal box-placement error still captures every dot cleanly.
+  const effCore = isPreRunProbe ? Math.max(coreFraction, 0.60) : coreFraction;
+
+  // Optional curved-lane centerline tracking (savgol_automiddle) on real developed lanes (never on gutters or pre-run probes)
   let centerOffsets: Float32Array | undefined;
-  if (automiddleEnabled && lane.id < 1000 && W >= 7 && L >= 24) {
+  if (automiddleEnabled && !isPreRunProbe && lane.id < 1000 && W >= 7 && L >= 24) {
     // Copy primary strip before optionally reading UV366 on the shared scratch canvas
     const primaryCopy = stripRgba instanceof Float32Array ? stripRgba : new Uint8ClampedArray(stripRgba);
     let uv366Strip: Float32Array | Uint8ClampedArray | undefined;
@@ -538,7 +545,7 @@ export function extractLaneProfile2d(
     W,
     L,
     key,
-    coreFraction,
+    effCore,
     lane.id >= 1000,
     centerOffsets
   );
@@ -2444,9 +2451,16 @@ function autoCacheSignature(set: TlcSet): string {
     .map(([k, im]) => `${k}:${im.name}`)
     .sort()
     .join(';');
+  const preEnabled = set.preRunEnabled !== false;
+  const preSig = preEnabled
+    ? Object.entries(set.preRunImgs || {})
+        .map(([k, im]) => `${k}:${im?.name || ''}`)
+        .sort()
+        .join(';')
+    : 'off';
   const l0 = set.cfg?.lanes[0];
   const laneSig = set.cfg ? `${set.cfg.lanes.length}_${l0?.x0 ?? 0}_${l0?.y0 ?? 0}_${l0?.length ?? 0}` : 'none';
-  return `${imgSig}|${laneSig}|${getBlankSilicaSignature()}`;
+  return `${imgSig}|pre:${preSig}|${laneSig}|${getBlankSilicaSignature()}`;
 }
 
 function detectDiffuseChannelFront(
@@ -3453,7 +3467,7 @@ function detectOriginNearDetailed(
     if (
       refRes.backEdge50 <= refPos - 2 &&
       sigAtRef >= 0.62 * refRes.coreMax &&
-      (refRes.coreMax < 70 || fwdShift > 7)
+      refRes.coreMax < 70
     ) {
       return empty;
     }
@@ -3947,7 +3961,411 @@ function buildCompositeOriginEntries(
   return { entries: outEntries, hist: compHist };
 }
 
-// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override -> multi-channel + composite joint origin peak -> fallback ~10% lane length
+interface MultiChannelOriginSolveResult {
+  best: ChannelOriginResult;
+  frame: OriginPlateFrame;
+}
+
+function solveMultiChannelHalfOrigin(
+  set: TlcSet,
+  halfLanes: TlcLane[],
+  laneLen: number,
+  channels: TlcChannelKey[],
+  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): MultiChannelOriginSolveResult {
+  let best: ChannelOriginResult = { pos: 0, score: 0 };
+  let bestClipped = false;
+  let bestSourceId: string | null = null;
+
+  interface OriginSourceData {
+    id: string;
+    sign: number;
+    entries: OriginLaneEntry[];
+    entriesById: Map<number, OriginLaneEntry>;
+    hist: ProfileHistogramStats;
+    clipped: boolean;
+    isComposite: boolean;
+    res: ChannelOriginResult;
+  }
+
+  const perSourceData: OriginSourceData[] = [];
+  const singleUnclippedForComp: Array<{
+    ch: TlcChannelKey;
+    sign: number;
+    entriesById: Map<number, OriginLaneEntry>;
+    hist: ProfileHistogramStats;
+  }> = [];
+
+  const considerCandidate = (src: OriginSourceData) => {
+    const res = src.res;
+    if (res.pos <= 10) return;
+    const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
+    if (!bestSolid) {
+      if (res.score > best.score) {
+        best = res;
+        bestClipped = src.clipped;
+        bestSourceId = src.id;
+      }
+    } else if (
+      (bestClipped && !src.clipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
+      ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
+        (src.isComposite || (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1) &&
+        res.score >= (src.isComposite ? best.score * 0.85 : best.score * 1.25))
+    ) {
+      best = res;
+      bestClipped = src.clipped;
+      bestSourceId = src.id;
+    }
+  };
+
+  for (const ch of channels) {
+    const chSign = TLC_SIGNAL[ch]?.sign ?? -1;
+    const entries: OriginLaneEntry[] = halfLanes
+      .map((l) => ({
+        laneId: l.id,
+        profile: getProfile(set, ch, l),
+        lane: l,
+        metrics: getCachedLane2dMetrics(set, ch, l),
+      }))
+      .filter((e) => e.profile.length > 0);
+    if (!entries.length) continue;
+    const chHist =
+      getChannelHistogram(set, ch, getProfile) ??
+      analyzeProfileHistogram(entries.map((e) => e.profile), chSign, 0.06, 0.90);
+    const resClipped = chSign < 0 ? chHist.clipHighFrac > 0.25 : chHist.clipLowFrac > 0.25;
+    const res = detectChannelOrigin(entries, chSign, laneLen, chHist);
+    const entriesById = new Map<number, OriginLaneEntry>(entries.map((e) => [e.laneId, e]));
+    const src: OriginSourceData = {
+      id: ch,
+      sign: chSign,
+      entries,
+      entriesById,
+      hist: chHist,
+      clipped: resClipped,
+      isComposite: false,
+      res,
+    };
+    perSourceData.push(src);
+    considerCandidate(src);
+    if (!resClipped) {
+      singleUnclippedForComp.push({ ch, sign: chSign, entriesById, hist: chHist });
+    }
+  }
+
+  // Build and evaluate multi-channel composite origin views (all unclipped channels, plus UV-only
+  // when UV254 + UV366 + White are all loaded) so split-channel plates & faint multi-channel dots
+  // are detected just like the composite solvent front.
+  const compositeGroups: Array<{ id: string; group: typeof singleUnclippedForComp }> = [];
+  if (singleUnclippedForComp.length >= 2) {
+    compositeGroups.push({ id: 'CompositeAll', group: singleUnclippedForComp });
+    const uvOnly = singleUnclippedForComp.filter((c) => c.ch === 'UV254' || c.ch === 'UV366');
+    if (singleUnclippedForComp.length >= 3 && uvOnly.length === 2) {
+      compositeGroups.push({ id: 'CompositeUV', group: uvOnly });
+    }
+  }
+  for (const cg of compositeGroups) {
+    const built = buildCompositeOriginEntries(halfLanes, cg.group);
+    if (!built) continue;
+    const res = detectChannelOrigin(built.entries, 1, laneLen, built.hist);
+    const src: OriginSourceData = {
+      id: cg.id,
+      sign: 1,
+      entries: built.entries,
+      entriesById: new Map(built.entries.map((e) => [e.laneId, e])),
+      hist: built.hist,
+      clipped: false,
+      isComposite: true,
+      res,
+    };
+    perSourceData.push(src);
+    considerCandidate(src);
+  }
+
+  const fallbackEntries: OriginLaneEntry[] = halfLanes.map((l) => ({
+    laneId: l.id,
+    profile: [],
+    lane: l,
+  }));
+  const primarySrc = perSourceData.find((s) => s.id === bestSourceId) ?? perSourceData[0];
+  const frame = buildOriginPlateFrame(primarySrc?.entries?.length ? primarySrc.entries : fallbackEntries, laneLen);
+
+  // Multi-channel & composite joint origin refinement (in physical plate-space!):
+  // 1. Rescue UV-silent lanes from any agreeing unclipped secondary channel or composite.
+  // 2. If a lane is heavily tailing on the primary channel, upgrade it if another unclipped
+  //    channel shows a clean, non-tailing origin dot near the same position.
+  // 3. Refit the smooth physical plate-space baseline across clean locked anchors so all blank
+  //    lanes stay aligned on one smooth curve even when lane.y0 varies in a microadjusted CSV.
+  if (best.pos > 10 && best.byLane && perSourceData.length > 1) {
+    const agreeTol = Math.max(16, Math.round(laneLen * 0.035));
+    const localRadius = Math.max(12, Math.round(laneLen * 0.016));
+    const locked = new Set<number>(best.lockedLanes || []);
+    const tailingSet = new Set<number>(best.tailingLanes || []);
+    const fusedByLane: Record<number, number> = { ...best.byLane };
+
+    const secondarySources = perSourceData.filter(
+      (c) =>
+        c.id !== bestSourceId &&
+        !c.clipped &&
+        (c.res.pos <= 10 || Math.abs(c.res.pos - best.pos) <= agreeTol)
+    );
+
+    let updatedAny = false;
+    for (const l of halfLanes) {
+      const refPos = fusedByLane[l.id] ?? Math.round(frame.toLanePos(l.id, best.pos));
+      const isLocked = locked.has(l.id);
+      const isTailing = tailingSet.has(l.id);
+
+      if (isLocked && !isTailing) continue;
+
+      for (const sec of secondarySources) {
+        const secTailing = sec.res.tailingLanes?.includes(l.id) ?? false;
+        // If the secondary channel/composite already locked this lane cleanly right on refPos:
+        if (sec.res.lockedLanes?.includes(l.id) && sec.res.byLane?.[l.id]) {
+          const secPos = sec.res.byLane[l.id];
+          if (Math.abs(secPos - refPos) <= 3 && (!isLocked || !secTailing)) {
+            fusedByLane[l.id] = secPos;
+            locked.add(l.id);
+            if (!secTailing) tailingSet.delete(l.id);
+            updatedAny = true;
+            break;
+          }
+        }
+        // Otherwise probe strictly around refPos on the secondary source with blank-safe & halo-safe floors
+        const entry = sec.entriesById.get(l.id);
+        if (!entry) continue;
+        const secFeatFloor =
+          sec.hist.sampleCount >= 16
+            ? Math.min(26.0, Math.max(16.0, 5.0 * sec.hist.bgSigma, 0.16 * sec.hist.contrastSpan))
+            : 18.0;
+        const secBiFloor = Math.min(15.0, Math.max(9.0, 0.55 * secFeatFloor));
+        const near = detectOriginNearDetailed(
+          entry.profile,
+          sec.sign,
+          refPos,
+          localRadius,
+          secFeatFloor,
+          6.5,
+          secBiFloor,
+          {
+            metrics: entry.metrics,
+            laneWidthPx: l.width,
+          }
+        );
+        if (near.pos > 0 && (!isLocked || !near.isTailing)) {
+          fusedByLane[l.id] = near.pos;
+          locked.add(l.id);
+          if (!near.isTailing) tailingSet.delete(l.id);
+          updatedAny = true;
+          break;
+        }
+      }
+    }
+
+    if (updatedAny && locked.size >= 4) {
+      const cleanIds = Array.from(locked).filter((id) => !tailingSet.has(id));
+      const fitIds = cleanIds.length >= 4 ? cleanIds : Array.from(locked);
+      const lockedPts = fitIds.map((id) => ({
+        laneId: id,
+        pos: frame.toPlatePos(id, fusedByLane[id]),
+      }));
+      const jointBackbonePlate = fitOriginQuadCurve(
+        lockedPts,
+        best.pos,
+        laneLen,
+        frame.uByLane,
+        frame.allLaneIds
+      );
+      if (jointBackbonePlate) {
+        for (const l of halfLanes) {
+          if (!locked.has(l.id) && jointBackbonePlate[l.id] != null) {
+            fusedByLane[l.id] = Math.round(frame.toLanePos(l.id, jointBackbonePlate[l.id]));
+          }
+        }
+      }
+    }
+    best = {
+      ...best,
+      byLane: fusedByLane,
+      lockedLanes: Array.from(locked),
+      tailingLanes: Array.from(tailingSet),
+      validFrac: halfLanes.length > 0 ? locked.size / halfLanes.length : best.validFrac,
+    };
+  }
+
+  return { best, frame };
+}
+
+/**
+ * Rigidly registers an undeveloped (pre-run) plate's clean origin row onto the developed plate
+ * (handling small box-corner placement shift + tiny rotation via matched un-eluted anchor dots)
+ * and merges per-lane origins so eluted, blank, faint-halo, and smearing lanes inherit their exact
+ * pre-run spotting coordinates while clean developed dots contribute sub-pixel agreement.
+ */
+export function mergePreRunWithDevelopedOrigin(
+  devRes: ChannelOriginResult,
+  preRes: ChannelOriginResult,
+  halfLanes: TlcLane[],
+  laneLen: number,
+  frame?: OriginPlateFrame
+): { res: ChannelOriginResult; alignment: TlcPreRunAlignment } {
+  const effFrame =
+    frame ??
+    buildOriginPlateFrame(
+      halfLanes.map((l) => ({ laneId: l.id, profile: [], lane: l })),
+      laneLen
+    );
+
+  const preLocked = new Set<number>(preRes.lockedLanes || []);
+  const devLocked = new Set<number>(devRes.lockedLanes || []);
+  const devTailing = new Set<number>(devRes.tailingLanes || []);
+  const maxBoxShift = Math.max(55, Math.round(laneLen * 0.09)); // ±9% (~9 mm) box-corner tolerance
+
+  // Collect clean matched anchor pairs (un-smeared dots detected on BOTH pre-run & developed photos)
+  const anchors: Array<{ id: number; u: number; delta: number }> = [];
+  if (devRes.pos > 10 && devRes.byLane && preRes.byLane) {
+    for (const l of halfLanes) {
+      if (!preLocked.has(l.id) || !devLocked.has(l.id) || devTailing.has(l.id)) continue;
+      const preLanePos = preRes.byLane[l.id];
+      const devLanePos = devRes.byLane[l.id];
+      if (preLanePos == null || devLanePos == null) continue;
+      const delta = effFrame.toPlatePos(l.id, devLanePos) - effFrame.toPlatePos(l.id, preLanePos);
+      if (Math.abs(delta) <= maxBoxShift) {
+        anchors.push({ id: l.id, u: effFrame.uByLane.get(l.id) ?? 0, delta });
+      }
+    }
+  }
+
+  let shiftA = 0;
+  let tiltB = 0;
+  let matchedAnchors = anchors.length;
+  let residualPx = 0;
+  let mode: 'rigid-merged' | 'direct-box' = 'direct-box';
+
+  const maxTiltB = Math.max(18, Math.round(laneLen * 0.03)); // max ~1.8° placement tilt across plate
+
+  if (anchors.length >= 4) {
+    mode = 'rigid-merged';
+    const deltas = anchors.map((a) => a.delta).sort((x, y) => x - y);
+    const medDelta = deltas[deltas.length >> 1];
+    const inlierTol = Math.max(maxTiltB + 6, Math.round(laneLen * 0.032));
+    let inliers = anchors.filter((a) => Math.abs(a.delta - medDelta) <= inlierTol);
+    if (inliers.length < 3) inliers = anchors;
+
+    const fitLine = (pts: typeof anchors): { a: number; b: number } => {
+      let n = pts.length;
+      let su = 0;
+      let sd = 0;
+      let suu = 0;
+      let sud = 0;
+      for (const p of pts) {
+        su += p.u;
+        sd += p.delta;
+        suu += p.u * p.u;
+        sud += p.u * p.delta;
+      }
+      const denom = n * suu - su * su;
+      if (denom < 1e-4) return { a: sd / Math.max(1, n), b: 0 };
+      const bRaw = (n * sud - su * sd) / denom;
+      const b = Math.max(-maxTiltB, Math.min(maxTiltB, bRaw));
+      const a = (sd - b * su) / n;
+      return { a, b };
+    };
+
+    let { a, b } = fitLine(inliers);
+    // One robust IRLS trim pass to reject any single drifted developed dot
+    const res1 = inliers.map((p) => Math.abs(p.delta - (a + b * p.u))).sort((x, y) => x - y);
+    const mad1 = res1[res1.length >> 1] ?? 0;
+    const trimThr = Math.max(4.0, 2.2 * mad1);
+    const trimmed = inliers.filter((p) => Math.abs(p.delta - (a + b * p.u)) <= trimThr);
+    if (trimmed.length >= 3) {
+      ({ a, b } = fitLine(trimmed));
+      inliers = trimmed;
+    }
+    shiftA = Math.max(-maxBoxShift, Math.min(maxBoxShift, a));
+    tiltB = b;
+    matchedAnchors = inliers.length;
+    const finalRes = inliers.map((p) => Math.abs(p.delta - (shiftA + tiltB * p.u))).sort((x, y) => x - y);
+    residualPx = finalRes[finalRes.length >> 1] ?? 0;
+  } else if (anchors.length >= 2) {
+    mode = 'rigid-merged';
+    const deltas = anchors.map((a) => a.delta).sort((x, y) => x - y);
+    shiftA = deltas[deltas.length >> 1];
+    tiltB = 0;
+    const finalRes = anchors.map((p) => Math.abs(p.delta - shiftA)).sort((x, y) => x - y);
+    residualPx = finalRes[finalRes.length >> 1] ?? 0;
+  } else if (devRes.pos > 10 && preRes.pos > 10) {
+    const rawShift = devRes.pos - preRes.pos;
+    if (Math.abs(rawShift) <= maxBoxShift) {
+      mode = 'rigid-merged';
+      shiftA = rawShift;
+      tiltB = 0;
+      matchedAnchors = anchors.length;
+    }
+  }
+
+  // Merge rigidly aligned pre-run origins with developed-plate origins within percentage tolerance
+  const mergeTol = Math.max(4, Math.round(laneLen * 0.006)); // ~0.6% (~6 px) agreement band
+  const maxLocalRefine = Math.max(10, Math.round(laneLen * 0.014)); // ~1.4% max local warp pull
+  const mergedByLane: Record<number, number> = {};
+  const mergedLocked = new Set<number>(preLocked);
+  const platePositions: number[] = [];
+
+  for (const l of halfLanes) {
+    const u = effFrame.uByLane.get(l.id) ?? 0;
+    const preLanePos = preRes.byLane?.[l.id];
+    const prePlate = preLanePos != null ? effFrame.toPlatePos(l.id, preLanePos) : preRes.pos;
+    const alignedPlate = prePlate + shiftA + tiltB * u;
+
+    const isDevClean = devLocked.has(l.id) && !devTailing.has(l.id) && devRes.byLane?.[l.id] != null;
+    let finalPlate = alignedPlate;
+    if (isDevClean) {
+      const devPlate = effFrame.toPlatePos(l.id, devRes.byLane![l.id]);
+      const diff = devPlate - alignedPlate;
+      if (Math.abs(diff) <= mergeTol) {
+        // Both pre-run and clean developed dot agree within tolerance: precision blend
+        finalPlate = 0.55 * alignedPlate + 0.45 * devPlate;
+        mergedLocked.add(l.id);
+      } else if (Math.abs(diff) <= maxLocalRefine) {
+        // Slight local warp: bounded gentle pull toward developed dot, capped at mergeTol
+        finalPlate = alignedPlate + Math.sign(diff) * Math.min(mergeTol, 0.35 * Math.abs(diff));
+        mergedLocked.add(l.id);
+      }
+      // Large outlier on developed plate (> maxLocalRefine) stays on aligned pre-run coordinate
+    }
+
+    platePositions.push(finalPlate);
+    const localPos = Math.round(effFrame.toLanePos(l.id, finalPlate));
+    mergedByLane[l.id] = Math.max(4, Math.min(laneLen - 4, localPos));
+  }
+
+  platePositions.sort((a, b) => a - b);
+  const medPos = platePositions.length ? Math.round(platePositions[platePositions.length >> 1]) : Math.round(preRes.pos + shiftA);
+  const laneSpanCount = Math.max(1, halfLanes.length - 1);
+  const alignment: TlcPreRunAlignment = {
+    dyPx: Math.round(shiftA * 10) / 10,
+    slopePxPerLane: Math.round(((2 * tiltB) / laneSpanCount) * 100) / 100,
+    matchedAnchors,
+    residualPx: Math.round(residualPx * 10) / 10,
+    mode,
+  };
+
+  return {
+    res: {
+      pos: medPos,
+      score: Math.max(preRes.score, devRes.score),
+      byLane: mergedByLane,
+      lockedLanes: Array.from(mergedLocked),
+      tailingLanes: [],
+      validFrac: halfLanes.length > 0 ? mergedLocked.size / halfLanes.length : preRes.validFrac,
+      medFeat: Math.max(preRes.medFeat ?? 0, devRes.medFeat ?? 0),
+    },
+    alignment,
+  };
+}
+
+// Spot origin resolution: explicit microadjusted lane.zeroRf -> manual set.originPx override ->
+// optional pre-run undeveloped plate registration merged with multi-channel developed origin ->
+// multi-channel + composite joint origin peak fallback -> ~10% lane length
 export function tlcOrigin(
   set: TlcSet,
   lane: TlcLane,
@@ -3957,7 +4375,11 @@ export function tlcOrigin(
   if (set.originPx != null && set.originPx > 0) return set.originPx;
 
   const channels = (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter((k) => !!set.imgs?.[k]);
-  if (!channels.length || !getProfile || !set.cfg) {
+  const preChannels =
+    set.preRunEnabled !== false
+      ? (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter((k) => !!set.preRunImgs?.[k])
+      : [];
+  if ((!channels.length && !preChannels.length) || !getProfile || !set.cfg) {
     return Math.max(20, Math.round(lane.length * 0.10));
   }
 
@@ -3967,6 +4389,7 @@ export function tlcOrigin(
     set.frontAutoByLane = {};
     set.originAuto = {};
     set.originAutoByLane = {};
+    set.preRunAlignment = {};
     set.autoConf = {};
     (set as any)._histCache = {};
     (set as any)._prof2d = {};
@@ -3978,217 +4401,53 @@ export function tlcOrigin(
   const h = tlcHalf(lane);
   if (set.originAuto[h] == null) {
     const halfLanes = set.cfg.lanes.filter((l) => tlcHalf(l) === h);
-    let best: ChannelOriginResult = { pos: 0, score: 0 };
-    let bestClipped = false;
-    let bestSourceId: string | null = null;
+    const devSolved = channels.length
+      ? solveMultiChannelHalfOrigin(set, halfLanes, lane.length, channels, getProfile)
+      : {
+          best: { pos: 0, score: 0 } as ChannelOriginResult,
+          frame: buildOriginPlateFrame(
+            halfLanes.map((l) => ({ laneId: l.id, profile: [], lane: l })),
+            lane.length
+          ),
+        };
+    let best = devSolved.best;
 
-    interface OriginSourceData {
-      id: string;
-      sign: number;
-      entries: OriginLaneEntry[];
-      entriesById: Map<number, OriginLaneEntry>;
-      hist: ProfileHistogramStats;
-      clipped: boolean;
-      isComposite: boolean;
-      res: ChannelOriginResult;
-    }
-
-    const perSourceData: OriginSourceData[] = [];
-    const singleUnclippedForComp: Array<{
-      ch: TlcChannelKey;
-      sign: number;
-      entriesById: Map<number, OriginLaneEntry>;
-      hist: ProfileHistogramStats;
-    }> = [];
-
-    const considerCandidate = (src: OriginSourceData) => {
-      const res = src.res;
-      if (res.pos <= 10) return;
-      const bestSolid = best.pos > 10 && best.score >= 8 && (best.validFrac ?? 0) >= 0.22;
-      if (!bestSolid) {
-        if (res.score > best.score) {
-          best = res;
-          bestClipped = src.clipped;
-          bestSourceId = src.id;
-        }
-      } else if (
-        (bestClipped && !src.clipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
-        ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
-          (src.isComposite || (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1) &&
-          res.score >= (src.isComposite ? best.score * 0.85 : best.score * 1.25))
-      ) {
-        best = res;
-        bestClipped = src.clipped;
-        bestSourceId = src.id;
-      }
-    };
-
-    for (const ch of channels) {
-      const chSign = TLC_SIGNAL[ch]?.sign ?? -1;
-      const entries: OriginLaneEntry[] = halfLanes
-        .map((l) => ({
-          laneId: l.id,
-          profile: getProfile(set, ch, l),
-          lane: l,
-          metrics: getCachedLane2dMetrics(set, ch, l),
-        }))
-        .filter((e) => e.profile.length > 0);
-      if (!entries.length) continue;
-      const chHist =
-        getChannelHistogram(set, ch, getProfile) ??
-        analyzeProfileHistogram(entries.map((e) => e.profile), chSign, 0.06, 0.90);
-      const resClipped = chSign < 0 ? chHist.clipHighFrac > 0.25 : chHist.clipLowFrac > 0.25;
-      const res = detectChannelOrigin(entries, chSign, lane.length, chHist);
-      const entriesById = new Map<number, OriginLaneEntry>(entries.map((e) => [e.laneId, e]));
-      const src: OriginSourceData = {
-        id: ch,
-        sign: chSign,
-        entries,
-        entriesById,
-        hist: chHist,
-        clipped: resClipped,
-        isComposite: false,
-        res,
+    // If spotted-but-undeveloped pre-run reference photos are uploaded for this plate, detect
+    // their clean un-eluted origin dots across all pre-run channels + composite and rigidly merge
+    // them with the developed plate's origin anchors (falling back cleanly to devSolved if needed).
+    if (preChannels.length > 0) {
+      const preProbeSet: TlcSet = {
+        ...set,
+        imgs: (set.preRunImgs || {}) as Record<string, TlcImageEntry>,
+        preRunImgs: undefined,
+        preRunEnabled: false,
+        prof: {},
+        frontAuto: {},
+        frontAutoByLane: {},
+        originAuto: {},
+        originAutoByLane: {},
+        autoConf: {},
       };
-      perSourceData.push(src);
-      considerCandidate(src);
-      if (!resClipped) {
-        singleUnclippedForComp.push({ ch, sign: chSign, entriesById, hist: chHist });
-      }
-    }
-
-    // Build and evaluate multi-channel composite origin views (all unclipped channels, plus UV-only
-    // when UV254 + UV366 + White are all loaded) so split-channel plates & faint multi-channel dots
-    // are detected just like the composite solvent front.
-    const compositeGroups: Array<{ id: string; group: typeof singleUnclippedForComp }> = [];
-    if (singleUnclippedForComp.length >= 2) {
-      compositeGroups.push({ id: 'CompositeAll', group: singleUnclippedForComp });
-      const uvOnly = singleUnclippedForComp.filter((c) => c.ch === 'UV254' || c.ch === 'UV366');
-      if (singleUnclippedForComp.length >= 3 && uvOnly.length === 2) {
-        compositeGroups.push({ id: 'CompositeUV', group: uvOnly });
-      }
-    }
-    for (const cg of compositeGroups) {
-      const built = buildCompositeOriginEntries(halfLanes, cg.group);
-      if (!built) continue;
-      const res = detectChannelOrigin(built.entries, 1, lane.length, built.hist);
-      const src: OriginSourceData = {
-        id: cg.id,
-        sign: 1,
-        entries: built.entries,
-        entriesById: new Map(built.entries.map((e) => [e.laneId, e])),
-        hist: built.hist,
-        clipped: false,
-        isComposite: true,
-        res,
-      };
-      perSourceData.push(src);
-      considerCandidate(src);
-    }
-
-    // Multi-channel & composite joint origin refinement (in physical plate-space!):
-    // 1. Rescue UV-silent lanes from any agreeing unclipped secondary channel or composite.
-    // 2. If a lane is heavily tailing on the primary channel, upgrade it if another unclipped
-    //    channel shows a clean, non-tailing origin dot near the same position.
-    // 3. Refit the smooth physical plate-space baseline across clean locked anchors so all blank
-    //    lanes stay aligned on one smooth curve even when lane.y0 varies in a microadjusted CSV.
-    if (best.pos > 10 && best.byLane && perSourceData.length > 1) {
-      const primarySrc = perSourceData.find((s) => s.id === bestSourceId) ?? perSourceData[0];
-      const frame = buildOriginPlateFrame(primarySrc.entries, lane.length);
-      const agreeTol = Math.max(16, Math.round(lane.length * 0.035));
-      const localRadius = Math.max(12, Math.round(lane.length * 0.016));
-      const locked = new Set<number>(best.lockedLanes || []);
-      const tailingSet = new Set<number>(best.tailingLanes || []);
-      const fusedByLane: Record<number, number> = { ...best.byLane };
-
-      const secondarySources = perSourceData.filter(
-        (c) =>
-          c.id !== bestSourceId &&
-          !c.clipped &&
-          (c.res.pos <= 10 || Math.abs(c.res.pos - best.pos) <= agreeTol)
-      );
-
-      let updatedAny = false;
-      for (const l of halfLanes) {
-        const refPos = fusedByLane[l.id] ?? Math.round(frame.toLanePos(l.id, best.pos));
-        const isLocked = locked.has(l.id);
-        const isTailing = tailingSet.has(l.id);
-
-        if (isLocked && !isTailing) continue;
-
-        for (const sec of secondarySources) {
-          const secTailing = sec.res.tailingLanes?.includes(l.id) ?? false;
-          // If the secondary channel/composite already locked this lane cleanly right on refPos:
-          if (sec.res.lockedLanes?.includes(l.id) && sec.res.byLane?.[l.id]) {
-            const secPos = sec.res.byLane[l.id];
-            if (Math.abs(secPos - refPos) <= 3 && (!isLocked || !secTailing)) {
-              fusedByLane[l.id] = secPos;
-              locked.add(l.id);
-              if (!secTailing) tailingSet.delete(l.id);
-              updatedAny = true;
-              break;
-            }
-          }
-          // Otherwise probe strictly around refPos on the secondary source with blank-safe & halo-safe floors
-          const entry = sec.entriesById.get(l.id);
-          if (!entry) continue;
-          const secFeatFloor =
-            sec.hist.sampleCount >= 16
-              ? Math.min(26.0, Math.max(16.0, 5.0 * sec.hist.bgSigma, 0.16 * sec.hist.contrastSpan))
-              : 18.0;
-          const secBiFloor = Math.min(15.0, Math.max(9.0, 0.55 * secFeatFloor));
-          const near = detectOriginNearDetailed(
-            entry.profile,
-            sec.sign,
-            refPos,
-            localRadius,
-            secFeatFloor,
-            6.5,
-            secBiFloor,
-            {
-              metrics: entry.metrics,
-              laneWidthPx: l.width,
-            }
-          );
-          if (near.pos > 0 && (!isLocked || !near.isTailing)) {
-            fusedByLane[l.id] = near.pos;
-            locked.add(l.id);
-            if (!near.isTailing) tailingSet.delete(l.id);
-            updatedAny = true;
-            break;
-          }
-        }
-      }
-
-      if (updatedAny && locked.size >= 4) {
-        const cleanIds = Array.from(locked).filter((id) => !tailingSet.has(id));
-        const fitIds = cleanIds.length >= 4 ? cleanIds : Array.from(locked);
-        const lockedPts = fitIds.map((id) => ({
-          laneId: id,
-          pos: frame.toPlatePos(id, fusedByLane[id]),
-        }));
-        const jointBackbonePlate = fitOriginQuadCurve(
-          lockedPts,
-          best.pos,
+      (preProbeSet as any)._isPreRunProbe = true;
+      (preProbeSet as any)._prof2d = {};
+      (preProbeSet as any)._histCache = {};
+      const preSolved = solveMultiChannelHalfOrigin(preProbeSet, halfLanes, lane.length, preChannels, getProfile);
+      if (preSolved.best.pos > 10 && preSolved.best.byLane) {
+        const merged = mergePreRunWithDevelopedOrigin(
+          devSolved.best,
+          preSolved.best,
+          halfLanes,
           lane.length,
-          frame.uByLane,
-          frame.allLaneIds
+          devSolved.frame
         );
-        if (jointBackbonePlate) {
-          for (const l of halfLanes) {
-            if (!locked.has(l.id) && jointBackbonePlate[l.id] != null) {
-              fusedByLane[l.id] = Math.round(frame.toLanePos(l.id, jointBackbonePlate[l.id]));
-            }
-          }
-        }
+        best = merged.res;
+        set.preRunAlignment = set.preRunAlignment || {};
+        set.preRunAlignment[h] = merged.alignment;
+      } else if (set.preRunAlignment) {
+        delete set.preRunAlignment[h];
       }
-      best = {
-        ...best,
-        byLane: fusedByLane,
-        lockedLanes: Array.from(locked),
-        tailingLanes: Array.from(tailingSet),
-        validFrac: halfLanes.length > 0 ? locked.size / halfLanes.length : best.validFrac,
-      };
+    } else if (set.preRunAlignment) {
+      delete set.preRunAlignment[h];
     }
 
     set.autoConf = set.autoConf || {};

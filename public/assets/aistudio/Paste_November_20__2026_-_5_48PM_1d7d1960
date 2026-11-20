@@ -1,0 +1,645 @@
+From 7ef67192be3bee8090fd6c5a36f421e13b69aab2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 14:51:18 +0900
+Subject: [PATCH 1/3] Advisor: offer a higher-capacity same-base alternative
+ when a recommended eluent has streak warnings
+
+An eluent flagged for acid-salt residual drag (e.g. 99:1 DCM/NH3-MeOH with TsOH) now gets an OR alternative when a higher-capacity rung of the same base resolves the same wells with fewer streak warnings, with a one-line reason in the UI.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/components/ui/AiSolventAdvisorModal.tsx |  5 ++-
+ src/engine/predictor/tlcSolventAdvisor.ts   | 36 ++++++++++++++++-----
+ tests/tlcSolventAdvisor.test.ts             | 36 +++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 9 deletions(-)
+
+diff --git a/src/components/ui/AiSolventAdvisorModal.tsx b/src/components/ui/AiSolventAdvisorModal.tsx
+index 9aa3ee4..6d249cf 100644
+--- a/src/components/ui/AiSolventAdvisorModal.tsx
++++ b/src/components/ui/AiSolventAdvisorModal.tsx
+@@ -2470,12 +2470,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                             }}
+                           >
+                             <div style={{ fontSize: '10.5px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--mut)' }}>
+-                              OR · same wells, other base
++                              {rec.alternativeNote ? 'OR · same wells, less streaking' : 'OR · same wells, other base'}
+                             </div>
+                             <div style={{ fontSize: '13px', fontWeight: 700 }}>{alt.name}</div>
+                             <div className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
+                               50 mL: {alt.chamberPrep50mL}
+                             </div>
++                            {rec.alternativeNote && (
++                              <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{rec.alternativeNote}</div>
++                            )}
+                             <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }} onClick={(e) => e.stopPropagation()}>
+                               {onApplyToCurrentSet && (
+                                 <button
+diff --git a/src/engine/predictor/tlcSolventAdvisor.ts b/src/engine/predictor/tlcSolventAdvisor.ts
+index de1a352..79d0ac1 100644
+--- a/src/engine/predictor/tlcSolventAdvisor.ts
++++ b/src/engine/predictor/tlcSolventAdvisor.ts
+@@ -6,6 +6,7 @@ import { wellLabel } from '../tlcLanes';
+ import { RunResult, RunState } from '../../types';
+ import {
+   CORE_ELUENT_SPECS,
++  MODIFIER_SPECS,
+   MixturePhysicalDescriptors,
+   composeSolventSystem,
+   generateExtendedDynamicSpecs,
+@@ -207,6 +208,8 @@ export interface RecommendedPlateSolvent {
+   lanes: SimulatedWellLane[];
+   /** Et₃N <-> NH₃/MeOH swap that resolves (almost) the same wells: use whichever base you have at hand */
+   alternatives?: TlcSolventSystemDef[];
++  /** why the alternative is offered when it is more than a swap (e.g. fewer streak warnings) */
++  alternativeNote?: string;
+ }
+ 
+ export interface PlateSolventGroup {
+@@ -2660,23 +2663,40 @@ export async function optimizePlateTlcSolvents(
+   const baseKind = (sys: TlcSolventSystemDef): 'et3n' | 'nh3' | null =>
+     sys.baseModifier?.includes('Et₃N') ? 'et3n' : sys.baseModifier?.includes('NH₃') ? 'nh3' : null;
+   const recIds = new Set(recommendedSystems.map((r) => r.system.id));
++  const modCapacity = (sys: TlcSolventSystemDef): number => {
++    const id = sys.composition?.modifierId;
++    return id && MODIFIER_SPECS[id] ? MODIFIER_SPECS[id].neutralizingCapacity ?? 0 : 0;
++  };
++  const wellFlagged = (sysId: string, wi: number): boolean =>
++    (evalMatrix.get(sysId)!.get(wi)!.spots || []).some((sp) => sp.tailing || (sp.mildStreak && Boolean(sp.tailingReason)));
+   for (const rec of recommendedSystems) {
+     const kind = baseKind(rec.system);
+     if (!kind || rec.assignedWellIndices.length === 0) continue;
+     const need = Math.ceil(rec.assignedWellIndices.length * 0.9);
++    const recFlagged = rec.assignedWellIndices.filter((wi) => wellFlagged(rec.system.id, wi)).length;
++    const recCap = modCapacity(rec.system);
+     const alts = allCandidateSystems
+       .filter((c) => c.stationaryPhase === rec.system.stationaryPhase && !recIds.has(c.id))
+-      .filter((c) => {
+-        const k = baseKind(c);
+-        return k !== null && k !== kind;
+-      })
+       .map((c) => {
++        const k = baseKind(c);
++        if (k === null) return null;
++        const flagged = rec.assignedWellIndices.filter((wi) => wellFlagged(c.id, wi)).length;
++        // other base (Et3N <-> NH3), or the same base with headroom: a higher-capacity rung that streaks less
++        const crossKind = k !== kind;
++        const upgrade = !crossKind && modCapacity(c) > recCap && recFlagged > 0 && flagged < recFlagged;
++        if (!crossKind && !upgrade) return null;
+         const ok = rec.assignedWellIndices.filter((wi) => evalMatrix.get(c.id)!.get(wi)!.score >= RESOLVED_SCORE).length;
+-        return { c, ok };
++        return { c, ok, flagged, upgrade };
+       })
+-      .filter((x) => x.ok >= need)
+-      .sort((a, b) => b.ok - a.ok);
+-    if (alts.length > 0) rec.alternatives = alts.slice(0, 1).map((x) => x.c);
++      .filter((x): x is { c: TlcSolventSystemDef; ok: number; flagged: number; upgrade: boolean } => !!x && x.ok >= need)
++      .sort((a, b) => a.flagged - b.flagged || b.ok - a.ok);
++    if (alts.length > 0) {
++      const best = alts[0];
++      rec.alternatives = [best.c];
++      if (best.upgrade || best.flagged < recFlagged) {
++        rec.alternativeNote = `${best.c.name} resolves the same wells with ${best.flagged} streak warning${best.flagged === 1 ? '' : 's'} instead of ${recFlagged} (more base capacity).`;
++      }
++    }
+   }
+ 
+   // Expose every core system in this stationary phase plus high-performing dynamic candidates for plate inspection
+diff --git a/tests/tlcSolventAdvisor.test.ts b/tests/tlcSolventAdvisor.test.ts
+index feff2f5..f693e72 100644
+--- a/tests/tlcSolventAdvisor.test.ts
++++ b/tests/tlcSolventAdvisor.test.ts
+@@ -1094,3 +1094,39 @@ describe('toluene/MeOH/NH3 strength (plate UJG-C0021 regression)', () => {
+   });
+ });
+ 
++describe('same-base alternative with more modifier capacity', () => {
++  it('a 2% NH3/MeOH rung streaks less than the 1% rung for acid-loaded wells, and any offered alternative is justified', async () => {
++    const amine = profileMoleculeForTlc(rdkit, 'Nc1ccccc1C(=O)c1ccccc1');
++    const ctx = { hasAcidAdditive: true, additiveLabel: 'TsOH', acidStrength: 'strong_nonvolatile', acidLoadEq: 0.9 } as any;
++    const one = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_1')!;
++    const two = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_2')!;
++    const p1 = predictNormalPhaseRf(amine, one, ctx);
++    const p2 = predictNormalPhaseRf(amine, two, ctx);
++    const flagged = (p: any) => Boolean(p.tailing || (p.mildStreak && p.tailingReason));
++    expect(flagged(p1) || !flagged(p2)).toBe(true); // headroom never goes the wrong way
++    expect(flagged(p2) && !flagged(p1)).toBe(false);
++
++    const state = exampleState();
++    state.mode = 'concentration';
++    state.reagents = [
++      { code: 'A', name: 'amine', smiles: 'Nc1ccccc1C(=O)c1ccccc1', molarMass: 197, density: 1.2, stock: 500, solvent: 'DMSO' },
++      { code: 'C', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
++    ];
++    const row = {
++      local_index: 0, global_index: 0, combo_index: 0, plate_number: 0, container_id: 0,
++      recipe: [
++        { code: 'A', name: 'amine', target_concentration: 50, equivalence: 1 },
++        { code: 'C', name: 'TsOH·H2O', target_concentration: 45, equivalence: 0.9 },
++      ],
++      'vol#solvent': 400,
++    };
++    const plan = await optimizePlateTlcSolvents(rdkit, state, { plates: 1, reactions: 1, rows: [row] } as unknown as RunResult, [], { plateIndex: 0, maxSystems: 3 });
++    for (const rec of plan.recommendedSystems) {
++      if (rec.alternativeNote) {
++        const alt = rec.alternatives![0];
++        expect(alt.id).not.toBe(rec.system.id);
++        expect(alt.baseModifier).toBeTruthy();
++      }
++    }
++  });
++});
+-- 
+2.43.0
+
+
+From 5988bd5fbae381cf746621ead5c958cdfbf7cc29 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 15:07:56 +0900
+Subject: [PATCH 2/3] Advisor: clean-spot coverage in eluent selection
+
+Selection now has three goals: visibility, resolution, and every spot (starting materials + High/Medium products) running clean in at least one chosen eluent. Adds a clean-spot term to the combination search (cleanSpotWeight, default 0.10), keeps an eluent in the pruning step when it is the only clean option for enough wells, and reports wells with no clean option in the set or in any candidate.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/engine/predictor/tlcSolventAdvisor.ts | 90 ++++++++++++++++++++++-
+ tests/tlcSolventAdvisor.test.ts           | 47 ++++++++++++
+ 2 files changed, 136 insertions(+), 1 deletion(-)
+
+diff --git a/src/engine/predictor/tlcSolventAdvisor.ts b/src/engine/predictor/tlcSolventAdvisor.ts
+index 79d0ac1..5a14ef8 100644
+--- a/src/engine/predictor/tlcSolventAdvisor.ts
++++ b/src/engine/predictor/tlcSolventAdvisor.ts
+@@ -425,6 +425,8 @@ export interface PlateSolventPlanOptions {
+   includeSpeculative?: boolean;
+   /** weight of Low-confidence products relative to High/Medium (0..1, default 0.2); only matters when they are included */
+   lowTierWeight?: number;
++  /** weight of the clean-spot coverage term in eluent selection (default 0.10; 0 disables) */
++  cleanSpotWeight?: number;
+   calibration?: TlcCalibrationModel;
+   onProgress?: (done: number, total: number) => void;
+   signal?: AbortSignal;
+@@ -2368,6 +2370,42 @@ export async function optimizePlateTlcSolvents(
+     return activeWells.map((w) => sysMap.get(w.wellIndex)!.prodReadability);
+   });
+ 
++  // Clean-spot coverage (goal 3): a spot is "clean" in an eluent when it is not predicted to tail or streak
++  // and sits in the usable window. Each chosen set should give every spot at least one clean eluent.
++  // Only spots that can run clean in SOME candidate count, so inherently streaking species do not skew the search.
++  const CLEAN_SPOT_CAP = 30;
++  const CLEAN_SPOT_WEIGHT = options.cleanSpotWeight ?? 0.10;
++  const cleanMask: Int32Array[] = searchPool.map((sys) => {
++    const sysMap = evalMatrix.get(sys.id)!;
++    const arr = new Int32Array(numActive);
++    for (let wi = 0; wi < numActive; wi++) {
++      const spots = sysMap.get(activeWells[wi].wellIndex)!.spots || [];
++      let m = 0;
++      for (let i = 0; i < spots.length && i < CLEAN_SPOT_CAP; i++) {
++        const sp = spots[i];
++        const counted = sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium';
++        if (!counted) continue;
++        const flagged = sp.tailing || (sp.mildStreak && Boolean(sp.tailingReason));
++        if (!flagged && sp.rf >= 0.06 && sp.rf <= 0.94) m |= 1 << i;
++      }
++      arr[wi] = m;
++    }
++    return arr;
++  });
++  const countedSpotCount = new Int32Array(numActive);
++  {
++    const first = evalMatrix.get(searchPool[0].id)!;
++    for (let wi = 0; wi < numActive; wi++) {
++      const spots = first.get(activeWells[wi].wellIndex)!.spots || [];
++      let n = 0;
++      for (let i = 0; i < spots.length && i < CLEAN_SPOT_CAP; i++) {
++        const sp = spots[i];
++        if (sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium') n++;
++      }
++      countedSpotCount[wi] = n;
++    }
++  }
++
+   const famIndexMap = new Map<string, number>();
+   const bandIndexMap = new Map<string, number>();
+   const famBit = new Int32Array(poolLen);
+@@ -2433,6 +2471,18 @@ export async function optimizePlateTlcSolvents(
+ 
+   // Best combination of effK systems from the pool using cross-plate SM + product species set coverage,
+   // skipping any system index in `excluded`.
++  const achievableClean = new Int32Array(numActive);
++  for (let wi = 0; wi < numActive; wi++) {
++    let m = 0;
++    for (let si = 0; si < poolLen; si++) m |= cleanMask[si][wi];
++    achievableClean[wi] = popCount(m);
++  }
++  const cleanCountForPoolIdx = (idxs: number[], wi: number): number => {
++    let m = 0;
++    for (const si of idxs) m |= cleanMask[si][wi];
++    return popCount(m);
++  };
++
+   const searchBestCombo = async (excluded: Set<number>): Promise<{ combo: number[]; objective: number }> => {
+     let bestComboIdx: number[] = [];
+     let bestObjective = -1e9;
+@@ -2522,6 +2572,15 @@ export async function optimizePlateTlcSolvents(
+         if (wellJointScore > 0) weightedSum += importanceArr[wi] * wellJointScore;
+       }
+ 
++      let cleanSum = 0;
++      for (let wi = 0; wi < numActive; wi++) {
++        cleanSum +=
++          achievableClean[wi] > 0
++            ? (importanceArr[wi] * cleanCountForPoolIdx(combo, wi)) / achievableClean[wi]
++            : importanceArr[wi];
++      }
++      weightedSum += (CLEAN_SPOT_WEIGHT * cleanSum);
++
+       let activeSystemsUsed = 0;
+       let famMask = 0;
+       let bandMask = 0;
+@@ -2599,7 +2658,17 @@ export async function optimizePlateTlcSolvents(
+     let weakestMean = Infinity;
+     for (let i = 0; i < chosenSystems.length; i++) {
+       const sys = chosenSystems[i];
+-      const loss = full - resolvedCountFor(chosenSystems.filter((_, j) => j !== i));
++      const resolvedLoss = full - resolvedCountFor(chosenSystems.filter((_, j) => j !== i));
++      // An eluent that is the only clean option for enough wells' spots is kept even if it resolves nothing new.
++      const without = chosenSystems.filter((_, j) => j !== i).map((c) => searchPool.indexOf(c));
++      const withAll = chosenSystems.map((c) => searchPool.indexOf(c));
++      let cleanLoss = 0;
++      if (without.every((x) => x >= 0) && withAll.every((x) => x >= 0)) {
++        for (let wi = 0; wi < numActive; wi++) {
++          if (cleanCountForPoolIdx(without, wi) < cleanCountForPoolIdx(withAll, wi)) cleanLoss++;
++        }
++      }
++      const loss = resolvedLoss + cleanLoss;
+       const sMap = evalMatrix.get(sys.id)!;
+       let scSum = 0;
+       for (const w of activeWells) scSum += sMap.get(w.wellIndex)!.score;
+@@ -2777,6 +2846,25 @@ export async function optimizePlateTlcSolvents(
+       `${recommendedSystems.length} eluent${recommendedSystems.length > 1 ? 's are' : ' is'} enough: ${droppedForSmallGain} more would each rescue fewer than ${minUniqueGain} extra wells.`
+     );
+   }
++  {
++    const finalIdx = chosenSystems.map((c) => searchPool.indexOf(c)).filter((x) => x >= 0);
++    let lostClean = 0;
++    let alwaysStreaking = 0;
++    for (let wi = 0; wi < numActive; wi++) {
++      if (cleanCountForPoolIdx(finalIdx, wi) < achievableClean[wi]) lostClean++;
++      if (achievableClean[wi] < countedSpotCount[wi]) alwaysStreaking++;
++    }
++    if (lostClean > 0) {
++      summaryNotes.push(
++        `${lostClean} well${lostClean > 1 ? 's have' : ' has'} a spot that would run clean in another candidate eluent but streaks in every chosen one — check the OR alternatives or the modifier.`
++      );
++    }
++    if (alwaysStreaking > 0) {
++      summaryNotes.push(
++        `${alwaysStreaking} well${alwaysStreaking > 1 ? 's have' : ' has'} spots predicted to streak in every eluent tried (charged or poly-functional species); expect smears whatever you pick.`
++      );
++    }
++  }
+   if (unresolvedWellIndices.length > 0) {
+     summaryNotes.push(
+       `${unresolvedWellIndices.length} well${unresolvedWellIndices.length > 1 ? 's' : ''} not resolved in any recommended eluent (${unresolvedWellIndices.slice(0, 12).map((i) => wellLabel(i)).join(', ')}${unresolvedWellIndices.length > 12 ? ', …' : ''}); try another solvent pool or run them by LCMS.`
+diff --git a/tests/tlcSolventAdvisor.test.ts b/tests/tlcSolventAdvisor.test.ts
+index f693e72..bf41f08 100644
+--- a/tests/tlcSolventAdvisor.test.ts
++++ b/tests/tlcSolventAdvisor.test.ts
+@@ -1130,3 +1130,50 @@ describe('same-base alternative with more modifier capacity', () => {
+     }
+   });
+ });
++
++describe('clean-spot coverage in eluent selection', () => {
++  it('a set chosen with the clean-spot term never leaves more spots streaking everywhere than one chosen without it', async () => {
++    const state: any = exampleState();
++    state.mode = 'concentration';
++    state.reagents = [
++      { code: 'C', name: '4-Bromopyrimidin-2-amine', smiles: 'Nc1nccc(Br)n1', molarMass: 174, density: 1.2, stock: 225, solvent: 'DMSO' },
++      { code: 'F', name: '2-Aminobenzophenone', smiles: 'Nc1ccccc1C(=O)c1ccccc1', molarMass: 197, density: 1.2, stock: 225, solvent: 'DMSO' },
++      { code: 'Acid', name: 'P-Toluenesulfonic acid monohydrate', smiles: '', molarMass: 190.2, density: 1.2, stock: 225, solvent: 'DMSO' },
++    ];
++    state.eln = { ...state.eln!, temperatureC: 80 };
++    const mk = (i: number, f: number) => ({
++      local_index: i, global_index: i, combo_index: i, plate_number: 0, container_id: i,
++      recipe: [
++        { code: 'C', name: '4-Bromopyrimidin-2-amine', target_concentration: 75, equivalence: 1 },
++        { code: 'F', name: '2-Aminobenzophenone', target_concentration: 75, equivalence: 1 },
++        { code: 'Acid', name: 'P-Toluenesulfonic acid monohydrate', target_concentration: 25 * f, equivalence: 0.33 * f },
++      ],
++      'vol#solvent': 400,
++    });
++    const rows = Array.from({ length: 8 }, (_, i) => mk(i, [0.5, 1, 2, 3][i % 4]));
++    const run = { plates: 1, reactions: 8, rows } as unknown as RunResult;
++    // spots (substrates + High/Medium products) that run clean in at least one chosen eluent
++    const cleanSpots = (plan: any): number => {
++      let n = 0;
++      for (const wi of new Set<number>(plan.recommendedSystems.flatMap((r: any) => r.lanes.map((l: any) => l.wellIndex)))) {
++        const per: Array<Set<number>> = [];
++        for (const r of plan.recommendedSystems) {
++          const lane = r.lanes.find((l: any) => l.wellIndex === wi);
++          if (!lane || lane.isBlank) continue;
++          const ok = new Set<number>();
++          lane.spots.forEach((sp: any, i: number) => {
++            const counted = sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium';
++            const flagged = sp.tailing || (sp.mildStreak && sp.tailingReason);
++            if (counted && !flagged && sp.rf >= 0.06 && sp.rf <= 0.94) ok.add(i);
++          });
++          per.push(ok);
++        }
++        n += new Set(per.flatMap((s) => [...s])).size;
++      }
++      return n;
++    };
++    const without = await optimizePlateTlcSolvents(rdkit, state, run, [], { plateIndex: 0, maxSystems: 3, cleanSpotWeight: 0 });
++    const withTerm = await optimizePlateTlcSolvents(rdkit, state, run, [], { plateIndex: 0, maxSystems: 3 });
++    expect(cleanSpots(withTerm)).toBeGreaterThanOrEqual(cleanSpots(without));
++  }, 120000);
++});
+-- 
+2.43.0
+
+
+From e0bad07dc7406af7d6d5dcdccb7ee237ff8f8e45 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 17:26:28 +0900
+Subject: [PATCH 3/3] Add 7 M NH3/MeOH stock option for chamber recipes
+
+Same final chamber (NH3 molarity and total MeOH): the 7 M stock is used at 2/7 the volume and the MeOH it no longer brings is added neat. Names and ratios stay in 2 M-equivalent terms so plate matching and calibration are unaffected. Selector in the advisor toolbar, remembered in localStorage; default stays 2 M.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPTRzo2qFGkFqzQrs65CA
+---
+ src/components/ui/AiSolventAdvisorModal.tsx | 42 ++++++++++++--
+ src/engine/predictor/solventSystemModel.ts  | 62 ++++++++++++++++++---
+ tests/tlcSolventAdvisor.test.ts             | 31 ++++++++++-
+ 3 files changed, 121 insertions(+), 14 deletions(-)
+
+diff --git a/src/components/ui/AiSolventAdvisorModal.tsx b/src/components/ui/AiSolventAdvisorModal.tsx
+index 6d249cf..c166e58 100644
+--- a/src/components/ui/AiSolventAdvisorModal.tsx
++++ b/src/components/ui/AiSolventAdvisorModal.tsx
+@@ -9,6 +9,7 @@ import { useApp } from '../../context/AppContext';
+ import {
+   calibrateTlcModelFromCampaign,
+   CalibratedLaneComparison,
++  chamberPrepForNh3Stock,
+   containerOfLane,
+   extractLaneProfile2d,
+   isKnownAdditiveReagent,
+@@ -143,6 +144,24 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+   const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
+   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
+   const [lowWeightPct, setLowWeightPct] = useState<number>(20);
++  // NH3/MeOH stock on the bench. Same final chamber composition; only the 50 mL recipe changes.
++  const [nh3StockM, setNh3StockM] = useState<number>(() => {
++    try {
++      const v = Number(localStorage.getItem('rs.nh3StockM'));
++      return v === 7 ? 7 : 2;
++    } catch {
++      return 2;
++    }
++  });
++  const chooseNh3Stock = (m: number) => {
++    setNh3StockM(m);
++    try {
++      localStorage.setItem('rs.nh3StockM', String(m));
++    } catch {
++      /* storage unavailable */
++    }
++  };
++  const prepOf = (sys: any): string => chamberPrepForNh3Stock(sys, nh3StockM);
+   const [calibrationEnabled, setCalibrationEnabled] = useState<boolean>(true);
+   const [showCalibVisuals, setShowCalibVisuals] = useState<boolean>(true);
+   const [setSolventOverrides, setSetSolventOverrides] = useState<Record<string, string>>({});
+@@ -703,6 +722,17 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                     <span>Include Low/Speculative</span>
+                   </label>
+ 
++                  <label
++                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
++                    title="Names stay in 2 M-equivalent terms. With a 7 M stock the 50 mL recipe uses 2/7 of the volume and adds the missing MeOH, so the chamber is identical."
++                  >
++                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>NH₃/MeOH stock</span>
++                    <select value={nh3StockM} onChange={(e) => chooseNh3Stock(Number(e.target.value))}>
++                      <option value={2}>2 M</option>
++                      <option value={7}>7 M</option>
++                    </select>
++                  </label>
++
+                   <label
+                     style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', opacity: includeSpeculative ? 1 : 0.5 }}
+                     title="How much Low-confidence products count compared with High/Medium ones when choosing eluents"
+@@ -2146,7 +2176,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                               </div>
+                               <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{opt.reason}</div>
+                               <div className="mono" style={{ fontSize: '10px', color: 'var(--mut)' }}>
+-                                50 mL: {opt.system.chamberPrep50mL} · Wells: {opt.rescuedWellCoords.slice(0, 8).join(', ')}
++                                50 mL: {prepOf(opt.system)} · Wells: {opt.rescuedWellCoords.slice(0, 8).join(', ')}
+                                 {opt.rescuedWellCoords.length > 8 ? ` +${opt.rescuedWellCoords.length - 8} more` : ''}
+                               </div>
+                               <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
+@@ -2376,7 +2406,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                           <div style={{ fontSize: '15px', fontWeight: 700 }}>{rec.system.name}</div>
+ 
+                           <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
+-                            50 mL: {rec.system.chamberPrep50mL}
++                            50 mL: {prepOf(rec.system)}
+                           </div>
+ 
+                           {rec.system.descriptors && (
+@@ -2474,7 +2504,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                             </div>
+                             <div style={{ fontSize: '13px', fontWeight: 700 }}>{alt.name}</div>
+                             <div className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
+-                              50 mL: {alt.chamberPrep50mL}
++                              50 mL: {prepOf(alt)}
+                             </div>
+                             {rec.alternativeNote && (
+                               <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{rec.alternativeNote}</div>
+@@ -2642,7 +2672,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                             )}
+                           </div>
+                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
+-                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {activeSystemPlan.system.chamberPrep50mL}
++                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {prepOf(activeSystemPlan.system)}
+                             {activeSystemPlan.system.descriptors && (
+                               <>
+                                 {' · '}ε⁰ {activeSystemPlan.system.descriptors.strength.toFixed(2)} · α {activeSystemPlan.system.descriptors.alphaMix.toFixed(2)} · β {activeSystemPlan.system.descriptors.betaMix.toFixed(2)} · π* {activeSystemPlan.system.descriptors.piStarMix.toFixed(2)}
+@@ -3095,7 +3125,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                                   gap: '3px',
+                                   color: 'var(--fg)',
+                                 }}
+-                                title={`${rec.system.chamberPrep50mL} — ${rec.system.bestFor}`}
++                                title={`${prepOf(rec.system)} — ${rec.system.bestFor}`}
+                               >
+                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '4px' }}>
+                                   <span style={{ fontSize: '12px', fontWeight: 700 }}>{rec.system.shortLabel}</span>
+@@ -3111,7 +3141,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
+                                   </span>
+                                 </div>
+                                 <div style={{ fontSize: '10.5px', color: 'var(--mut)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+-                                  {rec.system.chamberPrep50mL}
++                                  {prepOf(rec.system)}
+                                 </div>
+                               </button>
+                             );
+diff --git a/src/engine/predictor/solventSystemModel.ts b/src/engine/predictor/solventSystemModel.ts
+index a70706e..8fc4d07 100644
+--- a/src/engine/predictor/solventSystemModel.ts
++++ b/src/engine/predictor/solventSystemModel.ts
+@@ -106,6 +106,8 @@ export interface DynamicEluentSpec {
+   shortLabelOverride?: string;
+   ratioOverride?: string;
+   bestForOverride?: string;
++  /** Concentration (M) of the NH₃/MeOH stock used to make the chamber (default 2). Same final composition; only the recipe changes. */
++  nh3StockM?: number;
+ }
+ 
+ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
+@@ -538,6 +540,14 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
+   let shortLabel = spec.shortLabelOverride || '';
+   let ratio = spec.ratioOverride || '';
+   let chamberPrep50mL = '';
++  // A 7 M NH₃/MeOH stock delivers the same NH₃ in 2/7 of the volume; the MeOH it no longer brings is added neat,
++  // so the final chamber (NH₃ molarity and total MeOH) is identical to the 2 M recipe.
++  const stockM = spec.nh3StockM && spec.nh3StockM > 2 ? spec.nh3StockM : 2;
++  const nh3Split = (vol2M: number): { stockVol: number; extraMeoh: number } =>
++    stockM === 2
++      ? { stockVol: vol2M, extraMeoh: 0 }
++      : { stockVol: (vol2M * 2) / stockM, extraMeoh: vol2M - (vol2M * 2) / stockM };
++  const volTxt = (mL: number): string => (mL > 0 && mL < 1 ? `${Math.round(mL * 1000)} µL` : `${f1(mL)} mL`);
+ 
+   if (spec.stationaryPhase === 'C18') {
+     const orgVol = (spec.strongPct / 100) * 50;
+@@ -573,6 +583,7 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
+     const weakVol = (weakPct / 100) * 50;
+     const modVol = (modPct / 100) * 50;
+     const modToken = mod.kind === 'base_nh3' ? '(2M NH₃ in MeOH)' : mod.id === 'acoh_1' ? 'AcOH' : 'Et₃N';
++    const prepToken = mod.kind === 'base_nh3' ? `(${stockM}M NH₃ in MeOH)` : modToken;
+ 
+     if (!name) {
+       name = `${spec.strongPct}% ${strong.shortName} / ${terPct}% ${ter.shortName} / ${spec.weakSolvent}${mod.label ? ` + ${mod.label}` : ''}`;
+@@ -587,10 +598,20 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
+           : `${spec.strongPct}:${terPct}:${weakPct} v/v/v ${strong.shortName} / ${ter.shortName} / ${spec.weakSolvent}`;
+     }
+     const parts: string[] = [];
+-    if (strongVol > 0) parts.push(`${f1(strongVol)} mL ${strong.shortName}`);
+-    if (terVol > 0) parts.push(`${f1(terVol)} mL ${ter.shortName}`);
+-    if (weakVol > 0) parts.push(`${f1(weakVol)} mL ${spec.weakSolvent}`);
+-    if (modVol > 0) parts.push(`${f1(modVol)} mL ${modToken}`);
++    const split = mod.kind === 'base_nh3' ? nh3Split(modVol) : { stockVol: modVol, extraMeoh: 0 };
++    let strongVolP = strongVol;
++    let terVolP = terVol;
++    let looseMeoh = 0;
++    if (split.extraMeoh > 0) {
++      if (strong.id === 'MeOH') strongVolP += split.extraMeoh;
++      else if (ter.id === 'MeOH') terVolP += split.extraMeoh;
++      else looseMeoh = split.extraMeoh;
++    }
++    if (strongVolP > 0) parts.push(`${volTxt(strongVolP)} ${strong.shortName}`);
++    if (terVolP > 0) parts.push(`${volTxt(terVolP)} ${ter.shortName}`);
++    if (weakVol > 0) parts.push(`${volTxt(weakVol)} ${spec.weakSolvent}`);
++    if (looseMeoh > 0) parts.push(`${volTxt(looseMeoh)} MeOH`);
++    if (modVol > 0) parts.push(`${volTxt(split.stockVol)} ${prepToken}`);
+     chamberPrep50mL = parts.join(' + ');
+   } else if (mod.kind === 'base_nh3') {
+     const meohNeatPct = Math.max(0, spec.strongPct);
+@@ -620,10 +641,12 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
+           ? `${weakPct}:${nh3Pct} v/v ${wkName} / (2M NH₃ in MeOH)`
+           : `${weakPct}:${meohNeatPct}:${nh3Pct} v/v/v ${wkName} / MeOH / (2M NH₃ in MeOH)`;
+     }
++    const nh3 = nh3Split(nh3Vol);
++    const meohTotalVol = meohVol + nh3.extraMeoh;
+     chamberPrep50mL =
+-      meohVol > 0
+-        ? `${f1(weakVol)} mL ${wkName} + ${f1(meohVol)} mL MeOH + ${f1(nh3Vol)} mL (2M NH₃ in MeOH)`
+-        : `${f1(weakVol)} mL ${wkName} + ${f1(nh3Vol)} mL (2M NH₃ in MeOH)`;
++      meohTotalVol > 0
++        ? `${volTxt(weakVol)} ${wkName} + ${volTxt(meohTotalVol)} MeOH + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`
++        : `${volTxt(weakVol)} ${wkName} + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`;
+     void totalMeohPct;
+   } else {
+     const modPct = mod.volPct;
+@@ -725,6 +748,31 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
+   };
+ }
+ 
++/**
++ * The 50 mL chamber recipe for a system when the NH₃/MeOH stock is not the default 2 M.
++ * Final composition is unchanged; names and ratios stay in 2 M-equivalent terms.
++ */
++export function chamberPrepForNh3Stock(system: TlcSolventSystemDef, stockM: number): string {
++  const c = system.composition;
++  if (!c || !(stockM > 2) || !system.baseModifier?.includes('NH₃')) return system.chamberPrep50mL;
++  try {
++    return composeSolventSystem({
++      id: system.id,
++      strongSolvent: c.strongSolvent as NeatSolventId,
++      weakSolvent: c.weakSolvent as NeatSolventId,
++      ...(c.ternaryCoSolvent ? { ternaryCoSolvent: { solvent: c.ternaryCoSolvent.solvent as NeatSolventId, pct: c.ternaryCoSolvent.pct } } : {}),
++      strongPct: c.strongPct,
++      modifierId: c.modifierId as ModifierId,
++      stationaryPhase: system.stationaryPhase,
++      family: system.family,
++      preferenceTier: system.preferenceTier,
++      nh3StockM: stockM,
++    }).chamberPrep50mL;
++  } catch {
++    return system.chamberPrep50mL;
++  }
++}
++
+ /** Canonical baseline specification entries composed via the physical solvent model */
+ export const CORE_ELUENT_SPECS: DynamicEluentSpec[] = [
+   {
+diff --git a/tests/tlcSolventAdvisor.test.ts b/tests/tlcSolventAdvisor.test.ts
+index bf41f08..e6b84cb 100644
+--- a/tests/tlcSolventAdvisor.test.ts
++++ b/tests/tlcSolventAdvisor.test.ts
+@@ -18,7 +18,7 @@ import {
+   matchTlcSetNameToSolvent,
+   eluentReactivityWarnings,
+ } from '../src/engine/predictor';
+-import { MEOH_AFFINITY_SCALE_BY_CARRIER } from '../src/engine/predictor/solventSystemModel';
++import { MEOH_AFFINITY_SCALE_BY_CARRIER, chamberPrepForNh3Stock } from '../src/engine/predictor/solventSystemModel';
+ import { exampleState } from '../src/context/runPayload';
+ import { RunResult } from '../src/types';
+ 
+@@ -1177,3 +1177,32 @@ describe('clean-spot coverage in eluent selection', () => {
+     expect(cleanSpots(withTerm)).toBeGreaterThanOrEqual(cleanSpots(without));
+   }, 120000);
+ });
++
++describe('7 M NH3/MeOH stock option', () => {
++  const vol = (txt: string, token: RegExp): number => {
++    const m = txt.match(new RegExp(`([\\d.]+) (mL|µL) ${token.source}`));
++    if (!m) throw new Error(`no ${token} in ${txt}`);
++    return m[2] === 'µL' ? Number(m[1]) / 1000 : Number(m[1]);
++  };
++  it('keeps NH3 amount and total MeOH identical, using 2/7 the volume of stock', () => {
++    const sys = composeSolventSystem({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 3, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' } as any);
++    const p2 = chamberPrepForNh3Stock(sys, 2);
++    const p7 = chamberPrepForNh3Stock(sys, 7);
++    expect(p2).toBe(sys.chamberPrep50mL);
++    expect(p7).toContain('7M NH₃ in MeOH');
++    // 50 mL of 95:3:2: 1.0 mL of 2 M = 2 mmol NH3, same in 7 M stock
++    const nh3_2 = vol(p2, /\(2M/) * 2;
++    const nh3_7 = vol(p7, /\(7M/) * 7;
++    expect(nh3_7).toBeCloseTo(nh3_2, 1);
++    const meoh2 = vol(p2, /MeOH \+/) + vol(p2, /\(2M/);
++    const meoh7 = vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
++    expect(meoh7).toBeCloseTo(meoh2, 1);
++    // total still 50 mL
++    const total7 = vol(p7, /DCM/) + vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
++    expect(total7).toBeCloseTo(50, 1);
++  });
++  it('leaves non-ammonia systems and the default untouched', () => {
++    const et = TLC_SOLVENT_LIBRARY.find((x) => x.id === 'etoac_hex_25')!;
++    expect(chamberPrepForNh3Stock(et, 7)).toBe(et.chamberPrep50mL);
++  });
++});
+-- 
+2.43.0

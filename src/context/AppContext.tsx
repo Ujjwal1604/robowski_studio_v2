@@ -750,10 +750,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (Array.isArray(s.imgMeta)) {
               for (const m of s.imgMeta) knownImgKeys.push(m.key);
             }
+            if (Array.isArray((s as any).preRunImgMeta)) {
+              for (const m of (s as any).preRunImgMeta) {
+                knownImgKeys.push(Core.tlcPreRunStorageKey(m.key, 0));
+              }
+            }
             if (s.plateData && typeof s.plateData === 'object') {
               for (const [pStr, pd] of Object.entries(s.plateData as Record<string, any>)) {
                 if (Array.isArray(pd?.imgMeta)) {
                   for (const m of pd.imgMeta) knownImgKeys.push(Core.tlcStorageKey(m.key, Number(pStr)));
+                }
+                if (Array.isArray(pd?.preRunImgMeta)) {
+                  for (const m of pd.preRunImgMeta) {
+                    knownImgKeys.push(Core.tlcPreRunStorageKey(m.key, Number(pStr)));
+                  }
                 }
               }
             }
@@ -944,18 +954,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           let reconstructed = Core.deserializeTlcSetMeta(s);
           const matchingImages = parsed.tlcImages.filter((im) => im.uid === s.uid);
           for (const matched of matchingImages) {
-            const { plateIndex: pIdx, channel } = Core.parseTlcStorageKey(matched.key);
+            const { plateIndex: pIdx, channel, isPreRun } = Core.parseTlcStorageKey(matched.key);
             try {
               const bmp = await createImageBitmap(matched.blob);
-              const metaList =
-                pIdx === 0 ? s.imgMeta : s.plateData?.[pIdx]?.imgMeta;
+              const metaList = isPreRun
+                ? (pIdx === 0 ? (s as any).preRunImgMeta : s.plateData?.[pIdx]?.preRunImgMeta)
+                : (pIdx === 0 ? s.imgMeta : s.plateData?.[pIdx]?.imgMeta);
               const matchedMeta = Array.isArray(metaList)
                 ? metaList.find((m: any) => m.key === channel)
                 : null;
               const entryName = matchedMeta?.name || matched.name;
-              reconstructed = Core.updateTlcPlateSlice(reconstructed, pIdx, (slice) => ({
-                imgs: { ...slice.imgs, [channel]: { name: entryName, bmp } },
-              }));
+              reconstructed = Core.updateTlcPlateSlice(reconstructed, pIdx, (slice) =>
+                isPreRun
+                  ? { preRunImgs: { ...(slice.preRunImgs || {}), [channel]: { name: entryName, bmp } } }
+                  : { imgs: { ...slice.imgs, [channel]: { name: entryName, bmp } } }
+              );
             } catch {}
           }
           reconstructedSets.push(reconstructed);

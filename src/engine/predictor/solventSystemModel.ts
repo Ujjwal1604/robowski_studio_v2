@@ -106,6 +106,8 @@ export interface DynamicEluentSpec {
   shortLabelOverride?: string;
   ratioOverride?: string;
   bestForOverride?: string;
+  /** Concentration (M) of the NH₃/MeOH stock used to make the chamber (default 2). Same final composition; only the recipe changes. */
+  nh3StockM?: number;
 }
 
 export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
@@ -538,6 +540,14 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
   let shortLabel = spec.shortLabelOverride || '';
   let ratio = spec.ratioOverride || '';
   let chamberPrep50mL = '';
+  // A 7 M NH₃/MeOH stock delivers the same NH₃ in 2/7 of the volume; the MeOH it no longer brings is added neat,
+  // so the final chamber (NH₃ molarity and total MeOH) is identical to the 2 M recipe.
+  const stockM = spec.nh3StockM && spec.nh3StockM > 2 ? spec.nh3StockM : 2;
+  const nh3Split = (vol2M: number): { stockVol: number; extraMeoh: number } =>
+    stockM === 2
+      ? { stockVol: vol2M, extraMeoh: 0 }
+      : { stockVol: (vol2M * 2) / stockM, extraMeoh: vol2M - (vol2M * 2) / stockM };
+  const volTxt = (mL: number): string => (mL > 0 && mL < 0.9995 ? `${Math.round(mL * 1000)} µL` : `${f1(mL)} mL`);
 
   if (spec.stationaryPhase === 'C18') {
     const orgVol = (spec.strongPct / 100) * 50;
@@ -573,6 +583,7 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
     const weakVol = (weakPct / 100) * 50;
     const modVol = (modPct / 100) * 50;
     const modToken = mod.kind === 'base_nh3' ? '(2M NH₃ in MeOH)' : mod.id === 'acoh_1' ? 'AcOH' : 'Et₃N';
+    const prepToken = mod.kind === 'base_nh3' ? `(${stockM}M NH₃ in MeOH)` : modToken;
 
     if (!name) {
       name = `${spec.strongPct}% ${strong.shortName} / ${terPct}% ${ter.shortName} / ${spec.weakSolvent}${mod.label ? ` + ${mod.label}` : ''}`;
@@ -587,10 +598,20 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
           : `${spec.strongPct}:${terPct}:${weakPct} v/v/v ${strong.shortName} / ${ter.shortName} / ${spec.weakSolvent}`;
     }
     const parts: string[] = [];
-    if (strongVol > 0) parts.push(`${f1(strongVol)} mL ${strong.shortName}`);
-    if (terVol > 0) parts.push(`${f1(terVol)} mL ${ter.shortName}`);
-    if (weakVol > 0) parts.push(`${f1(weakVol)} mL ${spec.weakSolvent}`);
-    if (modVol > 0) parts.push(`${f1(modVol)} mL ${modToken}`);
+    const split = mod.kind === 'base_nh3' ? nh3Split(modVol) : { stockVol: modVol, extraMeoh: 0 };
+    let strongVolP = strongVol;
+    let terVolP = terVol;
+    let looseMeoh = 0;
+    if (split.extraMeoh > 0) {
+      if (strong.id === 'MeOH') strongVolP += split.extraMeoh;
+      else if (ter.id === 'MeOH') terVolP += split.extraMeoh;
+      else looseMeoh = split.extraMeoh;
+    }
+    if (strongVolP > 0) parts.push(`${volTxt(strongVolP)} ${strong.shortName}`);
+    if (terVolP > 0) parts.push(`${volTxt(terVolP)} ${ter.shortName}`);
+    if (weakVol > 0) parts.push(`${volTxt(weakVol)} ${spec.weakSolvent}`);
+    if (looseMeoh > 0) parts.push(`${volTxt(looseMeoh)} MeOH`);
+    if (modVol > 0) parts.push(`${volTxt(split.stockVol)} ${prepToken}`);
     chamberPrep50mL = parts.join(' + ');
   } else if (mod.kind === 'base_nh3') {
     const meohNeatPct = Math.max(0, spec.strongPct);
@@ -620,10 +641,12 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
           ? `${weakPct}:${nh3Pct} v/v ${wkName} / (2M NH₃ in MeOH)`
           : `${weakPct}:${meohNeatPct}:${nh3Pct} v/v/v ${wkName} / MeOH / (2M NH₃ in MeOH)`;
     }
+    const nh3 = nh3Split(nh3Vol);
+    const meohTotalVol = meohVol + nh3.extraMeoh;
     chamberPrep50mL =
-      meohVol > 0
-        ? `${f1(weakVol)} mL ${wkName} + ${f1(meohVol)} mL MeOH + ${f1(nh3Vol)} mL (2M NH₃ in MeOH)`
-        : `${f1(weakVol)} mL ${wkName} + ${f1(nh3Vol)} mL (2M NH₃ in MeOH)`;
+      meohTotalVol > 0
+        ? `${volTxt(weakVol)} ${wkName} + ${volTxt(meohTotalVol)} MeOH + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`
+        : `${volTxt(weakVol)} ${wkName} + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`;
     void totalMeohPct;
   } else {
     const modPct = mod.volPct;
@@ -723,6 +746,33 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
       modifierId: spec.modifierId,
     },
   };
+}
+
+/**
+ * The 50 mL chamber recipe for a system when the NH₃/MeOH stock is not the default 2 M.
+ * Final composition is unchanged; names and ratios stay in 2 M-equivalent terms.
+ */
+export function chamberPrepForNh3Stock(system: TlcSolventSystemDef, stockM: number): string {
+  const c = system.composition;
+  if (!c || !(stockM > 2) || !system.baseModifier?.includes('NH₃')) return system.chamberPrep50mL;
+  try {
+    return composeSolventSystem({
+      id: system.id,
+      strongSolvent: c.strongSolvent as NeatSolventId,
+      weakSolvent: c.weakSolvent as NeatSolventId,
+      ...(c.ternaryCoSolvent
+        ? { ternaryCoSolvent: { solvent: c.ternaryCoSolvent.solvent as NeatSolventId, pct: c.ternaryCoSolvent.pct } }
+        : {}),
+      strongPct: c.strongPct,
+      modifierId: c.modifierId as ModifierId,
+      stationaryPhase: system.stationaryPhase,
+      family: system.family,
+      preferenceTier: system.preferenceTier,
+      nh3StockM: stockM,
+    }).chamberPrep50mL;
+  } catch {
+    return system.chamberPrep50mL;
+  }
 }
 
 /** Canonical baseline specification entries composed via the physical solvent model */

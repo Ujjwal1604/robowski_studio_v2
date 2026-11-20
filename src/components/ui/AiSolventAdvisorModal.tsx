@@ -9,6 +9,7 @@ import { useApp } from '../../context/AppContext';
 import {
   calibrateTlcModelFromCampaign,
   CalibratedLaneComparison,
+  chamberPrepForNh3Stock,
   containerOfLane,
   extractLaneProfile2d,
   isKnownAdditiveReagent,
@@ -143,6 +144,24 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
   const [lowWeightPct, setLowWeightPct] = useState<number>(20);
+  // NH3/MeOH stock on the bench. Same final chamber composition; only the 50 mL recipe changes.
+  const [nh3StockM, setNh3StockM] = useState<number>(() => {
+    try {
+      const v = Number(localStorage.getItem('rs.nh3StockM'));
+      return v === 7 ? 7 : 2;
+    } catch {
+      return 2;
+    }
+  });
+  const chooseNh3Stock = (m: number) => {
+    setNh3StockM(m);
+    try {
+      localStorage.setItem('rs.nh3StockM', String(m));
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  const prepOf = (sys: any): string => chamberPrepForNh3Stock(sys, nh3StockM);
   const [calibrationEnabled, setCalibrationEnabled] = useState<boolean>(true);
   const [showCalibVisuals, setShowCalibVisuals] = useState<boolean>(true);
   const [setSolventOverrides, setSetSolventOverrides] = useState<Record<string, string>>({});
@@ -701,6 +720,17 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                       onChange={(e) => setIncludeSpeculative(e.target.checked)}
                     />
                     <span>Include Low/Speculative</span>
+                  </label>
+
+                  <label
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
+                    title="Names stay in 2 M-equivalent terms. With a 7 M stock the 50 mL recipe uses 2/7 of the volume and adds the missing MeOH, so the chamber is identical."
+                  >
+                    <span style={{ color: 'var(--mut)', fontWeight: 600 }}>NH₃/MeOH stock</span>
+                    <select value={nh3StockM} onChange={(e) => chooseNh3Stock(Number(e.target.value))}>
+                      <option value={2}>2 M</option>
+                      <option value={7}>7 M</option>
+                    </select>
                   </label>
 
                   <label
@@ -2146,7 +2176,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               </div>
                               <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{opt.reason}</div>
                               <div className="mono" style={{ fontSize: '10px', color: 'var(--mut)' }}>
-                                50 mL: {opt.system.chamberPrep50mL} · Wells: {opt.rescuedWellCoords.slice(0, 8).join(', ')}
+                                50 mL: {prepOf(opt.system)} · Wells: {opt.rescuedWellCoords.slice(0, 8).join(', ')}
                                 {opt.rescuedWellCoords.length > 8 ? ` +${opt.rescuedWellCoords.length - 8} more` : ''}
                               </div>
                               <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
@@ -2376,7 +2406,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                           <div style={{ fontSize: '15px', fontWeight: 700 }}>{rec.system.name}</div>
 
                           <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
-                            50 mL: {rec.system.chamberPrep50mL}
+                            50 mL: {prepOf(rec.system)}
                           </div>
 
                           {rec.system.descriptors && (
@@ -2470,12 +2500,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             }}
                           >
                             <div style={{ fontSize: '10.5px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--mut)' }}>
-                              OR · same wells, other base
+                              {rec.alternativeNote ? 'OR · same wells, less streaking' : 'OR · same wells, other base'}
                             </div>
                             <div style={{ fontSize: '13px', fontWeight: 700 }}>{alt.name}</div>
                             <div className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
-                              50 mL: {alt.chamberPrep50mL}
+                              50 mL: {prepOf(alt)}
                             </div>
+                            {rec.alternativeNote && (
+                              <div style={{ fontSize: '11px', color: 'var(--fg2)' }}>{rec.alternativeNote}</div>
+                            )}
                             <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }} onClick={(e) => e.stopPropagation()}>
                               {onApplyToCurrentSet && (
                                 <button
@@ -2639,7 +2672,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             )}
                           </div>
                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {activeSystemPlan.system.chamberPrep50mL}
+                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {prepOf(activeSystemPlan.system)}
                             {activeSystemPlan.system.descriptors && (
                               <>
                                 {' · '}ε⁰ {activeSystemPlan.system.descriptors.strength.toFixed(2)} · α {activeSystemPlan.system.descriptors.alphaMix.toFixed(2)} · β {activeSystemPlan.system.descriptors.betaMix.toFixed(2)} · π* {activeSystemPlan.system.descriptors.piStarMix.toFixed(2)}
@@ -3092,7 +3125,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   gap: '3px',
                                   color: 'var(--fg)',
                                 }}
-                                title={`${rec.system.chamberPrep50mL} — ${rec.system.bestFor}`}
+                                title={`${prepOf(rec.system)} — ${rec.system.bestFor}`}
                               >
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '4px' }}>
                                   <span style={{ fontSize: '12px', fontWeight: 700 }}>{rec.system.shortLabel}</span>
@@ -3108,7 +3141,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   </span>
                                 </div>
                                 <div style={{ fontSize: '10.5px', color: 'var(--mut)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                  {rec.system.chamberPrep50mL}
+                                  {prepOf(rec.system)}
                                 </div>
                               </button>
                             );

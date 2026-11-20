@@ -18,7 +18,7 @@ import {
   matchTlcSetNameToSolvent,
   eluentReactivityWarnings,
 } from '../src/engine/predictor';
-import { MEOH_AFFINITY_SCALE_BY_CARRIER } from '../src/engine/predictor/solventSystemModel';
+import { MEOH_AFFINITY_SCALE_BY_CARRIER, chamberPrepForNh3Stock } from '../src/engine/predictor/solventSystemModel';
 import { exampleState } from '../src/context/runPayload';
 import { RunResult } from '../src/types';
 
@@ -1093,4 +1093,118 @@ describe('toluene/MeOH/NH3 strength (plate UJG-C0021 regression)', () => {
     expect(invPct).toBeLessThanOrEqual(5);
   });
 });
+
+describe('same-base alternative with more modifier capacity', () => {
+  it('a 2% NH3/MeOH rung streaks less than the 1% rung for acid-loaded wells, and any offered alternative is justified', async () => {
+    const amine = profileMoleculeForTlc(rdkit, 'Nc1ccccc1C(=O)c1ccccc1');
+    const ctx = { hasAcidAdditive: true, additiveLabel: 'TsOH', acidStrength: 'strong_nonvolatile', acidLoadEq: 0.9 } as any;
+    const one = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_1')!;
+    const two = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_2')!;
+    const p1 = predictNormalPhaseRf(amine, one, ctx);
+    const p2 = predictNormalPhaseRf(amine, two, ctx);
+    const flagged = (p: any) => Boolean(p.tailing || (p.mildStreak && p.tailingReason));
+    expect(flagged(p1) || !flagged(p2)).toBe(true); // headroom never goes the wrong way
+    expect(flagged(p2) && !flagged(p1)).toBe(false);
+
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: 'amine', smiles: 'Nc1ccccc1C(=O)c1ccccc1', molarMass: 197, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    const row = {
+      local_index: 0, global_index: 0, combo_index: 0, plate_number: 0, container_id: 0,
+      recipe: [
+        { code: 'A', name: 'amine', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: 'TsOH·H2O', target_concentration: 45, equivalence: 0.9 },
+      ],
+      'vol#solvent': 400,
+    };
+    const plan = await optimizePlateTlcSolvents(rdkit, state, { plates: 1, reactions: 1, rows: [row] } as unknown as RunResult, [], { plateIndex: 0, maxSystems: 3 });
+    for (const rec of plan.recommendedSystems) {
+      if (rec.alternativeNote) {
+        const alt = rec.alternatives![0];
+        expect(alt.id).not.toBe(rec.system.id);
+        expect(alt.baseModifier).toBeTruthy();
+      }
+    }
+  });
+});
+
+describe('clean-spot coverage in eluent selection', () => {
+  it('a set chosen with the clean-spot term never leaves more spots streaking everywhere than one chosen without it', async () => {
+    const state: any = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'C', name: '4-Bromopyrimidin-2-amine', smiles: 'Nc1nccc(Br)n1', molarMass: 174, density: 1.2, stock: 225, solvent: 'DMSO' },
+      { code: 'F', name: '2-Aminobenzophenone', smiles: 'Nc1ccccc1C(=O)c1ccccc1', molarMass: 197, density: 1.2, stock: 225, solvent: 'DMSO' },
+      { code: 'Acid', name: 'P-Toluenesulfonic acid monohydrate', smiles: '', molarMass: 190.2, density: 1.2, stock: 225, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+    const mk = (i: number, f: number) => ({
+      local_index: i, global_index: i, combo_index: i, plate_number: 0, container_id: i,
+      recipe: [
+        { code: 'C', name: '4-Bromopyrimidin-2-amine', target_concentration: 75, equivalence: 1 },
+        { code: 'F', name: '2-Aminobenzophenone', target_concentration: 75, equivalence: 1 },
+        { code: 'Acid', name: 'P-Toluenesulfonic acid monohydrate', target_concentration: 25 * f, equivalence: 0.33 * f },
+      ],
+      'vol#solvent': 400,
+    });
+    const rows = Array.from({ length: 8 }, (_, i) => mk(i, [0.5, 1, 2, 3][i % 4]));
+    const run = { plates: 1, reactions: 8, rows } as unknown as RunResult;
+    // spots (substrates + High/Medium products) that run clean in at least one chosen eluent
+    const cleanSpots = (plan: any): number => {
+      let n = 0;
+      for (const wi of new Set<number>(plan.recommendedSystems.flatMap((r: any) => r.lanes.map((l: any) => l.wellIndex)))) {
+        const per: Array<Set<number>> = [];
+        for (const r of plan.recommendedSystems) {
+          const lane = r.lanes.find((l: any) => l.wellIndex === wi);
+          if (!lane || lane.isBlank) continue;
+          const ok = new Set<number>();
+          lane.spots.forEach((sp: any, i: number) => {
+            const counted = sp.kind === 'substrate' || sp.tier === 'High' || sp.tier === 'Medium';
+            const flagged = sp.tailing || (sp.mildStreak && sp.tailingReason);
+            if (counted && !flagged && sp.rf >= 0.06 && sp.rf <= 0.94) ok.add(i);
+          });
+          per.push(ok);
+        }
+        n += new Set(per.flatMap((s) => [...s])).size;
+      }
+      return n;
+    };
+    const without = await optimizePlateTlcSolvents(rdkit, state, run, [], { plateIndex: 0, maxSystems: 3, cleanSpotWeight: 0 });
+    const withTerm = await optimizePlateTlcSolvents(rdkit, state, run, [], { plateIndex: 0, maxSystems: 3 });
+    expect(cleanSpots(withTerm)).toBeGreaterThanOrEqual(cleanSpots(without));
+  }, 120000);
+});
+
+describe('7 M NH3/MeOH stock option', () => {
+  const vol = (txt: string, token: RegExp): number => {
+    const m = txt.match(new RegExp(`([\\d.]+) (mL|µL) ${token.source}`));
+    if (!m) throw new Error(`no ${token} in ${txt}`);
+    return m[2] === 'µL' ? Number(m[1]) / 1000 : Number(m[1]);
+  };
+  it('keeps NH3 amount and total MeOH identical, using 2/7 the volume of stock', () => {
+    const sys = composeSolventSystem({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 3, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' } as any);
+    const p2 = chamberPrepForNh3Stock(sys, 2);
+    const p7 = chamberPrepForNh3Stock(sys, 7);
+    expect(p2).toBe(sys.chamberPrep50mL);
+    expect(p7).toContain('7M NH₃ in MeOH');
+    // 50 mL of 95:3:2: 1.0 mL of 2 M = 2 mmol NH3, same in 7 M stock
+    const nh3_2 = vol(p2, /\(2M/) * 2;
+    const nh3_7 = vol(p7, /\(7M/) * 7;
+    expect(nh3_7).toBeCloseTo(nh3_2, 1);
+    const meoh2 = vol(p2, /MeOH \+/) + vol(p2, /\(2M/);
+    const meoh7 = vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
+    expect(meoh7).toBeCloseTo(meoh2, 1);
+    // total still 50 mL
+    const total7 = vol(p7, /DCM/) + vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
+    expect(total7).toBeCloseTo(50, 1);
+  });
+  it('leaves non-ammonia systems and the default untouched', () => {
+    const et = TLC_SOLVENT_LIBRARY.find((x) => x.id === 'etoac_hex_25')!;
+    expect(chamberPrepForNh3Stock(et, 7)).toBe(et.chamberPrep50mL);
+  });
+});
+
 

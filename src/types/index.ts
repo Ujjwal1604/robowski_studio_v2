@@ -442,6 +442,14 @@ export interface EdgeSetting {
   strength: number; // 0..1
 }
 
+export interface TlcPreRunAlignment {
+  dyPx: number;
+  slopePxPerLane: number;
+  matchedAnchors: number;
+  residualPx: number;
+  mode: 'rigid-merged' | 'direct-box';
+}
+
 export interface TlcPlateData {
   cfg: TlcLaneConfig | null;
   cfgName: string;
@@ -458,6 +466,12 @@ export interface TlcPlateData {
   originAutoByLane?: Record<number, number>;
   prof?: Record<string, number[]>;
   imgs: Record<string, TlcImageEntry>;
+  /** Optional spotted-but-undeveloped pre-run photos per channel for exact origin registration */
+  preRunImgs?: Record<string, TlcImageEntry>;
+  /** Whether uploaded pre-run photos are actively merged into origin detection (default true when present) */
+  preRunEnabled?: boolean;
+  /** Per-half registration summary when pre-run origin was merged with developed plate */
+  preRunAlignment?: Record<number, TlcPreRunAlignment>;
   missing?: string[];
   edgePicks?: EdgePick[];
   edgeSettings?: Record<number, EdgeSetting>;

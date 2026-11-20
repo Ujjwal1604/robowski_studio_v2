@@ -17,6 +17,7 @@ import {
   tlcHalfFrontBase,
   tlcOrigin,
 } from '../src/engine/tlcLanes';
+import { parseTlcStorageKey, tlcPreRunStorageKey, tlcStorageKey } from '../src/engine/tlcPlateSlice';
 import type { TlcLane, TlcSet } from '../src/types';
 
 function rng(seed: number) {
@@ -1599,7 +1600,216 @@ describe('tlcVision2d: Step 2 origin detection (plate-space CSV alignment, huge/
     expect(Math.abs(oRing5 - basePos)).toBeLessThanOrEqual(4);
     expect(Math.abs(oRing9 - basePos)).toBeLessThanOrEqual(4);
   });
+
+  it('aligns pre-run undeveloped TLC origin dots (across UV254/UV366/White) to a shifted & slightly tilted developed plate and merges accurately', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(2026);
+    const preBase = 104;
+    const shiftPx = 14; // plate placed +14 px (~1.4 mm) higher in the box after running
+    const tiltPerLane = 0.4; // slight ~0.4 px/lane box-corner tilt across 27 lanes (~10.4 px end-to-end)
+
+    // Deterministic per-lane robot spotting jitter (±4 px) shared identically by pre-run and developed plate
+    const jitterByCol = Array.from({ length: 27 }, (_, col) => {
+      const pattern = [-3, 2, -4, 3, -1, 4, -2, 0, 3, -3, 2, -2, 4, -1, 1, -4, 2, 0, -2, 3, -1, 2, -3, 1, -2, 3, 0];
+      return pattern[col] ?? 0;
+    });
+
+    const prePosFor = (col: number) => preBase + jitterByCol[col];
+    const devTruePosFor = (col: number) => prePosFor(col) + shiftPx + tiltPerLane * (col - 13);
+
+    const set: TlcSet = {
+      uid: 'step2b-prerun-rigid-merge',
+      name: 'Step 2B Pre-Run Rigid Merge',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: {
+        UV254: { name: 'dev_uv254.png', bmp: {} as any },
+        UV366: { name: 'dev_uv366.png', bmp: {} as any },
+        White: { name: 'dev_white.png', bmp: {} as any },
+      },
+      preRunImgs: {
+        UV254: { name: 'pre_uv254.png', bmp: {} as any },
+        UV366: { name: 'pre_uv366.png', bmp: {} as any },
+        White: { name: 'pre_white.png', bmp: {} as any },
+      },
+      preRunEnabled: true,
+      cfg,
+    };
+
+    const elutedCols = new Set([2, 3, 15, 16]); // completely migrated away on developed plate
+    const coffeeRingCols = new Set([5, 6]); // faint UV366 coffee-ring halo with misleading +15 px upper rim on developed plate
+    const tailingCols = new Set([9, 10]); // heavy upward comet smear on developed plate
+
+    const getProfile = (s: TlcSet, key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const L = l.length;
+      const isPre = Boolean((s as any)._isPreRunProbe);
+
+      if (isPre) {
+        // Undeveloped plate: EVERY lane has a crisp, un-eluted spotted dot in at least one channel:
+        // cols 0..11 in UV254, cols 12..19 in UV366, cols 20..26 in White
+        const p0 = prePosFor(col);
+        if (key === 'UV254') {
+          return Array.from({ length: L }, (_, i) => {
+            const dark = col <= 11 ? 155 * Math.exp(-(((i - p0) / 7) ** 2)) : 0;
+            return Math.max(10, 238 - dark + rand() * 1.0);
+          });
+        }
+        if (key === 'UV366') {
+          return Array.from({ length: L }, (_, i) => {
+            const glow = col >= 12 && col <= 19 ? 140 * Math.exp(-(((i - p0) / 7) ** 2)) : 0;
+            return Math.min(255, 22 + glow + rand() * 1.0);
+          });
+        }
+        return Array.from({ length: L }, (_, i) => {
+          const drop = col >= 20 ? 95 * Math.exp(-(((i - p0) / 7) ** 2)) : 0;
+          return Math.max(10, 228 - drop + rand() * 1.0);
+        });
+      }
+
+      // Developed plate: shifted by shiftPx + tiltPerLane*(col-13), with eluted, coffee-ring, and tailing lanes
+      const d0 = devTruePosFor(col);
+      if (key === 'UV254') {
+        return Array.from({ length: L }, (_, i) => {
+          let dark = 0;
+          if (elutedCols.has(col)) {
+            // Eluted far up-lane (Rf ~ 0.65), nothing left at origin
+            dark = 135 * Math.exp(-(((i - (d0 + 380)) / 14) ** 2));
+          } else if (tailingCols.has(col)) {
+            // Upward comet smear starting at d0
+            const core = 175 * Math.exp(-(((i - (d0 + 11)) / 16) ** 2));
+            const tail = i > d0 ? 125 * Math.exp(-(i - d0) / 48) : 0;
+            dark = Math.max(core, tail);
+          } else if (col <= 11 && !coffeeRingCols.has(col)) {
+            dark = 135 * Math.exp(-(((i - d0) / 8) ** 2));
+          }
+          return Math.max(10, 236 - dark + rand() * 1.2);
+        });
+      }
+      if (key === 'UV366') {
+        return Array.from({ length: L }, (_, i) => {
+          let glow = 0;
+          if (coffeeRingCols.has(col)) {
+            const body = 20 * Math.exp(-(((i - d0) / 18) ** 2));
+            const upperRim = 14 * Math.exp(-(((i - (d0 + 15)) / 6) ** 2));
+            glow = body + upperRim;
+          } else if (col >= 12 && col <= 19 && !elutedCols.has(col)) {
+            glow = 125 * Math.exp(-(((i - d0) / 8) ** 2));
+          }
+          return Math.min(255, 24 + glow + rand() * 1.5);
+        });
+      }
+      // White channel
+      return Array.from({ length: L }, (_, i) => {
+        const drop = col >= 20 ? 80 * Math.exp(-(((i - d0) / 8) ** 2)) : 0;
+        return Math.max(10, 226 - drop + rand() * 1.2);
+      });
+    };
+
+    // Evaluate across eluted, coffee-ring, tailing, and clean lanes in all 3 channels
+    const testCols = [0, 2, 3, 5, 6, 9, 10, 14, 15, 16, 22, 26];
+    for (const col of testCols) {
+      const got = tlcOrigin(set, cfg.lanes[col], getProfile as any);
+      const expected = devTruePosFor(col);
+      expect(Math.abs(got - expected), `col=${col} got=${got} expected=${expected}`).toBeLessThanOrEqual(3.0);
+    }
+
+    // Alignment diagnostics should reflect rigid-merged mode with recovered shift and tilt
+    const align0 = set.preRunAlignment?.[0];
+    expect(align0).toBeDefined();
+    expect(align0!.mode).toBe('rigid-merged');
+    expect(align0!.matchedAnchors).toBeGreaterThanOrEqual(10);
+    expect(Math.abs(align0!.dyPx - shiftPx)).toBeLessThanOrEqual(2.5);
+    expect(Math.abs(align0!.slopePxPerLane - tiltPerLane)).toBeLessThanOrEqual(0.25);
+
+    // Toggling preRunEnabled = false must cleanly fall back to developed-only origin detection
+    set.preRunEnabled = false;
+    set.originAuto = {};
+    set.originAutoByLane = {};
+    const fallbackClean = tlcOrigin(set, cfg.lanes[14], getProfile as any);
+    expect(Math.abs(fallbackClean - devTruePosFor(14))).toBeLessThanOrEqual(4.0);
+    expect(set.preRunAlignment?.[0]).toBeUndefined();
+  });
+
+  it('uses direct-box pre-run origin cleanly when all developed spots eluted away from the origin', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(9911);
+    const preBase = 112;
+    const jitter = (col: number) => ((col % 5) - 2) * 1.5;
+
+    const set: TlcSet = {
+      uid: 'step2b-direct-box-fallback',
+      name: 'Step 2B Direct Box Fallback',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: {
+        UV254: { name: 'dev_uv254.png', bmp: {} as any },
+      },
+      preRunImgs: {
+        UV254: { name: 'pre_uv254.png', bmp: {} as any },
+      },
+      preRunEnabled: true,
+      cfg,
+    };
+
+    const getProfile = (s: TlcSet, _key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const L = l.length;
+      const isPre = Boolean((s as any)._isPreRunProbe);
+      if (isPre) {
+        const p0 = preBase + jitter(col);
+        return Array.from({ length: L }, (_, i) => {
+          const dark = 150 * Math.exp(-(((i - p0) / 7) ** 2));
+          return Math.max(10, 238 - dark + rand() * 0.8);
+        });
+      }
+      // Developed plate: every compound eluted high up-lane (pos ~ 460), zero origin dots left
+      return Array.from({ length: L }, (_, i) => {
+        const dark = 130 * Math.exp(-(((i - 460) / 14) ** 2));
+        return Math.max(10, 238 - dark + rand() * 0.8);
+      });
+    };
+
+    const o0 = tlcOrigin(set, cfg.lanes[0], getProfile as any);
+    const o12 = tlcOrigin(set, cfg.lanes[12], getProfile as any);
+    expect(Math.abs(o0 - (preBase + jitter(0)))).toBeLessThanOrEqual(2.5);
+    expect(Math.abs(o12 - (preBase + jitter(12)))).toBeLessThanOrEqual(2.5);
+    expect(set.preRunAlignment?.[0]?.mode).toBe('direct-box');
+    expect(set.preRunAlignment?.[0]?.matchedAnchors).toBe(0);
+  });
+
+  it('round-trips per-plate pre-run storage keys without colliding with developed image keys', () => {
+    const k0Dev = tlcStorageKey('UV254', 0);
+    const k0Pre = tlcPreRunStorageKey('UV254', 0);
+    const k2Dev = tlcStorageKey('UV366', 2);
+    const k2Pre = tlcPreRunStorageKey('UV366', 2);
+
+    expect(k0Dev).not.toBe(k0Pre);
+    expect(k2Dev).not.toBe(k2Pre);
+
+    expect(parseTlcStorageKey(k0Dev)).toEqual({ plateIndex: 0, channel: 'UV254', isPreRun: false });
+    expect(parseTlcStorageKey(k0Pre)).toEqual({ plateIndex: 0, channel: 'UV254', isPreRun: true });
+    expect(parseTlcStorageKey(k2Dev)).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: false });
+    expect(parseTlcStorageKey(k2Pre)).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: true });
+  });
 });
+
 
 
 

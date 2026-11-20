@@ -72,9 +72,11 @@ describe('Multi-Plate TLC Support (Plates 1, 2, 3)', () => {
     expect(tlcStorageKey('UV254', 1)).not.toContain('__');
     expect(tlcStorageKey('UV366', 2)).not.toContain('__');
 
-    expect(parseTlcStorageKey('UV254')).toEqual({ plateIndex: 0, channel: 'UV254' });
-    expect(parseTlcStorageKey('p1_UV254')).toEqual({ plateIndex: 1, channel: 'UV254' });
-    expect(parseTlcStorageKey('p2_UV366')).toEqual({ plateIndex: 2, channel: 'UV366' });
+    expect(parseTlcStorageKey('UV254')).toEqual({ plateIndex: 0, channel: 'UV254', isPreRun: false });
+    expect(parseTlcStorageKey('p1_UV254')).toEqual({ plateIndex: 1, channel: 'UV254', isPreRun: false });
+    expect(parseTlcStorageKey('p2_UV366')).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: false });
+    expect(parseTlcStorageKey('pre_UV254')).toEqual({ plateIndex: 0, channel: 'UV254', isPreRun: true });
+    expect(parseTlcStorageKey('p2_pre_UV366')).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: true });
   });
 
   it('stores Plates 1, 2, and 3 photos and calibration independently without overwriting Plate 1', () => {

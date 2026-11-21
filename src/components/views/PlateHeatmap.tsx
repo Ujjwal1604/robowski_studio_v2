@@ -115,7 +115,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
 
         let mergedSpots: TlcSpot[] = [];
 
-        if (lane.customSpots && lane.customSpots.length > 0) {
+        if (lane.customSpots !== undefined) {
           mergedSpots = [...lane.customSpots];
         } else if (channelsToCheck.length > 1) {
           const profiles: Partial<Record<TlcChannelKey, number[]>> = {};

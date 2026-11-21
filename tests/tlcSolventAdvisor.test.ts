@@ -1207,4 +1207,115 @@ describe('7 M NH3/MeOH stock option', () => {
   });
 });
 
+describe('upgraded retention physics, ionization, reactivity & explainability', () => {
+  it('detects internal zwitterions, attenuates EWG-substituted basicity, and widens per-spot rfSigma on hard spots', () => {
+    const phe = profileMoleculeForTlc(rdkit, 'NC(Cc1ccccc1)C(=O)O'); // phenylalanine (internal zwitterion)
+    expect(phe.isInternalZwitterion).toBe(true);
+    expect(phe.canonicalSmiles.length).toBeGreaterThan(0);
+
+    const meoh7 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_7')!;
+    const c18_60 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'c18_mecn_60')!;
+    const ket = profileMoleculeForTlc(rdkit, 'CC(=O)c1ccccc1');
+
+    const pheNp = predictNormalPhaseRf(phe, meoh7);
+    const pheC18 = predictNormalPhaseRf(phe, c18_60);
+    const ketNp = predictNormalPhaseRf(ket, meoh7);
+
+    expect(pheNp.tailing).toBe(true);
+    expect(pheNp.tailingReason).toMatch(/zwitterion/i);
+    expect(pheNp.rf).toBeLessThan(0.20);
+    expect(pheC18.rf).toBeGreaterThan(0.65);
+    expect(pheNp.rfSigma).toBeGreaterThan(ketNp.rfSigma);
+
+    // EWG attenuation: 4-nitroaniline & 2-chloropyridine suffer less TsOH protonation lag than aniline / pyridine
+    const aniline = profileMoleculeForTlc(rdkit, 'Nc1ccccc1');
+    const nitroAniline = profileMoleculeForTlc(rdkit, 'Nc1ccc([N+](=O)[O-])cc1');
+    const pyridine = profileMoleculeForTlc(rdkit, 'c1ccncc1');
+    const chloroPyr = profileMoleculeForTlc(rdkit, 'Clc1ccccn1');
+    expect(nitroAniline.ewgAttenuatedBasicity).toBeGreaterThan(0);
+    expect(chloroPyr.ewgAttenuatedBasicity).toBeGreaterThan(0);
+
+    const ea50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const tsohCtx = { hasAcidAdditive: true, additiveLabel: 'TsOH', acidStrength: 'strong_nonvolatile' as const, acidLoadEq: 0.6 };
+    const anilDrop = predictNormalPhaseRf(aniline, ea50).rf - predictNormalPhaseRf(aniline, ea50, tsohCtx).rf;
+    const nitroDrop = predictNormalPhaseRf(nitroAniline, ea50).rf - predictNormalPhaseRf(nitroAniline, ea50, tsohCtx).rf;
+    expect(nitroDrop).toBeLessThanOrEqual(anilDrop);
+  });
+
+  it('models independent Al2O3 retention (tighter phenol/nitro retention relative to amines vs SiO2)', () => {
+    const phenol = profileMoleculeForTlc(rdkit, 'Oc1ccccc1');
+    const nitro = profileMoleculeForTlc(rdkit, 'O=[N+]([O-])c1ccccc1');
+    const amine = profileMoleculeForTlc(rdkit, 'NCc1ccccc1');
+    const ea50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+
+    // On SiO2, phenol elutes much higher than benzylamine (which tails/pins);
+    // on Neutral Al2O3, phenol chelates strongly while benzylamine runs far cleaner/higher.
+    const gapSiO2 = predictNormalPhaseRf(phenol, ea50, undefined, 'SiO2').rf - predictNormalPhaseRf(amine, ea50, undefined, 'SiO2').rf;
+    const gapAl2O3 = predictNormalPhaseRf(phenol, ea50, undefined, 'Al2O3_neutral').rf - predictNormalPhaseRf(amine, ea50, undefined, 'Al2O3_neutral').rf;
+    expect(gapAl2O3).toBeLessThan(gapSiO2 - 0.15);
+
+    // Nitroarene is also retained more strongly on Al2O3 (dipole/pi) than on SiO2
+    const nitroSi = predictNormalPhaseRf(nitro, ea50, undefined, 'SiO2').rf;
+    const nitroAl = predictNormalPhaseRf(nitro, ea50, undefined, 'Al2O3_neutral').rf;
+    expect(nitroAl).toBeLessThan(nitroSi);
+  });
+
+  it('flags reactive sample-eluent pairs in-loop, computes EHS practicality descriptors, and populates advisor card explainability', async () => {
+    const amine = profileMoleculeForTlc(rdkit, 'NCc1ccccc1');
+    const acidChloride = profileMoleculeForTlc(rdkit, 'O=C(Cl)c1ccccc1');
+    expect(amine.acetoneReactiveLabel).toBeTruthy();
+    expect(acidChloride.meohReactiveLabel).toBeTruthy();
+
+    // EHS practicality ordering: EtOAc/Hexanes cleaner than DCM/MeOH and Et2O/Pentane
+    const dEaHex = computeMixtureDescriptors({ strongSolvent: 'EtOAc', weakSolvent: 'Hexanes', strongPct: 40, modifierId: 'none', stationaryPhase: 'SiO2' });
+    const dDcm = computeMixtureDescriptors({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 5, modifierId: 'none', stationaryPhase: 'SiO2' });
+    const dEther = computeMixtureDescriptors({ strongSolvent: 'Et2O', weakSolvent: 'Pentane', strongPct: 30, modifierId: 'none', stationaryPhase: 'SiO2' });
+    expect(dEaHex.practicalityPenalty).toBeLessThan(dDcm.practicalityPenalty);
+    expect(dDcm.practicalityPenalty).toBeLessThan(dEther.practicalityPenalty);
+    expect(dEther.practicalityNote).toMatch(/volatile/i);
+
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: 'Benzaldehyde', smiles: 'O=Cc1ccccc1', molarMass: 106.12, density: 1.04, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: 'Benzylamine', smiles: 'NCc1ccccc1', molarMass: 107.15, density: 0.98, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 60 };
+    const rows = Array.from({ length: 4 }, (_, w) => ({
+      local_index: w, global_index: w, combo_index: w, plate_number: 0, container_id: w,
+      recipe: [
+        { code: 'A', name: 'Benzaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: 'Benzylamine', target_concentration: 50, equivalence: 1 },
+      ],
+      'vol#solvent': 400,
+    }));
+    const plan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 4, rows } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 2, poolMode: 'balanced' }
+    );
+
+    // Primary amine plate must not rank an Acetone/Hexanes system in recommendedSystems
+    expect(plan.recommendedSystems.every((r) => r.system.family !== 'acetone_hex')).toBe(true);
+    // Any Acetone system in otherSystems exposes reactiveWells > 0 in riskSummary
+    const acetoneAlt = plan.otherSystems.find((s) => s.system.family === 'acetone_hex');
+    if (acetoneAlt) {
+      expect(acetoneAlt.riskSummary.reactiveWells).toBeGreaterThan(0);
+    }
+
+    // Explainability fields populated on every recommended card
+    for (const rec of plan.recommendedSystems) {
+      expect(rec.meanRfSigma).toBeGreaterThan(0.05);
+      expect(rec.meanRfSigma).toBeLessThan(0.35);
+      expect(rec.rationale.length).toBeGreaterThan(10);
+      expect(rec.evidenceSummary.length).toBeGreaterThan(10);
+      expect(rec.riskSummary).toBeDefined();
+      expect(Array.isArray(rec.uniqueWellIndices)).toBe(true);
+    }
+  });
+});
+
+
 

@@ -1293,8 +1293,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 </div>
                                 <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px' }}>
                                   {phaseFit.validated && phaseFit.cvRmse !== undefined
-                                    ? `Held-out (unseen compounds): ±${phaseFit.cvRmse.toFixed(2)} vs ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(2)} uncalibrated`
+                                    ? `Held-out compounds: ±${phaseFit.cvRmse.toFixed(2)} vs ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(2)} uncalibrated`
                                     : 'Not validated: too few distinct compounds'}
+                                  {phaseFit.plateCvRmse !== undefined
+                                    ? ` · Held-out plates: ±${phaseFit.plateCvRmse.toFixed(2)}${phaseFit.plateCvRmseBaseline !== undefined ? ` vs ±${phaseFit.plateCvRmseBaseline.toFixed(2)}` : ''}`
+                                    : ''}
                                   {' · '}
                                   {phaseFit.uniqueCompounds ?? '?'} distinct compounds
                                   {phaseFit.calibrationApplied === false ? ' · correction switched off (no held-out gain)' : ''}
@@ -1314,7 +1317,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   ±0.12 → <span style={{ color: '#38bdf8' }}>±{phaseFit.calibratedSigma.toFixed(2)} Rf</span>
                                 </div>
                               </div>
-                              {Object.keys(phaseFit.familyDemandShifts).length > 0 && (
+                              {(Object.keys(phaseFit.familyDemandShifts).length > 0 ||
+                                (phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0)) && (
                                 <div
                                   style={{
                                     padding: '6px 8px',
@@ -1324,14 +1328,23 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     fontSize: '11px',
                                   }}
                                 >
-                                  <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Solvent-Family Offsets</div>
-                                  <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
-                                    {Object.entries(phaseFit.familyDemandShifts)
-                                      .map(([fam, d]) => {
-                                        const rfD = rfShiftAtMidplate(d || 0, targetPhaseKey === 'C18');
-                                        return `${fam}: ${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)}`;
-                                      })
-                                      .join(', ')}
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Solvent-Family Performance</div>
+                                  <div className="mono" style={{ fontWeight: 700, marginTop: '2px', fontSize: '10.5px' }}>
+                                    {phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0
+                                      ? Object.entries(phaseFit.familyStats)
+                                          .map(([fam, st]) => {
+                                            const d = phaseFit.familyDemandShifts[fam as keyof typeof phaseFit.familyDemandShifts];
+                                            const rfD = d !== undefined ? rfShiftAtMidplate(d, targetPhaseKey === 'C18') : null;
+                                            const shiftStr = rfD !== null ? ` (${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)})` : '';
+                                            return `${fam}: ±${(st?.rmseAfter ?? 0).toFixed(2)} [n=${st?.pairedCount ?? 0}]${shiftStr}`;
+                                          })
+                                          .join(', ')
+                                      : Object.entries(phaseFit.familyDemandShifts)
+                                          .map(([fam, d]) => {
+                                            const rfD = rfShiftAtMidplate(d || 0, targetPhaseKey === 'C18');
+                                            return `${fam}: ${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)}`;
+                                          })
+                                          .join(', ')}
                                   </div>
                                 </div>
                               )}
@@ -1515,11 +1528,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   <span title="Predicted polar spot matched residual origin/baseline deposit (Rf ≤ 0.05)">
                                     <span style={{ color: '#fb7185', fontWeight: 700 }}>▼</span> Base-Pin ({basePinCount})
                                   </span>
-                                  <span title="Predicted Product (emerald dashed) or SM (amber dashed) not detected at expected Rf">
-                                    <span style={{ color: '#10b981', fontWeight: 700 }}>◌</span> Missing ({missingProdCount}P / {consumedSmCount}SM)
+                                  <span title="Candidate predicted products (may not have formed) or starting materials (consumed / baseline-pinned) with no matching TLC spot within ±0.24 Rf">
+                                    <span style={{ color: '#10b981', fontWeight: 700 }}>◌</span> Not seen ({missingProdCount}P / {consumedSmCount}SM)
                                   </span>
-                                  <span title="Measured TLC spot with no nearby predicted SM or High/Med product">
-                                    <span style={{ color: '#c084fc', fontWeight: 700 }}>◆</span> Extra ({extraSpotCount})
+                                  <span title="Measured TLC spot with no predicted SM or High/Med candidate product within ±0.24 Rf">
+                                    <span style={{ color: '#c084fc', fontWeight: 700 }}>◆</span> Unmatched ({extraSpotCount})
                                   </span>
                                 </div>
                               </div>
@@ -1643,6 +1656,38 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                         const hasMissingProd = lane.predictedSpots.some((p) => p.kind === 'product' && !p.found);
                                         const hasExtra = lane.measuredSpots.some((m) => !m.matchedLabel);
 
+                                        const nFound = lane.predictedSpots.filter(
+                                          (p) =>
+                                            p.found &&
+                                            p.boundaryStatus !== 'front_saturated' &&
+                                            p.boundaryStatus !== 'baseline_pinned'
+                                        ).length;
+                                        const nBoundary = lane.predictedSpots.filter(
+                                          (p) =>
+                                            p.boundaryStatus === 'front_saturated' ||
+                                            p.boundaryStatus === 'baseline_pinned'
+                                        ).length;
+                                        const nSmNotSeen = lane.predictedSpots.filter(
+                                          (p) =>
+                                            !p.found &&
+                                            p.kind === 'substrate' &&
+                                            p.boundaryStatus !== 'front_saturated' &&
+                                            p.boundaryStatus !== 'baseline_pinned'
+                                        ).length;
+                                        const nProdNotSeen = lane.predictedSpots.filter(
+                                          (p) =>
+                                            !p.found &&
+                                            p.kind === 'product' &&
+                                            p.boundaryStatus !== 'front_saturated' &&
+                                            p.boundaryStatus !== 'baseline_pinned'
+                                        ).length;
+                                        const nExtra = lane.measuredSpots.filter((m) => !m.matchedLabel).length;
+                                        const tipParts: string[] = [`${nFound} matched`];
+                                        if (nBoundary > 0) tipParts.push(`${nBoundary} at front/base`);
+                                        if (nSmNotSeen > 0) tipParts.push(`${nSmNotSeen} SM not seen`);
+                                        if (nProdNotSeen > 0) tipParts.push(`${nProdNotSeen} cand. prod not seen`);
+                                        tipParts.push(`${nExtra} unmatched TLC spot(s)`);
+
                                         return (
                                           <button
                                             key={lane.wellIndex}
@@ -1652,11 +1697,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                             title={
                                               lane.isBlank
                                                 ? `Lane ${spotIdx + 1} · ${lane.wellCoord} (Blank / No Well)`
-                                                : `Lane ${spotIdx + 1} · ${lane.wellCoord}: ${
-                                                    lane.predictedSpots.filter((p) => p.found).length
-                                                  } found · ${lane.predictedSpots.filter((p) => !p.found).length} missing · ${
-                                                    lane.measuredSpots.filter((m) => !m.matchedLabel).length
-                                                  } extra spot(s)`
+                                                : `Lane ${spotIdx + 1} · ${lane.wellCoord}: ${tipParts.join(' · ')} (click to inspect)`
                                             }
                                             style={{
                                               position: 'relative',
@@ -1751,7 +1792,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                                       p.boundaryStatus !== 'front_saturated' &&
                                                       p.boundaryStatus !== 'baseline_pinned'
                                                   )
-                                                  .slice(0, 5)
+                                                  .slice(0, 8)
                                                   .map((p, pi) => {
                                                     const rfVal = calibrationEnabled ? p.rfAfter : p.rfBefore;
                                                     const topPct = Math.max(5, Math.min(95, (1 - rfVal) * 100));
@@ -2087,7 +2128,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                 platePlan?.followUpPlan &&
                 (platePlan.followUpPlan.recommendations.length > 0 ||
                   platePlan.followUpPlan.summary.frontCrowdedWells.length > 0 ||
-                  platePlan.followUpPlan.summary.baselinePinnedWells.length > 0) && (
+                  platePlan.followUpPlan.summary.baselinePinnedWells.length > 0 ||
+                  platePlan.followUpPlan.summary.tailingWells.length > 0) && (
                   <div
                     style={{
                       border: '1px solid color-mix(in srgb, #38bdf8 45%, var(--line))',
@@ -2136,8 +2178,16 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                           {platePlan.followUpPlan.summary.coelutedWells.length > 0 && (
                             <> · <strong>{platePlan.followUpPlan.summary.coelutedWells.length} co-eluted</strong></>
                           )}
+                          {platePlan.followUpPlan.summary.tailingWells.length > 0 && (
+                            <> · <strong style={{ color: '#f59e0b' }}>{platePlan.followUpPlan.summary.tailingWells.length} tailing/streaking</strong></>
+                          )}
                           {' '}— run a suggested rescue tab and re-load to refine the fit.
                         </div>
+                        {platePlan.followUpPlan.summary.plateProgressionNote && (
+                          <div style={{ fontSize: '11px', color: '#10b981', marginTop: '2px', fontWeight: 600 }}>
+                            {platePlan.followUpPlan.summary.plateProgressionNote}
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -2409,6 +2459,108 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             50 mL: {prepOf(rec.system)}
                           </div>
 
+                          {/* Explainability metrics: Unique coverage, Rf uncertainty, Separation quality */}
+                          <div
+                            className="mono"
+                            style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: '6px',
+                              fontSize: '10.5px',
+                              alignItems: 'center',
+                            }}
+                          >
+                            {rec.uniqueWellIndices.length > 0 && (
+                              <span
+                                style={{
+                                  padding: '2px 6px',
+                                  borderRadius: '4px',
+                                  background: 'color-mix(in srgb, #10b981 14%, transparent)',
+                                  color: '#10b981',
+                                  fontWeight: 700,
+                                }}
+                                title={`Wells uniquely resolved by this system in the recommended set: ${rec.uniqueWellCoords.join(', ')}`}
+                              >
+                                +{rec.uniqueWellIndices.length} unique
+                              </span>
+                            )}
+                            <span
+                              style={{
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                background: 'var(--soft)',
+                                color: 'var(--fg2)',
+                              }}
+                              title="Mean per-spot Rf prediction uncertainty (±1σ) across active wells"
+                            >
+                              ±{rec.meanRfSigma.toFixed(2)} Rf
+                            </span>
+                            <span
+                              style={{
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                background: 'var(--soft)',
+                                color: 'var(--fg2)',
+                              }}
+                              title="Mean predicted product–substrate separation across assigned wells"
+                            >
+                              avg ΔRf {rec.meanProductDeltaRf.toFixed(2)}
+                            </span>
+                            {rec.system.descriptors?.practicalityNote && (
+                              <span
+                                style={{
+                                  padding: '2px 6px',
+                                  borderRadius: '4px',
+                                  background: 'color-mix(in srgb, #f59e0b 12%, transparent)',
+                                  color: '#f59e0b',
+                                }}
+                              >
+                                {rec.system.descriptors.practicalityNote}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Failure risk summary */}
+                          {(() => {
+                            const rk = rec.riskSummary;
+                            const items: Array<{ label: string; color: string }> = [];
+                            if (rk.reactiveWells > 0) items.push({ label: `${rk.reactiveWells} reactive eluent`, color: '#ef4444' });
+                            if (rk.tailingWells > 0) items.push({ label: `${rk.tailingWells} tailing`, color: '#f59e0b' });
+                            if (rk.baselineWells > 0) items.push({ label: `${rk.baselineWells} baseline`, color: '#fb7185' });
+                            if (rk.frontWells > 0) items.push({ label: `${rk.frontWells} front`, color: '#38bdf8' });
+                            if (rk.coelutedWells > 0) items.push({ label: `${rk.coelutedWells} co-elution`, color: '#a78bfa' });
+                            if (rk.stainOnlyWells > 0) items.push({ label: `${rk.stainOnlyWells} stain-only`, color: '#94a3b8' });
+                            if (items.length === 0) return null;
+                            return (
+                              <div
+                                className="mono"
+                                style={{
+                                  display: 'flex',
+                                  flexWrap: 'wrap',
+                                  gap: '5px',
+                                  fontSize: '10px',
+                                  alignItems: 'center',
+                                }}
+                              >
+                                <span style={{ color: 'var(--mut)' }}>Risks:</span>
+                                {items.map((it) => (
+                                  <span
+                                    key={it.label}
+                                    style={{
+                                      padding: '1px 5px',
+                                      borderRadius: '4px',
+                                      border: `1px solid color-mix(in srgb, ${it.color} 40%, transparent)`,
+                                      color: it.color,
+                                      fontWeight: 600,
+                                    }}
+                                  >
+                                    {it.label}
+                                  </span>
+                                ))}
+                              </div>
+                            );
+                          })()}
+
                           {rec.system.descriptors && (
                             <div
                               className="mono"
@@ -2449,8 +2601,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             </div>
                           )}
 
-                          <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-                            {rec.system.synthesisNote ? `${rec.system.synthesisNote} — ${rec.system.bestFor}` : rec.system.bestFor}
+                          <div style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
+                            {rec.rationale || (rec.system.synthesisNote ? `${rec.system.synthesisNote} — ${rec.system.bestFor}` : rec.system.bestFor)}
+                          </div>
+                          <div style={{ fontSize: '10.5px', color: 'var(--mut)' }}>
+                            Evidence: {rec.evidenceSummary}
                           </div>
 
                           <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }} onClick={(e) => e.stopPropagation()}>

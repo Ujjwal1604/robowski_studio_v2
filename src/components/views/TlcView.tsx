@@ -1726,7 +1726,7 @@ export const TlcView: React.FC = () => {
     [coreFraction, spotProminence, getCoherenceRescuedMap, edgeSettingFor, getEdgeFits]
   );
 
-  // Helper to extract panels for lane t
+  // Helper to extract panels for lane t (always using unified multi-channel spots so Grid, Full Plate, and Modal agree 1-to-1)
   const getPanelsForLane = useCallback(
     (t: number): LanePanel[] => {
       if (compare && isMultiSet) {
@@ -1734,7 +1734,7 @@ export const TlcView: React.FC = () => {
           .map((s, idx): LanePanel | null => {
             const lane = s.cfg?.lanes.find((l) => l.id === t);
             if (!lane || !s.imgs[cmpKey]) return null;
-            const spots = markSpots ? getSpotsForLane(s, cmpKey, lane) : null;
+            const spots = markSpots ? getCompositeSpotsForLane(s, lane) : null;
             return {
               s,
               i: idx,
@@ -1748,23 +1748,20 @@ export const TlcView: React.FC = () => {
       }
 
       const s = activePlateSet;
+      const lane = s.cfg?.lanes.find((l) => l.id === t);
+      if (!lane) return [];
+      const unifiedSpots = markSpots ? getCompositeSpotsForLane(s, lane) : null;
       return TLC_KEYS.filter((k) => s.imgs[k] && show[k])
-        .map((k): LanePanel | null => {
-          const lane = s.cfg?.lanes.find((l) => l.id === t);
-          if (!lane) return null;
-          const spots = markSpots ? getSpotsForLane(s, k, lane) : null;
-          return {
-            s,
-            i: cur,
-            key: k,
-            lane,
-            label: '',
-            spots,
-          };
-        })
-        .filter((p): p is LanePanel => p !== null);
+        .map((k): LanePanel => ({
+          s,
+          i: cur,
+          key: k,
+          lane,
+          label: '',
+          spots: unifiedSpots,
+        }));
     },
-    [compare, isMultiSet, plateSets, cmpKey, activePlateSet, cur, show, markSpots, getSpotsForLane]
+    [compare, isMultiSet, plateSets, cmpKey, activePlateSet, cur, show, markSpots, getCompositeSpotsForLane]
   );
 
   // Big modal inspection drawing: UV 254, UV 365 Fluorescence, and Composite side by side
@@ -1774,7 +1771,9 @@ export const TlcView: React.FC = () => {
     const lane = activePlateSet.cfg.lanes.find((l) => l.id === t);
     if (!lane) return [];
 
-    // Individual channel view (if user explicitly chooses only one channel)
+    const unifiedSpots = markSpots ? getCompositeSpotsForLane(activePlateSet, lane) : null;
+
+    // Individual channel view (if user explicitly chooses only one channel photo)
     if (densViewMode === 'UV254' && activePlateSet.imgs.UV254) {
       return [{
         s: activePlateSet,
@@ -1783,7 +1782,7 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'UV 254 nm',
         channelTitle: 'UV 254 (Absorbance)',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
+        spots: unifiedSpots,
       }];
     }
     if (densViewMode === 'UV366' && activePlateSet.imgs.UV366) {
@@ -1794,7 +1793,7 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'UV 365 nm',
         channelTitle: 'UV 365 (Fluorescence)',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV366', lane) : null,
+        spots: unifiedSpots,
       }];
     }
     if (densViewMode === 'White' && activePlateSet.imgs.White) {
@@ -1805,7 +1804,7 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'Visible',
         channelTitle: 'Visible Stain',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'White', lane) : null,
+        spots: unifiedSpots,
       }];
     }
 
@@ -1821,7 +1820,7 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'UV 254 nm',
         channelTitle: 'UV 254 (Absorbance)',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV254', lane) : null,
+        spots: unifiedSpots,
       });
     }
 
@@ -1834,7 +1833,7 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'UV 365 nm',
         channelTitle: 'UV 365 (Fluorescence)',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'UV366', lane) : null,
+        spots: unifiedSpots,
       });
     }
 
@@ -1849,7 +1848,7 @@ export const TlcView: React.FC = () => {
         label: '✨ Composite',
         channelTitle: '✨ Composite (All Channels)',
         isComposite: true,
-        spots: markSpots ? getCompositeSpotsForLane(activePlateSet, lane) : null,
+        spots: unifiedSpots,
       });
     }
 
@@ -1862,12 +1861,12 @@ export const TlcView: React.FC = () => {
         lane,
         label: 'Visible',
         channelTitle: 'Visible (Stain)',
-        spots: markSpots ? getSpotsForLane(activePlateSet, 'White', lane) : null,
+        spots: unifiedSpots,
       });
     }
 
     return panels.length > 0 ? panels : getPanelsForLane(t);
-  }, [inspectWell, activePlateSet, cur, densViewMode, markSpots, getSpotsForLane, getCompositeSpotsForLane, getPanelsForLane]);
+  }, [inspectWell, activePlateSet, cur, densViewMode, markSpots, getCompositeSpotsForLane, getPanelsForLane]);
 
   // Memoized panels for all 54 wells in the plate grid (only computed when viewing 54-well grid)
   const allPanels = useMemo(() => {
@@ -1886,7 +1885,9 @@ export const TlcView: React.FC = () => {
 
   useEffect(() => {
     if (inspectWell !== null && bigCanvasRef.current && inspectPanels.length > 0) {
-      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, markSpots, false, boostWhiteSpots);
+      // Omit raw per-channel canvas tick marks in the zoomed modal because the interactive
+      // full-width guidelines above render the canonical unified modalActiveSpots 1-to-1.
+      drawLanePanels(bigCanvasRef.current, inspectPanels, 1.0, filters, false, false, boostWhiteSpots);
 
       // Extract distinct densitograms for all available channels
       const newDens: { UV254?: TlcDensitogramData; UV366?: TlcDensitogramData; White?: TlcDensitogramData } = {};
@@ -1907,11 +1908,6 @@ export const TlcView: React.FC = () => {
         for (const k of TLC_KEYS) {
           if (s.imgs[k]) {
             const prof = extractLaneProfile(s, k, l, coreFraction);
-            const span = Math.max(1, front - origin);
-            const minDistance = Math.max(
-              10,
-              Math.round(span * (spotProminence >= 0.45 ? 0.14 : spotProminence <= 0.15 ? 0.025 : 0.07))
-            );
             const getDensProf = (st: TlcSet, ck: TlcChannelKey, ln: TlcLane) =>
               extractLaneProfile(st, ck, ln, coreFraction);
             const rawDens = extractDensitogram(prof, {
@@ -1920,7 +1916,6 @@ export const TlcView: React.FC = () => {
               front,
               radius: l.spotRadius || 24,
               minProminence: spotProminence,
-              minDistance,
               plateHistogram: getChannelHistogram(s, k, getDensProf),
               lane2d: getLane2dMetrics(s, k, l, coreFraction),
               detectorMode: s.spotDetectorMode,
@@ -2267,6 +2262,50 @@ export const TlcView: React.FC = () => {
     });
   };
 
+  // Atomic batch lane update (e.g. 1-click removal of a confidence category across the plate)
+  // Snapshots Undo history once and keeps profile/front/origin caches intact when only spots change.
+  const handleUpdateLanesBatch = (
+    patches: Record<number, Partial<TlcLane>>,
+    options?: { keepCaches?: boolean; toastMessage?: string }
+  ) => {
+    if (!activePlateSet?.cfg) return;
+    const laneIds = Object.keys(patches);
+    if (laneIds.length === 0) return;
+
+    const currentCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+    setCfgHistoryByPlate((m) => ({
+      ...m,
+      [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), currentCfg],
+    }));
+    lastHistorySnapshotRef.current = Date.now();
+
+    setSets((prev) => {
+      const next = [...prev];
+      if (!next[cur]) return next;
+      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+        if (!slice.cfg) return {};
+        const newLanes = slice.cfg.lanes.map((l) =>
+          patches[l.id] ? { ...l, ...patches[l.id] } : l
+        );
+        if (options?.keepCaches) {
+          return { cfg: { ...slice.cfg, lanes: newLanes } };
+        }
+        return {
+          cfg: { ...slice.cfg, lanes: newLanes },
+          prof: {},
+          frontAuto: {},
+          frontAutoByLane: {},
+          originAuto: {},
+          originAutoByLane: {},
+        };
+      });
+      return next;
+    });
+    if (options?.toastMessage) {
+      toast(options.toastMessage);
+    }
+  };
+
   // Revert last adjustment
   const handleUndo = () => {
     if (cfgHistory.length === 0) return;
@@ -2469,26 +2508,19 @@ export const TlcView: React.FC = () => {
     return channelDensitograms[densViewMode] || null;
   }, [channelDensitograms, densViewMode]);
 
-  // Unified modal peak list: in Side-by-Side/Composite ('overlay') mode, merge detected peaks across all 3 channels;
-  // in single-channel mode, use that channel's spots (always respecting lane.customSpots)
+  // Unified canonical modal peak list: always identical across Full Plate View, 54-Well Grid,
+  // Zoomed Inspection strips, Densitogram, and Peak Deconvolution list (always respecting lane.customSpots).
   const modalActiveSpots = useMemo<TlcSpot[]>(() => {
-    if (densViewMode === 'overlay') {
-      const compPanel = inspectPanels.find((p) => (p as any).isComposite);
-      if (compPanel?.spots) return compPanel.spots;
-      const byCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
-      if (channelDensitograms.UV254) byCh.UV254 = channelDensitograms.UV254.spots;
-      if (channelDensitograms.UV366) byCh.UV366 = channelDensitograms.UV366.spots;
-      if (channelDensitograms.White) byCh.White = channelDensitograms.White.spots;
-      const merged = mergeMultiChannelSpots(byCh);
-      if (inspectWell !== null && activePlateSet.cfg) {
-        const laneId = tlcLane(inspectWell, 'column');
-        const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
-        if (lane) return getEffectiveLaneSpots(lane, merged);
+    if (inspectWell !== null && activePlateSet.cfg) {
+      const laneId = tlcLane(inspectWell, 'column');
+      const lane = activePlateSet.cfg.lanes.find((l) => l.id === laneId);
+      if (lane) {
+        const unified = getCompositeSpotsForLane(activePlateSet, lane);
+        if (unified) return unified;
       }
-      return merged;
     }
     return inspectPanels[0]?.spots || activeDens?.spots || [];
-  }, [densViewMode, inspectPanels, channelDensitograms, activeDens, inspectWell, activePlateSet.cfg]);
+  }, [inspectWell, activePlateSet, getCompositeSpotsForLane, inspectPanels, activeDens]);
 
   // Separation calculations between detected spots
   const separationMetrics = useMemo(() => {
@@ -2678,9 +2710,7 @@ export const TlcView: React.FC = () => {
         const baseSpots =
           laneObj.customSpots !== undefined
             ? [...laneObj.customSpots]
-            : densViewMode === 'overlay'
-            ? [...(getCompositeSpotsForLane(activePlateSet, laneObj) || [])]
-            : [...(getSpotsForLane(activePlateSet, targetCh, laneObj) || [])];
+            : [...(getCompositeSpotsForLane(activePlateSet, laneObj) || [])];
 
         let laneAdded = 0;
         for (const cand of m.spots) {
@@ -2787,7 +2817,7 @@ export const TlcView: React.FC = () => {
         const well = wellLabel(containerOfLane(lane.id));
         const origin = tlcOrigin(activePlateSet, lane, get);
         const front = tlcFront(activePlateSet, lane, get);
-        const spots = getSpotsForLane(activePlateSet, targetCh, lane) || [];
+        const spots = getCompositeSpotsForLane(activePlateSet, lane) || [];
 
         lanesSummary.push({
           well,
@@ -3034,7 +3064,7 @@ export const TlcView: React.FC = () => {
             const baseSpots =
               lane.customSpots !== undefined
                 ? [...lane.customSpots]
-                : [...(getSpotsForLane(activePlateSet, qcChannel, lane) || [])];
+                : [...(getCompositeSpotsForLane(activePlateSet, lane) || [])];
 
             for (const c of laneCorrs) {
               if (c.action === 'add') {
@@ -4725,7 +4755,9 @@ export const TlcView: React.FC = () => {
             run={run}
             plate={plate}
             getProfile={(s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)}
+            getCanonicalSpots={(ln) => getCompositeSpotsForLane(activePlateSet, ln)}
             onUpdateLane={handleUpdateLane}
+            onUpdateLanesBatch={handleUpdateLanesBatch}
             onUpdateSetFront={handleUpdateSetFront}
             onAutoDetectBaselines={handleAutoDetectBaselines}
             onSnapshotHistory={handleSnapshotHistory}
@@ -5194,7 +5226,7 @@ export const TlcView: React.FC = () => {
                                     padding: '0 5px',
                                     borderRadius: '8px',
                                     background: isDragged ? '#facc15' : isHovered ? '#ffffff' : spotColor,
-                                    color: isDragged || isHovered || sp.source === 'manual' || ((!sp.source || sp.source === 'auto') && confStyle.value >= 0.45 && confStyle.value < 0.72) ? '#000000' : '#ffffff',
+                                    color: isDragged || isHovered || sp.source === 'manual' || ((!sp.source || sp.source === 'auto') && (confStyle.tier === 'medium' || confStyle.tier === 'very-high' || confStyle.tier === 'low')) ? '#0f172a' : '#ffffff',
                                     boxShadow: '0 2px 6px rgba(0,0,0,0.8), 0 0 0 1px rgba(0,0,0,0.4)',
                                     cursor: 'ns-resize',
                                     display: 'flex',
@@ -5459,52 +5491,136 @@ export const TlcView: React.FC = () => {
                               {/* Baseline Reference Axis (X = 40) */}
                               <line x1="40" y1="0" x2="40" y2={ph} stroke="rgba(255,255,255,0.12)" strokeWidth="1" />
 
-                              {/* Render UV 254 nm Densitogram Trace (Quenching / Absorbance) */}
-                              {(densViewMode === 'overlay' || densViewMode === 'UV254') &&
-                                channelDensitograms.UV254 &&
-                                (() => {
-                                  const d = channelDensitograms.UV254;
-                                  const pts = d.points;
-                                  if (!pts.length) return null;
-                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
-                                  const dStr = pts
-                                    .map((p) => {
-                                      const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
-                                      return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-                                    })
-                                    .join(' ');
-                                  return (
-                                    <g key="uv254">
-                                      {/* Shaded real segmented spot boundaries under the UV254 curve */}
-                                      {d.spots.map((sp, idx) => {
-                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
-                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
-                                        if (hi <= lo) return null;
-                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
-                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
-                                          const pt = pts[pIdx];
-                                          if (!pt) continue;
-                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
-                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
-                                        }
-                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
-                                        return (
+                              {/* Render Channel Densitogram Traces & Unified Modal Spot Markers */}
+                              {(() => {
+                                const visibleChannels: TlcChannelKey[] =
+                                  densViewMode === 'overlay'
+                                    ? (['UV254', 'UV366', 'White'] as TlcChannelKey[]).filter((ch) => Boolean(channelDensitograms[ch]))
+                                    : channelDensitograms[densViewMode]
+                                    ? [densViewMode]
+                                    : [];
+
+                                const channelMeta: Record<
+                                  TlcChannelKey,
+                                  { stroke: string; fill: string; dash?: string }
+                                > = {
+                                  UV254: { stroke: '#10b981', fill: 'rgba(16, 185, 129, 0.18)' },
+                                  UV366: {
+                                    stroke: '#a855f7',
+                                    fill: 'rgba(168, 85, 247, 0.18)',
+                                    dash: densViewMode === 'overlay' ? '4,2' : undefined,
+                                  },
+                                  White: {
+                                    stroke: '#f59e0b',
+                                    fill: 'rgba(245, 158, 11, 0.18)',
+                                    dash: densViewMode === 'overlay' ? '2,2' : undefined,
+                                  },
+                                };
+
+                                const getScaleMax = (d: TlcDensitogramData, hasChannelSpots: boolean) =>
+                                  hasChannelSpots ? d.maxSignal : Math.max(d.maxSignal, 28);
+
+                                const curveXAtPos = (d: TlcDensitogramData, pos: number, scaleMax: number) => {
+                                  const clamped = Math.max(0, Math.min(d.points.length - 1, Math.round(pos)));
+                                  const pt = d.points[clamped];
+                                  return 40 + Math.min(230, ((pt?.signal || 0) / Math.max(1e-6, scaleMax)) * 230);
+                                };
+
+                                // Match canonical modalActiveSpots to each channel for shading so the densitogram
+                                // never shades or plots unmerged/suppressed duplicate spots that aren't in the list.
+                                const channelSpotMap: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
+                                const channelScaleMap: Partial<Record<TlcChannelKey, number>> = {};
+                                for (const ch of visibleChannels) {
+                                  const d = channelDensitograms[ch]!;
+                                  const chSpots = modalActiveSpots.filter(
+                                    (sp) =>
+                                      !sp.channels ||
+                                      sp.channels.length === 0 ||
+                                      sp.channels.includes(ch) ||
+                                      densViewMode === ch
+                                  );
+                                  channelSpotMap[ch] = chSpots;
+                                  channelScaleMap[ch] = getScaleMax(d, chSpots.length > 0);
+                                }
+
+                                return (
+                                  <>
+                                    {visibleChannels.map((ch) => {
+                                      const d = channelDensitograms[ch]!;
+                                      const pts = d.points;
+                                      if (!pts.length) return null;
+                                      const scaleMax = channelScaleMap[ch] ?? Math.max(d.maxSignal, 28);
+                                      const chSpots = channelSpotMap[ch] ?? [];
+                                      const meta = channelMeta[ch];
+                                      const dStr = pts
+                                        .map((p) => {
+                                          const y = ph - p.pos;
+                                          const x = 40 + Math.min(230, (p.signal / Math.max(1e-6, scaleMax)) * 230);
+                                          return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+                                        })
+                                        .join(' ');
+
+                                      return (
+                                        <g key={ch}>
+                                          {chSpots.map((sp, idx) => {
+                                            // Prefer this channel's own segmented extent if a raw channel peak matches sp
+                                            const rawMatch = d.spots.find((rs) => Math.abs(rs.rf - sp.rf) < 0.045);
+                                            const lo = Math.max(0, rawMatch?.extentStart ?? sp.extentStart ?? sp.pos - 8);
+                                            const hi = Math.min(pts.length - 1, rawMatch?.extentEnd ?? sp.extentEnd ?? sp.pos + 8);
+                                            if (hi <= lo) return null;
+                                            const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
+                                            for (let pIdx = lo; pIdx <= hi; pIdx++) {
+                                              const pt = pts[pIdx];
+                                              if (!pt) continue;
+                                              const px = 40 + Math.min(230, (pt.signal / Math.max(1e-6, scaleMax)) * 230);
+                                              segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
+                                            }
+                                            segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
+                                            return (
+                                              <path
+                                                key={`fill-${ch}-${idx}`}
+                                                d={segPts.join(' ')}
+                                                fill={meta.fill}
+                                                stroke="none"
+                                              />
+                                            );
+                                          })}
                                           <path
-                                            key={`fill254-${idx}`}
-                                            d={segPts.join(' ')}
-                                            fill="rgba(16, 185, 129, 0.18)"
-                                            stroke="none"
+                                            d={dStr}
+                                            fill="none"
+                                            stroke={meta.stroke}
+                                            strokeWidth="2"
+                                            strokeDasharray={meta.dash}
                                           />
-                                        );
-                                      })}
-                                      <path d={dStr} fill="none" stroke="#10b981" strokeWidth="2" />
-                                      {/* Detected Peak Apex Dots with Provenance Styling */}
-                                      {d.spots.map((sp, idx) => {
+                                        </g>
+                                      );
+                                    })}
+
+                                    {/* Unified Peak Apex Dots matching modalActiveSpots 1-to-1 */}
+                                    <g key="unified-spot-markers">
+                                      {modalActiveSpots.map((sp, idx) => {
+                                        const preferredChannels =
+                                          sp.channels && sp.channels.length > 0
+                                            ? visibleChannels.filter((ch) => sp.channels!.includes(ch))
+                                            : visibleChannels;
+                                        const candidateChannels =
+                                          preferredChannels.length > 0 ? preferredChannels : visibleChannels;
+                                        if (!candidateChannels.length) return null;
+
+                                        // Place the marker on the strongest visible trace at sp.pos
+                                        let bestX = 40;
+                                        for (const ch of candidateChannels) {
+                                          const d = channelDensitograms[ch];
+                                          if (!d || !d.points.length) continue;
+                                          const scaleMax = channelScaleMap[ch] ?? Math.max(d.maxSignal, 28);
+                                          const cx = curveXAtPos(d, sp.pos, scaleMax);
+                                          if (cx > bestX) bestX = cx;
+                                        }
+
                                         const y = ph - sp.pos;
-                                        const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
-                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
+                                        const isHovered = hoveredModalSpotIdx === idx;
+                                        const isDragged =
+                                          isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
                                         const isAuto = !sp.source || sp.source === 'auto';
                                         const confStyle = getSpotConfidenceStyle(sp.confidence);
                                         const isLowConf = isAuto && confStyle.needsReview;
@@ -5515,103 +5631,20 @@ export const TlcView: React.FC = () => {
                                           : sp.source === 'adjusted'
                                           ? '#a855f7'
                                           : confStyle.color;
-                                        return (
-                                          <g key={idx}>
-                                            <circle
-                                              cx={x}
-                                              cy={y}
-                                              r={isDragged ? '5' : '3.5'}
-                                              fill={spotColor}
-                                              stroke="#ffffff"
-                                              strokeWidth={isDragged ? '2' : '1'}
-                                              strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
-                                            />
-                                            <text
-                                              x={Math.min(270, x + 6)}
-                                              y={y + 3}
-                                              fill={spotColor}
-                                              fontSize="9"
-                                              fontWeight="bold"
-                                              fontFamily="monospace"
-                                            >
-                                              {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
-                                            </text>
-                                          </g>
-                                        );
-                                      })}
-                                    </g>
-                                  );
-                                })()}
 
-                              {/* Render UV 365 nm Densitogram Trace (Intrinsic Fluorescence) */}
-                              {(densViewMode === 'overlay' || densViewMode === 'UV366') &&
-                                channelDensitograms.UV366 &&
-                                (() => {
-                                  const d = channelDensitograms.UV366;
-                                  const pts = d.points;
-                                  if (!pts.length) return null;
-                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
-                                  const dStr = pts
-                                    .map((p) => {
-                                      const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
-                                      return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-                                    })
-                                    .join(' ');
-                                  return (
-                                    <g key="uv366">
-                                      {d.spots.map((sp, idx) => {
-                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
-                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
-                                        if (hi <= lo) return null;
-                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
-                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
-                                          const pt = pts[pIdx];
-                                          if (!pt) continue;
-                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
-                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
-                                        }
-                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
                                         return (
-                                          <path
-                                            key={`fill366-${idx}`}
-                                            d={segPts.join(' ')}
-                                            fill="rgba(168, 85, 247, 0.18)"
-                                            stroke="none"
-                                          />
-                                        );
-                                      })}
-                                      <path d={dStr} fill="none" stroke="#a855f7" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '4,2' : undefined} />
-                                      {/* Detected Peak Apex Dots with Provenance Styling */}
-                                      {d.spots.map((sp, idx) => {
-                                        const y = ph - sp.pos;
-                                        const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
-                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
-                                        const isAuto = !sp.source || sp.source === 'auto';
-                                        const confStyle = getSpotConfidenceStyle(sp.confidence);
-                                        const isLowConf = isAuto && confStyle.needsReview;
-                                        const spotColor = isDragged
-                                          ? '#facc15'
-                                          : sp.source === 'manual'
-                                          ? '#f59e0b'
-                                          : sp.source === 'adjusted'
-                                          ? '#c084fc'
-                                          : confStyle.color;
-                                        return (
-                                          <g key={idx}>
+                                          <g key={`spot-marker-${idx}`}>
                                             <circle
-                                              cx={x}
+                                              cx={bestX}
                                               cy={y}
-                                              r={isDragged ? '5' : '3.5'}
+                                              r={isDragged || isHovered ? '5' : '3.8'}
                                               fill={spotColor}
                                               stroke="#ffffff"
-                                              strokeWidth={isDragged ? '2' : '1'}
+                                              strokeWidth={isDragged || isHovered ? '2' : '1.2'}
                                               strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
                                             />
                                             <text
-                                              x={Math.min(270, x + 6)}
+                                              x={Math.min(268, bestX + 6)}
                                               y={y + 3}
                                               fill={spotColor}
                                               fontSize="9"
@@ -5619,97 +5652,19 @@ export const TlcView: React.FC = () => {
                                               fontFamily="monospace"
                                             >
                                               {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
+                                              Rf {sp.rf.toFixed(2)}
+                                              {sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005
+                                                ? ` (${sp.rfRaw.toFixed(2)})`
+                                                : ''}
+                                              {isLowConf ? '?' : ''}
                                             </text>
                                           </g>
                                         );
                                       })}
                                     </g>
-                                  );
-                                })()}
-
-                              {/* Render Visible Densitogram Trace */}
-                              {(densViewMode === 'overlay' || densViewMode === 'White') &&
-                                channelDensitograms.White &&
-                                (() => {
-                                  const d = channelDensitograms.White;
-                                  const pts = d.points;
-                                  if (!pts.length) return null;
-                                  const scaleMax = d.spots.length > 0 ? d.maxSignal : Math.max(d.maxSignal, 28);
-                                  const dStr = pts
-                                    .map((p) => {
-                                      const y = ph - p.pos;
-                                      const x = 40 + Math.min(230, (p.signal / scaleMax) * 230);
-                                      return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-                                    })
-                                    .join(' ');
-                                  return (
-                                    <g key="white">
-                                      {d.spots.map((sp, idx) => {
-                                        const lo = Math.max(0, sp.extentStart ?? sp.pos - 8);
-                                        const hi = Math.min(pts.length - 1, sp.extentEnd ?? sp.pos + 8);
-                                        if (hi <= lo) return null;
-                                        const segPts: string[] = [`M 40.0 ${(ph - lo).toFixed(1)}`];
-                                        for (let pIdx = lo; pIdx <= hi; pIdx++) {
-                                          const pt = pts[pIdx];
-                                          if (!pt) continue;
-                                          const px = 40 + Math.min(230, (pt.signal / scaleMax) * 230);
-                                          segPts.push(`L ${px.toFixed(1)} ${(ph - pt.pos).toFixed(1)}`);
-                                        }
-                                        segPts.push(`L 40.0 ${(ph - hi).toFixed(1)} Z`);
-                                        return (
-                                          <path
-                                            key={`fillWhite-${idx}`}
-                                            d={segPts.join(' ')}
-                                            fill="rgba(245, 158, 11, 0.18)"
-                                            stroke="none"
-                                          />
-                                        );
-                                      })}
-                                      <path d={dStr} fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray={densViewMode === 'overlay' ? '2,2' : undefined} />
-                                      {d.spots.map((sp, idx) => {
-                                        const y = ph - sp.pos;
-                                        const pt = pts[sp.pos];
-                                        const x = 40 + Math.min(230, ((pt?.signal || 0) / scaleMax) * 230);
-                                        const isDragged = isDraggingModalSpot && dragModalSpotRef.current?.spotIndex === idx;
-                                        const isAuto = !sp.source || sp.source === 'auto';
-                                        const confStyle = getSpotConfidenceStyle(sp.confidence);
-                                        const isLowConf = isAuto && confStyle.needsReview;
-                                        const spotColor = isDragged
-                                          ? '#facc15'
-                                          : sp.source === 'manual'
-                                          ? '#f59e0b'
-                                          : sp.source === 'adjusted'
-                                          ? '#a855f7'
-                                          : confStyle.color;
-                                        return (
-                                          <g key={idx}>
-                                            <circle
-                                              cx={x}
-                                              cy={y}
-                                              r={isDragged ? '5' : '3.5'}
-                                              fill={spotColor}
-                                              stroke="#ffffff"
-                                              strokeWidth={isDragged ? '2' : '1'}
-                                              strokeDasharray={isLowConf && !isDragged ? '2,1.5' : undefined}
-                                            />
-                                            <text
-                                              x={Math.min(270, x + 6)}
-                                              y={y + 3}
-                                              fill={spotColor}
-                                              fontSize="9"
-                                              fontWeight="bold"
-                                              fontFamily="monospace"
-                                            >
-                                              {sp.source === 'manual' ? '✋ ' : sp.source === 'adjusted' ? '✨ ' : ''}
-                                              Rf {sp.rf.toFixed(2)}{sp.rfRaw != null && Math.abs(sp.rf - sp.rfRaw) >= 0.005 ? ` (${sp.rfRaw.toFixed(2)})` : ''}{isLowConf ? '?' : ''}
-                                            </text>
-                                          </g>
-                                        );
-                                      })}
-                                    </g>
-                                  );
-                                })()}
+                                  </>
+                                );
+                              })()}
 
                               {/* Synchronized Hover / Drag Crosshair on Densitometer */}
                               {hoverY !== null && (
@@ -6290,7 +6245,7 @@ export const TlcView: React.FC = () => {
                                     style={{
                                       fontWeight: 800,
                                       fontSize: '11px',
-                                      color: isAuto && confStyle.value >= 0.45 && confStyle.value < 0.72 ? '#0f172a' : '#ffffff',
+                                      color: isAuto && (confStyle.tier === 'medium' || confStyle.tier === 'very-high' || confStyle.tier === 'low') ? '#0f172a' : '#ffffff',
                                       background: sp.source === 'manual' ? '#b45309' : sp.source === 'adjusted' ? '#7e22ce' : confStyle.color,
                                       borderRadius: '4px',
                                       padding: '2px 6px',
@@ -6303,7 +6258,7 @@ export const TlcView: React.FC = () => {
                                     style={{
                                       fontWeight: 700,
                                       fontSize: '13px',
-                                      color: sp.source === 'manual' ? '#fbbf24' : sp.source === 'adjusted' ? '#d8b4fe' : confStyle.text,
+                                      color: sp.source === 'manual' ? '#b45309' : sp.source === 'adjusted' ? '#9333ea' : 'var(--ink)',
                                     }}
                                   >
                                     Rf {sp.rf.toFixed(2)}
@@ -6322,8 +6277,8 @@ export const TlcView: React.FC = () => {
                                   {isAuto && (
                                     <span
                                       style={{
-                                        background: confStyle.bg,
-                                        color: confStyle.text,
+                                        background: confStyle.color,
+                                        color: confStyle.tier === 'medium' || confStyle.tier === 'very-high' || confStyle.tier === 'low' ? '#0f172a' : '#ffffff',
                                         border: `1px ${confStyle.needsReview ? 'dashed' : 'solid'} ${confStyle.border}`,
                                         padding: '1px 6px',
                                         borderRadius: '3px',

@@ -1277,9 +1277,16 @@ function refineOriginCoreDetailed(
     if (maxSw >= 0.12) {
       const dHorizPx = maxSw * (0.76 * opts.laneWidthPx);
       const diamFactor = maxSw >= 0.85 ? 1.26 : 1.18;
+      // Only floor against the plate median dot diameter when this deposit's horizontal width is
+      // comparable to typical plate dots (>= 70% of median), so genuinely small tailing deposits
+      // are still trimmed against their own circular diameter.
+      const usePlateDiamFloor =
+        opts.plateMedianDiam != null &&
+        opts.plateMedianDiam > 0 &&
+        dHorizPx >= 0.70 * opts.plateMedianDiam;
       const expectedVert50 = Math.max(
         diamFactor * dHorizPx,
-        opts.plateMedianDiam ? 0.96 * opts.plateMedianDiam : 0
+        usePlateDiamFloor ? 0.96 * opts.plateMedianDiam! : 0
       );
       if (
         dHorizPx >= 6 &&
@@ -2204,7 +2211,11 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
     const lowerHalf = Math.max(1, p.pos - lb);
     const tailing = +Math.max(upperHalf / lowerHalf, lowerHalf / upperHalf).toFixed(2);
     const snr = p.val / Math.max(noise, 0.8);
-    const confidence = +Math.max(0.15, Math.min(0.98, (snr - 2.2) / 10)).toFixed(2);
+    // Match the 2D detector's log-scaled SNR + contrast confidence curve in [0.08..0.96]
+    // so 1D fallback spots merge on the same calibrated scale as 2D spots.
+    const snrScore = Math.max(0, Math.min(1, Math.log1p(Math.max(0, snr - 2.2)) / Math.log1p(120)));
+    const contrastScore = Math.max(0, Math.min(1, Math.log1p(Math.max(0, p.val - 6)) / Math.log1p(140)));
+    const confidence = +Math.max(0.08, Math.min(0.96, 0.55 * snrScore + 0.45 * contrastScore)).toFixed(2);
     return { lb, rb, area, tailing, confidence };
   });
 
@@ -2296,29 +2307,97 @@ export function mergeMultiChannelSpots(
           if (!mergedChannels.includes(c)) mergedChannels.push(c);
         }
         bestMatch.channels = mergedChannels;
+        if (sp.extentStart != null) {
+          bestMatch.extentStart =
+            bestMatch.extentStart != null
+              ? Math.min(bestMatch.extentStart, sp.extentStart)
+              : sp.extentStart;
+        }
+        if (sp.extentEnd != null) {
+          bestMatch.extentEnd =
+            bestMatch.extentEnd != null
+              ? Math.max(bestMatch.extentEnd, sp.extentEnd)
+              : sp.extentEnd;
+        }
         if (sp.strength > bestMatch.strength) {
           bestMatch.strength = sp.strength;
           bestMatch.pos = sp.pos;
           bestMatch.rf = sp.rf;
           if (sp.areaPct != null) bestMatch.areaPct = sp.areaPct;
           if (sp.rfRaw != null) bestMatch.rfRaw = sp.rfRaw;
-          if (sp.extentStart != null) bestMatch.extentStart = sp.extentStart;
-          if (sp.extentEnd != null) bestMatch.extentEnd = sp.extentEnd;
           if (sp.widthFrac != null) bestMatch.widthFrac = sp.widthFrac;
           if (sp.tailing != null) bestMatch.tailing = sp.tailing;
           if (sp.detector != null) bestMatch.detector = sp.detector;
         }
-        // Multi-channel agreement confidence boost: seeing the exact same compound across
-        // UV254 + UV366 (or White) strongly increases detection certainty.
-        const c1 = bestMatch.confidence ?? 0.65;
-        const c2 = sp.confidence ?? 0.65;
-        bestMatch.confidence = +Math.min(0.99, 1 - (1 - c1) * (1 - c2) * 0.65).toFixed(2);
+        // Multi-channel agreement confidence boost (independent noisy-OR): seeing the same
+        // compound across UV254 + UV366 (or White) increases certainty without over-inflating
+        // weak trace agreement or inventing scores when confidence is absent.
+        const c1 = typeof bestMatch.confidence === 'number' ? bestMatch.confidence : undefined;
+        const c2 = typeof sp.confidence === 'number' ? sp.confidence : undefined;
+        if (c1 !== undefined && c2 !== undefined) {
+          bestMatch.confidence = +Math.min(0.99, 1 - (1 - c1) * (1 - c2)).toFixed(2);
+        } else if (c2 !== undefined) {
+          bestMatch.confidence = c2;
+        }
       }
     }
   }
 
-  merged.sort((a, b) => a.rf - b.rf || a.pos - b.pos);
-  return merged;
+  // Cross-channel halo/rim artifact suppression:
+  // A broad strong spot (especially an overloaded UV366 fluorescent band) can produce a weak
+  // single-channel ripple or UV254 fluorescence-bleed dark edge right on its immediate upper/lower
+  // rim (outside rfMergeTolerance from the primary center, yet within ~0.115 Rf on the primary
+  // spot's boundary). Suppress only genuine weak rim ghosts while NEVER deleting real separated
+  // compounds (e.g. a distinct UV254 spot under a UV366 tail or a real UV366 spot near UV254).
+  const filtered = merged.filter((cand) => {
+    if (cand.source === 'manual' || cand.source === 'adjusted') return true;
+    const candChannels = cand.channels ?? [];
+    if (candChannels.length !== 1) return true;
+    if (typeof cand.confidence !== 'number') return true;
+
+    for (const anchor of merged) {
+      if (anchor === cand) continue;
+      const anchorConf = typeof anchor.confidence === 'number' ? anchor.confidence : 0.9;
+      if (anchorConf < 0.78) continue;
+      // Never suppress a genuinely separated compound far from the anchor's center
+      if (Math.abs(cand.rf - anchor.rf) > 0.115) continue;
+      if (
+        anchor.extentStart == null ||
+        anchor.extentEnd == null ||
+        anchor.extentEnd <= anchor.extentStart
+      ) {
+        continue;
+      }
+
+      const anchorSpan = anchor.extentEnd - anchor.extentStart;
+      const rimPad = Math.max(4, Math.min(12, Math.round(anchorSpan * 0.14)));
+      if (cand.pos < anchor.extentStart - rimPad || cand.pos > anchor.extentEnd + rimPad) {
+        continue;
+      }
+
+      const anchorChannels = anchor.channels ?? [];
+      const isUv254RimOnUv366Fluorescence =
+        candChannels[0] === 'UV254' &&
+        anchorChannels.includes('UV366') &&
+        !anchorChannels.includes('UV254');
+
+      // A UV254-only dark quenching spot cannot physically manufacture a fake UV366 fluorescence
+      // rim; only suppress genuinely weak fluorescence-bleed rims or very weak (< 0.38) halos.
+      if (isUv254RimOnUv366Fluorescence) {
+        if (cand.confidence < 0.56 && anchorConf - cand.confidence >= 0.30) {
+          return false;
+        }
+      } else if (candChannels[0] === 'UV254' || anchorChannels.includes(candChannels[0])) {
+        if (cand.confidence < 0.38 && anchorConf - cand.confidence >= 0.42) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
+  filtered.sort((a, b) => a.rf - b.rf || a.pos - b.pos);
+  return filtered;
 }
 
 export interface MultiChannelSpotsOptions {
@@ -3125,24 +3204,44 @@ export function tlcFront(
       // suppression, and a penalized smoothing spline across exact lane/gutter coordinates so wavy
       // fronts, edge-curled aluminium plates, bows, and tilts are tracked per lane.
       const minFrontGap = Math.max(18, Math.round(lane.length * 0.035));
-      const shouldPreferSeam = (cand: CurvedFrontSeamResult, cur: CurvedFrontSeamResult): boolean => {
+      let bestSeamIsWhiteOnly = false;
+      const shouldPreferSeam = (
+        cand: CurvedFrontSeamResult,
+        cur: CurvedFrontSeamResult,
+        candIsWhiteOnly: boolean = false,
+        curIsWhiteOnly: boolean = false
+      ): boolean => {
         if (cand.medianPos <= 0) return false;
         if (cur.medianPos <= 0) return true;
-        // A genuine sustained band/step-backed solvent front always outranks a ridge-only thin line
-        // (such as a residual pencil mark or scratch) regardless of darkness.
+        // A genuine sustained band/step-backed solvent front outranks a ridge-only thin line
+        // when at/beyond the ridge OR when the ridge is weak/White-only (e.g. residual graphite
+        // pencil mark ahead of the front), without letting an inner spot band beat a strong
+        // outer UV ridge front.
         if (cand.bandOrStepBacked && !cur.bandOrStepBacked && cand.score >= 3.8) {
-          return true;
+          const curIsStrongOuterUvRidge =
+            !curIsWhiteOnly &&
+            cur.medianPos > cand.medianPos + minFrontGap &&
+            cur.score >= 5.0;
+          if (!curIsStrongOuterUvRidge) return true;
         }
         if (cur.bandOrStepBacked && !cand.bandOrStepBacked && cur.score >= 3.8) {
-          return false;
+          const candIsStrongOuterUvRidge =
+            !candIsWhiteOnly &&
+            cand.medianPos > cur.medianPos + minFrontGap &&
+            cand.score >= 5.0;
+          if (!candIsStrongOuterUvRidge) return false;
         }
-        // Chromatography physics: a confirmed continuous band/step-backed outer front (e.g. very light
-        // UV254 front) physically outranks an inner bright high-Rf compound spot band (e.g. UV366 spots).
-        if (cand.medianPos > cur.medianPos + minFrontGap && cand.bandOrStepBacked && cand.score >= 3.8) {
-          return true;
+        // Chromatography physics: a confirmed continuous outer front physically outranks an
+        // inner high-Rf compound spot band.
+        if (cand.medianPos > cur.medianPos + minFrontGap && cand.score >= 3.8) {
+          if (cand.bandOrStepBacked || (!candIsWhiteOnly && cand.score >= 5.0)) {
+            return true;
+          }
         }
-        if (cur.medianPos > cand.medianPos + minFrontGap && cur.bandOrStepBacked && cur.score >= 3.8) {
-          return false;
+        if (cur.medianPos > cand.medianPos + minFrontGap && cur.score >= 3.8) {
+          if (cur.bandOrStepBacked || (!curIsWhiteOnly && cur.score >= 5.0)) {
+            return false;
+          }
         }
         return cand.score > cur.score;
       };
@@ -3151,8 +3250,10 @@ export function tlcFront(
         if (fused.suppressedPencilPositions?.length) {
           suppressedPencilPositions.push(...fused.suppressedPencilPositions);
         }
-        if (shouldPreferSeam(fused, bestSeam)) {
+        const fusedIsWhiteOnly = seamInputs.length === 1 && seamInputs[0].channel === 'White';
+        if (shouldPreferSeam(fused, bestSeam, fusedIsWhiteOnly, bestSeamIsWhiteOnly)) {
           bestSeam = fused;
+          bestSeamIsWhiteOnly = fusedIsWhiteOnly;
         }
         if (seamInputs.length > 1) {
           const hasUvInSet = seamInputs.some(
@@ -3172,8 +3273,10 @@ export function tlcFront(
             if (hasUvInSet && single.channel === 'White' && !singleRes.bandOrStepBacked) {
               continue;
             }
-            if (shouldPreferSeam(singleRes, bestSeam)) {
+            const singleIsWhiteOnly = single.channel === 'White';
+            if (shouldPreferSeam(singleRes, bestSeam, singleIsWhiteOnly, bestSeamIsWhiteOnly)) {
               bestSeam = singleRes;
+              bestSeamIsWhiteOnly = singleIsWhiteOnly;
             }
           }
         }
@@ -3209,7 +3312,7 @@ export function tlcFront(
       bestSeam.medianPos > 0 &&
       (bestFlat.pos <= 0 ||
         outerSeamBeatsInnerFlat ||
-        (bestSeam.bandOrStepBacked && bestSeam.score >= 3.8) ||
+        (bestSeam.bandOrStepBacked && sameFrontAsFlat && bestSeam.score >= 3.8) ||
         bestSeam.score >= 8.0 ||
         (bestSeam.isCurved && sameFrontAsFlat && bestSeam.score >= 4.5) ||
         (bestSeam.isCurved && bestSeam.score >= Math.max(4.5, flatScoreCapped * 0.72)) ||
@@ -4284,20 +4387,51 @@ function solveMultiChannelHalfOrigin(
         (c.res.pos <= 10 || Math.abs(c.res.pos - best.pos) <= agreeTol)
     );
 
+    // Compute each lane's local clean-neighbor baseline before secondary upgrades so bowed or
+    // stepped plates know the true local origin height (not just the global scalar median).
+    const initCleanIds = Array.from(locked).filter((id) => !tailingSet.has(id));
+    const initBackbonePlate =
+      initCleanIds.length >= 4
+        ? fitOriginQuadCurve(
+            initCleanIds.map((id) => ({
+              laneId: id,
+              pos: frame.toPlatePos(id, fusedByLane[id]),
+            })),
+            best.pos,
+            laneLen,
+            frame.uByLane,
+            frame.allLaneIds
+          )
+        : null;
+
     let updatedAny = false;
     for (const l of halfLanes) {
       const refPos = fusedByLane[l.id] ?? Math.round(frame.toLanePos(l.id, best.pos));
+      const localBasePos =
+        initBackbonePlate && initBackbonePlate[l.id] != null
+          ? Math.round(frame.toLanePos(l.id, initBackbonePlate[l.id]))
+          : Math.round(frame.toLanePos(l.id, best.pos));
       const isLocked = locked.has(l.id);
       const isTailing = tailingSet.has(l.id);
 
       if (isLocked && !isTailing) continue;
 
+      // For an already-locked tailing lane, a clean secondary channel may pull an upward-smeared
+      // primary dot back toward the local clean baseline (up to maxBackCorrection), while never
+      // dropping >3 px below the local baseline (bottom-rim guard) or jumping >3 px forward into a halo.
+      const maxBackCorrection = Math.max(8, Math.round(laneLen * 0.012));
+      const minAllowedPos = Math.max(refPos - maxBackCorrection, Math.min(refPos, localBasePos) - 3);
+      const maxAllowedPos = refPos + 3;
+
       for (const sec of secondarySources) {
         const secTailing = sec.res.tailingLanes?.includes(l.id) ?? false;
-        // If the secondary channel/composite already locked this lane cleanly right on refPos:
+        // If the secondary channel/composite already locked this lane cleanly within upgrade bounds:
         if (sec.res.lockedLanes?.includes(l.id) && sec.res.byLane?.[l.id]) {
           const secPos = sec.res.byLane[l.id];
-          if (Math.abs(secPos - refPos) <= 3 && (!isLocked || !secTailing)) {
+          const secOk = isLocked
+            ? !secTailing && secPos >= minAllowedPos && secPos <= maxAllowedPos
+            : Math.abs(secPos - refPos) <= 3;
+          if (secOk) {
             fusedByLane[l.id] = secPos;
             locked.add(l.id);
             if (!secTailing) tailingSet.delete(l.id);
@@ -4326,15 +4460,11 @@ function solveMultiChannelHalfOrigin(
             laneWidthPx: l.width,
           }
         );
-        // When a lane is already locked on the primary channel (just tailing), only allow a
-        // secondary channel to refine it within tight agreement (never let a UV366 halo/rim jump
-        // the baseline below or ahead of the primary dark origin dot).
-        const maxUpgradeShift = Math.max(5, Math.round(laneLen * 0.007));
         const withinLockedUpgrade =
           !isLocked ||
           (!near.isTailing &&
-            Math.abs(near.pos - refPos) <= maxUpgradeShift &&
-            near.pos <= refPos + 3);
+            near.pos >= minAllowedPos &&
+            near.pos <= maxAllowedPos);
         if (near.pos > 0 && withinLockedUpgrade) {
           fusedByLane[l.id] = near.pos;
           locked.add(l.id);

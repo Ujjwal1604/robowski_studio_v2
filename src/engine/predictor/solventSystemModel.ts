@@ -48,8 +48,10 @@ export interface NeatSolventDescriptor {
   piStar: number;
   /** Aromatic pi-pi competition score (0..1) */
   aromaticity: number;
-  /** Boiling point (°C) — informational for evaporation / volatile retention */
+  /** Boiling point (°C) — used for evaporation / volatile chamber drift checks */
   bpC: number;
+  /** Bench practicality & EHS penalty (0 = green/easy workhorse, higher = toxic, ultra-volatile, or slow-drying) */
+  ehsPenalty: number;
 }
 
 export interface ModifierDescriptor {
@@ -85,6 +87,10 @@ export interface MixturePhysicalDescriptors {
   modifierKind: ModifierDescriptor['kind'];
   modifierCapacity: number;
   modifierMolarity: number;
+  /** Weighted bench practicality / EHS / volatility penalty (0 = ideal, up to ~1.0) */
+  practicalityPenalty?: number;
+  /** Short practicality warning when ultra-volatile, chlorinated, or high-cost C18 */
+  practicalityNote?: string;
 }
 
 export interface DynamicEluentSpec {
@@ -121,6 +127,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: -0.08,
     aromaticity: 0.0,
     bpC: 69,
+    ehsPenalty: 0.12,
   },
   Pentane: {
     id: 'Pentane',
@@ -132,6 +139,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: -0.1,
     aromaticity: 0.0,
     bpC: 36,
+    ehsPenalty: 0.45, // extreme volatility -> chamber ratio drift
   },
   Toluene: {
     id: 'Toluene',
@@ -143,6 +151,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.54,
     aromaticity: 1.0,
     bpC: 111,
+    ehsPenalty: 0.34, // slow drying + aromatic toxicity
   },
   DCM: {
     id: 'DCM',
@@ -154,6 +163,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.82,
     aromaticity: 0.0,
     bpC: 40,
+    ehsPenalty: 0.38, // chlorinated solvent hazard + high volatility
   },
   Et2O: {
     id: 'Et2O',
@@ -165,6 +175,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.27,
     aromaticity: 0.0,
     bpC: 35,
+    ehsPenalty: 0.52, // extreme volatility + peroxide/flammability hazard
   },
   MTBE: {
     id: 'MTBE',
@@ -176,6 +187,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.27,
     aromaticity: 0.0,
     bpC: 55,
+    ehsPenalty: 0.14,
   },
   EtOAc: {
     id: 'EtOAc',
@@ -187,6 +199,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.55,
     aromaticity: 0.0,
     bpC: 77,
+    ehsPenalty: 0.05,
   },
   Acetone: {
     id: 'Acetone',
@@ -198,6 +211,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.71,
     aromaticity: 0.0,
     bpC: 56,
+    ehsPenalty: 0.08,
   },
   MeCN: {
     id: 'MeCN',
@@ -209,6 +223,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.75,
     aromaticity: 0.0,
     bpC: 82,
+    ehsPenalty: 0.22,
   },
   MeOH: {
     id: 'MeOH',
@@ -220,6 +235,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 0.6,
     aromaticity: 0.0,
     bpC: 65,
+    ehsPenalty: 0.16,
   },
   H2O: {
     id: 'H2O',
@@ -231,6 +247,7 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
     piStar: 1.09,
     aromaticity: 0.0,
     bpC: 100,
+    ehsPenalty: 0.0,
   },
 };
 
@@ -434,6 +451,7 @@ export function computeMixtureDescriptors(
   if (spec.stationaryPhase === 'C18') {
     const orgFrac = Math.max(0.05, Math.min(0.95, spec.strongPct / 100));
     const strength = Math.round((orgFrac + (mod.kind === 'acid_tfa' ? 0.03 : 0)) * 1000) / 1000;
+    const c18Penalty = Math.round((0.35 + orgFrac * strong.ehsPenalty + (mod.kind === 'acid_tfa' ? 0.08 : 0)) * 1000) / 1000;
     return {
       strength,
       alphaMix: orgFrac * strong.alphaHbd + (1 - orgFrac) * weak.alphaHbd,
@@ -445,6 +463,8 @@ export function computeMixtureDescriptors(
       modifierKind: mod.kind,
       modifierCapacity: mod.neutralizingCapacity,
       modifierMolarity: mod.molarity,
+      practicalityPenalty: c18Penalty,
+      practicalityNote: 'Higher plate cost & slower drying (C18)',
     };
   }
 
@@ -509,6 +529,23 @@ export function computeMixtureDescriptors(
     ) / 1000;
   }
 
+  const mixEhs =
+    vA * weak.ehsPenalty +
+    vB * strong.ehsPenalty +
+    (ter ? vTer * ter.ehsPenalty : 0) +
+    (mod.kind !== 'none' ? 0.04 : 0) +
+    (ter ? 0.05 : 0);
+  const practicalityPenalty = Math.round(Math.min(1, mixEhs) * 1000) / 1000;
+  const noteParts: string[] = [];
+  if ((vA > 0.2 && weak.bpC <= 40) || (vB > 0.2 && strong.bpC <= 40) || (ter && vTer > 0.2 && ter.bpC <= 40)) {
+    noteParts.push('volatile (keep chamber sealed)');
+  }
+  if (spec.weakSolvent === 'DCM' || spec.strongSolvent === 'DCM' || spec.ternaryCoSolvent?.solvent === 'DCM') {
+    noteParts.push('chlorinated');
+  } else if (spec.weakSolvent === 'Toluene' || spec.strongSolvent === 'Toluene' || spec.ternaryCoSolvent?.solvent === 'Toluene') {
+    noteParts.push('slow-drying aromatic');
+  }
+
   return {
     strength,
     alphaMix: Math.round(alphaMix * 1000) / 1000,
@@ -520,6 +557,8 @@ export function computeMixtureDescriptors(
     modifierKind: mod.kind,
     modifierCapacity: mod.neutralizingCapacity,
     modifierMolarity: mod.molarity,
+    practicalityPenalty,
+    ...(noteParts.length > 0 ? { practicalityNote: noteParts.join(' · ') } : {}),
   };
 }
 

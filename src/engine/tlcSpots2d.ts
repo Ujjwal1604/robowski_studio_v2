@@ -529,7 +529,10 @@ export function segmentLaneSpots2d(
   const cx1 = Math.min(w - 1, Math.ceil(w * 0.78) - 1);
   const cCount = Math.max(1, cx1 - cx0 + 1);
   const rawCoreProf = new Float64Array(h);
+  const rawCoreForBase = new Float64Array(h);
   const locCoreProf = new Float64Array(h);
+  const baseFlankCols = Math.max(1, Math.min(3, Math.round(w * 0.16)));
+  const negPitTol = Math.max(4, 2.5 * bgSigma);
   for (let r = originRow; r <= frontRow; r++) {
     const off = r * w;
     let sR = 0,
@@ -538,11 +541,27 @@ export function segmentLaneSpots2d(
       sR += rawSm[off + x];
       sL += locSm[off + x];
     }
-    rawCoreProf[r] = sR / cCount;
+    const coreMean = sR / cCount;
+    rawCoreProf[r] = coreMean;
     locCoreProf[r] = sL / cCount;
+    if (channel === 'UV254') {
+      // Bright green fluorescence under UV254 drives invG strongly below silica background,
+      // which would otherwise drag the lower-envelope arPLS baseline down and create phantom
+      // dark spots on adjacent blank silica. Floor localized negative pits against the brighter flank.
+      let leftSum = 0;
+      let rightSum = 0;
+      for (let fx = 0; fx < baseFlankCols; fx++) {
+        leftSum += rawSm[off + fx];
+        rightSum += rawSm[off + (w - 1 - fx)];
+      }
+      const flankSilica = Math.min(leftSum / baseFlankCols, rightSum / baseFlankCols);
+      rawCoreForBase[r] = Math.max(coreMean, flankSilica - negPitTol);
+    } else {
+      rawCoreForBase[r] = coreMean;
+    }
   }
 
-  const rawBase = computeArplsBaseline(rawCoreProf, 1, originRow, frontRow);
+  const rawBase = computeArplsBaseline(rawCoreForBase, 1, originRow, frontRow);
   const locBase = computeArplsBaseline(locCoreProf, 1, originRow, frontRow);
 
   // Precompute a smooth row-level lateral-peaking gate inside [originRow, frontRow] from the
@@ -591,14 +610,36 @@ export function segmentLaneSpots2d(
     }
   }
 
+  // Compute smoothed 1D lane-core profile across [cx0..cx1] (22%..78% width) inside [originRow, frontRow].
+  // Averaging across the lane core suppresses mottled 2D silica/camera grain by ~4x so chromatographic
+  // valley checks distinguish genuine vertically separated doublets from grainy monotonic tails.
+  const wideCoreRaw = new Float64Array(h);
+  for (let r = originRow; r <= frontRow; r++) {
+    wideCoreRaw[r] = Math.max(0, rawCoreProf[r] - rawBase[r]);
+  }
+  const wideCore1d = new Float64Array(h);
+  for (let r = originRow; r <= frontRow; r++) {
+    const r2m = Math.max(originRow, r - 2);
+    const r1m = Math.max(originRow, r - 1);
+    const r1p = Math.min(frontRow, r + 1);
+    const r2p = Math.min(frontRow, r + 2);
+    wideCore1d[r] =
+      0.10 * wideCoreRaw[r2m] +
+      0.24 * wideCoreRaw[r1m] +
+      0.32 * wideCoreRaw[r] +
+      0.24 * wideCoreRaw[r1p] +
+      0.10 * wideCoreRaw[r2p];
+  }
+
   // Build baseline-corrected 2D fields inside [originRow, frontRow].
   // - Near the solvent front (rf >= 0.88): use strict gutter-subtracted localField to suppress
   //   uniform horizontal solvent-front bands & pencil marks.
   // - In the chromatographic interior (rf < 0.88): apply smooth rowGate[r] to raw darkness/fluorescence
   //   so faint & medium shared-Rf HTE spots recover clean single-peaked contrast while flat bands
-  //   (rowGate = 0) stay completely suppressed. Strong coalesced spots (> ceil) also pass cleanly.
+  //   (rowGate = 0) stay completely suppressed, and strong coalesced spots (> ceil) pass directly.
   const interiorBandCeil = channel === 'UV366' ? 28 : 40;
   const frontBandStartRow = Math.round(originRow + 0.88 * spanRows);
+
   const rawField = new Float32Array(w * h);
   const F = new Float32Array(w * h);
   let fMax = 0;
@@ -614,13 +655,88 @@ export function segmentLaneSpots2d(
       // Local excess can never exceed true baseline-subtracted darkness/fluorescence (rv);
       // clamping prevents bright flank-noise specks from inventing fake signal on blank silica.
       const lv = Math.min(lvRaw, rv);
-      const fv = isNearFront ? lv : Math.max(lv, rv * gate, Math.max(0, rv - interiorBandCeil));
+      const fv = isNearFront
+        ? lv
+        : Math.max(lv, rv * gate, Math.max(0, rv - interiorBandCeil));
       rawField[off + x] = rv;
       F[off + x] = fv;
       if (r >= startRow && r <= endRow && fv > fMax) fMax = fv;
     }
   }
   if (fMax <= 1e-4) return [];
+
+  // 1D core profile of F across [cx0..cx1] (reflects gutter-gated chromatographic valleys cleanly)
+  const fCoreRaw = new Float64Array(h);
+  for (let r = originRow; r <= frontRow; r++) {
+    const off = r * w;
+    let sum = 0;
+    for (let x = cx0; x <= cx1; x++) sum += F[off + x];
+    fCoreRaw[r] = sum / cCount;
+  }
+  const fCore1d = new Float64Array(h);
+  for (let r = originRow; r <= frontRow; r++) {
+    const r2m = Math.max(originRow, r - 2);
+    const r1m = Math.max(originRow, r - 1);
+    const r1p = Math.min(frontRow, r + 1);
+    const r2p = Math.min(frontRow, r + 2);
+    fCore1d[r] =
+      0.10 * fCoreRaw[r2m] +
+      0.24 * fCoreRaw[r1m] +
+      0.32 * fCoreRaw[r] +
+      0.24 * fCoreRaw[r1p] +
+      0.10 * fCoreRaw[r2p];
+  }
+  const measureProfileValley = (prof: Float64Array, rowA: number, rowB: number) => {
+    const rLo = Math.max(originRow, Math.min(frontRow, Math.min(rowA, rowB)));
+    const rHi = Math.max(originRow, Math.min(frontRow, Math.max(rowA, rowB)));
+    let idxLo = rLo;
+    let pLo = prof[rLo];
+    for (let r = Math.max(originRow, rLo - 1); r <= Math.min(rHi, rLo + 1); r++) {
+      if (prof[r] > pLo) {
+        pLo = prof[r];
+        idxLo = r;
+      }
+    }
+    let idxHi = rHi;
+    let pHi = prof[rHi];
+    for (let r = Math.max(idxLo, rHi - 1); r <= Math.min(frontRow, rHi + 1); r++) {
+      if (prof[r] > pHi) {
+        pHi = prof[r];
+        idxHi = r;
+      }
+    }
+    let valley = Infinity;
+    for (let r = idxLo; r <= idxHi; r++) {
+      if (prof[r] < valley) valley = prof[r];
+    }
+    if (!Number.isFinite(valley)) valley = 0;
+    const lower1d = Math.min(pLo, pHi);
+    const higher1d = Math.max(pLo, pHi);
+    const valleyDrop1d = Math.max(0, lower1d - valley);
+    const dropRatio1d = lower1d > 1e-4 ? valleyDrop1d / lower1d : 0;
+    return { pLo, pHi, valley, lower1d, higher1d, valleyDrop1d, dropRatio1d };
+  };
+  const measure1dValley = (rowA: number, rowB: number) => {
+    const rHi = Math.max(originRow, Math.min(frontRow, Math.max(rowA, rowB)));
+    const vf = measureProfileValley(fCore1d, rowA, rowB);
+    if (rHi >= frontBandStartRow) return vf;
+    const vw = measureProfileValley(wideCore1d, rowA, rowB);
+    // Keep both profiles' evidence: a genuine valley visible in gutter-gated F (e.g. two adjacent
+    // UV254 spots bridged by a faint wide shadow) is preserved, while monotonic grain ripples on
+    // a wide tailing streak lack a valley on BOTH profiles.
+    return {
+      pLo: vw.pLo,
+      pHi: vw.pHi,
+      valley: Math.min(vw.valley, vf.valley),
+      rawValley: vw.valley,
+      lower1d: vw.lower1d,
+      higher1d: vw.higher1d,
+      valleyDrop1d: Math.max(vw.valleyDrop1d, vf.valleyDrop1d),
+      dropRatio1d: Math.max(vw.dropRatio1d, vf.dropRatio1d),
+      rawDrop1d: vw.valleyDrop1d,
+      rawDropRatio1d: vw.dropRatio1d,
+    };
+  };
 
   // 3. Robust 2D post-smoothing local-noise & physical minimum detection floor calibrated by channel + slider.
   //    Measure noise directly on continuous smoothed rawSm (lag-2 vertical differences) rather than raw
@@ -907,8 +1023,26 @@ export function segmentLaneSpots2d(
         continue;
       }
 
-      // (b) 2D Hourglass doublet protection: two strong vertically stacked spots with a clear
-      //     intensity saddle AND narrower waist at the saddle row stay resolved in Sensitive/Standard modes
+      // (a2) 1D chromatographic vertical-valley verification:
+      //      In TLC, separation occurs strictly along the vertical migration axis (Rf). Two
+      //      vertically stacked 2D basins sitting on a monotonic 1D slope (created by mottled
+      //      silica/camera grain on a broad tailing band) lack a real 1D valley and MUST merge.
+      const v1d = measure1dValley(sa.peakY, sb.peakY);
+      const min1dValleyAbs = Math.max(2.6 * effSigma, isDarkSpotCh ? 3.5 : 3.0);
+      const min1dDropRatio = 0.06 + 0.06 * t;
+      const lacks1dValley =
+        v1d.lower1d > 1e-4 &&
+        (v1d.valleyDrop1d < min1dValleyAbs || v1d.dropRatio1d < min1dDropRatio);
+      if (lacks1dValley) {
+        const prio = -1 + v1d.dropRatio1d;
+        if (!bestMerge || prio < bestMerge.priority) {
+          bestMerge = { a: entry.a, b: entry.b, priority: prio };
+        }
+        continue;
+      }
+
+      // (b) 2D Hourglass doublet protection: two strong vertically stacked spots with BOTH a clear
+      //     1D vertical valley AND a 2D saddle + narrower waist stay resolved in Sensitive/Standard modes
       const saddleRow = Math.round(entry.rowSum / Math.max(1, entry.cnt));
       const waistW = rowFgWidth[Math.max(startRow, Math.min(endRow, saddleRow))];
       const minLobeW = Math.min(sa.peakRowWidth, sb.peakRowWidth);
@@ -919,23 +1053,43 @@ export function segmentLaneSpots2d(
         lowerPeak >= Math.max(peakThr * 1.5, 16) &&
         saddleDrop >= Math.max(4.5, 2.6 * effSigma) &&
         dropRatio >= 0.045 + 0.08 * t &&
+        v1d.valleyDrop1d >= Math.max(4.2, 2.8 * effSigma) &&
+        v1d.dropRatio1d >= 0.08 + 0.08 * t &&
         widthPinch >= 0.08;
 
       if (isStrong2dDoublet) continue;
 
-      // (c) Chromatographic saddle resolution check
+      // (c) Chromatographic saddle resolution check (combining 2D saddle and 1D vertical valley)
+      const effDropRatio = Math.min(dropRatio, v1d.dropRatio1d);
       const sep = Math.min(1, Math.max(0, (vertDist / spanRows - 0.065) / 0.015));
       const asym = Math.min(1, Math.max(0, (1 - lowerPeak / higherPeak) / 0.22));
-      const distDiscount = 1 - 0.80 * sep * asym * Math.max(0, 1 - t / 0.75);
+      // Only grant the long-distance asymmetry discount when the minor peak is substantive and
+      // separated by a genuine valley — never for tiny noise/halo ripples on a broad spot's skirt.
+      const isSubstantiveMinor =
+        lowerPeak >= Math.max(peakThr * 1.65, isDarkSpotCh ? 22 : 16) &&
+        saddleDrop >= Math.max(3.6 * effSigma, 0.75 * absFloor) &&
+        v1d.valleyDrop1d >= Math.max(3.6 * effSigma, 0.70 * absFloor);
+      const distDiscount = isSubstantiveMinor
+        ? 1 - 0.80 * sep * asym * Math.max(0, 1 - t / 0.75)
+        : 1;
       const reqDrop = baseMergeDrop * distDiscount;
 
+      // Faint shoulder/halo-rim ripple guard: a weak (<22% of parent peak) satellite touching a
+      // broad primary spot without returning near background is a halo edge ripple, not a compound.
+      const isFaintSkirtRipple =
+        lowerPeak / higherPeak < 0.22 &&
+        lowerPeak < (isDarkSpotCh ? 26 : 24) &&
+        (effDropRatio < Math.max(baseMergeDrop, 0.48) ||
+          saddleDrop < Math.max(4.2 * effSigma, 0.85 * absFloor, isDarkSpotCh ? 7.5 : 6.0));
+
       const shouldMerge =
-        dropRatio < reqDrop ||
-        (vertDist < closeVertDist && dropRatio < Math.min(0.94, baseMergeDrop + 0.14)) ||
+        isFaintSkirtRipple ||
+        effDropRatio < reqDrop ||
+        (vertDist < closeVertDist && effDropRatio < Math.min(0.94, baseMergeDrop + 0.14)) ||
         saddleDrop < Math.max(2.4 * effSigma, 0.45 * absFloor);
 
       if (shouldMerge) {
-        const prio = dropRatio;
+        const prio = effDropRatio;
         if (!bestMerge || prio < bestMerge.priority) {
           bestMerge = { a: entry.a, b: entry.b, priority: prio };
         }
@@ -1040,12 +1194,14 @@ export function segmentLaneSpots2d(
   const candidates: Array<{
     pos: number;
     rf: number;
+    peakRow: number;
     peakVal: number;
     mass: number;
     extentStart: number;
     extentEnd: number;
     widthFrac: number;
     tailing: number;
+    geomQuality: number;
     confidence: number;
   }> = [];
 
@@ -1096,11 +1252,17 @@ export function segmentLaneSpots2d(
     let minY50 = h;
     let maxY50 = -1;
     let core50Count = 0;
+    let sumY50 = 0;
+    let sumY2_50 = 0;
     for (const p of reg.pixels) {
-      if (F[p] >= halfCut) {
+      const fv = F[p];
+      if (fv >= halfCut) {
         const pr = Math.floor(p / w);
         const px = p - pr * w;
         core50Count++;
+        const wSq = fv * fv;
+        sumY50 += pr * wSq;
+        sumY2_50 += wSq;
         if (px < minX50) minX50 = px;
         if (px > maxX50) maxX50 = px;
         if (pr < minY50) minY50 = pr;
@@ -1119,8 +1281,10 @@ export function segmentLaneSpots2d(
       }
     }
 
-    // Square-intensity weighted vertical centroid for crisp peak centering
-    const cyRow = reg.sumY2 > 0 ? reg.sumY / reg.sumY2 : reg.peakRow;
+    // Square-intensity weighted vertical centroid over the 50%-height FWHM core so asymmetric
+    // tails or shoulders never pull the reported Rf away from the visual spot apex.
+    const cyRow =
+      sumY2_50 > 0 ? sumY50 / sumY2_50 : reg.sumY2 > 0 ? reg.sumY / reg.sumY2 : reg.peakRow;
     const cxCol = reg.mass > 0 ? reg.sumX / reg.mass : (reg.minX + reg.maxX) * 0.5;
     const centroidXFrac = (cxCol + 0.5) / w;
     const widthFrac = (reg.maxX - reg.minX + 1) / w;
@@ -1220,15 +1384,8 @@ export function segmentLaneSpots2d(
     const lowerHalf = Math.max(0.5, cyRow - extMinRow);
     const tailing = +(Math.max(upperHalf / lowerHalf, lowerHalf / upperHalf)).toFixed(2);
 
-    // Quantitative spot confidence in [0.08..0.96] (multi-channel agreement can boost up to 0.99).
-    // Blend log-scaled SNR with absolute optical contrast and core lateral specificity so
-    // trace, faint, medium, and strong spots distribute smoothly across the full confidence spectrum.
-    const snr = reg.peakVal / Math.max(effSigma, 0.8);
-    const snrScore = Math.max(0, Math.min(1, Math.log1p(Math.max(0, snr - 2.5)) / Math.log1p(45)));
-    const contrastScore = Math.max(
-      0,
-      Math.min(1, Math.log1p(Math.max(0, reg.peakVal - 6)) / Math.log1p(65))
-    );
+    // Save raw geometry quality so confidence can be computed after post-watershed
+    // monotonic-slope consolidation using effective prominence above any adjacent valley.
     const centerScore = Math.max(0, Math.min(1, 1 - Math.abs(centroidXFrac - 0.5) / 0.36));
     const localScore = isStrongCoalescedInterior
       ? 0.85
@@ -1237,28 +1394,20 @@ export function segmentLaneSpots2d(
       0,
       Math.min(1, (pxCount - minSpotArea * 0.6) / Math.max(6, minSpotArea * 2.5))
     );
-    const confidence = +Math.max(
-      0.08,
-      Math.min(
-        0.96,
-        0.30 * snrScore +
-          0.25 * contrastScore +
-          0.18 * centerScore +
-          0.15 * localScore +
-          0.12 * sizeScore
-      )
-    ).toFixed(2);
+    const geomQuality = 0.42 * centerScore + 0.34 * localScore + 0.24 * sizeScore;
 
     candidates.push({
       pos: posOrig,
       rf: +rf.toFixed(4),
+      peakRow: reg.peakRow,
       peakVal: reg.peakVal,
       mass: reg.mass,
       extentStart,
       extentEnd,
       widthFrac: +Math.min(1, widthFrac).toFixed(2),
       tailing,
-      confidence,
+      geomQuality,
+      confidence: 0.08,
     });
   }
 
@@ -1270,20 +1419,108 @@ export function segmentLaneSpots2d(
   const deduped: typeof candidates = [];
   for (const c of candidates) {
     const prev = deduped[deduped.length - 1];
-    if (prev && (c.pos - prev.pos < Math.max(minDistPx, Math.round(origSpan * 0.014)))) {
+    if (prev && c.pos - prev.pos < Math.max(minDistPx, Math.round(origSpan * 0.014))) {
       // Combine into stronger/merged spot
       const totalM = prev.mass + c.mass;
       prev.pos = Math.round((prev.pos * prev.mass + c.pos * c.mass) / Math.max(totalM, 1e-6));
       prev.rf = +((prev.pos - opts.origin) / origSpan).toFixed(4);
-      prev.peakVal = Math.max(prev.peakVal, c.peakVal);
+      if (c.peakVal > prev.peakVal) {
+        prev.peakVal = c.peakVal;
+        prev.peakRow = c.peakRow;
+        prev.geomQuality = c.geomQuality;
+      }
       prev.mass = totalM;
       prev.extentStart = Math.min(prev.extentStart, c.extentStart);
       prev.extentEnd = Math.max(prev.extentEnd, c.extentEnd);
       prev.widthFrac = Math.max(prev.widthFrac, c.widthFrac);
-      prev.confidence = Math.max(prev.confidence, c.confidence);
     } else {
       deduped.push({ ...c });
     }
+  }
+
+  // Post-watershed 1D monotonic-slope consolidation:
+  // Even if two basins were disconnected in 2D F (e.g. a noisy lower tail below a bright UV366
+  // streak where rv crosses interiorBandCeil), collapse any adjacent candidate sitting on the
+  // same monotonic 1D slope (elevated valley on wideCore1d with no real dip on either profile)
+  // into the stronger true peak without shifting its Rf or over-expanding its body extent.
+  const minSlopeValleyAbs = Math.max(2.6 * effSigma, isDarkSpotCh ? 3.5 : 3.0);
+  const minSlopeDropRatio = 0.06 + 0.06 * t;
+  const elevatedFloor = Math.max(2.2 * effSigma, 4.0);
+  let mergedAny = true;
+  while (mergedAny && deduped.length > 1) {
+    mergedAny = false;
+    for (let i = 0; i < deduped.length - 1; i++) {
+      const a = deduped[i];
+      const b = deduped[i + 1];
+      const v1d = measure1dValley(a.peakRow, b.peakRow);
+      const rawVal = 'rawValley' in v1d ? v1d.rawValley : v1d.valley;
+      const rawDrop = 'rawDrop1d' in v1d ? v1d.rawDrop1d : v1d.valleyDrop1d;
+      const rawDropRatio = 'rawDropRatio1d' in v1d ? v1d.rawDropRatio1d : v1d.dropRatio1d;
+      const isMonotonicTail =
+        rawVal > elevatedFloor &&
+        v1d.lower1d > 1e-4 &&
+        (rawDrop < minSlopeValleyAbs || rawDropRatio < minSlopeDropRatio);
+      if (isMonotonicTail) {
+        // Keep the stronger peak's pos/rf/peakRow; only expand extent if loser is substantive
+        // so weak absorbed lower tails do not stretch extentStart across half the plate.
+        const keepA = a.peakVal >= b.peakVal;
+        const winner = keepA ? a : b;
+        const loser = keepA ? b : a;
+        winner.mass += loser.mass;
+        if (loser.peakVal >= winner.peakVal * 0.25) {
+          winner.extentStart = Math.min(winner.extentStart, loser.extentStart);
+          winner.extentEnd = Math.max(winner.extentEnd, loser.extentEnd);
+        }
+        winner.widthFrac = Math.max(winner.widthFrac, loser.widthFrac);
+        deduped.splice(keepA ? i + 1 : i, 1);
+        mergedAny = true;
+        break;
+      }
+    }
+  }
+
+  // Quantitative spot confidence in [0.08..0.96] (multi-channel agreement can boost up to 0.99).
+  // Use effective optical prominence above the higher adjacent valley (so a minor shoulder sitting
+  // halfway up a tall peak's slope is scored by its real dip/prominence rather than its altitude
+  // above blank silica), then modulate multiplicatively by geometry quality.
+  const contrastFloor0 = isDarkSpotCh ? 6.5 : 4.5;
+  const contrastHalf = isDarkSpotCh ? 38 : 30;
+  for (let i = 0; i < deduped.length; i++) {
+    const c = deduped[i];
+    let adjValleyFloor = 0;
+    let selfCore1d = 0;
+    if (i > 0) {
+      const vl = measure1dValley(deduped[i - 1].peakRow, c.peakRow);
+      selfCore1d = Math.max(selfCore1d, vl.pHi);
+      if (vl.valley > adjValleyFloor) adjValleyFloor = vl.valley;
+    }
+    if (i + 1 < deduped.length) {
+      const vr = measure1dValley(c.peakRow, deduped[i + 1].peakRow);
+      selfCore1d = Math.max(selfCore1d, vr.pLo);
+      if (vr.valley > adjValleyFloor) adjValleyFloor = vr.valley;
+    }
+
+    let effPeakVal = c.peakVal;
+    if (selfCore1d > 1e-4 && adjValleyFloor > 0.25 * selfCore1d) {
+      const promRatio = Math.max(0, Math.min(1, (selfCore1d - adjValleyFloor) / selfCore1d));
+      // Blend full peak with valley-prominence fraction so well-separated doublets keep strong
+      // confidence while shallow shoulders on a parent's slope are honestly scored Low/Very Low.
+      effPeakVal = Math.min(c.peakVal, c.peakVal * (0.15 + 0.85 * Math.sqrt(promRatio)));
+    }
+
+    const snr = effPeakVal / Math.max(effSigma, 1.0);
+    const snrExcess = Math.max(0, snr - 3.0);
+    const snrScore = Math.max(0, Math.min(1, (snrExcess / (snrExcess + 24)) * 1.12));
+    const contrastExcess = Math.max(0, effPeakVal - contrastFloor0);
+    const contrastScore = Math.max(
+      0,
+      Math.min(1, (contrastExcess / (contrastExcess + contrastHalf)) * 1.15)
+    );
+    const signalScore = 0.42 * snrScore + 0.58 * contrastScore;
+    c.confidence = +Math.max(
+      0.08,
+      Math.min(0.96, signalScore * (0.48 + 0.52 * c.geomQuality))
+    ).toFixed(2);
   }
 
   const maxPeak = Math.max(...deduped.map((c) => c.peakVal), 1e-6);

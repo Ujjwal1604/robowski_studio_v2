@@ -27,6 +27,7 @@ import {
   RF_SIGMA,
   SolventFamily,
   TLC_SOLVENT_LIBRARY,
+  TlcCalibrationFamilyStats,
   TlcCalibrationFeatureWeights,
   TlcCalibrationModel,
   TlcCalibrationPhaseFit,
@@ -76,10 +77,15 @@ export interface SolventNameMatchResult {
   matchSource: 'auto' | 'manual';
 }
 
+export interface MeasuredTlcSpot extends TlcSpot {
+  /** Measured vertical spot extent normalized by origin-to-front span (Rf units). */
+  rfSpan?: number;
+}
+
 export interface MeasuredWellSpots {
   wellIndex: number;
   laneId: number;
-  spots: TlcSpot[];
+  spots: MeasuredTlcSpot[];
   hasWhiteChannel: boolean;
   originOccupied?: boolean;
   frontOccupied?: boolean;
@@ -432,15 +438,15 @@ export function extractMeasuredWellSpotsForSet(
   let laneCountWithSpots = 0;
   let boundaryOccupiedLanes = 0;
   const boundaryInputs: Array<{ laneId: number; profile: number[]; origin: number; front: number; sign: number }> = [];
-  const laneResults = new Map<number, { spots: TlcSpot[] }>();
+  const laneResults = new Map<number, { spots: MeasuredTlcSpot[] }>();
 
   for (const lane of lanes) {
     try {
       const hasCustom = Array.isArray(lane.customSpots);
-      let mergedSpots: TlcSpot[] = [];
+      let mergedSpots: MeasuredTlcSpot[] = [];
 
       if (hasCustom) {
-        mergedSpots = [...lane.customSpots!];
+        mergedSpots = lane.customSpots!.map((sp) => ({ ...sp }));
         validSpanLanes++;
       } else {
         const oVal = tlcOrigin(setSlice, lane, getProf);
@@ -476,12 +482,35 @@ export function extractMeasuredWellSpotsForSet(
             detectorMode: setSlice.spotDetectorMode,
           });
           for (const sp of chSpots) {
+            const rfSpan =
+              sp.extentStart !== undefined && sp.extentEnd !== undefined && span > 0
+                ? Math.round(clamp((sp.extentEnd - sp.extentStart) / span, 0.01, 0.95) * 1000) / 1000
+                : undefined;
+            const enriched: MeasuredTlcSpot = {
+              ...sp,
+              ...(rfSpan !== undefined ? { rfSpan } : {}),
+            };
             const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
             if (!match) {
-              mergedSpots.push({ ...sp });
-            } else if (sp.strength > match.strength) {
-              match.strength = sp.strength;
-              match.pos = sp.pos;
+              mergedSpots.push(enriched);
+            } else {
+              if (sp.strength > match.strength) {
+                match.strength = sp.strength;
+                match.pos = sp.pos;
+                if (sp.widthFrac !== undefined) match.widthFrac = sp.widthFrac;
+                if (sp.tailing !== undefined) match.tailing = sp.tailing;
+                if (rfSpan !== undefined) match.rfSpan = rfSpan;
+              } else if (sp.strength >= match.strength * 0.55) {
+                if (sp.tailing !== undefined && (match.tailing === undefined || sp.tailing > match.tailing)) {
+                  match.tailing = sp.tailing;
+                }
+                if (rfSpan !== undefined && (match.rfSpan === undefined || rfSpan > match.rfSpan)) {
+                  match.rfSpan = rfSpan;
+                }
+                if (sp.widthFrac !== undefined && match.widthFrac === undefined) {
+                  match.widthFrac = sp.widthFrac;
+                }
+              }
             }
           }
         }
@@ -548,7 +577,10 @@ export function estimatePlateLevelDemandShift(
   kPhase: number
 ): { shift: number; n: number } | null {
   const obs = observedRf.filter((r) => Number.isFinite(r) && r > 0.05 && r < 0.92);
-  const pred = predictedRf.filter((r) => Number.isFinite(r) && r >= 0.02 && r <= 0.99);
+  // Exclude baseline-pinned predictions (<= 0.05) symmetrically with obs (> 0.05) so polar
+  // origin-pinned SMs cannot collapse medianLogit(pred) and fabricate a huge upward Rf shift;
+  // keep predictions up to 0.99 so front-clamped over-predictions are still detected.
+  const pred = predictedRf.filter((r) => Number.isFinite(r) && r > 0.05 && r <= 0.99);
   if (obs.length < 8 || pred.length < 8) return null;
   const medianLogit = (a: number[]) => {
     const b = a.map((r) => logitRf(r)).sort((x, y) => x - y);
@@ -792,6 +824,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     plateSummaryIdx: number;
     family: SolventFamily;
     isC18: boolean;
+    compoundKey: string;
     profile: TlcMolProfile;
     features: [number, number, number, number, number];
     displacementN: number;
@@ -801,6 +834,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     plateSummaryIdx: number;
     family: SolventFamily;
     isC18: boolean;
+    compoundKey: string;
     kind: 'front' | 'baseline';
     predictedRfBefore: number;
     boundRf: number;
@@ -811,7 +845,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
   const plateAnchorProfiles = new Map<number, Map<number, TlcMolProfile[]>>();
   const plateLevelByPhase = new Map<
     TlcStationaryPhasePreference,
-    Array<{ family: SolventFamily; shift: number; n: number }>
+    Array<{ family: SolventFamily; shift: number; n: number; obsCount: number }>
   >();
 
   for (const set of tlcSets) {
@@ -1019,11 +1053,22 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         const hasOriginEvidence = Boolean(measuredWell?.originOccupied || originBoundarySpot);
 
         // Build per-lane Found vs Boundary-Saturated vs Missing vs Extra comparison
+        // Only evaluate tailing/streaking on interior spots (boundary bands at the front/origin are saturation, not streaking)
+        let maxTailing = 0;
+        let maxRfSpan = 0;
         const compMeasured = obsSpots.map((sp) => {
           const pMatch = pairedByObs.get(sp);
+          const isInterior = sp.rf > 0.08 && sp.rf < 0.90;
+          if (isInterior) {
+            if (sp.tailing !== undefined && sp.tailing > maxTailing) maxTailing = sp.tailing;
+            if (sp.rfSpan !== undefined && sp.rfSpan > maxRfSpan) maxRfSpan = sp.rfSpan;
+          }
           return {
             rf: Math.round(sp.rf * 100) / 100,
             strength: sp.strength,
+            ...(sp.widthFrac !== undefined ? { widthFrac: Math.round(sp.widthFrac * 1000) / 1000 } : {}),
+            ...(sp.tailing !== undefined ? { tailing: Math.round(sp.tailing * 100) / 100 } : {}),
+            ...(sp.rfSpan !== undefined ? { rfSpan: sp.rfSpan } : {}),
             ...(pMatch
               ? {
                   matchedLabel: pMatch.label,
@@ -1034,6 +1079,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
               : {}),
           };
         });
+        const measuredTailing = maxTailing >= 1.85 || maxRfSpan >= 0.18;
 
         let laneFrontCensored = 0;
         let laneBaseCensored = 0;
@@ -1052,6 +1098,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           }
           let boundaryStatus: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing' = 'missing';
           let boundaryObsRf: number | undefined;
+          const ancCompoundKey = anc.profile.canonicalSmiles || anc.profile.smiles;
           if (obsMatch && !isFrontPegged(obsMatch.rf) && !isBasePegged(obsMatch.rf)) {
             boundaryStatus = 'found';
           } else if (
@@ -1065,6 +1112,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             laneCensoredRecords.push({
               family: matched.system.family,
               isC18,
+              compoundKey: ancCompoundKey,
               kind: 'front',
               predictedRfBefore: anc.rf,
               boundRf: usedObs ? Math.min(0.95, Math.max(0.92, usedObs.rf)) : 0.94,
@@ -1081,6 +1129,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             laneCensoredRecords.push({
               family: matched.system.family,
               isC18,
+              compoundKey: ancCompoundKey,
               kind: 'baseline',
               predictedRfBefore: anc.rf,
               boundRf: usedObs ? Math.max(0.02, Math.min(0.06, usedObs.rf)) : 0.05,
@@ -1111,6 +1160,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           originOccupied: hasOriginEvidence,
           frontExcess: measuredWell?.frontExcess ?? 0,
           originExcess: measuredWell?.originExcess ?? 0,
+          measuredTailing,
+          ...(maxTailing > 0 ? { maxMeasuredTailing: Math.round(maxTailing * 100) / 100 } : {}),
           measuredSpots: compMeasured,
           predictedSpots: compPredicted,
         });
@@ -1135,8 +1186,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
 
       let plateFrontCensCount = 0;
       let plateBaseCensCount = 0;
+      let plateTailingLaneCount = 0;
       for (const l of lanesOut) {
         if (l.isBlank) continue;
+        if (l.measuredTailing) plateTailingLaneCount++;
         for (const p of l.predictedSpots) {
           if (p.boundaryStatus === 'front_saturated') plateFrontCensCount++;
           else if (p.boundaryStatus === 'baseline_pinned') plateBaseCensCount++;
@@ -1159,6 +1212,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         pairedCount: platePairs.length,
         frontCensoredCount: plateFrontCensCount,
         baselineCensoredCount: plateBaseCensCount,
+        tailingLaneCount: plateTailingLaneCount,
         meanRfResidual: 0,
         rmseBefore: 0,
         rmseAfter: 0,
@@ -1169,6 +1223,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       });
 
       {
+        const interiorObsCount = plateObsRf.filter((r) => Number.isFinite(r) && r > 0.05 && r < 0.92).length;
         const est = estimatePlateLevelDemandShift(plateObsRf, platePredSmRf, isC18 ? 4.8 : 6.2);
         if (est) {
           let pl = plateLevelByPhase.get(matched.stationaryPhase);
@@ -1176,7 +1231,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             pl = [];
             plateLevelByPhase.set(matched.stationaryPhase, pl);
           }
-          pl.push({ family: matched.system.family, shift: est.shift, n: est.n });
+          pl.push({ family: matched.system.family, shift: est.shift, n: est.n, obsCount: interiorObsCount });
         }
       }
 
@@ -1191,6 +1246,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             plateSummaryIdx,
             family: matched.system.family,
             isC18,
+            compoundKey: item.profile.canonicalSmiles || item.profile.smiles,
             profile: item.profile,
             features: computeCalibrationFeatureVector(item.profile),
             displacementN: item.profile.lser?.displacementN ?? 1.0,
@@ -1392,11 +1448,12 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       };
     };
 
-    // Effective weights: a compound seen in many wells counts about once overall, not once per well.
-    const compoundCount = new Map<TlcMolProfile, number>();
-    for (const rec of records) compoundCount.set(rec.profile, (compoundCount.get(rec.profile) ?? 0) + 1);
+    // Effective weights: a compound seen in many wells (even across non-canonical SMILES variants)
+    // counts about once overall, not once per well.
+    const compoundCount = new Map<string, number>();
+    for (const rec of records) compoundCount.set(rec.compoundKey, (compoundCount.get(rec.compoundKey) ?? 0) + 1);
     for (const rec of records) {
-      rec.pair.weight = Math.round((rec.pair.weight / (compoundCount.get(rec.profile) ?? 1)) * 10000) / 10000;
+      rec.pair.weight = Math.round((rec.pair.weight / (compoundCount.get(rec.compoundKey) ?? 1)) * 10000) / 10000;
     }
     const uniqueCompounds = compoundCount.size;
     // Censored front / baseline hits are per well too: cap their total pull at about one unit per compound.
@@ -1408,7 +1465,9 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     }
 
     // Grouped (leave-compounds-out) validation: an eluent-polarity correction must predict compounds it has
-    // not seen. Candidate A = global shift + slope only; candidate B adds family shifts / descriptor ridge.
+    // not seen. Both paired records AND censored boundary hits are filtered by canonical compoundKey so zero
+    // test-compound evidence leaks into any training fold.
+    // Candidate A = global shift + slope only; candidate B adds family shifts / descriptor ridge.
     const predictRf = (rec: RawPairRecord, phaseFit: PhaseFitResult): number => {
       const famShift = phaseFit.familyDemandShifts[rec.family] ?? 0;
       return applyCalibrationShiftToRf(
@@ -1427,17 +1486,18 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
     if (uniqueCompounds >= 4 && records.length >= 6) {
       const compounds = Array.from(compoundCount.keys());
       const folds = Math.min(5, compounds.length);
-      const foldOf = new Map<TlcMolProfile, number>();
+      const foldOf = new Map<string, number>();
       compounds.forEach((c, i) => foldOf.set(c, i % folds));
       const cvError = (allowExtras: boolean): number => {
         let se = 0;
         let wt = 0;
         for (let f = 0; f < folds; f++) {
-          const train = records.filter((r) => foldOf.get(r.profile) !== f);
-          const test = records.filter((r) => foldOf.get(r.profile) === f);
+          const train = records.filter((r) => foldOf.get(r.compoundKey) !== f);
+          const test = records.filter((r) => foldOf.get(r.compoundKey) === f);
           if (test.length === 0 || train.length === 0) continue;
-          const tc = new Set(train.map((r) => r.profile)).size;
-          const foldFit = fitPhaseModel(train, censRecords, allowExtras, tc);
+          const foldCens = censRecords.filter((c) => foldOf.get(c.compoundKey) !== f);
+          const tc = new Set(train.map((r) => r.compoundKey)).size;
+          const foldFit = fitPhaseModel(train, foldCens, allowExtras, tc);
           for (const r of test) {
             const e = r.pair.observedRf - predictRf(r, foldFit);
             se += r.pair.weight * e * e;
@@ -1465,6 +1525,35 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       }
     }
 
+    // Leave-one-plate-out holdout validation when >= 2 measured plates exist in this phase
+    let plateCvRmse: number | undefined;
+    let plateCvRmseBaseline: number | undefined;
+    const distinctPlates = Array.from(new Set(records.map((r) => r.plateSummaryIdx)));
+    if (distinctPlates.length >= 2 && records.length >= 6) {
+      let pSe = 0;
+      let pBaseSe = 0;
+      let pWt = 0;
+      for (const heldOutPlate of distinctPlates) {
+        const train = records.filter((r) => r.plateSummaryIdx !== heldOutPlate);
+        const test = records.filter((r) => r.plateSummaryIdx === heldOutPlate);
+        if (train.length === 0 || test.length === 0) continue;
+        const trainCens = censRecords.filter((c) => c.plateSummaryIdx !== heldOutPlate);
+        const tc = new Set(train.map((r) => r.compoundKey)).size;
+        const foldFit = fitPhaseModel(train, trainCens, useExtras, tc);
+        for (const r of test) {
+          const e = r.pair.observedRf - predictRf(r, foldFit);
+          const e0 = r.pair.observedRf - r.pair.predictedRfBefore;
+          pSe += r.pair.weight * e * e;
+          pBaseSe += r.pair.weight * e0 * e0;
+          pWt += r.pair.weight;
+        }
+      }
+      if (pWt > 0) {
+        plateCvRmse = Math.round(Math.sqrt(pSe / pWt) * 1000) / 1000;
+        plateCvRmseBaseline = Math.round(Math.sqrt(pBaseSe / pWt) * 1000) / 1000;
+      }
+    }
+
     let { globalDemandShift, demandSlope, familyDemandShifts, featureWeights } = fitPhaseModel(
       records,
       censRecords,
@@ -1481,28 +1570,64 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       featureWeights = undefined;
     }
 
-    // Plate-level backstop: if a family's whole plate runs far from the prediction but the pair-based fit
-    // (which can only see spots that pair within +/-0.24 Rf) misses it, use the pairing-independent estimate.
+    // Plate-level backstop: ONLY activates when a family's whole plate runs far from the prediction
+    // AND pairing actually failed to cover the plate's interior spots (< 10 pairs or < 25% of observed spots),
+    // AND never when applying it worsens the paired spots' RMSE.
     const plateLevelFamilies: Partial<Record<SolventFamily, number>> = {};
     {
-      const byFam = new Map<SolventFamily, { w: number; ws: number }>();
+      const byFam = new Map<SolventFamily, { w: number; ws: number; obsCount: number }>();
       for (const pl of plateLevel) {
-        const cur = byFam.get(pl.family) || { w: 0, ws: 0 };
+        const cur = byFam.get(pl.family) || { w: 0, ws: 0, obsCount: 0 };
         cur.w += pl.n;
         cur.ws += pl.n * pl.shift;
+        cur.obsCount += pl.obsCount;
         byFam.set(pl.family, cur);
       }
       for (const [fam, st] of byFam.entries()) {
         const est = st.ws / st.w;
         const pairBased = globalDemandShift + (familyDemandShifts[fam] ?? 0);
-        if (Math.abs(est - pairBased) > 0.15) {
-          familyDemandShifts[fam] = Math.round(clamp(est - globalDemandShift, -0.45, 0.45) * 10000) / 10000;
-          plateLevelFamilies[fam] = Math.round(est * 10000) / 10000;
+        if (Math.abs(est - pairBased) <= 0.15) continue;
+
+        const famRecords = records.filter((r) => r.family === fam);
+        // Gate 1: If pairing already matched a healthy share of interior spots, trust the paired fit.
+        if (famRecords.length >= 10 && famRecords.length >= 0.25 * st.obsCount) continue;
+
+        // Gate 2: Never apply a backstop shift that degrades the existing paired spots' RMSE.
+        if (famRecords.length > 0) {
+          let sqCur = 0;
+          let sqEst = 0;
+          for (const rec of famRecords) {
+            const featDelta = computeFeatureDemandDelta(rec.profile, featureWeights);
+            const pCur = applyCalibrationShiftToRf(
+              rec.pair.predictedRfBefore,
+              pairBased,
+              isC18,
+              demandSlope,
+              featDelta,
+              rec.displacementN
+            );
+            const pEst = applyCalibrationShiftToRf(
+              rec.pair.predictedRfBefore,
+              est,
+              isC18,
+              demandSlope,
+              featDelta,
+              rec.displacementN
+            );
+            sqCur += (rec.pair.observedRf - pCur) ** 2;
+            sqEst += (rec.pair.observedRf - pEst) ** 2;
+          }
+          const rmseCur = Math.sqrt(sqCur / famRecords.length);
+          const rmseEst = Math.sqrt(sqEst / famRecords.length);
+          if (rmseEst > rmseCur + 0.025) continue;
         }
+
+        familyDemandShifts[fam] = Math.round(clamp(est - globalDemandShift, -0.45, 0.45) * 10000) / 10000;
+        plateLevelFamilies[fam] = Math.round(est * 10000) / 10000;
       }
     }
 
-    // Re-evaluate all pairs after calibration to fill parity points & RMSE
+    // Re-evaluate all pairs after calibration to fill parity points, RMSE, and per-family stats
     let wSum = 0;
     let sqErrBefore = 0;
     let sqErrAfter = 0;
@@ -1512,6 +1637,21 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       number,
       { sqBefore: number; sqAfter: number; rfSum: number; wSum: number; wrSum: number }
     >();
+    const familyAccum = new Map<
+      SolventFamily,
+      { plates: Set<number>; count: number; sqBefore: number; sqAfter: number }
+    >();
+
+    for (let pIdxSummary = 0; pIdxSummary < model.plates.length; pIdxSummary++) {
+      const pEntry = model.plates[pIdxSummary];
+      if (pEntry.stationaryPhase !== phase) continue;
+      let fa = familyAccum.get(pEntry.family);
+      if (!fa) {
+        fa = { plates: new Set(), count: 0, sqBefore: 0, sqAfter: 0 };
+        familyAccum.set(pEntry.family, fa);
+      }
+      fa.plates.add(pIdxSummary);
+    }
 
     for (const rec of records) {
       const famShift = familyDemandShifts[rec.family] ?? 0;
@@ -1553,6 +1693,26 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       pa.wSum += rec.pair.weight;
       pa.wrSum += rec.pair.weight * rec.pair.residualDemand;
       plateAccum.set(rec.plateSummaryIdx, pa);
+
+      let fa = familyAccum.get(rec.family);
+      if (!fa) {
+        fa = { plates: new Set(), count: 0, sqBefore: 0, sqAfter: 0 };
+        familyAccum.set(rec.family, fa);
+      }
+      fa.plates.add(rec.plateSummaryIdx);
+      fa.count++;
+      fa.sqBefore += errBefore * errBefore;
+      fa.sqAfter += errAfter * errAfter;
+    }
+
+    const familyStats: Partial<Record<SolventFamily, TlcCalibrationFamilyStats>> = {};
+    for (const [fam, fa] of familyAccum.entries()) {
+      familyStats[fam] = {
+        plateCount: fa.plates.size,
+        pairedCount: fa.count,
+        rmseBefore: fa.count > 0 ? Math.round(Math.sqrt(fa.sqBefore / fa.count) * 1000) / 1000 : 0,
+        rmseAfter: fa.count > 0 ? Math.round(Math.sqrt(fa.sqAfter / fa.count) * 1000) / 1000 : 0,
+      };
     }
 
     const n = records.length;
@@ -1618,6 +1778,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       globalDemandShift,
       demandSlope,
       familyDemandShifts,
+      ...(Object.keys(familyStats).length > 0 ? { familyStats } : {}),
       ...(featureWeights ? { featureWeights } : {}),
       midplateRfShift: rfShiftAtMidplate(globalDemandShift, isC18),
       calibratedSigma,
@@ -1632,6 +1793,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       validated,
       ...(cvRmse !== undefined ? { cvRmse: Math.round(cvRmse * 1000) / 1000 } : {}),
       ...(cvRmseBaseline !== undefined ? { cvRmseBaseline: Math.round(cvRmseBaseline * 1000) / 1000 } : {}),
+      ...(plateCvRmse !== undefined ? { plateCvRmse } : {}),
+      ...(plateCvRmseBaseline !== undefined ? { plateCvRmseBaseline } : {}),
       calibrationApplied: calibrationHelps || Object.keys(plateLevelFamilies).length > 0,
       ...(Object.keys(plateLevelFamilies).length > 0 ? { plateLevelFamilies } : {}),
     };

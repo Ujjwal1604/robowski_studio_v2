@@ -65,48 +65,29 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
     if (!tlcSet || !lane || !availableChannels.length) return null;
     const origin = tlcOrigin(tlcSet, lane, extractProfile);
     const front = tlcFront(tlcSet, lane, extractProfile);
-    let autoSpots: TlcSpot[] = [];
-    if (activeMode === 'composite') {
-      const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
-      const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
-      const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
-      for (const ch of availableChannels) {
-        const p = extractProfile(tlcSet, ch, lane);
-        if (p.length) {
-          profiles[ch] = p;
-          const chHist = getChannelHistogram(tlcSet, ch, extractProfile);
-          if (chHist) histograms[ch] = chHist;
-          const m2d = getLane2dMetrics(tlcSet, ch, lane);
-          if (m2d) lane2dByChannel[ch] = m2d;
-        }
+    const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+    const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+    const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+    for (const ch of availableChannels) {
+      const p = extractProfile(tlcSet, ch, lane);
+      if (p.length) {
+        profiles[ch] = p;
+        const chHist = getChannelHistogram(tlcSet, ch, extractProfile);
+        if (chHist) histograms[ch] = chHist;
+        const m2d = getLane2dMetrics(tlcSet, ch, lane);
+        if (m2d) lane2dByChannel[ch] = m2d;
       }
-      autoSpots = findMultiChannelSpots({
-        profiles,
-        origin,
-        front,
-        radius: lane.spotRadius ?? undefined,
-        minProminence: tlcSet.spotProminence ?? 0.28,
-        histograms,
-        lane2dByChannel,
-        detectorMode: tlcSet.spotDetectorMode,
-      });
-    } else {
-      const traceKey: TlcChannelKey =
-        activeMode || (availableChannels.includes('UV254') ? 'UV254' : availableChannels[0]);
-      const profile = extractProfile(tlcSet, traceKey, lane);
-      if (!profile.length) return null;
-      const dens = extractDensitogram(profile, {
-        sign: TLC_SIGNAL[traceKey].sign,
-        origin,
-        front,
-        radius: lane.spotRadius ?? undefined,
-        minProminence: tlcSet.spotProminence ?? 0.28,
-        plateHistogram: getChannelHistogram(tlcSet, traceKey, extractProfile),
-        lane2d: getLane2dMetrics(tlcSet, traceKey, lane),
-        detectorMode: tlcSet.spotDetectorMode,
-      });
-      autoSpots = dens.spots;
     }
+    const autoSpots = findMultiChannelSpots({
+      profiles,
+      origin,
+      front,
+      radius: lane.spotRadius ?? undefined,
+      minProminence: tlcSet.spotProminence ?? 0.28,
+      histograms,
+      lane2dByChannel,
+      detectorMode: tlcSet.spotDetectorMode,
+    });
     const spots = getEffectiveLaneSpots(lane, autoSpots);
     return { origin, front, spots };
   }, [tlcSet, lane, availableChannels, activeMode]);

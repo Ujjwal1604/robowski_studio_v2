@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { TlcSet, TlcLane, TlcSpot } from '../../types';
 import {
   containerOfLane,
@@ -21,9 +21,10 @@ import {
 import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
 import {
+  ConfidenceTierKey,
+  SPOT_CONFIDENCE_TIERS,
   getSpotConfidenceStyle,
   confidenceRgba,
-  SPOT_CONFIDENCE_GRADIENT_CSS,
 } from '../../utils/spotConfidence';
 
 export type CompositeSubMode = 'false-color';
@@ -37,7 +38,13 @@ interface TlcFullPlateViewProps {
   run?: any;
   plate?: number;
   getProfile?: (set: TlcSet, key: any, lane: any) => number[];
+  /** Unified multi-channel spot provider shared across Full Plate, Grid, Modal, and Densitogram */
+  getCanonicalSpots?: (lane: TlcLane) => TlcSpot[] | null;
   onUpdateLane?: (laneId: number, patch: Partial<TlcLane>) => void;
+  onUpdateLanesBatch?: (
+    patches: Record<number, Partial<TlcLane>>,
+    options?: { keepCaches?: boolean; toastMessage?: string }
+  ) => void;
   onUpdateSetFront?: (frontPx: number | null, side?: number) => void;
   onAutoDetectBaselines?: () => void;
   onSnapshotHistory?: () => void;
@@ -108,7 +115,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   run,
   plate = 0,
   getProfile,
+  getCanonicalSpots,
   onUpdateLane,
+  onUpdateLanesBatch,
   onUpdateSetFront,
   onAutoDetectBaselines,
   onSnapshotHistory,
@@ -140,6 +149,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
   // Preview of the edge-effect correction: re-stretch the photo so same-compound spots line up
   const [straighten, setStraighten] = useState(false);
+  // Hovering a confidence category button highlights all matching auto spots across the plate
+  const [hoveredConfidenceTier, setHoveredConfidenceTier] = useState<ConfidenceTierKey | null>(null);
 
   // Modular HUD state: only the selected module's drawer is expanded, keeping HUD ultra-compact
   const [activeHudModule, setActiveHudModule] = useState<HudModule>('geometry');
@@ -379,10 +390,31 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const oVal = tlcOrigin(currentSet, l, getProfile as any);
       const fVal = tlcFront(currentSet, l, getProfile);
       const span = Math.max(1, fVal - oVal);
+      const half = l.id < 27 ? 0 : 1;
+      const fit = edgeFits ? edgeFits[half] : null;
+      const setting = edgeSettings ? edgeSettings[half] : null;
+      const isCorrecting = edgeActive(fit, setting);
+      const gain = isCorrecting && fit ? edgeGain(fit, l.x0, setting?.strength ?? 1) : 1;
+      const offset = isCorrecting && fit ? edgeOffset(fit, l.x0, setting?.strength ?? 1) : 0;
+
+      if (getCanonicalSpots) {
+        return {
+          spots: getCanonicalSpots(l) || [],
+          originDist: oVal,
+          frontDist: fVal,
+          spanDist: span,
+          isCorrecting,
+          gain,
+          offset,
+        };
+      }
+
       let autoSpots: TlcSpot[] = [];
       if (getProfile) {
-        if (isComposite) {
-          const loadedChannels = getLoadedTlcChannels(currentSet.imgs, true);
+        // Always detect across all loaded channels so switching UV254/UV366/White/Composite
+        // changes only the background photo, never the plate's detected compound list.
+        const loadedChannels = getLoadedTlcChannels(currentSet.imgs, true);
+        if (loadedChannels.length > 0) {
           const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
           const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
           const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
@@ -406,32 +438,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             lane2dByChannel,
             detectorMode: currentSet.spotDetectorMode,
           });
-        } else {
-          const spotChannel = activeChannel as TlcChannelKey;
-          if (currentSet.imgs[spotChannel]) {
-            const prof = getProfile(currentSet, spotChannel, l);
-            if (prof && prof.length > 0) {
-              autoSpots = findSpots(prof, {
-                sign: TLC_SIGNAL[spotChannel]?.sign ?? -1,
-                origin: oVal,
-                front: fVal,
-                radius: l.spotRadius || 24,
-                minProminence: spotProminence,
-                plateHistogram: getChannelHistogram(currentSet, spotChannel, getProfile),
-                lane2d: getLane2dMetrics(currentSet, spotChannel, l),
-                detectorMode: currentSet.spotDetectorMode,
-              });
-            }
-          }
         }
       }
       const baseSpots = getEffectiveLaneSpots(l, autoSpots);
-      const half = l.id < 27 ? 0 : 1;
-      const fit = edgeFits ? edgeFits[half] : null;
-      const setting = edgeSettings ? edgeSettings[half] : null;
-      const isCorrecting = edgeActive(fit, setting);
-      const gain = isCorrecting && fit ? edgeGain(fit, l.x0, setting?.strength ?? 1) : 1;
-      const offset = isCorrecting && fit ? edgeOffset(fit, l.x0, setting?.strength ?? 1) : 0;
       const spots = isCorrecting ? correctSpots(baseSpots, gain, offset) : baseSpots;
       return {
         spots,
@@ -443,7 +452,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
         offset,
       };
     },
-    [currentSet, getProfile, isComposite, activeChannel, spotProminence, edgeFits, edgeSettings]
+    [currentSet, getProfile, getCanonicalSpots, spotProminence, edgeFits, edgeSettings]
   );
 
   // Render Full Plate Canvas (clears context, resets transform, and ensures leak-free drawing)
@@ -802,20 +811,29 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ? Math.min(w * 0.95, 36 / scale)
               : Math.min(w * 0.75, 22 / scale);
 
-            // Determine spot color & styling based on provenance and continuous confidence scale
+            // Determine spot color & styling based on provenance and discrete 5-tier confidence palette
             const spotSource = sp.source || 'auto';
             const confStyle = getSpotConfidenceStyle(sp.confidence);
+            const isTierHighlighted =
+              hoveredConfidenceTier !== null &&
+              spotSource === 'auto' &&
+              confStyle.tier === hoveredConfidenceTier;
+            const isTierDimmed =
+              hoveredConfidenceTier !== null && !isTierHighlighted && !isDragged && !isHoveredSpot;
+            const spotAlpha = isTierDimmed ? 0.28 : isSelected || isTierHighlighted ? 1.0 : 0.96;
             const baseColor = isDragged
               ? '#facc15'
               : spotSource === 'manual'
-              ? '#f59e0b'
+              ? isTierDimmed
+                ? 'rgba(245, 158, 11, 0.30)'
+                : '#f59e0b'
               : spotSource === 'adjusted'
-              ? '#a855f7'
+              ? isTierDimmed
+                ? 'rgba(168, 85, 247, 0.30)'
+                : '#a855f7'
               : isHoveredSpot
               ? confStyle.text
-              : isSelected
-              ? confStyle.color
-              : confidenceRgba(confStyle, 0.92);
+              : confidenceRgba(confStyle, spotAlpha);
 
             // If edge correction is active, draw the leveled alignment tick in emerald
             if (isCorrecting && !straightHere && sp.rfRaw != null && (Math.abs(gain - 1) >= 0.003 || Math.abs(offset) >= 0.002)) {
@@ -842,12 +860,12 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ctx.stroke();
               ctx.restore();
             } else {
-              // Subtle dark backing stroke keeps all gradient stops crisp on bright UV254 / White plates
+              // Crisp dark backing stroke keeps all 5 discrete category colors sharp on UV254 / White
               ctx.beginPath();
               ctx.moveTo(-markerW / 2, rawSpotY);
               ctx.lineTo(markerW / 2, rawSpotY);
-              ctx.strokeStyle = 'rgba(15, 23, 42, 0.65)';
-              ctx.lineWidth = (isHoveredSpot || isSelected ? 4.0 : 2.8) / scale;
+              ctx.strokeStyle = isTierDimmed ? 'rgba(15, 23, 42, 0.25)' : 'rgba(15, 23, 42, 0.78)';
+              ctx.lineWidth = (isHoveredSpot || isSelected || isTierHighlighted ? 4.2 : 3.0) / scale;
               ctx.stroke();
 
               // Horizontal tick at physical spot location
@@ -855,47 +873,64 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               ctx.moveTo(-markerW / 2, rawSpotY);
               ctx.lineTo(markerW / 2, rawSpotY);
               ctx.strokeStyle = baseColor;
-              ctx.lineWidth = (isHoveredSpot || isSelected ? 2.5 : 1.6) / scale;
+              ctx.lineWidth = (isHoveredSpot || isSelected || isTierHighlighted ? 2.6 : 1.8) / scale;
               ctx.stroke();
             }
 
             // Draggable Centroid Grab Handle: distinct ring + inner dot (diamond for manual picks)
-            const handleRadius = isDragged
+            const baseHandleRadius = isDragged
               ? 6.5 / scale
               : isHoveredSpot
               ? 6 / scale
+              : isTierHighlighted
+              ? 5.0 / scale
               : isSelected
-              ? 4.2 / scale
-              : 2.9 / scale;
+              ? 4.3 / scale
+              : 3.1 / scale;
+            const handleRadius =
+              spotSource === 'auto' && !isDragged && !isHoveredSpot
+                ? baseHandleRadius * confStyle.radiusScale
+                : baseHandleRadius;
 
-            if (spotSource === 'manual' || spotSource === 'adjusted' || isHoveredSpot || isDragged) {
-              // Draw provenance aura / grab target halo
+            if (
+              spotSource === 'manual' ||
+              spotSource === 'adjusted' ||
+              isHoveredSpot ||
+              isDragged ||
+              isTierHighlighted
+            ) {
+              // Draw provenance aura / grab target halo / category removal preview ring
               ctx.beginPath();
-              ctx.arc(0, rawSpotY, handleRadius + 3 / scale, 0, Math.PI * 2);
+              ctx.arc(0, rawSpotY, handleRadius + (isTierHighlighted ? 4.2 : 3) / scale, 0, Math.PI * 2);
               ctx.fillStyle = isDragged
                 ? 'rgba(250, 204, 21, 0.45)'
                 : spotSource === 'manual'
                 ? 'rgba(245, 158, 11, 0.34)'
                 : spotSource === 'adjusted'
                 ? 'rgba(168, 85, 247, 0.34)'
-                : confidenceRgba(confStyle, 0.30);
+                : confidenceRgba(confStyle, isTierHighlighted ? 0.42 : 0.30);
               ctx.fill();
+              if (isTierHighlighted) {
+                ctx.strokeStyle = confStyle.color;
+                ctx.lineWidth = 1.6 / scale;
+                ctx.stroke();
+              }
             }
 
             const isLowConfAuto = spotSource === 'auto' && confStyle.needsReview;
-            if (spotSource === 'auto' && confStyle.reviewRingAlpha > 0 && !isDragged) {
+            if (spotSource === 'auto' && confStyle.reviewRingAlpha > 0 && !isDragged && !isTierDimmed) {
               ctx.save();
               ctx.beginPath();
               ctx.setLineDash([2.5 / scale, 2 / scale]);
               ctx.arc(0, rawSpotY, handleRadius + 3.2 / scale, 0, Math.PI * 2);
               ctx.strokeStyle = confidenceRgba(confStyle, confStyle.reviewRingAlpha);
-              ctx.lineWidth = 1.4 / scale;
+              ctx.lineWidth = 1.5 / scale;
               ctx.stroke();
               ctx.restore();
             }
 
             // Draw centroid marker: rotated diamond for manual picks so provenance never
-            // clashes with the continuous auto-confidence color gradient
+            // clashes with the 5-category auto-confidence colors
             ctx.beginPath();
             if (spotSource === 'manual' && !isDragged) {
               const dr = handleRadius * 1.28;
@@ -910,10 +945,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             ctx.fillStyle = isDragged ? '#facc15' : baseColor;
             ctx.fill();
             // Thin dark outer halo + crisp white inner rim for readability on every channel
-            ctx.strokeStyle = 'rgba(15, 23, 42, 0.72)';
+            ctx.strokeStyle = isTierDimmed ? 'rgba(15, 23, 42, 0.25)' : 'rgba(15, 23, 42, 0.80)';
             ctx.lineWidth = 2.4 / scale;
             ctx.stroke();
-            ctx.strokeStyle = '#ffffff';
+            ctx.strokeStyle = isTierDimmed ? 'rgba(255, 255, 255, 0.32)' : '#ffffff';
             ctx.lineWidth = 1.25 / scale;
             ctx.stroke();
 
@@ -1033,6 +1068,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     hoveredSpotInfo,
     boostWhiteSpots,
     automiddleEnabled,
+    hoveredConfidenceTier,
   ]);
 
   // Find spot collision at mouse coordinates (for dragging, Alt+Click deletion, or tooltip)
@@ -1151,6 +1187,97 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     },
     [onUpdateLane, onSnapshotHistory]
   );
+
+  // Plate-wide counts for each of the 5 auto-detection confidence categories
+  const confidenceTierCounts = useMemo(() => {
+    const counts: Record<ConfidenceTierKey, number> = {
+      'very-low': 0,
+      low: 0,
+      medium: 0,
+      high: 0,
+      'very-high': 0,
+    };
+    if (!showRfBadges || !getProfile) return counts;
+    for (const l of lanes) {
+      const { spots } = getLaneEffectiveSpots(l);
+      for (const sp of spots) {
+        if (sp.source && sp.source !== 'auto') continue;
+        const tier = getSpotConfidenceStyle(sp.confidence).tier;
+        counts[tier]++;
+      }
+    }
+    return counts;
+  }, [lanes, showRfBadges, getProfile, getLaneEffectiveSpots]);
+
+  const hasAnyCustomSpots = useMemo(
+    () => lanes.some((l) => l.customSpots !== undefined),
+    [lanes]
+  );
+
+  // 1-click removal of all auto-detected spots in a given confidence category across the plate
+  const handleRemoveSpotsByConfidenceTier = useCallback(
+    (tierKey: ConfidenceTierKey) => {
+      if (!onUpdateLanesBatch && !onUpdateLane) return;
+      const tierMeta = SPOT_CONFIDENCE_TIERS.find((t) => t.key === tierKey);
+      const patches: Record<number, Partial<TlcLane>> = {};
+      let removedSpots = 0;
+      let affectedLanes = 0;
+
+      for (const l of lanes) {
+        const { spots } = getLaneEffectiveSpots(l);
+        if (!spots.length) continue;
+        const remaining = spots.filter((sp) => {
+          const isAuto = !sp.source || sp.source === 'auto';
+          if (isAuto && getSpotConfidenceStyle(sp.confidence).tier === tierKey) {
+            removedSpots++;
+            return false;
+          }
+          return true;
+        });
+        if (remaining.length !== spots.length) {
+          affectedLanes++;
+          patches[l.id] = { customSpots: remaining };
+        }
+      }
+
+      if (removedSpots === 0) return;
+      setHoveredConfidenceTier(null);
+      if (onUpdateLanesBatch) {
+        onUpdateLanesBatch(patches, {
+          keepCaches: true,
+          toastMessage: `Removed ${removedSpots} ${tierMeta?.label ?? tierKey} (${tierMeta?.rangeLabel ?? ''}) spot${removedSpots === 1 ? '' : 's'} across ${affectedLanes} lane${affectedLanes === 1 ? '' : 's'}.`,
+        });
+      } else if (onUpdateLane) {
+        if (onSnapshotHistory) onSnapshotHistory();
+        for (const [idStr, patch] of Object.entries(patches)) {
+          onUpdateLane(Number(idStr), patch);
+        }
+      }
+    },
+    [lanes, getLaneEffectiveSpots, onUpdateLanesBatch, onUpdateLane, onSnapshotHistory]
+  );
+
+  const handleRestoreAllAutoSpots = useCallback(() => {
+    if (!onUpdateLanesBatch && !onUpdateLane) return;
+    const patches: Record<number, Partial<TlcLane>> = {};
+    for (const l of lanes) {
+      if (l.customSpots !== undefined) {
+        patches[l.id] = { customSpots: undefined };
+      }
+    }
+    if (Object.keys(patches).length === 0) return;
+    if (onUpdateLanesBatch) {
+      onUpdateLanesBatch(patches, {
+        keepCaches: true,
+        toastMessage: `Restored automated spot detection across ${Object.keys(patches).length} lane${Object.keys(patches).length === 1 ? '' : 's'}.`,
+      });
+    } else if (onUpdateLane) {
+      if (onSnapshotHistory) onSnapshotHistory();
+      for (const [idStr, patch] of Object.entries(patches)) {
+        onUpdateLane(Number(idStr), patch);
+      }
+    }
+  }, [lanes, onUpdateLanesBatch, onUpdateLane, onSnapshotHistory]);
 
   const handleNudgeSpotRf = useCallback(
     (laneId: number, spotIndex: number, deltaRf: number) => {
@@ -3382,24 +3509,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               <span style={{ display: 'inline-block', width: '12px', height: '3px', background: '#38bdf8' }} />
               Solvent Front (Rf = 1)
             </span>
-            <span
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
-              title="Auto-detected spot confidence scale: Rose (Trace/Very Low) → Orange (Low) → Gold (Medium) → Teal (High) → Cyan (Very High)"
-            >
-              <span>Auto Confidence:</span>
-              <span style={{ fontSize: '10px', color: '#f43f5e', fontWeight: 600 }}>Low</span>
-              <span
-                style={{
-                  display: 'inline-block',
-                  width: '68px',
-                  height: '7px',
-                  borderRadius: '4px',
-                  background: SPOT_CONFIDENCE_GRADIENT_CSS,
-                  border: '1px solid rgba(255,255,255,0.22)',
-                }}
-              />
-              <span style={{ fontSize: '10px', color: '#38bdf8', fontWeight: 600 }}>High</span>
-            </span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#f59e0b' }}>
               <span
                 style={{
@@ -3434,6 +3543,150 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               </span>
             )}
           </div>
+
+          {/* Interactive 5-Category Spot Confidence Filter & 1-Click Bulk Removal Bar */}
+          {showRfBadges && getProfile && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexWrap: 'wrap',
+                gap: '6px',
+                marginTop: '8px',
+                padding: '6px 10px',
+                borderRadius: '8px',
+                background: 'rgba(15, 23, 42, 0.78)',
+                border: '1px solid rgba(255, 255, 255, 0.12)',
+                fontSize: '11px',
+              }}
+            >
+              <span style={{ color: '#cbd5e1', fontWeight: 700, marginRight: '2px', fontSize: '10.5px' }}>
+                Spot Confidence (1-click remove):
+              </span>
+              {SPOT_CONFIDENCE_TIERS.map((tier) => {
+                const count = confidenceTierCounts[tier.key];
+                const isHoveredTier = hoveredConfidenceTier === tier.key;
+                const disabled = count === 0 || (!onUpdateLanesBatch && !onUpdateLane);
+                return (
+                  <button
+                    key={tier.key}
+                    type="button"
+                    disabled={disabled}
+                    onMouseEnter={() => {
+                      if (count > 0) setHoveredConfidenceTier(tier.key);
+                    }}
+                    onMouseLeave={() => {
+                      setHoveredConfidenceTier((prev) => (prev === tier.key ? null : prev));
+                    }}
+                    onClick={() => handleRemoveSpotsByConfidenceTier(tier.key)}
+                    title={
+                      count > 0
+                        ? `Hover to preview · Click to remove all ${count} ${tier.label} (${tier.rangeLabel}) auto spot${count === 1 ? '' : 's'} across the plate`
+                        : `No ${tier.label} (${tier.rangeLabel}) auto spots currently on plate`
+                    }
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                      padding: '3px 8px',
+                      borderRadius: '5px',
+                      background: isHoveredTier ? tier.bg : 'rgba(15, 23, 42, 0.92)',
+                      border: `1px ${tier.needsReview ? 'dashed' : 'solid'} ${
+                        disabled ? 'rgba(148, 163, 184, 0.25)' : tier.border
+                      }`,
+                      color: disabled ? '#64748b' : tier.text,
+                      cursor: disabled ? 'default' : 'pointer',
+                      opacity: disabled ? 0.50 : 1,
+                      fontSize: '11px',
+                      fontWeight: 700,
+                      transition: 'background 0.12s, transform 0.12s, opacity 0.12s',
+                      transform: isHoveredTier && !disabled ? 'translateY(-1px)' : 'none',
+                    }}
+                  >
+                    <span
+                      style={{
+                        display: 'inline-block',
+                        width: '9px',
+                        height: '9px',
+                        borderRadius: '50%',
+                        background: tier.color,
+                        border: '1.5px solid #ffffff',
+                        boxShadow: '0 0 0 1px rgba(15, 23, 42, 0.85)',
+                      }}
+                    />
+                    <span>{tier.label}</span>
+                    <span style={{ fontSize: '9.5px', opacity: 0.85, fontWeight: 600 }}>
+                      {tier.rangeLabel}
+                    </span>
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: '10px',
+                        fontWeight: 800,
+                        padding: '0 4px',
+                        borderRadius: '3px',
+                        background: disabled ? 'rgba(100, 116, 139, 0.18)' : tier.bg,
+                        color: disabled ? '#64748b' : '#ffffff',
+                      }}
+                    >
+                      {count}
+                    </span>
+                    {!disabled && (
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          lineHeight: 1,
+                          marginLeft: '1px',
+                          color: isHoveredTier ? '#ffffff' : tier.text,
+                        }}
+                        aria-hidden="true"
+                      >
+                        ✕
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+
+              {canUndo && onUndo && (
+                <button
+                  type="button"
+                  onClick={onUndo}
+                  title="Undo last spot removal or adjustment"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 7px',
+                    fontSize: '10.5px',
+                    background: '#1e293b',
+                    color: '#38bdf8',
+                    borderColor: '#0284c7',
+                    marginLeft: '4px',
+                  }}
+                >
+                  ↩ Undo
+                </button>
+              )}
+
+              {hasAnyCustomSpots && (onUpdateLanesBatch || onUpdateLane) && (
+                <button
+                  type="button"
+                  onClick={handleRestoreAllAutoSpots}
+                  title="Restore all auto-detected spots across all lanes on this plate"
+                  style={{
+                    ...hudBtn,
+                    padding: '3px 7px',
+                    fontSize: '10.5px',
+                    background: '#1e293b',
+                    color: '#fde047',
+                    borderColor: '#854d0e',
+                  }}
+                >
+                  ↺ Restore Auto
+                </button>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <div

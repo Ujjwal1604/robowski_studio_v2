@@ -6,6 +6,7 @@ import {
   extractDensitogram,
   findMultiChannelSpots,
   findSpots,
+  mergeMultiChannelSpots,
   rgbLabDeltaE,
   segmentLaneSpots2d,
 } from '../src/engine';
@@ -551,24 +552,38 @@ describe('Step 3: arPLS Baseline, Channel-Calibrated 2D Maps & Watershed Spot Se
     expect(elapsedMs).toBeLessThan(1200);
   });
 
-  it('produces a continuous multi-level confidence color gradient and monotonic scores across spot strengths', () => {
-    // Verify 5 distinct named tiers and strictly unique interpolated hex colors across the scale
-    const sampleLevels = [0.15, 0.30, 0.42, 0.56, 0.68, 0.78, 0.94];
+  it('produces 5 maximally distinct discrete confidence categories and monotonic scores across spot strengths', () => {
+    // Verify 5 distinct named tiers, tier keys, and strongly separated hex colors across the scale
+    const sampleLevels = [0.20, 0.42, 0.60, 0.78, 0.94];
     const styles = sampleLevels.map((c) => getSpotConfidenceStyle(c));
     const uniqueColors = new Set(styles.map((s) => s.color));
-    expect(uniqueColors.size).toBe(sampleLevels.length);
+    expect(uniqueColors.size).toBe(5);
+    expect(styles.map((s) => s.tier)).toEqual([
+      'very-low',
+      'low',
+      'medium',
+      'high',
+      'very-high',
+    ]);
     expect(styles.map((s) => s.label)).toEqual([
       'Very Low',
-      'Very Low',
       'Low',
-      'Medium',
       'Medium',
       'High',
       'Very High',
     ]);
+    // Every pair of tiers must be strongly separated in RGB space (Euclidean dist >= 95)
+    for (let i = 0; i < styles.length; i++) {
+      for (let j = i + 1; j < styles.length; j++) {
+        const [r1, g1, b1] = styles[i].rgb;
+        const [r2, g2, b2] = styles[j].rgb;
+        expect(Math.hypot(r1 - r2, g1 - g2, b1 - b2)).toBeGreaterThanOrEqual(95);
+      }
+    }
     expect(styles[0].needsReview).toBe(true);
-    expect(styles[3].needsReview).toBe(false);
-    expect(styles[6].reviewRingAlpha).toBe(0);
+    expect(styles[1].needsReview).toBe(true);
+    expect(styles[2].needsReview).toBe(false);
+    expect(styles[4].reviewRingAlpha).toBe(0);
 
     // Verify monotonic confidence spread from faint to medium to strong spots on a realistic UV254 lane
     const origin = 45;
@@ -582,12 +597,355 @@ describe('Step 3: arPLS Baseline, Channel-Calibrated 2D Maps & Watershed Spot Se
       return spots[0].confidence!;
     };
 
-    const cFaint = measureConf(-24);
+    const cFaint = measureConf(-18);
     const cMed = measureConf(-55);
-    const cStrong = measureConf(-135);
+    const cStrong = measureConf(-145);
     expect(cFaint).toBeLessThan(cMed);
     expect(cMed).toBeLessThan(cStrong);
-    expect(getSpotConfidenceStyle(cFaint).color).not.toBe(getSpotConfidenceStyle(cMed).color);
-    expect(getSpotConfidenceStyle(cMed).color).not.toBe(getSpotConfidenceStyle(cStrong).color);
+    expect(getSpotConfidenceStyle(cFaint).tier).not.toBe(getSpotConfidenceStyle(cStrong).tier);
+  });
+
+  it('merges multi-channel confidence via calibrated noisy-OR without inflating weak hits or inventing missing scores', () => {
+    // Two weak 0.15 detections should combine to ~0.28 (still Very Low), never jump to ~0.53 (Medium)
+    const weakMerged = mergeMultiChannelSpots({
+      UV254: [{ pos: 200, rf: 0.5, strength: 0.2, confidence: 0.15 }],
+      UV366: [{ pos: 201, rf: 0.503, strength: 0.18, confidence: 0.15 }],
+    });
+    expect(weakMerged.length).toBe(1);
+    expect(weakMerged[0].confidence).toBeCloseTo(0.28, 2);
+    expect(getSpotConfidenceStyle(weakMerged[0].confidence).label).toBe('Very Low');
+
+    // Two spots with missing confidence should remain undefined rather than fabricating 0.92
+    const missingMerged = mergeMultiChannelSpots({
+      UV254: [{ pos: 200, rf: 0.5, strength: 0.5 }],
+      UV366: [{ pos: 200, rf: 0.5, strength: 0.4 }],
+    });
+    expect(missingMerged.length).toBe(1);
+    expect(missingMerged[0].confidence).toBeUndefined();
+
+    // One defined + one missing keeps the defined score without fabrication
+    const partialMerged = mergeMultiChannelSpots({
+      UV254: [{ pos: 200, rf: 0.5, strength: 0.5 }],
+      UV366: [{ pos: 200, rf: 0.5, strength: 0.6, confidence: 0.62 }],
+    });
+    expect(partialMerged.length).toBe(1);
+    expect(partialMerged[0].confidence).toBe(0.62);
+  });
+
+  it('keeps barely-visible low-contrast spots below Medium confidence instead of inflating them via geometry', () => {
+    const origin = 45;
+    const front = 375;
+    const measureConf = (deltaG: number) => {
+      const strip = makeLaneStrip(34, 420, [8, 190, 10]);
+      paintSpot(strip, { pos: 210, cxFrac: 0.5, sigmaY: 9, sigmaXFrac: 0.22, deltaRgb: [0, deltaG, 0] });
+      const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+      const spots = findSpots(profile, { sign: -1, origin, front, minProminence: 0.28, lane2d: metrics });
+      expect(spots.length).toBe(1);
+      return spots[0].confidence!;
+    };
+
+    // A barely-perceptible deltaG=-14 smudge must remain Very Low / Low (< 0.45), never Medium/High (>= 0.52)
+    const cWhisper = measureConf(-14);
+    const cMedium = measureConf(-55);
+    const cStrong = measureConf(-145);
+    expect(cWhisper).toBeLessThan(0.45);
+    expect(getSpotConfidenceStyle(cWhisper).needsReview).toBe(true);
+    expect(cMedium).toBeGreaterThanOrEqual(0.55);
+    expect(cStrong).toBeGreaterThanOrEqual(0.86);
+  });
+
+  it('merges faint upper-skirt shoulder ripples on broad spots (C3 regression) without losing resolved faint spots', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin; // 330
+    const mainPos = origin + Math.round(0.71 * span); // ~279
+    const skirtPos = origin + Math.round(0.81 * span); // ~312
+
+    // UV366 broad bright fluorescent band at Rf 0.71 with a small ripple riding on its decaying upper halo at Rf 0.81
+    const uv366 = makeLaneStrip(34, 420, [4, 60, 56]);
+    paintSpot(uv366, { pos: mainPos, cxFrac: 0.5, sigmaY: 22, sigmaXFrac: 0.32, deltaRgb: [10, 75, 170], power: 3 });
+    paintSpot(uv366, { pos: skirtPos, cxFrac: 0.5, sigmaY: 4, sigmaXFrac: 0.22, deltaRgb: [0, 4, 12] });
+    const res366 = analyzeLaneStripRgb(uv366.rgba, uv366.width, uv366.length, 'UV366', 0.35);
+    const spots366 = findSpots(res366.profile, { sign: 1, origin, front, minProminence: 0.28, lane2d: res366.metrics });
+    expect(spots366.length).toBe(1);
+    expect(Math.abs(spots366[0].rf - 0.71)).toBeLessThan(0.03);
+
+    // UV254 broad quenching spot at Rf 0.71 with a tiny -7 shoulder ripple at Rf 0.81
+    const uv254 = makeLaneStrip(34, 420, [2, 189, 3]);
+    paintSpot(uv254, { pos: mainPos, cxFrac: 0.5, sigmaY: 20, sigmaXFrac: 0.28, deltaRgb: [0, -85, 0], power: 3 });
+    paintSpot(uv254, { pos: skirtPos, cxFrac: 0.5, sigmaY: 4, sigmaXFrac: 0.22, deltaRgb: [0, -7, 0] });
+    const res254 = analyzeLaneStripRgb(uv254.rgba, uv254.width, uv254.length, 'UV254', 0.35);
+    const spots254 = findSpots(res254.profile, { sign: -1, origin, front, minProminence: 0.28, lane2d: res254.metrics });
+    expect(spots254.length).toBe(1);
+    expect(Math.abs(spots254[0].rf - 0.71)).toBeLessThan(0.03);
+  });
+
+  it('prevents bright green fluorescence under UV254 from dragging arPLS down and fabricating phantom dark spots on blank silica', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    const strip = makeLaneStrip(34, 420, [4, 185, 4]);
+    // Bright fluorescent spot under UV254 (brighter than F254 silica: G goes UP by +55!)
+    paintSpot(strip, {
+      pos: origin + Math.round(0.68 * span),
+      cxFrac: 0.5,
+      sigmaY: 16,
+      sigmaXFrac: 0.26,
+      deltaRgb: [0, 55, 0],
+    });
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+    const spots = findSpots(profile, { sign: -1, origin, front, minProminence: 0.28, lane2d: metrics });
+    expect(spots.length).toBe(0);
+  });
+
+  it('suppresses weak single-channel halo/rim ghosts on a strong spot boundary while preserving real doublets and manual picks', () => {
+    // Strong UV254+UV366 primary spot at Rf 0.71 spanning pos [230..295], plus weak single-channel rim ghost at pos 300 (Rf 0.81)
+    const suppressed = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 265, rf: 0.71, strength: 1.0, confidence: 0.88, extentStart: 240, extentEnd: 285, source: 'auto' },
+        { pos: 300, rf: 0.81, strength: 0.14, confidence: 0.34, extentStart: 294, extentEnd: 306, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 266, rf: 0.712, strength: 1.0, confidence: 0.94, extentStart: 230, extentEnd: 296, source: 'auto' },
+      ],
+    });
+    expect(suppressed.length).toBe(1);
+    expect(suppressed[0].rf).toBeCloseTo(0.71, 2);
+
+    // Weak UV254-only dark rim on a strong UV366-only fluorescent band (no UV254 hit at center) is suppressed
+    const fluorRim = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 298, rf: 0.81, strength: 1.0, confidence: 0.54, extentStart: 292, extentEnd: 304, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 265, rf: 0.71, strength: 1.0, confidence: 0.92, extentStart: 230, extentEnd: 295, source: 'auto' },
+      ],
+    });
+    expect(fluorRim.length).toBe(1);
+    expect(fluorRim[0].channels).toEqual(['UV366']);
+
+    // Genuine separated faint spot well outside the rim (pos 330) is preserved
+    const separated = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 265, rf: 0.71, strength: 1.0, confidence: 0.88, extentStart: 240, extentEnd: 285, source: 'auto' },
+        { pos: 330, rf: 0.90, strength: 0.14, confidence: 0.34, extentStart: 324, extentEnd: 336, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 266, rf: 0.712, strength: 1.0, confidence: 0.94, extentStart: 230, extentEnd: 296, source: 'auto' },
+      ],
+    });
+    expect(separated.length).toBe(2);
+
+    // Genuine visible Medium/High second compound right at the boundary (confidence 0.68) is preserved
+    const realDoublet = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 265, rf: 0.71, strength: 1.0, confidence: 0.88, extentStart: 240, extentEnd: 285, source: 'auto' },
+        { pos: 300, rf: 0.81, strength: 0.55, confidence: 0.68, extentStart: 292, extentEnd: 308, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 266, rf: 0.712, strength: 1.0, confidence: 0.94, extentStart: 230, extentEnd: 296, source: 'auto' },
+      ],
+    });
+    expect(realDoublet.length).toBe(2);
+
+    // Manual picks are never suppressed even on a strong spot rim
+    const manualKept = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 300, rf: 0.81, strength: 0.12, confidence: 0.20, extentStart: 294, extentEnd: 306, source: 'manual' },
+      ],
+      UV366: [
+        { pos: 265, rf: 0.71, strength: 1.0, confidence: 0.94, extentStart: 230, extentEnd: 296, source: 'auto' },
+      ],
+    });
+    expect(manualKept.length).toBe(2);
+  });
+
+  it('does not stair-step over-split a broad grainy UV366 fluorescent tailing band into multiple Rf picks', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin; // 330
+    const peakPos = origin + Math.round(0.72 * span); // ~283
+
+    // Wide full-width UV366 fluorescent band at Rf 0.72 with a long asymmetric monotonic tail down to Rf 0.42
+    const strip = makeLaneStrip(36, 420, [8, 42, 62]);
+    for (let pos = 0; pos < strip.length; pos++) {
+      const y = strip.length - 1 - pos;
+      const dy = pos - peakPos;
+      // Asymmetric longitudinal profile: faster upper decay (sigma 18), long monotonic lower tail (sigma 46)
+      const sigmaY = dy >= 0 ? 18 : 46;
+      const yEnv = Math.exp(-0.5 * (dy / sigmaY) ** 2);
+      for (let x = 0; x < strip.width; x++) {
+        const xNorm = (x + 0.5) / strip.width - 0.5;
+        // Very wide lateral fill spanning nearly full lane width (like a bright UV366 streak)
+        const xEnv = Math.exp(-0.5 * (xNorm / 0.58) ** 2);
+        const amp = yEnv * xEnv;
+        // Deterministic mottled 2D camera/silica grain (±12 amplitude, multi-frequency spatial speckles)
+        const h1 = Math.sin(x * 1.9 + pos * 0.73) * Math.cos(x * 0.87 - pos * 1.31);
+        const h2 = Math.sin(x * 0.61 - pos * 0.37) * Math.cos(x * 1.43 + pos * 0.49);
+        const grain = Math.round((h1 * 8 + h2 * 6) * (0.45 + 0.55 * amp));
+        const idx = (y * strip.width + x) * 4;
+        strip.rgba[idx] = Math.max(0, Math.min(255, Math.round(strip.rgba[idx] + 18 * amp + grain * 0.4)));
+        strip.rgba[idx + 1] = Math.max(0, Math.min(255, Math.round(strip.rgba[idx + 1] + 95 * amp + grain)));
+        strip.rgba[idx + 2] = Math.max(0, Math.min(255, Math.round(strip.rgba[idx + 2] + 165 * amp + grain)));
+      }
+    }
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV366', 0.35);
+    const spots = findSpots(profile, { sign: 1, origin, front, minProminence: 0.28, lane2d: metrics });
+
+    // Must consolidate into a single true peak near Rf 0.72 instead of 5-8 stair-step slope slices
+    expect(spots.length).toBe(1);
+    expect(Math.abs(spots[0].rf - 0.72)).toBeLessThanOrEqual(0.05);
+    expect(spots[0].confidence!).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('consolidates grainy monotonic UV254 tailing shoulders into one spot while still splitting true touching doublets', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    const peakPos = origin + Math.round(0.72 * span);
+
+    // Broad UV254 quenching spot at Rf 0.72 with asymmetric tail + mottled 2D grain
+    const strip = makeLaneStrip(36, 420, [6, 190, 8]);
+    for (let pos = 0; pos < strip.length; pos++) {
+      const y = strip.length - 1 - pos;
+      const dy = pos - peakPos;
+      const sigmaY = dy >= 0 ? 15 : 36;
+      const yEnv = Math.exp(-0.5 * (dy / sigmaY) ** 2);
+      for (let x = 0; x < strip.width; x++) {
+        const xNorm = (x + 0.5) / strip.width - 0.5;
+        const xEnv = Math.exp(-0.5 * (xNorm / 0.45) ** 2);
+        const amp = yEnv * xEnv;
+        const grain = Math.round(
+          (Math.sin(x * 1.7 + pos * 0.83) * 6 + Math.cos(x * 0.91 - pos * 0.41) * 5) * (0.4 + 0.6 * amp)
+        );
+        const idx = (y * strip.width + x) * 4;
+        strip.rgba[idx + 1] = Math.max(0, Math.min(255, Math.round(strip.rgba[idx + 1] - 115 * amp + grain)));
+      }
+    }
+
+    const resTailed = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+    const tailedSpots = findSpots(resTailed.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: resTailed.metrics,
+    });
+    expect(tailedSpots.length).toBe(1);
+    expect(Math.abs(tailedSpots[0].rf - 0.72)).toBeLessThanOrEqual(0.05);
+
+    // Genuine touching figure-8 doublet with a real chromatographic dip still resolves as 2 spots
+    const doublet = makeLaneStrip(36, 420, [6, 190, 8]);
+    const posA = origin + Math.round(0.50 * span);
+    const posB = origin + Math.round(0.59 * span);
+    paintSpot(doublet, { pos: posA, cxFrac: 0.5, sigmaY: 9, sigmaXFrac: 0.24, deltaRgb: [0, -105, 0] });
+    paintSpot(doublet, { pos: posB, cxFrac: 0.5, sigmaY: 9, sigmaXFrac: 0.24, deltaRgb: [0, -95, 0] });
+    const resDbl = analyzeLaneStripRgb(doublet.rgba, doublet.width, doublet.length, 'UV254', 0.35);
+    const dblSpots = findSpots(resDbl.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: resDbl.metrics,
+    });
+    expect(dblSpots.length).toBe(2);
+    expect(Math.abs(dblSpots[0].pos - posA)).toBeLessThanOrEqual(5);
+    expect(Math.abs(dblSpots[1].pos - posB)).toBeLessThanOrEqual(5);
+  });
+
+  it('scores a minor peak sitting on an elevated parent slope lower than an equal-altitude isolated spot', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    const minorPos = origin + Math.round(0.54 * span);
+    const parentPos = origin + Math.round(0.72 * span);
+
+    // Isolated spot of depth -70 on blank silica
+    const isoStrip = makeLaneStrip(36, 420, [6, 190, 8]);
+    paintSpot(isoStrip, { pos: minorPos, cxFrac: 0.5, sigmaY: 10, sigmaXFrac: 0.25, deltaRgb: [0, -70, 0] });
+    const isoRes = analyzeLaneStripRgb(isoStrip.rgba, isoStrip.width, isoStrip.length, 'UV254', 0.35);
+    const isoSpots = findSpots(isoRes.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: isoRes.metrics,
+    });
+    expect(isoSpots.length).toBe(1);
+
+    // Same-altitude (~ -70 total depth) minor peak sitting on an elevated tail shelf from a large parent at Rf 0.72
+    const shelfStrip = makeLaneStrip(36, 420, [6, 190, 8]);
+    paintSpot(shelfStrip, { pos: parentPos, cxFrac: 0.5, sigmaY: 28, sigmaXFrac: 0.28, deltaRgb: [0, -145, 0] });
+    paintSpot(shelfStrip, { pos: minorPos, cxFrac: 0.5, sigmaY: 8.5, sigmaXFrac: 0.24, deltaRgb: [0, -45, 0] });
+    const shelfRes = analyzeLaneStripRgb(shelfStrip.rgba, shelfStrip.width, shelfStrip.length, 'UV254', 0.35);
+    const shelfSpots = findSpots(shelfRes.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: shelfRes.metrics,
+    });
+
+    expect(shelfSpots.length).toBe(2);
+    const minorOnShelf = shelfSpots[0];
+    const parentSpot = shelfSpots[1];
+    expect(Math.abs(minorOnShelf.pos - minorPos)).toBeLessThanOrEqual(7);
+    expect(parentSpot.confidence!).toBeGreaterThan(minorOnShelf.confidence!);
+    // Prominence-gated confidence on the elevated shelf must be meaningfully lower than the equal-altitude isolated spot
+    expect(minorOnShelf.confidence!).toBeLessThan(isoSpots[0].confidence! - 0.08);
+  });
+
+  it('keeps adjacent UV254 spots bridged by a wide shadow split and centers Rf on the 50%-height visual apex', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    const lowerPos = origin + Math.round(0.63 * span);
+    const upperPos = origin + Math.round(0.74 * span);
+
+    const strip = makeLaneStrip(32, 420, [4, 188, 5]);
+    // Strong lower dark spot centered at Rf 0.63
+    paintSpot(strip, { pos: lowerPos, cxFrac: 0.5, sigmaY: 11, sigmaXFrac: 0.28, deltaRgb: [0, -115, 0] });
+    // Wider upper dark band centered at Rf 0.74 plus a faint shared full-width background shadow bridging them
+    paintSpot(strip, { pos: upperPos, cxFrac: 0.5, sigmaY: 10, sigmaXFrac: 0.36, deltaRgb: [0, -68, 0] });
+    paintHorizontalBand(strip, Math.round((lowerPos + upperPos) * 0.5), 18, [0, -32, 0]);
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+    const spots = findSpots(profile, { sign: -1, origin, front, minProminence: 0.28, lane2d: metrics });
+
+    // Must remain split as 2 distinct spots and place the lower spot squarely on its visual center (Rf ~0.63),
+    // never merged into one blob dragged up to Rf ~0.67
+    expect(spots.length).toBe(2);
+    expect(Math.abs(spots[0].rf - 0.63)).toBeLessThanOrEqual(0.025);
+    expect(Math.abs(spots[1].rf - 0.74)).toBeLessThanOrEqual(0.03);
+  });
+
+  it('never deletes real separated UV254 spots under a wide UV366 tail or real UV366 spots near a UV254 anchor', () => {
+    // Separated UV254 dark spot at Rf 0.50 (conf 0.47) under a broad UV366 tailing band centered at Rf 0.71
+    // whose extentStart reaches Rf 0.44 must NEVER be deleted as a rim ghost (ΔRf = 0.21 > 0.115).
+    const uv254UnderTail = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 210, rf: 0.50, strength: 0.55, confidence: 0.47, extentStart: 196, extentEnd: 224, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 280, rf: 0.71, strength: 1.0, confidence: 0.94, extentStart: 190, extentEnd: 308, source: 'auto' },
+      ],
+    });
+    expect(uv254UnderTail.length).toBe(2);
+    expect(uv254UnderTail.some((s) => Math.abs(s.rf - 0.50) < 0.01)).toBe(true);
+
+    // Real UV366 fluorescent spot at Rf 0.57 (conf 0.50) near a strong UV254-only dark spot at Rf 0.66
+    // must NEVER be deleted by a UV254 anchor (dark quenching cannot cause fake UV366 fluorescence).
+    const uv366NearUv254 = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 263, rf: 0.66, strength: 1.0, confidence: 0.89, extentStart: 230, extentEnd: 300, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 233, rf: 0.57, strength: 0.60, confidence: 0.50, extentStart: 218, extentEnd: 248, source: 'auto' },
+      ],
+    });
+    expect(uv366NearUv254.length).toBe(2);
+    expect(uv366NearUv254.some((s) => Math.abs(s.rf - 0.57) < 0.01 && s.channels?.includes('UV366'))).toBe(true);
   });
 });

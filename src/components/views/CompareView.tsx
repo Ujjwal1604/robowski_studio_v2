@@ -73,52 +73,30 @@ function resolveSpotsForSnapshot(
   const origin = tlcOrigin(tlcSet, lane, extractLaneProfileOnce);
   const front = tlcFront(tlcSet, lane, extractLaneProfileOnce);
 
-  if (preferredChannel === 'composite') {
-    const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
-    const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
-    const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
-    for (const ch of available) {
-      const p = extractLaneProfileOnce(tlcSet, ch, lane);
-      if (p.length) {
-        profiles[ch] = p;
-        const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileOnce);
-        if (chHist) histograms[ch] = chHist;
-        const m2d = getLane2dMetrics(tlcSet, ch, lane);
-        if (m2d) lane2dByChannel[ch] = m2d;
-      }
+  const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+  const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+  const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+  for (const ch of available) {
+    const p = extractLaneProfileOnce(tlcSet, ch, lane);
+    if (p.length) {
+      profiles[ch] = p;
+      const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileOnce);
+      if (chHist) histograms[ch] = chHist;
+      const m2d = getLane2dMetrics(tlcSet, ch, lane);
+      if (m2d) lane2dByChannel[ch] = m2d;
     }
-    const merged = findMultiChannelSpots({
-      profiles,
-      origin,
-      front,
-      radius: lane.spotRadius ?? undefined,
-      minProminence: tlcSet.spotProminence ?? 0.28,
-      histograms,
-      lane2dByChannel,
-      detectorMode: tlcSet.spotDetectorMode,
-    });
-    return getEffectiveLaneSpots(lane, merged);
   }
-
-  const traceKey: TlcChannelKey = available.includes(preferredChannel)
-    ? preferredChannel
-    : available.includes('UV254')
-    ? 'UV254'
-    : available[0];
-
-  const profile = extractLaneProfileOnce(tlcSet, traceKey, lane);
-  if (!profile.length) return [];
-  const dens = extractDensitogram(profile, {
-    sign: TLC_SIGNAL[traceKey].sign,
+  const merged = findMultiChannelSpots({
+    profiles,
     origin,
     front,
     radius: lane.spotRadius ?? undefined,
     minProminence: tlcSet.spotProminence ?? 0.28,
-    plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileOnce),
-    lane2d: getLane2dMetrics(tlcSet, traceKey, lane),
+    histograms,
+    lane2dByChannel,
     detectorMode: tlcSet.spotDetectorMode,
   });
-  return getEffectiveLaneSpots(lane, dens.spots);
+  return getEffectiveLaneSpots(lane, merged);
 }
 
 function downloadCsvFile(filename: string, csv: string) {

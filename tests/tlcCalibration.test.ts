@@ -898,7 +898,178 @@ describe('plate-level distribution check', () => {
   it('stays silent with too little evidence', () => {
     expect(estimatePlateLevelDemandShift([0.5, 0.6], [0.9, 0.9], 6.2)).toBeNull();
   });
+
+  it('ignores baseline-pinned predicted SMs (<= 0.05) so polar SMs cannot fabricate a giant upward Rf shift on a well-matched plate', () => {
+    // 25 baseline-pinned polar SMs (0.02-0.04) + 15 interior mobile SMs (0.50-0.60); observed interior spots sit at 0.55-0.65 (+0.05 shift)
+    const pred = [
+      ...Array.from({ length: 25 }, () => 0.03),
+      ...Array.from({ length: 15 }, (_, i) => 0.50 + (i % 3) * 0.04),
+    ];
+    const obs = Array.from({ length: 15 }, (_, i) => 0.55 + (i % 3) * 0.04);
+    const est = estimatePlateLevelDemandShift(obs, pred, 6.2)!;
+    expect(est).not.toBeNull();
+    // True shift is only ~ -0.03 demand (+0.05 Rf), never the bogus -0.45 blow-up
+    expect(Math.abs(est.shift)).toBeLessThan(0.08);
+  });
 });
+
+describe('rigorous multi-plate validation, canonical grouping & 2D tailing feedback', () => {
+  it('groups non-canonical SMILES duplicates as one compound, computes leave-one-plate-out plateCvRmse and per-family familyStats', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    // Include two non-canonical SMILES forms of Benzaldehyde ('O=Cc1ccccc1' and 'c1ccccc1C=O')
+    const mols = [
+      { code: 'A', name: 'Benzaldehyde-1', smiles: 'O=Cc1ccccc1' },
+      { code: 'B', name: 'Benzaldehyde-2', smiles: 'c1ccccc1C=O' },
+      { code: 'C', name: 'Acetophenone', smiles: 'CC(=O)c1ccccc1' },
+      { code: 'D', name: '4-Nitroanisole', smiles: 'COc1ccc([N+](=O)[O-])cc1' },
+      { code: 'E', name: 'Acetanilide', smiles: 'CC(=O)Nc1ccccc1' },
+      { code: 'F', name: 'Benzamide', smiles: 'NC(=O)c1ccccc1' },
+    ];
+    state.reagents = mols.map((m) => ({
+      code: m.code, name: m.name, smiles: m.smiles, molarMass: 135, density: 1.1, stock: 500, solvent: 'DMSO',
+    }));
+    const rows = mols.map((m, w) => ({
+      local_index: w, global_index: w, combo_index: w, plate_number: 0, container_id: w,
+      recipe: [{ code: m.code, name: m.name, target_concentration: 50, equivalence: 1 }],
+    }));
+    const fakeRun = { plates: 1, reactions: mols.length, rows } as unknown as RunResult;
+
+    const makePlate = (uid: string, name: string, sysId: string, shiftRf: number): TlcSet => {
+      const sys = TLC_SOLVENT_LIBRARY.find((s) => s.id === sysId)!;
+      const lanes = Array.from({ length: 54 }, (_, laneId) => {
+        const w = containerOfLane(laneId);
+        const m = mols[w];
+        const baseRf = m ? predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys).rf : 0;
+        const obsRf = Math.max(0.10, Math.min(0.88, baseRf + shiftRf));
+        return {
+          id: laneId, x0: 10 + laneId * 20, y0: 0, x1: 10 + laneId * 20, y1: 400, width: 14, length: 400, zeroRf: 40,
+          customSpots: m ? [{ pos: Math.round(40 + obsRf * 320), rf: obsRf, strength: 0.9, source: 'manual' as const }] : [],
+        };
+      });
+      return { uid, name, cfg: { lanes }, cfgName: uid, frameW: LANE_FRAME_WIDTH, frontPx: 360, originPx: 40, imgs: {} };
+    };
+
+    const p1 = makePlate('p_ea', '50% EtOAc / Hexanes', 'etoac_hex_50', -0.14);
+    const p2 = makePlate('p_meoh', '3% MeOH / DCM', 'meoh_dcm_3', -0.12);
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [p1, p2],
+    });
+
+    const fit = model.byPhase.SiO2!;
+    expect(fit).toBeDefined();
+    // 6 reagents but 2 are non-canonical duplicates of Benzaldehyde -> at most 5 distinct compounds
+    expect(fit.uniqueCompounds).toBeLessThanOrEqual(5);
+    expect(fit.plateCvRmse).toBeDefined();
+    expect(fit.plateCvRmseBaseline).toBeDefined();
+    expect(fit.plateCvRmse!).toBeLessThan(fit.plateCvRmseBaseline!);
+    expect(fit.familyStats?.etoac_hex?.plateCount).toBe(1);
+    expect(fit.familyStats?.meoh_dcm?.plateCount).toBe(1);
+    expect(fit.familyStats?.etoac_hex?.pairedCount).toBeGreaterThan(0);
+    expect(fit.familyStats?.meoh_dcm?.pairedCount).toBeGreaterThan(0);
+  });
+
+  it('feeds 2D measured tailing into followUpPlan rescue recommendations and tracks multi-plate progression', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    const smAmine = 'NCc1ccccc1';
+    const smAld = 'O=Cc1ccc(O)cc1';
+    const prodImine = 'Oc1ccc(C=NCc2ccccc2)cc1';
+    state.reagents = [
+      { code: 'A', name: 'Benzylamine', smiles: smAmine, molarMass: 107.15, density: 0.98, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '4-Hydroxybenzaldehyde', smiles: smAld, molarMass: 122.12, density: 1.12, stock: 500, solvent: 'DMSO' },
+    ];
+    const rows = Array.from({ length: 4 }, (_, w) => ({
+      local_index: w, global_index: w, combo_index: w, plate_number: 0, container_id: w,
+      recipe: [
+        { code: 'A', name: 'Benzylamine', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: '4-Hydroxybenzaldehyde', target_concentration: 50, equivalence: 1 },
+      ],
+    }));
+    const fakeRun = { plates: 1, reactions: 4, rows } as unknown as RunResult;
+    const cachedPredictions: Record<string, any> = {};
+    for (let w = 0; w < 4; w++) {
+      cachedPredictions[`0-${w}`] = {
+        substrates: [
+          { code: 'A', name: 'Benzylamine', neutralSmiles: smAmine, valid: true },
+          { code: 'B', name: '4-Hydroxybenzaldehyde', neutralSmiles: smAld, valid: true },
+        ],
+        species: [
+          { key: 'imine', tautomerKey: 'imine', smiles: prodImine, formula: 'C14H13NO', mechanismSummary: 'Imine adduct', tier: 'High', score: 0.9 },
+        ],
+      };
+    }
+
+    // Plate 1: unbuffered 50% EtOAc/Hexanes where the interior spot shows severe 2D measured tailing (tailing = 2.6)
+    const lanesTailing = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      return {
+        id: laneId, x0: 10 + laneId * 20, y0: 0, x1: 10 + laneId * 20, y1: 400, width: 14, length: 400, zeroRf: 40,
+        customSpots:
+          w < 4
+            ? [
+                { pos: 140, rf: 0.31, strength: 0.85, tailing: 2.6, widthFrac: 0.55, source: 'manual' as const },
+                { pos: 245, rf: 0.64, strength: 0.9, tailing: 1.1, widthFrac: 0.45, source: 'manual' as const },
+              ]
+            : [],
+      };
+    });
+    const tailingSet: TlcSet = {
+      uid: 'set_tail', name: '50% EtOAc / Hexanes', cfg: { lanes: lanesTailing },
+      cfgName: 'tail', frameW: LANE_FRAME_WIDTH, frontPx: 360, originPx: 40, imgs: {},
+    };
+
+    const { model: mTail } = calibrateTlcModelFromCampaign({
+      rdkit, state, run: fakeRun, tlcSets: [tailingSet], cachedPredictions,
+    });
+    expect(mTail.plates[0].tailingLaneCount).toBe(4);
+    expect(mTail.plates[0].lanes[0].measuredTailing).toBe(true);
+
+    const plan1 = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      plateIndex: 0, stationaryPhase: 'SiO2', cachedPredictions, calibration: mTail,
+    });
+    expect(plan1.followUpPlan?.summary.tailingWells.length).toBe(4);
+    expect(plan1.followUpPlan!.recommendations.length).toBeGreaterThanOrEqual(1);
+    const rescueOpt = plan1.followUpPlan!.recommendations[0];
+    expect(rescueOpt.rescuedTailingCount).toBeGreaterThan(0);
+    expect(Boolean(rescueOpt.system.baseModifier) || rescueOpt.system.alcoholPct >= 5).toBe(true);
+
+    // Plate 2: base-modified rescue plate resolves the 4 wells cleanly -> plateProgressionNote records the gain
+    const sysRescue = rescueOpt.system;
+    const prodRfR = predictTlcRf(profileMoleculeForTlc(rdkit, prodImine), sysRescue).rf;
+    const smRfR = predictTlcRf(profileMoleculeForTlc(rdkit, smAmine), sysRescue).rf;
+    const lanesClean = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      return {
+        id: laneId, x0: 10 + laneId * 20, y0: 0, x1: 10 + laneId * 20, y1: 400, width: 14, length: 400, zeroRf: 40,
+        customSpots:
+          w < 4
+            ? [
+                { pos: Math.round(40 + smRfR * 320), rf: smRfR, strength: 0.85, tailing: 1.15, source: 'manual' as const },
+                { pos: Math.round(40 + prodRfR * 320), rf: prodRfR, strength: 0.9, tailing: 1.1, source: 'manual' as const },
+              ]
+            : [],
+      };
+    });
+    const cleanSet: TlcSet = {
+      uid: 'set_clean', name: sysRescue.name, cfg: { lanes: lanesClean },
+      cfgName: 'clean', frameW: LANE_FRAME_WIDTH, frontPx: 360, originPx: 40, imgs: {},
+    };
+    const { model: m2 } = calibrateTlcModelFromCampaign({
+      rdkit, state, run: fakeRun, tlcSets: [tailingSet, cleanSet], cachedPredictions,
+    });
+    const plan2 = await optimizePlateTlcSolvents(rdkit, state, fakeRun, [], {
+      plateIndex: 0, stationaryPhase: 'SiO2', cachedPredictions, calibration: m2,
+    });
+    expect(plan2.followUpPlan?.summary.plateProgressionNote).toBeTruthy();
+    expect(plan2.followUpPlan!.summary.resolvedWellCount).toBeGreaterThan(plan1.followUpPlan!.summary.resolvedWellCount);
+  });
+});
+
 
 
 

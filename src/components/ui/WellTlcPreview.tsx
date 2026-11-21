@@ -10,6 +10,7 @@ import {
   findMultiChannelSpots,
   getChannelHistogram,
   getEffectiveLaneSpots,
+  getLane2dMetrics,
   laneMatrix,
   renderFalseColorLane,
   tlcFront,
@@ -120,37 +121,45 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
 
     const origin = tlcOrigin(tlcSet, lane, extractLaneProfileLocal);
     const front = tlcFront(tlcSet, lane, extractLaneProfileLocal);
+    const minProm = tlcSet.spotProminence ?? 0.28;
+    const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
+    const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
+    const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+    for (const ch of availableChannels) {
+      const p = extractLaneProfileLocal(tlcSet, ch, lane);
+      if (p.length) {
+        profiles[ch] = p;
+        const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileLocal);
+        if (chHist) histograms[ch] = chHist;
+        const m2d = getLane2dMetrics(tlcSet, ch, lane);
+        if (m2d) lane2dByChannel[ch] = m2d;
+      }
+    }
+
     const dens = extractDensitogram(profile, {
       sign: TLC_SIGNAL[traceKey].sign,
       origin,
       front,
       radius: lane.spotRadius ?? undefined,
-      minProminence: tlcSet.spotProminence ?? 0.08,
-      plateHistogram: getChannelHistogram(tlcSet, traceKey, extractLaneProfileLocal),
+      minProminence: minProm,
+      plateHistogram: histograms[traceKey],
+      lane2d: lane2dByChannel[traceKey],
+      detectorMode: tlcSet.spotDetectorMode,
     });
 
     let uv366Dens = null;
     let whiteDens = null;
-    let effectiveSpots: TlcSpot[];
     if (activeMode === 'composite') {
-      const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
-      const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
-      for (const ch of availableChannels) {
-        const p = extractLaneProfileLocal(tlcSet, ch, lane);
-        if (p.length) {
-          profiles[ch] = p;
-          const chHist = getChannelHistogram(tlcSet, ch, extractLaneProfileLocal);
-          if (chHist) histograms[ch] = chHist;
-        }
-      }
       if (availableChannels.includes('UV366') && profiles.UV366 && traceKey !== 'UV366') {
         uv366Dens = extractDensitogram(profiles.UV366, {
           sign: TLC_SIGNAL.UV366.sign,
           origin,
           front,
           radius: lane.spotRadius ?? undefined,
-          minProminence: tlcSet.spotProminence ?? 0.08,
+          minProminence: minProm,
           plateHistogram: histograms.UV366,
+          lane2d: lane2dByChannel.UV366,
+          detectorMode: tlcSet.spotDetectorMode,
         });
       }
       if (availableChannels.includes('White') && profiles.White && traceKey !== 'White') {
@@ -159,22 +168,24 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           origin,
           front,
           radius: lane.spotRadius ?? undefined,
-          minProminence: tlcSet.spotProminence ?? 0.08,
+          minProminence: minProm,
           plateHistogram: histograms.White,
+          lane2d: lane2dByChannel.White,
+          detectorMode: tlcSet.spotDetectorMode,
         });
       }
-      const multiSpots = findMultiChannelSpots({
-        profiles,
-        origin,
-        front,
-        radius: lane.spotRadius ?? undefined,
-        minProminence: tlcSet.spotProminence ?? 0.08,
-        histograms,
-      });
-      effectiveSpots = getEffectiveLaneSpots(lane, multiSpots);
-    } else {
-      effectiveSpots = getEffectiveLaneSpots(lane, dens.spots);
     }
+    const multiSpots = findMultiChannelSpots({
+      profiles,
+      origin,
+      front,
+      radius: lane.spotRadius ?? undefined,
+      minProminence: minProm,
+      histograms,
+      lane2dByChannel,
+      detectorMode: tlcSet.spotDetectorMode,
+    });
+    const effectiveSpots = getEffectiveLaneSpots(lane, multiSpots);
 
     return {
       traceKey,

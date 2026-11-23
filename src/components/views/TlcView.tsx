@@ -25,6 +25,7 @@ import {
   mergeMultiChannelSpots,
   getLoadedTlcChannels,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getLane2dMetrics,
   extractLaneProfile2d,
   setBlankSilicaRef,
@@ -42,6 +43,7 @@ import {
   rescueSharedReagentSpots,
   hasCompositeChannels,
   extractDensitogram,
+  spotProminenceForDensitogramCutoff,
   tlcHalf,
   tlcFront,
   tlcHalfFrontBase,
@@ -579,6 +581,54 @@ export const TlcView: React.FC = () => {
   const fileBlankRef = useRef<HTMLInputElement>(null);
   const filePreRunRef = useRef<HTMLInputElement>(null);
   const bigCanvasRef = useRef<HTMLCanvasElement>(null);
+  const densSvgRef = useRef<SVGSVGElement>(null);
+  const [draggingCutoff, setDraggingCutoff] = useState(false);
+  const cutoffDragRef = useRef<{
+    scaleMax: number;
+    plateSpan: number;
+    noiseFloor: number;
+  } | null>(null);
+  const justDraggedCutoffRef = useRef(false);
+
+  // Live horizontal pointer-drag for the Densitogram Cutoff guide line
+  useEffect(() => {
+    if (!draggingCutoff) return;
+    const handlePointerMove = (e: PointerEvent) => {
+      const drag = cutoffDragRef.current;
+      const svg = densSvgRef.current;
+      if (!drag || !svg) return;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const svgX = ((e.clientX - rect.left) / rect.width) * 320;
+      const clampedX = Math.max(40, Math.min(270, svgX));
+      const targetCutoff = ((clampedX - 40) / 230) * drag.scaleMax;
+      const nextProm = spotProminenceForDensitogramCutoff(
+        targetCutoff,
+        drag.plateSpan,
+        drag.noiseFloor
+      );
+      setSpotProminence(nextProm);
+      if (nextProm >= 0.45) setSpotMode('broad');
+      else if (nextProm <= 0.16) setSpotMode('sensitive');
+      else setSpotMode('standard');
+    };
+    const handlePointerUp = () => {
+      setDraggingCutoff(false);
+      cutoffDragRef.current = null;
+      justDraggedCutoffRef.current = true;
+      window.setTimeout(() => {
+        justDraggedCutoffRef.current = false;
+      }, 120);
+    };
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    };
+  }, [draggingCutoff, setSpotProminence]);
 
   // Blank Silica Flat-Field Calibration (persisted once per camera/channel in IndexedDB)
   const [blankMeta, setBlankMeta] = useState<Partial<Record<TlcChannelKey, { name: string }>>>(() =>
@@ -1410,6 +1460,7 @@ export const TlcView: React.FC = () => {
       const front = tlcFront(set, lane, get);
       const plateHistogram = getChannelHistogram(set, key, get);
       const lane2d = getLane2dMetrics(set, key, lane, coreFraction);
+      const frontBandBg = getChannelFrontBandProfile(set, key, tlcHalf(lane), get);
       return {
         prof,
         origin,
@@ -1421,6 +1472,7 @@ export const TlcView: React.FC = () => {
           minProminence: spotProminence,
           plateHistogram,
           lane2d,
+          frontBandBg,
           detectorMode: set.spotDetectorMode,
         },
       };
@@ -1463,6 +1515,7 @@ export const TlcView: React.FC = () => {
         const oVal = tlcOrigin(set, l, get);
         const fVal = tlcFront(set, l, get);
         const lane2d = getLane2dMetrics(set, key, l, coreFraction);
+        const frontBandBg = getChannelFrontBandProfile(set, key, tlcHalf(l), get);
         const soloSpots = findSpots(prof, {
           sign: TLC_SIGNAL[key].sign,
           origin: oVal,
@@ -1471,6 +1524,7 @@ export const TlcView: React.FC = () => {
           minProminence: spotProminence,
           plateHistogram,
           lane2d,
+          frontBandBg,
           detectorMode: set.spotDetectorMode,
         });
         const relaxedCandidates =
@@ -1483,6 +1537,7 @@ export const TlcView: React.FC = () => {
                 minProminence: relaxedProm,
                 plateHistogram,
                 lane2d,
+                frontBandBg,
                 detectorMode: set.spotDetectorMode,
               })
             : [];
@@ -1527,6 +1582,8 @@ export const TlcView: React.FC = () => {
             const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
             const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
             const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+            const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+            const halfIdx = tlcHalf(lane);
             for (const ch of loadedChs) {
               const p = get(set, ch, lane);
               if (p && p.length >= 10) {
@@ -1535,6 +1592,8 @@ export const TlcView: React.FC = () => {
                 if (chHist) histograms[ch] = chHist;
                 const m2d = getLane2dMetrics(set, ch, lane, coreFraction);
                 if (m2d) lane2dByChannel[ch] = m2d;
+                const fBg = getChannelFrontBandProfile(set, ch, halfIdx, get);
+                if (fBg) frontBandByChannel[ch] = fBg;
               }
             }
             laneSpots = findMultiChannelSpots({
@@ -1545,6 +1604,7 @@ export const TlcView: React.FC = () => {
               minProminence: spotProminence,
               histograms,
               lane2dByChannel,
+              frontBandByChannel,
               detectorMode: set.spotDetectorMode,
             });
           }
@@ -1673,6 +1733,8 @@ export const TlcView: React.FC = () => {
       const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
       const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
       const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+      const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+      const halfIdx = tlcHalf(lane);
       for (const ch of loaded) {
         const p = get(set, ch, lane);
         if (p && p.length >= 10) {
@@ -1681,6 +1743,8 @@ export const TlcView: React.FC = () => {
           if (chHist) histograms[ch] = chHist;
           const m2d = getLane2dMetrics(set, ch, lane, coreFraction);
           if (m2d) lane2dByChannel[ch] = m2d;
+          const fBg = getChannelFrontBandProfile(set, ch, halfIdx, get);
+          if (fBg) frontBandByChannel[ch] = fBg;
         }
       }
       let autoSpots = findMultiChannelSpots({
@@ -1691,6 +1755,7 @@ export const TlcView: React.FC = () => {
         minProminence: spotProminence,
         histograms,
         lane2dByChannel,
+        frontBandByChannel,
         detectorMode: set.spotDetectorMode,
       });
       // Include cross-lane shared-reagent rescued spots from any loaded channel
@@ -1918,6 +1983,7 @@ export const TlcView: React.FC = () => {
               minProminence: spotProminence,
               plateHistogram: getChannelHistogram(s, k, getDensProf),
               lane2d: getLane2dMetrics(s, k, l, coreFraction),
+              frontBandBg: getChannelFrontBandProfile(s, k, h, getDensProf),
               detectorMode: s.spotDetectorMode,
             });
             const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
@@ -2132,6 +2198,10 @@ export const TlcView: React.FC = () => {
 
   // Click on Canvas to Pin a Spot Marker, Shift+Click to Add Spot, Alt+Click to Delete Spot
   const handleCanvasClick = (e: React.MouseEvent<any>) => {
+    if (justDraggedCutoffRef.current || draggingCutoff) {
+      justDraggedCutoffRef.current = false;
+      return;
+    }
     if (hoverRf === null || hoverY === null || !inspectPanels[0]) return;
     // Shift + Click: Add manual spot at exact hover Rf
     if (e.shiftKey) {
@@ -3741,12 +3811,14 @@ export const TlcView: React.FC = () => {
                   marginLeft: '2px',
                 }}
               >
-                <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>Merge:</span>
+                <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>
+                  {activePlateSet.spotDetectorMode === 'densitogram' ? 'Cutoff:' : 'Merge:'}
+                </span>
                 <input
                   type="range"
-                  min="0.08"
-                  max="0.70"
-                  step="0.02"
+                  min={activePlateSet.spotDetectorMode === 'densitogram' ? '0.04' : '0.08'}
+                  max={activePlateSet.spotDetectorMode === 'densitogram' ? '0.95' : '0.70'}
+                  step="0.01"
                   value={spotProminence}
                   onChange={(e) => {
                     const v = parseFloat(e.target.value);
@@ -3756,7 +3828,11 @@ export const TlcView: React.FC = () => {
                     else setSpotMode('standard');
                   }}
                   style={{ width: '60px', height: '14px', cursor: 'pointer' }}
-                  title={`Valley Prominence Threshold: ${Math.round(spotProminence * 100)}% (higher = merges broad/tailing bands; lower = detects fine trace spots)`}
+                  title={
+                    activePlateSet.spotDetectorMode === 'densitogram'
+                      ? `Densitogram Intensity Cutoff: ${Math.round(spotProminence * 100)}% (higher = only stronger peaks above the dashed cutoff line; lower = catches fainter spots)`
+                      : `Valley Prominence Threshold: ${Math.round(spotProminence * 100)}% (higher = merges broad/tailing bands; lower = detects fine trace spots)`
+                  }
                 />
                 <span className="mono" style={{ fontSize: '10px', minWidth: '26px', color: 'var(--fg)', fontWeight: 700 }}>
                   {Math.round(spotProminence * 100)}%
@@ -3773,7 +3849,7 @@ export const TlcView: React.FC = () => {
                   marginLeft: '2px',
                 }}
               >
-                {(['2d', '1d'] as const).map((mode) => {
+                {(['2d', 'densitogram', '1d'] as const).map((mode) => {
                   const isActive = (activePlateSet.spotDetectorMode ?? '2d') === mode;
                   return (
                     <button
@@ -3802,11 +3878,13 @@ export const TlcView: React.FC = () => {
                       }}
                       title={
                         mode === '2d'
-                          ? '2D Region & Watershed Segmentation (default) — segments real 2D spot boundaries and suppresses solvent-front bands'
+                          ? '2D Region & Watershed Segmentation (default) — segments real 2D spot boundaries and compares near-front spots against the plate-wide meniscus'
+                          : mode === 'densitogram'
+                          ? 'Direct Densitogram Cutoff — picks local peaks directly from the core densitogram above the Cutoff line between origin and solvent front'
                           : 'Legacy 1D Profile Peak Detector — fallback for A/B comparison'
                       }
                     >
-                      {mode === '2d' ? '2D Seg' : '1D Legacy'}
+                      {mode === '2d' ? '2D Seg' : mode === 'densitogram' ? 'Densitogram' : '1D Legacy'}
                     </button>
                   );
                 })}
@@ -5408,6 +5486,11 @@ export const TlcView: React.FC = () => {
                           }}
                         >
                           Parallel 1D Densitogram (Base ➔ Front)
+                          {activePlateSet.spotDetectorMode === 'densitogram' && (
+                            <span style={{ color: '#fbbf24', marginLeft: '6px', fontWeight: 600, textTransform: 'none' }}>
+                              · Drag Cutoff ↔
+                            </span>
+                          )}
                         </div>
 
                         {/* Interactive Pixel-Matched SVG Densitogram */}
@@ -5420,15 +5503,17 @@ export const TlcView: React.FC = () => {
 
                           return (
                             <svg
+                              ref={densSvgRef}
                               width="320"
                               height={ph}
                               viewBox={`0 0 320 ${ph}`}
                               style={{
                                 display: 'block',
                                 background: '#020403',
-                                cursor: 'crosshair',
+                                cursor: draggingCutoff ? 'ew-resize' : 'crosshair',
+                                userSelect: 'none',
                               }}
-                              onMouseMove={handleCanvasMouseMove}
+                              onMouseMove={draggingCutoff ? undefined : handleCanvasMouseMove}
                               onMouseLeave={() => {
                                 setHoverRf(null);
                                 setHoverY(null);
@@ -5517,8 +5602,15 @@ export const TlcView: React.FC = () => {
                                   },
                                 };
 
-                                const getScaleMax = (d: TlcDensitogramData, hasChannelSpots: boolean) =>
-                                  hasChannelSpots ? d.maxSignal : Math.max(d.maxSignal, 28);
+                                const getScaleMax = (d: TlcDensitogramData, hasChannelSpots: boolean) => {
+                                  if (draggingCutoff && cutoffDragRef.current) {
+                                    return cutoffDragRef.current.scaleMax;
+                                  }
+                                  const baseMax = hasChannelSpots ? d.maxSignal : Math.max(d.maxSignal, 28);
+                                  return d.densitogramCutoff != null
+                                    ? Math.max(baseMax, d.densitogramCutoff * 1.25)
+                                    : baseMax;
+                                };
 
                                 const curveXAtPos = (d: TlcDensitogramData, pos: number, scaleMax: number) => {
                                   const clamped = Math.max(0, Math.min(d.points.length - 1, Math.round(pos)));
@@ -5559,6 +5651,13 @@ export const TlcView: React.FC = () => {
                                           return `${y === ph - pts[0].pos ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
                                         })
                                         .join(' ');
+                                      const showCutoff =
+                                        d.densitogramCutoff != null &&
+                                        (densViewMode !== 'overlay' || ch === visibleChannels[0]);
+                                      const cutoffX =
+                                        showCutoff && d.densitogramCutoff != null
+                                          ? 40 + Math.min(230, (d.densitogramCutoff / Math.max(1e-6, scaleMax)) * 230)
+                                          : null;
 
                                       return (
                                         <g key={ch}>
@@ -5592,6 +5691,69 @@ export const TlcView: React.FC = () => {
                                             strokeWidth="2"
                                             strokeDasharray={meta.dash}
                                           />
+                                          {cutoffX !== null && (
+                                            <g
+                                              style={{ cursor: 'ew-resize' }}
+                                              onPointerDown={(e) => {
+                                                e.stopPropagation();
+                                                e.preventDefault();
+                                                cutoffDragRef.current = {
+                                                  scaleMax,
+                                                  plateSpan: d.densitogramPlateSpan ?? Math.max(45, scaleMax),
+                                                  noiseFloor: d.densitogramNoiseFloor ?? 4.5,
+                                                };
+                                                setDraggingCutoff(true);
+                                              }}
+                                              onClick={(e) => e.stopPropagation()}
+                                            >
+                                              {/* Wide invisible grab corridor along the full Cutoff line */}
+                                              <rect
+                                                x={Math.max(32, cutoffX - 9)}
+                                                y={Math.min(originY, frontY)}
+                                                width="18"
+                                                height={Math.max(12, Math.abs(originY - frontY))}
+                                                fill="transparent"
+                                              />
+                                              <line
+                                                x1={cutoffX.toFixed(1)}
+                                                y1={Math.min(originY, frontY)}
+                                                x2={cutoffX.toFixed(1)}
+                                                y2={Math.max(originY, frontY)}
+                                                stroke={draggingCutoff ? '#fde047' : '#f59e0b'}
+                                                strokeWidth={draggingCutoff ? '2' : '1.4'}
+                                                strokeDasharray="4,3"
+                                                strokeOpacity={draggingCutoff ? '1' : '0.9'}
+                                              />
+                                              {/* Draggable top pill handle */}
+                                              <rect
+                                                x={Math.max(42, Math.min(220, cutoffX - 34))}
+                                                y={Math.min(originY, frontY) + 3}
+                                                width="68"
+                                                height="15"
+                                                rx="4"
+                                                fill={draggingCutoff ? 'rgba(245,158,11,0.95)' : 'rgba(15,23,42,0.88)'}
+                                                stroke="#f59e0b"
+                                                strokeWidth="1"
+                                              />
+                                              <text
+                                                x={Math.max(42, Math.min(220, cutoffX - 34)) + 34}
+                                                y={Math.min(originY, frontY) + 13}
+                                                textAnchor="middle"
+                                                fill={draggingCutoff ? '#020403' : '#fbbf24'}
+                                                fontSize="8.5"
+                                                fontFamily="ui-monospace, monospace"
+                                                fontWeight="700"
+                                                style={{ pointerEvents: 'none' }}
+                                              >
+                                                ↔ {Math.round(spotProminence * 100)}%
+                                              </text>
+                                              {/* Bottom grab diamond */}
+                                              <polygon
+                                                points={`${cutoffX.toFixed(1)},${Math.max(originY, frontY) - 9} ${(cutoffX + 4.5).toFixed(1)},${Math.max(originY, frontY) - 4.5} ${cutoffX.toFixed(1)},${Math.max(originY, frontY)} ${(cutoffX - 4.5).toFixed(1)},${Math.max(originY, frontY) - 4.5}`}
+                                                fill={draggingCutoff ? '#fde047' : '#f59e0b'}
+                                              />
+                                            </g>
+                                          )}
                                         </g>
                                       );
                                     })}

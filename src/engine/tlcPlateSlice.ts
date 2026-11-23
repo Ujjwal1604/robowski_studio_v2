@@ -197,7 +197,14 @@ function deserializePlateData(raw: any): TlcPlateData {
     edgePicks: raw?.edgePicks || [],
     edgeSettings: raw?.edgeSettings || {},
     spotProminence: raw?.spotProminence,
-    spotDetectorMode: raw?.spotDetectorMode === '1d' ? '1d' : raw?.spotDetectorMode === '2d' ? '2d' : undefined,
+    spotDetectorMode:
+      raw?.spotDetectorMode === '1d'
+        ? '1d'
+        : raw?.spotDetectorMode === 'densitogram'
+        ? 'densitogram'
+        : raw?.spotDetectorMode === '2d'
+        ? '2d'
+        : undefined,
     imgs: {},
     preRunImgs: {},
     preRunEnabled: raw?.preRunEnabled !== false,

@@ -18,6 +18,7 @@ import {
   PlateSolventPlanResult,
   RecommendedPlateSolvent,
   RESOLVED_SCORE,
+  resolveSystemPhase,
   rfShiftAtMidplate,
   SimulatedWellLane,
   SolventPoolMode,
@@ -77,6 +78,7 @@ const COMMON_REACTIONS = [
 ];
 
 const STATIONARY_PHASES = [
+  'All Stationary Phases Equal (Suggest Best)',
   'Silica Gel (SiO2 - Normal Phase)',
   'Neutral Alumina (Al2O3)',
   'Basic Alumina (Al2O3)',
@@ -94,7 +96,7 @@ function stationaryPhaseBadge(
   sysPhase: 'SiO2' | 'C18',
   pref: TlcStationaryPhasePreference
 ): { short: string; full: string; isC18: boolean; isAlumina: boolean } {
-  if (sysPhase === 'C18') {
+  if (sysPhase === 'C18' || pref === 'C18') {
     return { short: 'C18 RP', full: 'Reverse-Phase C18', isC18: true, isAlumina: false };
   }
   if (pref === 'Al2O3_neutral') {
@@ -104,6 +106,41 @@ function stationaryPhaseBadge(
     return { short: 'Basic Al₂O₃', full: 'Basic Alumina (Al₂O₃)', isC18: false, isAlumina: true };
   }
   return { short: 'SiO₂', full: 'Normal-Phase SiO₂', isC18: false, isAlumina: false };
+}
+
+const SOLVENT_FAMILY_LABELS: Record<string, string> = {
+  etoac_hex: 'EtOAc / Hexanes',
+  meoh_dcm: 'MeOH / DCM',
+  basic_mod: 'Basic Modifier (NH₃ / Et₃N)',
+  acid_mod: 'Acidic Modifier (AcOH / FA)',
+  acetone_hex: 'Acetone / Hexanes',
+  meoh_etoac: 'MeOH / EtOAc',
+  meoh_toluene: 'MeOH / Toluene',
+  etoac_dcm: 'EtOAc / DCM',
+  ether_pentane: 'Et₂O / Pentane',
+  mtbe_hex: 'MTBE / Hexanes',
+  prisma_ternary: 'PRISMA Ternary',
+  c18_rp: 'C18 Reversed-Phase',
+};
+
+const FEATURE_WEIGHT_LABELS: Record<string, string> = {
+  tpsa: 'Polar surface area (TPSA)',
+  hbd: 'H-bond donors',
+  aromaticRings: 'Aromatic rings',
+  basicN: 'Basic nitrogens',
+  clogP: 'Lipophilicity (cLogP)',
+};
+
+function friendlyPhaseLabel(phase: TlcStationaryPhasePreference): string {
+  if (phase === 'C18') return 'C18 Reversed-Phase';
+  if (phase === 'Al2O3_neutral') return 'Neutral Alumina';
+  if (phase === 'Al2O3_basic') return 'Basic Alumina';
+  if (phase === 'all_equal') return 'All Phases (Best Fit)';
+  return 'Silica';
+}
+
+function friendlySolventFamily(family: string): string {
+  return SOLVENT_FAMILY_LABELS[family] || family.replace(/_/g, ' ');
 }
 
 function formatTlcTabName(baseName: string, pref: TlcStationaryPhasePreference): string {
@@ -164,6 +201,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const prepOf = (sys: any): string => chamberPrepForNh3Stock(sys, nh3StockM);
   const [calibrationEnabled, setCalibrationEnabled] = useState<boolean>(true);
   const [showCalibVisuals, setShowCalibVisuals] = useState<boolean>(true);
+  const [showTechCalibDetails, setShowTechCalibDetails] = useState<boolean>(false);
+  const [showAllCalibCompounds, setShowAllCalibCompounds] = useState<boolean>(false);
   const [setSolventOverrides, setSetSolventOverrides] = useState<Record<string, string>>({});
   const [calibrationModel, setCalibrationModel] = useState<TlcCalibrationModel | null>(null);
   const [hoveredCalibPair, setHoveredCalibPair] = useState<TlcCalibrationSpotPair | null>(null);
@@ -418,7 +457,9 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const handleApplyAllSystemsAsTlcTabs = () => {
     if (!platePlan || platePlan.recommendedSystems.length === 0) return;
     const planPhase = platePlan.stationaryPhase || stationaryPhasePref;
-    const sysNames = platePlan.recommendedSystems.map((r) => formatTlcTabName(r.system.name, planPhase));
+    const sysNames = platePlan.recommendedSystems.map((r) =>
+      formatTlcTabName(r.system.name, resolveSystemPhase(r.system, planPhase))
+    );
     setTlcSets((prev) => {
       const existingNames = new Set(prev.map((s) => s.name.trim().toLowerCase()));
       const next = [...prev];
@@ -681,6 +722,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                       title="Choose the TLC plate stationary phase for retention modeling and solvent selection"
                     >
                       <option value="auto">Auto (SiO₂ Primary + C18 Fallback)</option>
+                      <option value="all_equal">All Phases Equal (Suggest Best)</option>
                       <option value="SiO2">Silica Gel (SiO₂ — Normal Phase)</option>
                       <option value="C18">Reverse Phase (C18)</option>
                       <option value="Al2O3_neutral">Neutral Alumina (Al₂O₃)</option>
@@ -805,6 +847,19 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                       ? 'Al2O3_neutral'
                       : stationaryPhasePref === 'Al2O3_basic'
                       ? 'Al2O3_basic'
+                      : stationaryPhasePref === 'all_equal'
+                      ? platePlan?.calibrationApplied?.stationaryPhase ||
+                        (['SiO2', 'Al2O3_basic', 'Al2O3_neutral', 'C18'] as const).find((pk) => {
+                          const pf = calibrationModel.byPhase[pk];
+                          return Boolean(
+                            pf &&
+                              (pf.pairedSpotCount ?? 0) +
+                                (pf.frontCensoredCount ?? 0) +
+                                (pf.baselineCensoredCount ?? 0) >
+                                0
+                          );
+                        }) ||
+                        'SiO2'
                       : 'SiO2';
                   const phaseFit = calibrationModel.byPhase[targetPhaseKey];
                   const matchedPhasePlates = calibrationModel.plates.filter(
@@ -817,22 +872,42 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   const shiftSigned = phaseFit
                     ? `${phaseFit.midplateRfShift >= 0 ? '+' : ''}${phaseFit.midplateRfShift.toFixed(2)}`
                     : '+0.00';
+                  const phaseName = friendlyPhaseLabel(targetPhaseKey);
+                  const consensusCompounds = phaseFit?.consensusCompoundCount ?? 0;
+                  const activePlateForSummary =
+                    matchedPhasePlates.find((mp) => `${mp.setUid}:${mp.plateIndex}` === selectedComparePlateKey) ||
+                    matchedPhasePlates[0];
+                  const displayedCompoundSummaries =
+                    (matchedPhasePlates.length > 1
+                      ? activePlateForSummary?.compoundSummaries
+                      : phaseFit?.compoundSummaries) ||
+                    phaseFit?.compoundSummaries ||
+                    [];
+                  const shiftPlainPhrase = !phaseFit
+                    ? ''
+                    : phaseFit.calibrationApplied === false
+                    ? 'Matches baseline model'
+                    : Math.abs(phaseFit.midplateRfShift) < 0.015
+                    ? 'Matches model closely'
+                    : phaseFit.midplateRfShift > 0
+                    ? `Spots ran ${shiftSigned} Rf higher`
+                    : `Spots ran ${shiftSigned} Rf lower`;
 
                   return (
                     <div
                       style={{
                         border: isActive
-                          ? '1px solid color-mix(in srgb, #10b981 40%, var(--line))'
+                          ? '1px solid color-mix(in srgb, #10b981 36%, var(--line))'
                           : '1px solid var(--line)',
                         borderRadius: '10px',
                         background: 'var(--soft)',
                         padding: '10px 14px',
                         display: 'flex',
                         flexDirection: 'column',
-                        gap: '10px',
+                        gap: '12px',
                       }}
                     >
-                      {/* Header Strip */}
+                      {/* Header Ribbon — plain chemistry summary, zero static pill clutter */}
                       <div
                         style={{
                           display: 'flex',
@@ -842,80 +917,64 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                           gap: '8px',
                         }}
                       >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap', fontSize: '12px' }}>
                           <span
-                            className="mono"
                             style={{
-                              fontSize: '10.5px',
                               fontWeight: 700,
-                              padding: '2px 7px',
-                              borderRadius: '5px',
-                              background: isActive
-                                ? '#10b981'
-                                : !calibrationEnabled
-                                ? 'var(--panel)'
-                                : 'color-mix(in srgb, #f59e0b 20%, var(--panel))',
-                              color: isActive ? '#fff' : !calibrationEnabled ? 'var(--mut)' : '#f59e0b',
-                              border: isActive ? 'none' : '1px solid var(--line)',
+                              color: isActive ? '#10b981' : !calibrationEnabled ? 'var(--mut)' : '#f59e0b',
                             }}
                           >
                             {!calibrationEnabled
-                              ? 'CALIBRATION OFF'
+                              ? 'Calibration off'
                               : isActive
-                              ? `CALIBRATED (${targetPhaseKey})`
-                              : 'NEEDS SOLVENT TAG'}
+                              ? `${phaseName} calibration active`
+                              : 'Assign plate solvent'}
                           </span>
 
                           {!calibrationEnabled ? (
-                            <span style={{ fontSize: '12px', color: 'var(--mut)' }}>
-                              Using uncalibrated theoretical Rf predictions
+                            <span style={{ color: 'var(--mut)' }}>
+                              · Using uncalibrated Rf predictions
                               {phaseFit && evidenceCount > 0
-                                ? ` (${phaseFit.pairedSpotCount} paired + ${censTotal} boundary spots available · ${shiftSigned} Rf shift)`
-                                : ''}.
+                                ? ` (${matchedPhasePlates.length} measured plate${matchedPhasePlates.length > 1 ? 's' : ''} ready)`
+                                : ''}
                             </span>
                           ) : phaseFit && evidenceCount > 0 ? (
-                            <span style={{ fontSize: '12px' }}>
-                              Fitted from <strong>{matchedPhasePlates.length}</strong> measured plate
-                              {matchedPhasePlates.length > 1 ? 's' : ''} (
-                              <span className="mono" style={{ fontWeight: 700 }}>
-                                {phaseFit.pairedSpotCount} spots · {phaseFit.matchedLaneCount} lanes
-                                {censTotal > 0 ? ` + ${phaseFit.frontCensoredCount ?? 0}▲/${phaseFit.baselineCensoredCount ?? 0}▼ bounds` : ''}
-                              </span>
-                              ) · Mid-plate Rf shift{' '}
+                            <span style={{ color: 'var(--fg)' }}>
+                              <span style={{ color: 'var(--mut)' }}>· </span>
+                              <strong>{matchedPhasePlates.length}</strong> plate{matchedPhasePlates.length > 1 ? 's' : ''}
+                              {phaseFit.uniqueCompounds ? (
+                                <>
+                                  <span style={{ color: 'var(--mut)' }}> · </span>
+                                  <strong>{phaseFit.uniqueCompounds}</strong> compound{phaseFit.uniqueCompounds > 1 ? 's' : ''}
+                                </>
+                              ) : null}
+                              {consensusCompounds > 0 && (
+                                <span style={{ color: '#10b981', fontWeight: 600 }}>
+                                  {' '}
+                                  ({consensusCompounds} confirmed across wells)
+                                </span>
+                              )}
+                              <span style={{ color: 'var(--mut)' }}> · </span>
                               <span
                                 className="mono"
                                 style={{
-                                  fontWeight: 700,
+                                  fontWeight: 600,
                                   color: Math.abs(phaseFit.midplateRfShift) >= 0.02 ? '#10b981' : 'var(--fg)',
                                 }}
                               >
-                                {shiftSigned}
+                                {shiftPlainPhrase}
                               </span>
-                              {phaseFit.demandSlope !== undefined && Math.abs(phaseFit.demandSlope - 1) >= 0.03 && (
-                                <span className="mono" style={{ color: 'var(--mut)', marginLeft: '4px' }}>
-                                  (spread ×{phaseFit.demandSlope.toFixed(2)})
+                              <span style={{ color: 'var(--mut)' }}> · </span>
+                              <span>
+                                Typical error{' '}
+                                <span className="mono" style={{ fontWeight: 700 }}>
+                                  ±{phaseFit.rmseAfter.toFixed(2)} Rf
                                 </span>
-                              )}
-                              {phaseFit.featureWeights &&
-                                Object.keys(phaseFit.featureWeights).length > 0 && (
-                                  <span
-                                    className="mono"
-                                    style={{ color: '#10b981', marginLeft: '6px', fontWeight: 700 }}
-                                    title={`Learned L2 Ridge descriptor offsets: ${Object.entries(phaseFit.featureWeights)
-                                      .map(([k, v]) => `${k} ${v >= 0 ? '+' : ''}${Number(v).toFixed(3)}`)
-                                      .join(', ')}`}
-                                  >
-                                    · Ridge 5D
-                                  </span>
-                                )}{' '}
-                              · RMSE{' '}
-                              <span className="mono" style={{ fontWeight: 700 }}>
-                                ±{phaseFit.rmseBefore.toFixed(2)} → ±{phaseFit.rmseAfter.toFixed(2)}
                               </span>
                             </span>
                           ) : (
-                            <span style={{ fontSize: '12px', color: 'var(--mut)' }}>
-                              Measured TLC tabs detected below — assign their mobile phase to calibrate {targetPhaseKey} predictions.
+                            <span style={{ color: 'var(--mut)' }}>
+                              · Measured TLC tabs detected — select their eluent below to calibrate {phaseName} predictions.
                             </span>
                           )}
                         </div>
@@ -936,7 +995,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                               onClick={() => setShowCalibVisuals((v) => !v)}
                             >
-                              {showCalibVisuals ? 'Hide Fit Visuals ▲' : 'Show Fit Visuals ▾'}
+                              {showCalibVisuals ? 'Hide Calibration Details ▲' : 'Show Calibration Details ▾'}
                             </button>
                           )}
                         </div>
@@ -991,439 +1050,731 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         </div>
                       )}
 
-                      {/* Expanded Visual Calibration Diagnostics */}
+                      {/* Expanded Chemist-Friendly Calibration Diagnostics */}
                       {showCalibVisuals && phaseFit && allPairs.length > 0 && (
-                        <div
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: 'minmax(270px, 310px) 1fr',
-                            gap: '14px',
-                            alignItems: 'stretch',
-                            opacity: calibrationEnabled ? 1 : 0.55,
-                          }}
-                        >
-                          {/* 1. Parity Plot: Predicted Rf (Before & After) vs Measured Rf */}
+                        <>
                           <div
                             style={{
-                              background: 'var(--panel)',
-                              border: '1px solid var(--line2)',
-                              borderRadius: '8px',
-                              padding: '8px 10px',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: '6px',
+                              display: 'grid',
+                              gridTemplateColumns: 'minmax(275px, 320px) 1fr',
+                              gap: '14px',
+                              alignItems: 'stretch',
+                              opacity: calibrationEnabled ? 1 : 0.55,
                             }}
                           >
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
-                              <strong>Measured vs Predicted Rf</strong>
-                              <span style={{ color: 'var(--mut)', fontSize: '10px' }}>
-                                ○ Raw → ● Calibrated
-                              </span>
-                            </div>
-
-                            {(() => {
-                              const W = 270;
-                              const H = 200;
-                              const padL = 28;
-                              const padR = 10;
-                              const padT = 10;
-                              const padB = 24;
-                              const pw = W - padL - padR;
-                              const ph = H - padT - padB;
-                              const xOf = (rf: number) => padL + Math.max(0, Math.min(1, rf)) * pw;
-                              const yOf = (rf: number) => padT + (1 - Math.max(0, Math.min(1, rf))) * ph;
-                              const sigBand = phaseFit.calibratedSigma || 0.12;
-                              // Shaded +-sigma band polygon inside [0, 1]^2
-                              const polyPts = [
-                                `${xOf(0)},${yOf(Math.min(1, sigBand))}`,
-                                `${xOf(Math.max(0, 1 - sigBand))},${yOf(1)}`,
-                                `${xOf(1)},${yOf(1)}`,
-                                `${xOf(1)},${yOf(Math.max(0, 1 - sigBand))}`,
-                                `${xOf(Math.min(1, sigBand))},${yOf(0)}`,
-                                `${xOf(0)},${yOf(0)}`,
-                              ].join(' ');
-
-                              return (
-                                <svg
-                                  viewBox={`0 0 ${W} ${H}`}
-                                  style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
-                                >
-                                  {/* +/- sigma uncertainty band */}
-                                  <polygon points={polyPts} fill="rgba(16, 185, 129, 0.09)" />
-
-                                  {/* Grid & ticks */}
-                                  {[0, 0.25, 0.5, 0.75, 1].map((t) => (
-                                    <g key={t}>
-                                      <line
-                                        x1={xOf(t)}
-                                        y1={padT}
-                                        x2={xOf(t)}
-                                        y2={padT + ph}
-                                        stroke="var(--line2)"
-                                        strokeWidth={0.7}
-                                      />
-                                      <line
-                                        x1={padL}
-                                        y1={yOf(t)}
-                                        x2={padL + pw}
-                                        y2={yOf(t)}
-                                        stroke="var(--line2)"
-                                        strokeWidth={0.7}
-                                      />
-                                      <text
-                                        x={xOf(t)}
-                                        y={padT + ph + 11}
-                                        textAnchor="middle"
-                                        fontSize="8.5"
-                                        fill="var(--mut)"
-                                      >
-                                        {t.toFixed(2)}
-                                      </text>
-                                      <text
-                                        x={padL - 4}
-                                        y={yOf(t) + 3}
-                                        textAnchor="end"
-                                        fontSize="8.5"
-                                        fill="var(--mut)"
-                                      >
-                                        {t.toFixed(2)}
-                                      </text>
-                                    </g>
-                                  ))}
-
-                                  {/* Plot border */}
-                                  <rect
-                                    x={padL}
-                                    y={padT}
-                                    width={pw}
-                                    height={ph}
-                                    fill="none"
-                                    stroke="var(--line)"
-                                    strokeWidth={1}
-                                  />
-
-                                  {/* Ideal y = x diagonal */}
-                                  <line
-                                    x1={xOf(0)}
-                                    y1={yOf(0)}
-                                    x2={xOf(1)}
-                                    y2={yOf(1)}
-                                    stroke="var(--mut)"
-                                    strokeWidth={1}
-                                    strokeDasharray="4 3"
-                                  />
-
-                                  {/* Before -> After horizontal shift lines & points */}
-                                  {allPairs.slice(0, 500).map((pair, idx) => {
-                                    const xB = xOf(pair.predictedRfBefore);
-                                    const xA = xOf(pair.predictedRfAfter);
-                                    const yO = yOf(pair.observedRf);
-                                    const withinBand = Math.abs(pair.observedRf - pair.predictedRfAfter) <= sigBand;
-                                    const dotColor = withinBand ? '#10b981' : '#f59e0b';
-                                    const isHov = hoveredCalibPair === pair;
-                                    return (
-                                      <g
-                                        key={idx}
-                                        onMouseEnter={() => setHoveredCalibPair(pair)}
-                                        onMouseLeave={() => setHoveredCalibPair((cur) => (cur === pair ? null : cur))}
-                                        style={{ cursor: 'pointer' }}
-                                      >
-                                        {Math.abs(xA - xB) >= 1.5 && (
-                                          <line
-                                            x1={xB}
-                                            y1={yO}
-                                            x2={xA}
-                                            y2={yO}
-                                            stroke="rgba(16, 185, 129, 0.45)"
-                                            strokeWidth={1.1}
-                                          />
-                                        )}
-                                        <circle
-                                          cx={xB}
-                                          cy={yO}
-                                          r={2.4}
-                                          fill="none"
-                                          stroke="var(--mut)"
-                                          strokeWidth={1}
-                                          opacity={0.75}
-                                        />
-                                        <circle
-                                          cx={xA}
-                                          cy={yO}
-                                          r={isHov ? 4.4 : 3.0}
-                                          fill={dotColor}
-                                          stroke={isHov ? '#fff' : 'none'}
-                                          strokeWidth={1}
-                                          opacity={0.9}
-                                        />
-                                      </g>
-                                    );
-                                  })}
-
-                                  <text
-                                    x={padL + pw / 2}
-                                    y={H - 2}
-                                    textAnchor="middle"
-                                    fontSize="9"
-                                    fill="var(--mut)"
-                                  >
-                                    Predicted Rf
-                                  </text>
-                                </svg>
-                              );
-                            })()}
-
-                            <div className="mono" style={{ fontSize: '10px', color: 'var(--fg2)', minHeight: '14px' }}>
-                              {hoveredCalibPair
-                                ? `${hoveredCalibPair.wellCoord} (${hoveredCalibPair.speciesKind === 'product' ? 'Prod' : 'SM'}): Obs ${hoveredCalibPair.observedRf.toFixed(2)} | Raw ${hoveredCalibPair.predictedRfBefore.toFixed(2)} → Cal ${hoveredCalibPair.predictedRfAfter.toFixed(2)}`
-                                : 'Hover any point to inspect well, measured Rf & shift'}
-                            </div>
-                          </div>
-
-                          {/* 2. Shift Meter, Family Offsets & Plate Breakdown */}
-                          <div
-                            style={{
-                              background: 'var(--panel)',
-                              border: '1px solid var(--line2)',
-                              borderRadius: '8px',
-                              padding: '10px 12px',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              justifyContent: 'space-between',
-                              gap: '10px',
-                            }}
-                          >
-                            {/* Global Shift Gauge */}
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11.5px' }}>
-                                <strong>Global Plate Calibration Shift</strong>
-                                <span className="mono" style={{ fontWeight: 700, color: '#10b981' }}>
-                                  {shiftSigned} Rf at mid-plate (Δdemand {phaseFit.globalDemandShift >= 0 ? '+' : ''}
-                                  {phaseFit.globalDemandShift.toFixed(3)})
-                                </span>
-                              </div>
-                              {(() => {
-                                const maxRange = 0.22;
-                                const pct = Math.max(-1, Math.min(1, phaseFit.midplateRfShift / maxRange));
-                                const leftPct = pct < 0 ? 50 + pct * 50 : 50;
-                                const widthPct = Math.abs(pct) * 50;
-                                return (
-                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                                    <div
-                                      style={{
-                                        position: 'relative',
-                                        height: '12px',
-                                        borderRadius: '6px',
-                                        background: 'var(--soft)',
-                                        border: '1px solid var(--line2)',
-                                        overflow: 'hidden',
-                                      }}
-                                    >
-                                      <div
-                                        style={{
-                                          position: 'absolute',
-                                          left: '50%',
-                                          top: 0,
-                                          bottom: 0,
-                                          width: '1.5px',
-                                          background: 'var(--mut)',
-                                          zIndex: 2,
-                                        }}
-                                      />
-                                      <div
-                                        style={{
-                                          position: 'absolute',
-                                          left: `${leftPct}%`,
-                                          width: `${Math.max(2, widthPct)}%`,
-                                          top: '1px',
-                                          bottom: '1px',
-                                          borderRadius: '4px',
-                                          background: pct >= 0 ? '#10b981' : '#38bdf8',
-                                        }}
-                                      />
-                                    </div>
-                                    <div
-                                      className="mono"
-                                      style={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
-                                        fontSize: '9.5px',
-                                        color: 'var(--mut)',
-                                      }}
-                                    >
-                                      <span>-0.22 Rf (more retained)</span>
-                                      <span>0 (raw model)</span>
-                                      <span>+0.22 Rf (elutes higher)</span>
-                                    </div>
-                                  </div>
-                                );
-                              })()}
-                              <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                                {Math.abs(phaseFit.midplateRfShift) < 0.015
-                                  ? 'Measured plates closely match baseline predictions.'
-                                  : phaseFit.midplateRfShift > 0
-                                  ? 'Measured spots ran higher Rf than raw model — recommendations shifted up to stay in 0.22–0.68 window.'
-                                  : 'Measured spots ran lower Rf than raw model — stronger eluent ratios favored automatically.'}
-                              </div>
-                            </div>
-
-                            {/* RMSE & Uncertainty + Family Offsets */}
+                            {/* 1. Measured vs. Predicted Rf Chart */}
                             <div
                               style={{
-                                display: 'grid',
-                                gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
-                                gap: '8px',
+                                background: 'var(--panel)',
+                                border: '1px solid var(--line2)',
+                                borderRadius: '8px',
+                                padding: '10px 12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '6px',
                               }}
                             >
-                              <div
-                                style={{
-                                  padding: '6px 8px',
-                                  borderRadius: '6px',
-                                  background: 'var(--soft)',
-                                  border: '1px solid var(--line2)',
-                                  fontSize: '11px',
-                                }}
-                              >
-                                <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Rf Fit Error (RMSE)</div>
-                                <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
-                                  ±{phaseFit.rmseBefore.toFixed(2)} →{' '}
-                                  <span style={{ color: phaseFit.rmseAfter <= phaseFit.rmseBefore ? '#10b981' : '#f59e0b' }}>
-                                    ±{phaseFit.rmseAfter.toFixed(2)} Rf
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', fontSize: '11.5px' }}>
+                                <strong>Measured vs. Predicted Rf</strong>
+                                <span style={{ color: 'var(--mut)', fontSize: '10px' }}>
+                                  ○ Before · ● After
+                                </span>
+                              </div>
+
+                              {(() => {
+                                const W = 284;
+                                const H = 204;
+                                const padL = 38;
+                                const padR = 10;
+                                const padT = 10;
+                                const padB = 26;
+                                const pw = W - padL - padR;
+                                const ph = H - padT - padB;
+                                const xOf = (rf: number) => padL + Math.max(0, Math.min(1, rf)) * pw;
+                                const yOf = (rf: number) => padT + (1 - Math.max(0, Math.min(1, rf))) * ph;
+                                const sigBand = phaseFit.calibratedSigma || 0.12;
+                                const polyPts = [
+                                  `${xOf(0)},${yOf(Math.min(1, sigBand))}`,
+                                  `${xOf(Math.max(0, 1 - sigBand))},${yOf(1)}`,
+                                  `${xOf(1)},${yOf(1)}`,
+                                  `${xOf(1)},${yOf(Math.max(0, 1 - sigBand))}`,
+                                  `${xOf(Math.min(1, sigBand))},${yOf(0)}`,
+                                  `${xOf(0)},${yOf(0)}`,
+                                ].join(' ');
+
+                                return (
+                                  <svg
+                                    viewBox={`0 0 ${W} ${H}`}
+                                    style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
+                                  >
+                                    {/* Accurate zone (+/- margin band) */}
+                                    <polygon points={polyPts} fill="rgba(16, 185, 129, 0.09)" />
+
+                                    {/* Grid & ticks */}
+                                    {[0, 0.25, 0.5, 0.75, 1].map((t) => (
+                                      <g key={t}>
+                                        <line
+                                          x1={xOf(t)}
+                                          y1={padT}
+                                          x2={xOf(t)}
+                                          y2={padT + ph}
+                                          stroke="var(--line2)"
+                                          strokeWidth={0.7}
+                                        />
+                                        <line
+                                          x1={padL}
+                                          y1={yOf(t)}
+                                          x2={padL + pw}
+                                          y2={yOf(t)}
+                                          stroke="var(--line2)"
+                                          strokeWidth={0.7}
+                                        />
+                                        <text
+                                          x={xOf(t)}
+                                          y={padT + ph + 11}
+                                          textAnchor="middle"
+                                          fontSize="8.5"
+                                          fill="var(--mut)"
+                                        >
+                                          {t.toFixed(2)}
+                                        </text>
+                                        <text
+                                          x={padL - 4}
+                                          y={yOf(t) + 3}
+                                          textAnchor="end"
+                                          fontSize="8.5"
+                                          fill="var(--mut)"
+                                        >
+                                          {t.toFixed(2)}
+                                        </text>
+                                      </g>
+                                    ))}
+
+                                    {/* Plot border */}
+                                    <rect
+                                      x={padL}
+                                      y={padT}
+                                      width={pw}
+                                      height={ph}
+                                      fill="none"
+                                      stroke="var(--line)"
+                                      strokeWidth={1}
+                                    />
+
+                                    {/* Ideal y = x diagonal */}
+                                    <line
+                                      x1={xOf(0)}
+                                      y1={yOf(0)}
+                                      x2={xOf(1)}
+                                      y2={yOf(1)}
+                                      stroke="var(--mut)"
+                                      strokeWidth={1}
+                                      strokeDasharray="4 3"
+                                    />
+
+                                    {/* Before -> After horizontal shift lines & points */}
+                                    {allPairs.slice(0, 500).map((pair, idx) => {
+                                      const xB = xOf(pair.predictedRfBefore);
+                                      const xA = xOf(pair.predictedRfAfter);
+                                      const yO = yOf(pair.observedRf);
+                                      const withinBand = Math.abs(pair.observedRf - pair.predictedRfAfter) <= sigBand;
+                                      const dotColor = withinBand ? '#10b981' : '#f59e0b';
+                                      const isHov = hoveredCalibPair === pair;
+                                      return (
+                                        <g
+                                          key={idx}
+                                          onMouseEnter={() => setHoveredCalibPair(pair)}
+                                          onMouseLeave={() => setHoveredCalibPair((cur) => (cur === pair ? null : cur))}
+                                          style={{ cursor: 'pointer' }}
+                                        >
+                                          {Math.abs(xA - xB) >= 1.5 && (
+                                            <line
+                                              x1={xB}
+                                              y1={yO}
+                                              x2={xA}
+                                              y2={yO}
+                                              stroke="rgba(16, 185, 129, 0.45)"
+                                              strokeWidth={1.1}
+                                            />
+                                          )}
+                                          <circle
+                                            cx={xB}
+                                            cy={yO}
+                                            r={2.3}
+                                            fill="none"
+                                            stroke="var(--mut)"
+                                            strokeWidth={1}
+                                            opacity={0.7}
+                                          />
+                                          <circle
+                                            cx={xA}
+                                            cy={yO}
+                                            r={isHov ? 4.4 : 3.0}
+                                            fill={dotColor}
+                                            stroke={isHov ? '#fff' : 'none'}
+                                            strokeWidth={1}
+                                            opacity={0.9}
+                                          />
+                                        </g>
+                                      );
+                                    })}
+
+                                    {/* Axis labels */}
+                                    <text
+                                      x={padL + pw / 2}
+                                      y={H - 3}
+                                      textAnchor="middle"
+                                      fontSize="9"
+                                      fill="var(--mut)"
+                                    >
+                                      Predicted Rf
+                                    </text>
+                                    <text
+                                      x={10}
+                                      y={padT + ph / 2}
+                                      textAnchor="middle"
+                                      fontSize="9"
+                                      fill="var(--mut)"
+                                      transform={`rotate(-90 10 ${padT + ph / 2})`}
+                                    >
+                                      Measured Rf
+                                    </text>
+                                  </svg>
+                                );
+                              })()}
+
+                              <div style={{ fontSize: '10.5px', color: 'var(--mut)', minHeight: '28px', lineHeight: 1.35 }}>
+                                {hoveredCalibPair ? (
+                                  <span style={{ color: 'var(--fg)' }}>
+                                    <strong>{hoveredCalibPair.wellCoord}</strong> · {hoveredCalibPair.speciesLabel} (
+                                    {hoveredCalibPair.speciesKind === 'product' ? 'Prod' : 'SM'}):{' '}
+                                    <span className="mono">
+                                      Measured {hoveredCalibPair.observedRf.toFixed(2)} · Predicted{' '}
+                                      {hoveredCalibPair.predictedRfBefore.toFixed(2)} → {hoveredCalibPair.predictedRfAfter.toFixed(2)}
+                                    </span>
+                                    {hoveredCalibPair.matchMethod === 'consensus' && hoveredCalibPair.consensusWellCount
+                                      ? ` · confirmed across ${hoveredCalibPair.consensusWellCount}/${hoveredCalibPair.consensusTotalWells ?? hoveredCalibPair.consensusWellCount} wells`
+                                      : ''}
+                                  </span>
+                                ) : (
+                                  'Hover any spot to compare predicted vs. measured Rf. Green band shows expected ±Rf margin.'
+                                )}
+                              </div>
+                            </div>
+
+                            {/* 2. Chemist-Friendly Summary: Shift Gauge, Key Metrics & Plates */}
+                            <div
+                              style={{
+                                background: 'var(--panel)',
+                                border: '1px solid var(--line2)',
+                                borderRadius: '8px',
+                                padding: '10px 12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                justifyContent: 'space-between',
+                                gap: '12px',
+                              }}
+                            >
+                              {/* How Your Plate Ran vs. Prediction */}
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '8px', fontSize: '11.5px' }}>
+                                  <strong>How Your Plate Ran vs. Prediction</strong>
+                                  <span
+                                    className="mono"
+                                    style={{
+                                      fontWeight: 700,
+                                      color:
+                                        Math.abs(phaseFit.midplateRfShift) < 0.015
+                                          ? 'var(--fg)'
+                                          : phaseFit.midplateRfShift > 0
+                                          ? '#10b981'
+                                          : '#38bdf8',
+                                    }}
+                                  >
+                                    {Math.abs(phaseFit.midplateRfShift) < 0.015
+                                      ? 'Matches model (±0.01 Rf)'
+                                      : phaseFit.midplateRfShift > 0
+                                      ? `${shiftSigned} Rf higher`
+                                      : `${shiftSigned} Rf lower`}
                                   </span>
                                 </div>
-                                <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px' }}>
-                                  {phaseFit.validated && phaseFit.cvRmse !== undefined
-                                    ? `Held-out compounds: ±${phaseFit.cvRmse.toFixed(2)} vs ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(2)} uncalibrated`
-                                    : 'Not validated: too few distinct compounds'}
-                                  {phaseFit.plateCvRmse !== undefined
-                                    ? ` · Held-out plates: ±${phaseFit.plateCvRmse.toFixed(2)}${phaseFit.plateCvRmseBaseline !== undefined ? ` vs ±${phaseFit.plateCvRmseBaseline.toFixed(2)}` : ''}`
-                                    : ''}
-                                  {' · '}
-                                  {phaseFit.uniqueCompounds ?? '?'} distinct compounds
-                                  {phaseFit.calibrationApplied === false ? ' · correction switched off (no held-out gain)' : ''}
+                                {(() => {
+                                  const maxRange = 0.35;
+                                  const pct = Math.max(-1, Math.min(1, phaseFit.midplateRfShift / maxRange));
+                                  const leftPct = pct < 0 ? 50 + pct * 50 : 50;
+                                  const widthPct = Math.abs(pct) * 50;
+                                  return (
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                      <div
+                                        style={{
+                                          position: 'relative',
+                                          height: '10px',
+                                          borderRadius: '5px',
+                                          background: 'var(--soft)',
+                                          border: '1px solid var(--line2)',
+                                          overflow: 'hidden',
+                                        }}
+                                      >
+                                        <div
+                                          style={{
+                                            position: 'absolute',
+                                            left: '50%',
+                                            top: 0,
+                                            bottom: 0,
+                                            width: '1.5px',
+                                            background: 'var(--mut)',
+                                            zIndex: 2,
+                                          }}
+                                        />
+                                        <div
+                                          style={{
+                                            position: 'absolute',
+                                            left: `${leftPct}%`,
+                                            width: `${Math.max(1.5, widthPct)}%`,
+                                            top: '1px',
+                                            bottom: '1px',
+                                            borderRadius: '3px',
+                                            background: pct >= 0 ? '#10b981' : '#38bdf8',
+                                          }}
+                                        />
+                                      </div>
+                                      <div
+                                        style={{
+                                          display: 'flex',
+                                          justifyContent: 'space-between',
+                                          fontSize: '10px',
+                                          color: 'var(--mut)',
+                                        }}
+                                      >
+                                        <span>Lower Rf (more retained)</span>
+                                        <span>Matches model</span>
+                                        <span>Higher Rf (faster eluting)</span>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                                <div style={{ fontSize: '11px', color: 'var(--mut)', lineHeight: 1.4 }}>
+                                  {phaseFit.calibrationApplied === false
+                                    ? 'Your measured spots already closely match the baseline model — no solvent shift was applied.'
+                                    : Math.abs(phaseFit.midplateRfShift) < 0.015
+                                    ? 'Measured spots closely match the baseline model across your plate.'
+                                    : phaseFit.midplateRfShift > 0
+                                    ? 'Spots eluted faster (higher Rf) than predicted — recommendations favor slightly less polar mixtures to keep spots in the 0.22–0.68 sweet spot.'
+                                    : 'Spots were more retained (lower Rf) than predicted — recommendations favor slightly more polar mixtures to lift spots into the 0.22–0.68 sweet spot.'}
                                 </div>
                               </div>
+
+                              {/* 3 Plain-English Chemistry Metric Tiles */}
                               <div
                                 style={{
-                                  padding: '6px 8px',
-                                  borderRadius: '6px',
-                                  background: 'var(--soft)',
-                                  border: '1px solid var(--line2)',
-                                  fontSize: '11px',
+                                  display: 'grid',
+                                  gridTemplateColumns: 'repeat(auto-fit, minmax(155px, 1fr))',
+                                  gap: '8px',
                                 }}
                               >
-                                <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Separation Uncertainty (σ)</div>
-                                <div className="mono" style={{ fontWeight: 700, marginTop: '2px' }}>
-                                  ±0.12 → <span style={{ color: '#38bdf8' }}>±{phaseFit.calibratedSigma.toFixed(2)} Rf</span>
-                                </div>
-                              </div>
-                              {(Object.keys(phaseFit.familyDemandShifts).length > 0 ||
-                                (phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0)) && (
                                 <div
                                   style={{
-                                    padding: '6px 8px',
+                                    padding: '7px 9px',
                                     borderRadius: '6px',
                                     background: 'var(--soft)',
                                     border: '1px solid var(--line2)',
                                     fontSize: '11px',
                                   }}
                                 >
-                                  <div style={{ color: 'var(--mut)', fontSize: '10px' }}>Solvent-Family Performance</div>
-                                  <div className="mono" style={{ fontWeight: 700, marginTop: '2px', fontSize: '10.5px' }}>
-                                    {phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0
-                                      ? Object.entries(phaseFit.familyStats)
-                                          .map(([fam, st]) => {
-                                            const d = phaseFit.familyDemandShifts[fam as keyof typeof phaseFit.familyDemandShifts];
-                                            const rfD = d !== undefined ? rfShiftAtMidplate(d, targetPhaseKey === 'C18') : null;
-                                            const shiftStr = rfD !== null ? ` (${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)})` : '';
-                                            return `${fam}: ±${(st?.rmseAfter ?? 0).toFixed(2)} [n=${st?.pairedCount ?? 0}]${shiftStr}`;
-                                          })
-                                          .join(', ')
-                                      : Object.entries(phaseFit.familyDemandShifts)
-                                          .map(([fam, d]) => {
-                                            const rfD = rfShiftAtMidplate(d || 0, targetPhaseKey === 'C18');
-                                            return `${fam}: ${rfD >= 0 ? '+' : ''}${rfD.toFixed(2)}`;
-                                          })
-                                          .join(', ')}
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px', fontWeight: 600 }}>
+                                    Prediction Accuracy
+                                  </div>
+                                  <div className="mono" style={{ fontWeight: 700, fontSize: '12.5px', marginTop: '2px' }}>
+                                    ±{phaseFit.rmseBefore.toFixed(2)} →{' '}
+                                    <span style={{ color: phaseFit.rmseAfter <= phaseFit.rmseBefore ? '#10b981' : '#f59e0b' }}>
+                                      ±{phaseFit.rmseAfter.toFixed(2)} Rf
+                                    </span>
+                                  </div>
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px', lineHeight: 1.35 }}>
+                                    {phaseFit.validated
+                                      ? `Verified across ${phaseFit.uniqueCompounds ?? '?'} distinct compounds`
+                                      : `${phaseFit.uniqueCompounds ?? '?'} distinct compound${(phaseFit.uniqueCompounds ?? 0) === 1 ? '' : 's'} measured`}
+                                    {consensusCompounds > 0 ? ` · ${consensusCompounds} confirmed across wells` : ''}
                                   </div>
                                 </div>
-                              )}
-                            </div>
 
-                            {/* Contributing Measured Plates */}
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                              <div style={{ fontSize: '11px', fontWeight: 700 }}>
-                                Measured Plates Used ({matchedPhasePlates.length}):
-                              </div>
-                              {matchedPhasePlates.map((mp) => {
-                                const overrideKey = `${mp.setUid}:${mp.plateIndex}`;
-                                return (
+                                <div
+                                  style={{
+                                    padding: '7px 9px',
+                                    borderRadius: '6px',
+                                    background: 'var(--soft)',
+                                    border: '1px solid var(--line2)',
+                                    fontSize: '11px',
+                                  }}
+                                >
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px', fontWeight: 600 }}>
+                                    Spot Separation Margin
+                                  </div>
+                                  <div className="mono" style={{ fontWeight: 700, fontSize: '12.5px', marginTop: '2px', color: '#38bdf8' }}>
+                                    ±{phaseFit.calibratedSigma.toFixed(2)} Rf
+                                  </div>
+                                  <div style={{ color: 'var(--mut)', fontSize: '10px', marginTop: '3px', lineHeight: 1.35 }}>
+                                    Aim for ≥{' '}
+                                    <span className="mono">{(phaseFit.calibratedSigma * 1.5).toFixed(2)}</span> Rf gap for clean resolution
+                                  </div>
+                                </div>
+
+                                {(Object.keys(phaseFit.familyDemandShifts).length > 0 ||
+                                  (phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0)) && (
                                   <div
-                                    key={overrideKey}
                                     style={{
-                                      display: 'flex',
-                                      justifyContent: 'space-between',
-                                      alignItems: 'center',
-                                      gap: '8px',
-                                      flexWrap: 'nowrap',
-                                      padding: '4px 8px',
+                                      padding: '7px 9px',
                                       borderRadius: '6px',
                                       background: 'var(--soft)',
+                                      border: '1px solid var(--line2)',
                                       fontSize: '11px',
                                     }}
                                   >
-                                    <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                      <strong>{mp.setName}</strong>{' '}
-                                      <span style={{ color: 'var(--mut)' }}>
-                                        (Plate {mp.plateIndex + 1} · {mp.pairedCount} pairs · bias{' '}
-                                        <span className="mono">
-                                          {mp.meanRfResidual >= 0 ? '+' : ''}
-                                          {mp.meanRfResidual.toFixed(2)} Rf
-                                        </span>
-                                        )
-                                      </span>
+                                    <div style={{ color: 'var(--mut)', fontSize: '10px', fontWeight: 600 }}>
+                                      Measured Eluent Family
                                     </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
-                                      <select
-                                        className="f"
-                                        style={{ height: '22px', fontSize: '10.5px', padding: '0 6px', maxWidth: '175px' }}
-                                        value={setSolventOverrides[overrideKey] || mp.matchedSystemId}
-                                        onChange={(e) => {
-                                          const val = e.target.value;
-                                          setSetSolventOverrides((prev) => {
-                                            const next = { ...prev };
-                                            if (
-                                              val === mp.matchedSystemId &&
-                                              !ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === val)
-                                            ) {
-                                              delete next[overrideKey];
-                                            } else {
-                                              next[overrideKey] = val;
-                                            }
-                                            return next;
-                                          });
-                                        }}
-                                        title="Override matched solvent system for this measured TLC plate"
-                                      >
-                                        {!ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === mp.matchedSystemId) && (
-                                          <option value={mp.matchedSystemId}>
-                                            {mp.matchedSystem?.shortLabel || mp.matchedSystemName}
-                                          </option>
-                                        )}
-                                        {ALL_KNOWN_SOLVENT_SYSTEMS.map((sys) => (
-                                          <option key={sys.id} value={sys.id}>
-                                            {sys.shortLabel}
-                                          </option>
-                                        ))}
-                                        <option value="ignore">Exclude from calibration</option>
-                                      </select>
+                                    <div style={{ fontWeight: 600, marginTop: '2px', fontSize: '11px', lineHeight: 1.4 }}>
+                                      {phaseFit.familyStats && Object.keys(phaseFit.familyStats).length > 0
+                                        ? Object.entries(phaseFit.familyStats).map(([fam, st]) => (
+                                            <div key={fam} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                                              <span>{friendlySolventFamily(fam)}</span>
+                                              <span className="mono" style={{ color: 'var(--mut)', fontWeight: 600 }}>
+                                                ±{(st?.rmseAfter ?? 0).toFixed(2)} ({st?.pairedCount ?? 0} spots)
+                                              </span>
+                                            </div>
+                                          ))
+                                        : Object.entries(phaseFit.familyDemandShifts).map(([fam, d]) => {
+                                            const rfD = rfShiftAtMidplate(d || 0, targetPhaseKey === 'C18');
+                                            return (
+                                              <div key={fam} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
+                                                <span>{friendlySolventFamily(fam)}</span>
+                                                <span className="mono" style={{ color: 'var(--mut)', fontWeight: 600 }}>
+                                                  {rfD >= 0 ? '+' : ''}
+                                                  {rfD.toFixed(2)} Rf
+                                                </span>
+                                              </div>
+                                            );
+                                          })}
                                     </div>
                                   </div>
-                                );
-                              })}
+                                )}
+                              </div>
+
+                              {/* Contributing Measured Plates */}
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                <div style={{ fontSize: '11px', fontWeight: 700 }}>
+                                  Measured Plates Used ({matchedPhasePlates.length})
+                                </div>
+                                {matchedPhasePlates.map((mp) => {
+                                  const overrideKey = `${mp.setUid}:${mp.plateIndex}`;
+                                  return (
+                                    <div
+                                      key={overrideKey}
+                                      style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        alignItems: 'center',
+                                        gap: '8px',
+                                        flexWrap: 'nowrap',
+                                        padding: '4px 8px',
+                                        borderRadius: '6px',
+                                        background: 'var(--soft)',
+                                        fontSize: '11px',
+                                      }}
+                                    >
+                                      <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        <strong>{mp.setName}</strong>{' '}
+                                        <span style={{ color: 'var(--mut)' }}>
+                                          · Plate {mp.plateIndex + 1} · {mp.pairedCount} matched spots · avg{' '}
+                                          <span className="mono">
+                                            {mp.meanRfResidual >= 0 ? '+' : ''}
+                                            {mp.meanRfResidual.toFixed(2)} Rf
+                                          </span>
+                                        </span>
+                                      </div>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+                                        <select
+                                          className="f"
+                                          style={{ height: '22px', fontSize: '10.5px', padding: '0 6px', maxWidth: '175px' }}
+                                          value={setSolventOverrides[overrideKey] || mp.matchedSystemId}
+                                          onChange={(e) => {
+                                            const val = e.target.value;
+                                            setSetSolventOverrides((prev) => {
+                                              const next = { ...prev };
+                                              if (
+                                                val === mp.matchedSystemId &&
+                                                !ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === val)
+                                              ) {
+                                                delete next[overrideKey];
+                                              } else {
+                                                next[overrideKey] = val;
+                                              }
+                                              return next;
+                                            });
+                                          }}
+                                          title="Override matched solvent system for this measured TLC plate"
+                                        >
+                                          {!ALL_KNOWN_SOLVENT_SYSTEMS.some((s) => s.id === mp.matchedSystemId) && (
+                                            <option value={mp.matchedSystemId}>
+                                              {mp.matchedSystem?.shortLabel || mp.matchedSystemName}
+                                            </option>
+                                          )}
+                                          {ALL_KNOWN_SOLVENT_SYSTEMS.map((sys) => (
+                                            <option key={sys.id} value={sys.id}>
+                                              {sys.shortLabel}
+                                            </option>
+                                          ))}
+                                          <option value="ignore">Exclude from calibration</option>
+                                        </select>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             </div>
                           </div>
-                        </div>
+
+                          {/* 3. Compounds Matched on Your Plate — transparent chemist-readable table */}
+                          {displayedCompoundSummaries.length > 0 && (
+                            <div
+                              style={{
+                                background: 'var(--panel)',
+                                border: '1px solid var(--line2)',
+                                borderRadius: '8px',
+                                padding: '10px 12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '8px',
+                                opacity: calibrationEnabled ? 1 : 0.65,
+                              }}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: '6px' }}>
+                                <div>
+                                  <strong style={{ fontSize: '11.5px' }}>
+                                    Compounds Matched on Your Plate ({displayedCompoundSummaries.length})
+                                  </strong>
+                                  {matchedPhasePlates.length > 1 && activePlateForSummary && (
+                                    <span style={{ fontSize: '11px', color: 'var(--mut)', marginLeft: '6px' }}>
+                                      · {activePlateForSummary.setName}
+                                    </span>
+                                  )}
+                                </div>
+                                <span style={{ fontSize: '10.5px', color: 'var(--mut)' }}>
+                                  Shared compounds are confirmed across multiple wells, even when shifted well beyond ±0.25 Rf.
+                                </span>
+                              </div>
+
+                              <div style={{ overflowX: 'auto' }}>
+                                <table
+                                  style={{
+                                    width: '100%',
+                                    borderCollapse: 'collapse',
+                                    fontSize: '11px',
+                                  }}
+                                >
+                                  <thead>
+                                    <tr
+                                      style={{
+                                        borderBottom: '1px solid var(--line)',
+                                        color: 'var(--mut)',
+                                        fontSize: '10px',
+                                        textAlign: 'left',
+                                      }}
+                                    >
+                                      <th style={{ padding: '4px 6px 5px 0', fontWeight: 600 }}>Compound</th>
+                                      <th style={{ padding: '4px 6px 5px', fontWeight: 600 }}>Role</th>
+                                      <th style={{ padding: '4px 6px 5px', fontWeight: 600, textAlign: 'right' }}>Wells Seen</th>
+                                      <th style={{ padding: '4px 6px 5px', fontWeight: 600, textAlign: 'right' }}>Predicted Rf</th>
+                                      <th style={{ padding: '4px 6px 5px', fontWeight: 600, textAlign: 'right' }}>Measured Rf</th>
+                                      <th style={{ padding: '4px 6px 5px', fontWeight: 600, textAlign: 'right' }}>Shift</th>
+                                      <th style={{ padding: '4px 0 5px 6px', fontWeight: 600, textAlign: 'right' }}>Confirmation</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {(showAllCalibCompounds
+                                      ? displayedCompoundSummaries
+                                      : displayedCompoundSummaries.slice(0, 8)
+                                    ).map((cs) => {
+                                      const isLargeShift = Math.abs(cs.rfShift) >= 0.2;
+                                      const shiftStr = `${cs.rfShift >= 0 ? '+' : ''}${cs.rfShift.toFixed(2)}`;
+                                      return (
+                                        <tr
+                                          key={cs.compoundKey}
+                                          style={{
+                                            borderBottom: '1px solid var(--line2)',
+                                          }}
+                                        >
+                                          <td
+                                            style={{
+                                              padding: '5px 6px 5px 0',
+                                              fontWeight: 600,
+                                              maxWidth: '220px',
+                                              overflow: 'hidden',
+                                              textOverflow: 'ellipsis',
+                                              whiteSpace: 'nowrap',
+                                            }}
+                                            title={cs.label}
+                                          >
+                                            {cs.label}
+                                          </td>
+                                          <td style={{ padding: '5px 6px', color: 'var(--mut)' }}>
+                                            {cs.kind === 'product' ? 'Product' : 'Starting Material'}
+                                          </td>
+                                          <td className="mono" style={{ padding: '5px 6px', textAlign: 'right' }}>
+                                            {cs.wellsMatched}/{cs.wellsPresent}
+                                          </td>
+                                          <td className="mono" style={{ padding: '5px 6px', textAlign: 'right', color: 'var(--mut)' }}>
+                                            {cs.predictedRfBefore.toFixed(2)} →{' '}
+                                            <span style={{ color: 'var(--fg)' }}>{cs.predictedRfAfter.toFixed(2)}</span>
+                                          </td>
+                                          <td className="mono" style={{ padding: '5px 6px', textAlign: 'right', fontWeight: 700 }}>
+                                            {cs.observedRfMean.toFixed(2)}
+                                            {cs.observedRfSpread >= 0.015 ? (
+                                              <span style={{ color: 'var(--mut)', fontWeight: 400, fontSize: '10px' }}>
+                                                {' '}
+                                                ±{cs.observedRfSpread.toFixed(2)}
+                                              </span>
+                                            ) : null}
+                                          </td>
+                                          <td
+                                            className="mono"
+                                            style={{
+                                              padding: '5px 6px',
+                                              textAlign: 'right',
+                                              fontWeight: isLargeShift ? 700 : 600,
+                                              color: isLargeShift
+                                                ? cs.rfShift > 0
+                                                  ? '#10b981'
+                                                  : '#38bdf8'
+                                                : 'var(--fg)',
+                                            }}
+                                          >
+                                            {shiftStr}
+                                          </td>
+                                          <td
+                                            style={{
+                                              padding: '5px 0 5px 6px',
+                                              textAlign: 'right',
+                                              fontWeight: cs.matchMethod === 'consensus' ? 600 : 400,
+                                              color: cs.matchMethod === 'consensus' ? '#10b981' : 'var(--mut)',
+                                            }}
+                                            title={
+                                              cs.matchMethod === 'consensus'
+                                                ? 'Confirmed across multiple wells containing this compound and absent in wells without it'
+                                                : 'Matched within individual lanes'
+                                            }
+                                          >
+                                            {cs.matchMethod === 'consensus' ? 'Plate consensus' : 'Per-well'}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              {displayedCompoundSummaries.length > 8 && (
+                                <div>
+                                  <button
+                                    type="button"
+                                    className="btn sm"
+                                    style={{ height: '22px', fontSize: '10.5px', padding: '0 8px' }}
+                                    onClick={() => setShowAllCalibCompounds((v) => !v)}
+                                  >
+                                    {showAllCalibCompounds
+                                      ? 'Show fewer compounds ▲'
+                                      : `Show all ${displayedCompoundSummaries.length} compounds ▾`}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* 4. Collapsible Technical Model Details (hidden by default for chemists) */}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            <div>
+                              <button
+                                type="button"
+                                onClick={() => setShowTechCalibDetails((v) => !v)}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  padding: '2px 0',
+                                  cursor: 'pointer',
+                                  fontSize: '11px',
+                                  color: 'var(--mut)',
+                                  fontWeight: 600,
+                                }}
+                              >
+                                {showTechCalibDetails ? 'Hide technical model details ▲' : 'Technical model details ▾'}
+                              </button>
+                            </div>
+                            {showTechCalibDetails && (
+                              <div
+                                className="mono"
+                                style={{
+                                  background: 'var(--panel)',
+                                  border: '1px solid var(--line2)',
+                                  borderRadius: '8px',
+                                  padding: '8px 12px',
+                                  fontSize: '10.5px',
+                                  color: 'var(--mut)',
+                                  display: 'grid',
+                                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                                  gap: '8px 16px',
+                                  lineHeight: 1.5,
+                                }}
+                              >
+                                <div>
+                                  <div style={{ color: 'var(--fg)', fontWeight: 700, marginBottom: '2px' }}>Fit Parameters</div>
+                                  <div>
+                                    Global Δdemand: {phaseFit.globalDemandShift >= 0 ? '+' : ''}
+                                    {phaseFit.globalDemandShift.toFixed(3)}
+                                  </div>
+                                  <div>
+                                    Polarity slope: ×{(phaseFit.demandSlope ?? 1).toFixed(2)}
+                                  </div>
+                                  <div>
+                                    Matched spots: {phaseFit.pairedSpotCount} across {phaseFit.matchedLaneCount} lanes
+                                    {censTotal > 0
+                                      ? ` (+${phaseFit.frontCensoredCount ?? 0} front / +${phaseFit.baselineCensoredCount ?? 0} origin)`
+                                      : ''}
+                                  </div>
+                                </div>
+                                <div>
+                                  <div style={{ color: 'var(--fg)', fontWeight: 700, marginBottom: '2px' }}>Cross-Validation</div>
+                                  <div>
+                                    In-sample RMSE: ±{phaseFit.rmseBefore.toFixed(3)} → ±{phaseFit.rmseAfter.toFixed(3)} Rf
+                                  </div>
+                                  <div>
+                                    {phaseFit.validated && phaseFit.cvRmse !== undefined
+                                      ? `Leave-compounds-out CV: ±${(phaseFit.cvRmseBaseline ?? 0).toFixed(3)} → ±${phaseFit.cvRmse.toFixed(3)} Rf`
+                                      : 'Leave-compounds-out CV: not enough distinct compounds'}
+                                  </div>
+                                  {phaseFit.plateCvRmse !== undefined && (
+                                    <div>
+                                      Leave-one-plate-out CV: ±{(phaseFit.plateCvRmseBaseline ?? 0).toFixed(3)} → ±
+                                      {phaseFit.plateCvRmse.toFixed(3)} Rf
+                                    </div>
+                                  )}
+                                </div>
+                                {phaseFit.featureWeights && Object.keys(phaseFit.featureWeights).length > 0 && (
+                                  <div>
+                                    <div style={{ color: 'var(--fg)', fontWeight: 700, marginBottom: '2px' }}>
+                                      Structural Corrections (L2 Ridge)
+                                    </div>
+                                    {Object.entries(phaseFit.featureWeights).map(([k, v]) => (
+                                      <div key={k}>
+                                        {FEATURE_WEIGHT_LABELS[k] || k}: {Number(v) >= 0 ? '+' : ''}
+                                        {Number(v).toFixed(3)}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </>
                       )}
 
                       {/* Measured vs Predicted 54-Well Plate Overlay: What Was Found vs Missing vs Unexpected */}
@@ -1528,10 +1879,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   <span title="Predicted polar spot matched residual origin/baseline deposit (Rf ≤ 0.05)">
                                     <span style={{ color: '#fb7185', fontWeight: 700 }}>▼</span> Base-Pin ({basePinCount})
                                   </span>
-                                  <span title="Candidate predicted products (may not have formed) or starting materials (consumed / baseline-pinned) with no matching TLC spot within ±0.24 Rf">
+                                  <span title="Predicted products (may not have formed) or starting materials (consumed / baseline-pinned) with no plate-consensus or per-well TLC match">
                                     <span style={{ color: '#10b981', fontWeight: 700 }}>◌</span> Not seen ({missingProdCount}P / {consumedSmCount}SM)
                                   </span>
-                                  <span title="Measured TLC spot with no predicted SM or High/Med candidate product within ±0.24 Rf">
+                                  <span title="Measured TLC spot that did not match any predicted SM or High/Med candidate product by plate consensus or within-lane proximity">
                                     <span style={{ color: '#c084fc', fontWeight: 700 }}>◆</span> Unmatched ({extraSpotCount})
                                   </span>
                                 </div>
@@ -2200,10 +2551,12 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         }}
                       >
                         {platePlan.followUpPlan.recommendations.map((opt) => {
-                          const tabName = formatTlcTabName(
-                            opt.system.name,
+                          const optPhase = resolveSystemPhase(
+                            opt.system,
                             platePlan.stationaryPhase || stationaryPhasePref
                           );
+                          const optBadge = stationaryPhaseBadge(opt.system.stationaryPhase, optPhase);
+                          const tabName = formatTlcTabName(opt.system.name, optPhase);
                           const isPreview = activeSystemPlan?.system.id === opt.system.id;
                           return (
                             <div
@@ -2219,7 +2572,30 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                               }}
                             >
                               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
-                                <strong style={{ fontSize: '13px' }}>{opt.system.name}</strong>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                  <strong style={{ fontSize: '13px' }}>{opt.system.name}</strong>
+                                  <span
+                                    className="mono"
+                                    style={{
+                                      fontSize: '9.5px',
+                                      fontWeight: 700,
+                                      padding: '1px 5px',
+                                      borderRadius: '4px',
+                                      background: optBadge.isC18
+                                        ? 'color-mix(in srgb, #38bdf8 18%, transparent)'
+                                        : optBadge.isAlumina
+                                        ? 'color-mix(in srgb, #c084fc 18%, transparent)'
+                                        : 'color-mix(in srgb, #10b981 14%, transparent)',
+                                      color: optBadge.isC18
+                                        ? '#38bdf8'
+                                        : optBadge.isAlumina
+                                        ? '#c084fc'
+                                        : '#10b981',
+                                    }}
+                                  >
+                                    {optBadge.short}
+                                  </span>
+                                </div>
                                 <span className="mono" style={{ fontSize: '10.5px', fontWeight: 700, color: '#38bdf8' }}>
                                   +{opt.rescuedWellIndices.length} wells
                                 </span>
@@ -2295,7 +2671,9 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                 >
                   <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
                     Predicting products &amp; simulating{' '}
-                    {stationaryPhasePref === 'C18'
+                    {stationaryPhasePref === 'all_equal'
+                      ? 'all stationary phases equally (SiO₂, Al₂O₃ & C18)'
+                      : stationaryPhasePref === 'C18'
                       ? 'reverse-phase C18'
                       : stationaryPhasePref === 'Al2O3_neutral'
                       ? 'neutral alumina (Al₂O₃)'
@@ -2322,18 +2700,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                   >
                     {platePlan.recommendedSystems.map((rec) => {
                       const isSel = activeSystemPlan?.system.id === rec.system.id;
-                      const badge = stationaryPhaseBadge(
-                        rec.system.stationaryPhase,
-                        platePlan.stationaryPhase || stationaryPhasePref
-                      );
-                      const tabName = formatTlcTabName(
-                        rec.system.name,
-                        platePlan.stationaryPhase || stationaryPhasePref
-                      );
+                      const planPhase = platePlan.stationaryPhase || stationaryPhasePref;
+                      const recPhase = resolveSystemPhase(rec.system, planPhase);
+                      const badge = stationaryPhaseBadge(rec.system.stationaryPhase, recPhase);
+                      const tabName = formatTlcTabName(rec.system.name, recPhase);
                       const alt = rec.alternatives?.[0];
                       const altSel = alt ? activeSystemPlan?.system.id === alt.id : false;
                       const altTabName = alt
-                        ? formatTlcTabName(alt.name, platePlan.stationaryPhase || stationaryPhasePref)
+                        ? formatTlcTabName(alt.name, resolveSystemPhase(alt, planPhase))
                         : '';
                       return (
                         <div key={rec.system.id} style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -2827,7 +3201,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             )}
                           </div>
                           <div className="mono" style={{ fontSize: '11px', color: 'var(--mut)' }}>
-                            {stationaryPhaseBadge(activeSystemPlan.system.stationaryPhase, platePlan.stationaryPhase || stationaryPhasePref).full} · 50 mL: {prepOf(activeSystemPlan.system)}
+                            {stationaryPhaseBadge(
+                              activeSystemPlan.system.stationaryPhase,
+                              resolveSystemPhase(activeSystemPlan.system, platePlan.stationaryPhase || stationaryPhasePref)
+                            ).full} · 50 mL: {prepOf(activeSystemPlan.system)}
                             {activeSystemPlan.system.descriptors && (
                               <>
                                 {' · '}ε⁰ {activeSystemPlan.system.descriptors.strength.toFixed(2)} · α {activeSystemPlan.system.descriptors.alphaMix.toFixed(2)} · β {activeSystemPlan.system.descriptors.betaMix.toFixed(2)} · π* {activeSystemPlan.system.descriptors.piStarMix.toFixed(2)}
@@ -2850,7 +3227,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             onClick={() => {
                               const name = formatTlcTabName(
                                 activeSystemPlan.system.name,
-                                platePlan.stationaryPhase || stationaryPhasePref
+                                resolveSystemPhase(activeSystemPlan.system, platePlan.stationaryPhase || stationaryPhasePref)
                               );
                               setTlcSets((prev) => {
                                 if (prev.some((s) => s.name.trim().toLowerCase() === name.trim().toLowerCase())) {
@@ -3253,10 +3630,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         (() => {
                           const renderCard = (rec: RecommendedPlateSolvent) => {
                             const isSel = activeSystemPlan?.system.id === rec.system.id;
-                            const badge = stationaryPhaseBadge(
-                              rec.system.stationaryPhase,
+                            const recPhase = resolveSystemPhase(
+                              rec.system,
                               platePlan.stationaryPhase || stationaryPhasePref
                             );
+                            const badge = stationaryPhaseBadge(rec.system.stationaryPhase, recPhase);
+                            const showPhasePrefix =
+                              badge.isC18 ||
+                              badge.isAlumina ||
+                              (platePlan.stationaryPhase || stationaryPhasePref) === 'all_equal';
                             return (
                               <button
                                 key={rec.system.id}
@@ -3280,7 +3662,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   gap: '3px',
                                   color: 'var(--fg)',
                                 }}
-                                title={`${prepOf(rec.system)} — ${rec.system.bestFor}`}
+                                title={`${badge.full} · ${prepOf(rec.system)} — ${rec.system.bestFor}`}
                               >
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '4px' }}>
                                   <span style={{ fontSize: '12px', fontWeight: 700 }}>{rec.system.shortLabel}</span>
@@ -3292,7 +3674,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                       color: badge.isC18 ? '#38bdf8' : badge.isAlumina ? '#c084fc' : '#10b981',
                                     }}
                                   >
-                                    {badge.isC18 ? 'C18 · ' : badge.isAlumina ? `${badge.short} · ` : ''}{rec.wellCoveragePct}%
+                                    {showPhasePrefix ? `${badge.short} · ` : ''}{rec.wellCoveragePct}%
                                   </span>
                                 </div>
                                 <div style={{ fontSize: '10.5px', color: 'var(--mut)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>

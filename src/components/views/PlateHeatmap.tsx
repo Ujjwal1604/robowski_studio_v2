@@ -12,7 +12,9 @@ import {
   findSpots,
   findMultiChannelSpots,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getLane2dMetrics,
+  tlcHalf,
   tlcOrigin,
   tlcFront,
   TLC_SIGNAL,
@@ -121,6 +123,8 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
           const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
           const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
           const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+          const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+          const halfIdx = tlcHalf(lane);
           for (const ch of channelsToCheck) {
             const prof = getProf(activeTlcSet, ch, lane);
             if (prof && prof.length > 0) {
@@ -129,6 +133,8 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               if (chHist) histograms[ch] = chHist;
               const m2d = getLane2dMetrics(activeTlcSet, ch, lane, 0.35);
               if (m2d) lane2dByChannel[ch] = m2d;
+              const fBg = getChannelFrontBandProfile(activeTlcSet, ch, halfIdx, getProf);
+              if (fBg) frontBandByChannel[ch] = fBg;
             }
           }
           mergedSpots = findMultiChannelSpots({
@@ -139,6 +145,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
             minProminence: spotProminence,
             histograms,
             lane2dByChannel,
+            frontBandByChannel,
             detectorMode: activeTlcSet.spotDetectorMode,
           });
         } else if (channelsToCheck.length === 1) {
@@ -153,6 +160,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               minProminence: spotProminence,
               plateHistogram: getChannelHistogram(activeTlcSet, ch, getProf),
               lane2d: getLane2dMetrics(activeTlcSet, ch, lane, 0.35),
+              frontBandBg: getChannelFrontBandProfile(activeTlcSet, ch, tlcHalf(lane), getProf),
               detectorMode: activeTlcSet.spotDetectorMode,
             });
           }

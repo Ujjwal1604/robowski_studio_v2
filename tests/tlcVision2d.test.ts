@@ -1043,6 +1043,109 @@ describe('tlcVision2d: 2D smooth curved solvent-front seam tracking', () => {
     });
     expect(pencilOnly.detected).toBe(false);
   });
+
+  it('never jumps from a real dark solvent-front band into middle-gap handwriting, close pencil lines, or weak UV366 glare on native-res dual-half plates', () => {
+    const L = 1400;
+    const pairDist = 2680;
+    const frontEdge = 1245;
+    const pencil1 = 1275;
+    const pencil2 = pairDist - 1275;
+    const oppFrontEdge = pairDist - frontEdge;
+
+    const lanes: TlcLane[] = [];
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: i, x0: 200 + i * 90, y0: 2780, length: L, width: 70, angle: 0, zeroRf: 0 });
+    }
+    for (let i = 0; i < 27; i++) {
+      lanes.push({ id: 27 + i, x0: 200 + i * 90, y0: 100, length: L, width: 70, angle: 180, zeroRf: 0 });
+    }
+
+    const rand = rng(12345);
+    const sharedCache: Record<string, Record<number, number[]>> = {};
+    const getSharedProfile = (cacheKey: string, lane: TlcLane): number[] => {
+      sharedCache[cacheKey] = sharedCache[cacheKey] || {};
+      if (sharedCache[cacheKey][lane.id]) return sharedCache[cacheKey][lane.id];
+      const col = lane.id >= 1000 ? ((lane.id - 1000) % 27) + 0.5 : lane.id % 27;
+      // Dense middle-gap handwriting spanning ~75% of plate width across 3 text blocks
+      const hasWriting = (col >= 0 && col <= 5) || (col >= 8 && col <= 18) || (col >= 21 && col <= 26);
+      const writeCenter = 1320 + Math.round(14 * Math.sin((col / 26) * Math.PI));
+      const arr = Array.from({ length: L }, (_, p) => {
+        if (cacheKey === 'UV254') {
+          let v = (p > frontEdge && p < oppFrontEdge ? 190 : 178) + rand() * 1.4;
+          if (p >= frontEdge - 60 && p <= frontEdge + 8) {
+            const ramp =
+              p <= frontEdge
+                ? Math.min(1, (frontEdge - p + 1) / 14)
+                : Math.exp(-0.5 * ((p - frontEdge) / 3) ** 2);
+            const tail = p < frontEdge - 42 ? Math.exp(-0.5 * ((frontEdge - 42 - p) / 12) ** 2) : 1;
+            v -= 88 * ramp * tail;
+          }
+          if (p >= oppFrontEdge - 8 && p <= oppFrontEdge + 60) {
+            const ramp =
+              p >= oppFrontEdge
+                ? Math.min(1, (p - oppFrontEdge + 1) / 14)
+                : Math.exp(-0.5 * ((oppFrontEdge - p) / 3) ** 2);
+            v -= 85 * ramp;
+          }
+          v -= 55 * Math.exp(-0.5 * ((p - pencil1) / 4.2) ** 2);
+          v -= 55 * Math.exp(-0.5 * ((p - pencil2) / 4.2) ** 2);
+          if (hasWriting) v -= 50 * Math.exp(-0.5 * ((p - writeCenter) / 6.5) ** 2);
+          return Math.max(10, Math.min(250, v));
+        }
+        if (cacheKey === 'White') {
+          let v = 215 + rand() * 1.4;
+          v -= 65 * Math.exp(-0.5 * ((p - pencil1) / 4.2) ** 2);
+          v -= 65 * Math.exp(-0.5 * ((p - pencil2) / 4.2) ** 2);
+          if (hasWriting) v -= 45 * Math.exp(-0.5 * ((p - writeCenter) / 6.5) ** 2);
+          return Math.max(10, Math.min(250, v));
+        }
+        let v = 25 + rand() * 1.2;
+        v -= 3.5 * Math.exp(-0.5 * ((p - pencil1) / 4.2) ** 2);
+        if (cacheKey === 'UV366_glare') {
+          v += 16 * Math.exp(-0.5 * ((p - 1320) / 3.0) ** 2);
+        } else if (p >= frontEdge - 50 && p <= frontEdge) {
+          v += 14 * Math.min(1, (frontEdge - p + 1) / 10);
+        }
+        return Math.max(5, Math.min(250, v));
+      });
+      sharedCache[cacheKey][lane.id] = arr;
+      return arr;
+    };
+
+    const scenarios: Array<{
+      label: string;
+      channels: Array<'UV254' | 'UV366' | 'White'>;
+      uv366GapGlare: boolean;
+    }> = [
+      { label: 'uv254-only', channels: ['UV254'], uv366GapGlare: false },
+      { label: 'uv254-white', channels: ['UV254', 'White'], uv366GapGlare: false },
+      { label: 'uv254-uv366-white', channels: ['UV254', 'UV366', 'White'], uv366GapGlare: false },
+      { label: 'uv254-uv366glare-white', channels: ['UV254', 'UV366', 'White'], uv366GapGlare: true },
+    ];
+
+    for (const sc of scenarios) {
+      const set: TlcSet = {
+        uid: `dual-handwriting-${sc.label}`,
+        name: sc.label,
+        frameW: 3280,
+        frontPx: null,
+        frontAuto: {},
+        frontAutoByLane: {},
+        originPx: null,
+        originAuto: {},
+        imgs: Object.fromEntries(sc.channels.map((ch) => [ch, { name: `${ch}.png`, url: '', bmp: {} as any }])),
+        cfg: { lanes, hasZeroRf: false, warnings: [] },
+      };
+
+      const getProfile = (_s: TlcSet, key: string, lane: TlcLane) =>
+        getSharedProfile(key === 'UV366' && sc.uv366GapGlare ? 'UV366_glare' : key, lane);
+
+      for (const idx of [0, 13, 26]) {
+        const lowerFront = tlcFront(set, lanes[idx], getProfile as any);
+        expect(Math.abs(lowerFront - frontEdge)).toBeLessThanOrEqual(12);
+      }
+    }
+  }, 15000);
 });
 
 describe('tlcVision2d: multi-channel joint origin & smear-proof snapping', () => {

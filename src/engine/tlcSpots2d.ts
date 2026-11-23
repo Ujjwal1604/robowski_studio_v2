@@ -469,9 +469,24 @@ export interface SegmentSpots2dOptions {
   minDistance?: number;
   radius?: number;
   plateHistogram?: ProfileHistogramStats;
+  /** Optional plate-wide near-front background profile (Rf 0.80..1.00) to separate real high-Rf spots from plate-wide solvent-front bands */
+  frontBandBg?: number[];
   /** Optional raw 1D lateral metrics (for offPlate / borderStraddle checks) */
   offPlate?: boolean;
   borderStraddle?: boolean;
+}
+
+const FRONT_BAND_RF_START = 0.80;
+
+function sampleFrontBandBg2d(frontBandBg: number[] | undefined, rf: number): number | undefined {
+  if (!frontBandBg || frontBandBg.length < 2) return undefined;
+  if (rf <= FRONT_BAND_RF_START) return 0;
+  const clamped = Math.min(1, rf);
+  const pos = ((clamped - FRONT_BAND_RF_START) / (1 - FRONT_BAND_RF_START)) * (frontBandBg.length - 1);
+  const lo = Math.max(0, Math.min(frontBandBg.length - 1, Math.floor(pos)));
+  const hi = Math.min(frontBandBg.length - 1, lo + 1);
+  const frac = pos - lo;
+  return frontBandBg[lo] * (1 - frac) + frontBandBg[hi] * frac;
 }
 
 /**
@@ -649,14 +664,22 @@ export function segmentLaneSpots2d(
     const lb = locBase[r];
     const isNearFront = r >= frontBandStartRow;
     const gate = rowGate[r];
+    const rowRf = (r - originRow) / Math.max(1, spanRows);
+    const frontBgAtRow = isNearFront ? sampleFrontBandBg2d(opts.frontBandBg, rowRf) : undefined;
     for (let x = 0; x < w; x++) {
       const rv = Math.max(0, rawSm[off + x] - rb);
       const lvRaw = Math.max(0, locSm[off + x] - lb);
       // Local excess can never exceed true baseline-subtracted darkness/fluorescence (rv);
       // clamping prevents bright flank-noise specks from inventing fake signal on blank silica.
       const lv = Math.min(lvRaw, rv);
+      // Near the solvent front (rf >= 0.88): if we have the plate-wide 25th-percentile front-band
+      // profile, any intensity clearly exceeding the plate-wide meniscus (e.g. real high-Rf spots
+      // even when 2-3 adjacent wells share the same compound) survives intact, while plate-wide
+      // horizontal meniscuses & pencil lines (rv <= frontBgAtRow) remain completely suppressed.
+      const plateFrontExcess =
+        frontBgAtRow !== undefined ? Math.max(0, rv - frontBgAtRow * 1.15) : 0;
       const fv = isNearFront
-        ? lv
+        ? Math.max(lv, plateFrontExcess)
         : Math.max(lv, rv * gate, Math.max(0, rv - interiorBandCeil));
       rawField[off + x] = rv;
       F[off + x] = fv;
@@ -768,8 +791,8 @@ export function segmentLaneSpots2d(
       ? 5.0
       : 3.0;
   const absFloor = isDarkSpotCh
-    ? Math.max(6.8 + 4.8 * t, (4.8 + 1.8 * t) * effSigma, contrastFloor)
-    : Math.max(3.4 + 3.0 * t, (3.8 + 1.6 * t) * effSigma, contrastFloor);
+    ? Math.max(8.0 + 4.0 * t, (4.8 + 1.8 * t) * effSigma, contrastFloor)
+    : Math.max(5.2 + 3.2 * t, (4.0 + 1.6 * t) * effSigma, contrastFloor);
 
   // Cap relative-to-fMax floor so a single pitch-black saturated spot in the same lane
   // never blinds the detector to genuine faint spots (peakVal 10..20).
@@ -795,11 +818,13 @@ export function segmentLaneSpots2d(
     for (let x = 0; x < w; x++) {
       const v = F[off + x];
       if (v < peakThr) continue;
-      // Quick 4-neighbor reject
+      // Quick 4-neighbor reject checked against true physical neighbors in [originRow..frontRow]
+      // so a falling origin-dot skirt at startRow or rising solvent-front meniscus at endRow
+      // never creates an artificial boundary seed.
       if (x > 0 && F[off + x - 1] > v) continue;
       if (x + 1 < w && F[off + x + 1] > v) continue;
-      if (r > startRow && F[(r - 1) * w + x] > v) continue;
-      if (r < endRow && F[(r + 1) * w + x] > v) continue;
+      if (r > originRow && F[(r - 1) * w + x] > v) continue;
+      if (r < frontRow && F[(r + 1) * w + x] > v) continue;
 
       let isMax = true;
       const y0 = Math.max(startRow, r - rY);
@@ -918,15 +943,42 @@ export function segmentLaneSpots2d(
     return a;
   };
 
-  // Precompute active width per row on foreground mask for 2D hourglass waist verification
+  // Precompute active foreground width AND true per-row geometric FWHM (50% of row peak)
+  // for 2D hourglass waist verification (handles both moderate spots and saturated dark cores).
   const rowFgWidth = new Float32Array(h);
-  for (let r = startRow; r <= endRow; r++) {
+  const rowHalfWidth = new Float32Array(h);
+  const rowRawHalfWidth = new Float32Array(h);
+  const fgWidthCut = Math.max(fgThr, 0.25 * peakThr);
+  for (let r = Math.max(0, originRow - 2); r <= frontRow; r++) {
     const off = r * w;
     let cnt = 0;
+    let rowMaxF = 0;
+    let rowMaxRaw = 0;
+    const rb = rawBase[Math.max(originRow, Math.min(frontRow, r))];
     for (let x = 0; x < w; x++) {
-      if (F[off + x] >= Math.max(fgThr, 0.25 * peakThr)) cnt++;
+      const fv = r >= startRow && r <= endRow ? F[off + x] : 0;
+      if (fv >= fgWidthCut) cnt++;
+      if (fv > rowMaxF) rowMaxF = fv;
+      const rv = Math.max(0, rawSm[off + x] - rb);
+      if (rv > rowMaxRaw) rowMaxRaw = rv;
     }
     rowFgWidth[r] = cnt;
+    if (rowMaxF >= peakThr) {
+      const halfF = rowMaxF * 0.50;
+      let hCnt = 0;
+      for (let x = 0; x < w; x++) {
+        if (F[off + x] >= halfF) hCnt++;
+      }
+      rowHalfWidth[r] = hCnt;
+    }
+    if (rowMaxRaw >= peakThr) {
+      const halfR = rowMaxRaw * 0.50;
+      let rCnt = 0;
+      for (let x = 0; x < w; x++) {
+        if (Math.max(0, rawSm[off + x] - rb) >= halfR) rCnt++;
+      }
+      rowRawHalfWidth[r] = rCnt;
+    }
   }
 
   const computeBasinStats = (): Map<number, BasinStats> => {
@@ -1042,11 +1094,31 @@ export function segmentLaneSpots2d(
       }
 
       // (b) 2D Hourglass doublet protection: two strong vertically stacked spots with BOTH a clear
-      //     1D vertical valley AND a 2D saddle + narrower waist stay resolved in Sensitive/Standard modes
+      //     1D vertical valley AND a 2D saddle + narrower waist stay resolved in Sensitive/Standard modes.
+      //     Check both foreground width pinch and true per-row FWHM width pinch (needed when two
+      //     saturated dark spots share an outer halo whose fgThr width stays flat across the waist).
       const saddleRow = Math.round(entry.rowSum / Math.max(1, entry.cnt));
-      const waistW = rowFgWidth[Math.max(startRow, Math.min(endRow, saddleRow))];
+      const clampedSaddle = Math.max(startRow, Math.min(endRow, saddleRow));
+      const waistW = rowFgWidth[clampedSaddle];
       const minLobeW = Math.min(sa.peakRowWidth, sb.peakRowWidth);
-      const widthPinch = minLobeW > 0 ? (minLobeW - waistW) / minLobeW : 0;
+      const fgWidthPinch = minLobeW > 0 ? (minLobeW - waistW) / minLobeW : 0;
+
+      const loY = Math.min(sa.peakY, sb.peakY);
+      const hiY = Math.max(sa.peakY, sb.peakY);
+      const halfA = rowHalfWidth[loY];
+      const halfB = rowHalfWidth[hiY];
+      let minWaistHalf = Math.min(halfA, halfB);
+      for (let ry = loY + 1; ry <= hiY - 1; ry++) {
+        if (rowHalfWidth[ry] > 0 && rowHalfWidth[ry] < minWaistHalf) {
+          minWaistHalf = rowHalfWidth[ry];
+        }
+      }
+      const refHalfW = Math.max(halfA, halfB);
+      const minHalfW = Math.min(halfA, halfB);
+      const halfWidthPinch =
+        minHalfW > 0 ? Math.max((minHalfW - minWaistHalf) / minHalfW, (refHalfW - minWaistHalf) / Math.max(1, refHalfW) * 0.7) : 0;
+      const widthPinch = Math.max(fgWidthPinch, halfWidthPinch);
+
       const isStrong2dDoublet =
         t < 0.72 &&
         vertDist >= Math.max(4, spanRows * 0.022) &&
@@ -1058,6 +1130,28 @@ export function segmentLaneSpots2d(
         widthPinch >= 0.08;
 
       if (isStrong2dDoublet) continue;
+
+      // (b2) Origin-basin swallow protection:
+      //      Never let a doomed origin-dot basin (centered below Rf 0.050 and touching startRow)
+      //      swallow a distinct eluted low-Rf compound spot (centered at Rf >= 0.072) across a real
+      //      valley — otherwise the merged blob's peak snaps down to the origin dot and gets killed.
+      const rfA = (sa.peakY * scaleY - opts.origin) / origSpan;
+      const rfB = (sb.peakY * scaleY - opts.origin) / origSpan;
+      const loBasin = rfA <= rfB ? sa : sb;
+      const hiBasin = rfA <= rfB ? sb : sa;
+      const loRf = Math.min(rfA, rfB);
+      const hiRf = Math.max(rfA, rfB);
+      const isOriginVsElutedLowRf =
+        t < 0.72 &&
+        loRf < 0.052 &&
+        loBasin.minY <= startRow + 2 &&
+        hiRf >= 0.072 &&
+        hiBasin.peakVal >= Math.max(peakThr * 2.0, 26) &&
+        saddleDrop >= Math.max(3.5, 2.2 * effSigma) &&
+        v1d.valleyDrop1d >= Math.max(3.5, 2.2 * effSigma) &&
+        Math.max(dropRatio, v1d.dropRatio1d) >= 0.07;
+
+      if (isOriginVsElutedLowRf) continue;
 
       // (c) Chromatographic saddle resolution check (combining 2D saddle and 1D vertical valley)
       const effDropRatio = Math.min(dropRatio, v1d.dropRatio1d);
@@ -1231,10 +1325,21 @@ export function segmentLaneSpots2d(
     rowCorePeakRaw[r] = topK === 1 ? b1 : topK === 2 ? (b1 + b2) * 0.5 : (b1 + b2 + b3) / 3;
   }
 
+  // Measure true origin-dot strength strictly around originRow (±2 rows), ensuring it is an
+  // actual origin dot rather than the rising lower tail of a low-Rf spot sitting above originRow.
   let originPeakVal = 0;
-  for (let r = Math.max(0, originRow - 2); r <= Math.min(startRow, originRow + 3); r++) {
-    if (rowCorePeakRaw[r] > originPeakVal) originPeakVal = rowCorePeakRaw[r];
+  let originPeakRow = originRow;
+  for (let r = Math.max(0, originRow - 2); r <= Math.min(startRow, originRow + 2); r++) {
+    if (rowCorePeakRaw[r] > originPeakVal) {
+      originPeakVal = rowCorePeakRaw[r];
+      originPeakRow = r;
+    }
   }
+  const originCenterVal = rowCorePeakRaw[originRow];
+  const originAboveVal = rowCorePeakRaw[Math.min(frontRow, originPeakRow + 3)];
+  const hasRealOriginDot =
+    originPeakVal >= Math.max(peakThr * 2.0, 20) &&
+    (originCenterVal >= Math.max(peakThr * 1.8, 18) || originPeakVal >= originAboveVal * 0.92);
 
   for (const reg of finalMap.values()) {
     const pxCount = reg.pixels.length;
@@ -1325,40 +1430,129 @@ export function segmentLaneSpots2d(
     const coreLocalRatio = reg.coreRawMass > 1e-6 ? Math.min(1, reg.coreLocalMass / reg.coreRawMass) : localBandRatio;
     const effLocalRatio = rf >= 0.88 ? localBandRatio : Math.max(localBandRatio, coreLocalRatio);
     const isStrongCoalescedInterior = rf < 0.88 && reg.rawPeakVal >= interiorBandCeil * 1.25;
-    if (!isStrongCoalescedInterior && widthFrac >= 0.80 && effLocalRatio < (rf >= 0.88 ? 0.36 : 0.11)) {
-      continue;
-    }
-    // Reject solvent-front meniscus pressed directly against frontRow with no clean silica separation
-    if (rf >= 0.935 && reg.maxY >= frontRow - 1 && localBandRatio < 0.48) {
+    const plateFrontBgVal = rf >= 0.88 ? sampleFrontBandBg2d(opts.frontBandBg, rf) : undefined;
+    const spotCoreFrontCheck = Math.max(rowCorePeakRaw[reg.peakRow], reg.rawPeakVal * 0.65, 1e-6);
+    const excessAbovePlateFront =
+      plateFrontBgVal !== undefined ? Math.max(0, spotCoreFrontCheck - plateFrontBgVal) : 0;
+    const isClearPlateExcessHighRf =
+      plateFrontBgVal !== undefined &&
+      rf < 0.975 &&
+      excessAbovePlateFront >= Math.max(absFloor * 1.15, spotCoreFrontCheck * 0.45);
+
+    if (
+      !isStrongCoalescedInterior &&
+      !isClearPlateExcessHighRf &&
+      widthFrac >= 0.80 &&
+      effLocalRatio < (rf >= 0.88 ? 0.36 : 0.11)
+    ) {
       continue;
     }
 
-    // (c) Consistent origin-dot teardrop / comet streak guard:
-    //     For any low-Rf blob (Rf < 0.14) below a real origin dot, require a genuine return toward
-    //     bright silica between originRow and peakRow. Continuous dark origin teardrops stay dark
-    //     throughout the neck (neckMin / min(orig, spot) ~ 0.78–0.98 and > 25% of origin), whereas
-    //     truly resolved low-Rf compounds show either a clean bright-silica gap (<= 25% of origin)
-    //     or a deep >34% valley drop between the origin dot and the spot center.
-    if (rf < 0.14 && originPeakVal >= Math.max(peakThr * 2.0, 20)) {
+    // Near-front solvent-front meniscus & impurity-band guard (rf >= 0.915):
+    // Wavy or slightly tilted dark solvent-front bands often leave residual signal in min-flank
+    // localMap because one flank is brighter than the other, yet BOTH flanks (averaged) remain
+    // dark and intensity runs straight into frontRow without returning to clean silica.
+    // However, when plateFrontBg confirms this lane rises far above the plate-wide meniscus
+    // at this exact Rf (isClearPlateExcessHighRf), preserve real high-Rf spots even when
+    // adjacent lanes share the same spot or the meniscus sits immediately behind them.
+    if (rf >= 0.915 && !isClearPlateExcessHighRf) {
+      const spotCoreFront = spotCoreFrontCheck;
+      const fCols = Math.max(1, Math.min(3, Math.round(w * 0.16)));
+      let lFlankSum = 0;
+      let rFlankSum = 0;
+      let fRowCnt = 0;
+      for (let rr = Math.max(originRow, reg.peakRow - 1); rr <= Math.min(frontRow, reg.peakRow + 1); rr++) {
+        const roff = rr * w;
+        const rb = rawBase[rr];
+        for (let fx = 0; fx < fCols; fx++) {
+          lFlankSum += Math.max(0, rawSm[roff + fx] - rb);
+          rFlankSum += Math.max(0, rawSm[roff + (w - 1 - fx)] - rb);
+        }
+        fRowCnt++;
+      }
+      const leftFlankRaw = lFlankSum / Math.max(1, fCols * fRowCnt);
+      const rightFlankRaw = rFlankSum / Math.max(1, fCols * fRowCnt);
+      const meanFlankRaw = 0.5 * (leftFlankRaw + rightFlankRaw);
+      const maxFlankRaw = Math.max(leftFlankRaw, rightFlankRaw);
+      const meanFlankFrac = meanFlankRaw / spotCoreFront;
+      const maxFlankFrac = maxFlankRaw / spotCoreFront;
+
+      let frontReturnMin = Infinity;
+      for (let rr = reg.peakRow; rr <= frontRow; rr++) {
+        if (rowCorePeakRaw[rr] < frontReturnMin) frontReturnMin = rowCorePeakRaw[rr];
+      }
+      const touchesFrontEdge = reg.maxY >= endRow - 2 || rf >= 0.945;
+      const returnsBeforeFront = frontReturnMin <= spotCoreFront * 0.42;
+
+      // Reject solvent-front meniscus/band touching the top edge without a clean silica gap
+      if (touchesFrontEdge && !returnsBeforeFront && (meanFlankFrac >= 0.28 || localBandRatio < 0.60)) {
+        continue;
+      }
+      // Reject horizontally continuous or tilted front-accumulation bands at Rf >= 0.92
+      if (rf >= 0.92 && (meanFlankFrac >= 0.42 || (maxFlankFrac >= 0.62 && localBandRatio < 0.55))) {
+        continue;
+      }
+      // Anything right on the solvent-front line (Rf >= 0.96) must be an unmistakable isolated oval
+      if (rf >= 0.96 && (!returnsBeforeFront || meanFlankFrac >= 0.25 || localBandRatio < 0.58)) {
+        continue;
+      }
+    }
+
+    // (c) Physics-based origin-dot teardrop / comet streak guard:
+    //     Distinguish genuine eluted low-Rf compounds (which migrate to Rf ~0.07–0.14, diffuse
+    //     laterally wider than the origin/neck, and show a real intensity dip even when both cores
+    //     are Beer-Lambert saturated) from short, narrow, monotonically decaying origin teardrops.
+    if (rf < 0.14 && hasRealOriginDot) {
       const spotCorePeak = Math.max(rowCorePeakRaw[reg.peakRow], reg.rawPeakVal * 0.65);
+      const neckStart = Math.min(reg.peakRow, Math.max(originRow, originPeakRow));
       let neckMin = Infinity;
-      for (let r = originRow; r <= reg.peakRow; r++) {
+      for (let r = neckStart; r <= reg.peakRow; r++) {
         if (rowCorePeakRaw[r] < neckMin) neckMin = rowCorePeakRaw[r];
       }
       const minAnchor = Math.max(1e-6, Math.min(originPeakVal, spotCorePeak));
       const neckVsAnchor = neckMin / minAnchor;
       const neckVsOrigin = neckMin / Math.max(1e-6, originPeakVal);
+      const maxY50Rf = maxY50 >= 0 ? (maxY50 * scaleY - opts.origin) / origSpan : rf;
 
-      // Reject continuous dark teardrop bridge attached to the origin dot (no genuine silica valley)
-      if (neckVsOrigin > 0.25 && neckVsAnchor > 0.66) {
-        continue;
+      // Compare true geometric FWHM width (50% of row peak) at spot vs neck and origin:
+      // Real eluted low-Rf compounds diffuse laterally wider than the neck/origin; teardrops do not.
+      const spotLatW = rowRawHalfWidth[reg.peakRow];
+      let neckLatW = spotLatW;
+      for (let r = Math.min(reg.peakRow, neckStart + 1); r <= reg.peakRow; r++) {
+        if (rowRawHalfWidth[r] > 0 && rowRawHalfWidth[r] < neckLatW) {
+          neckLatW = rowRawHalfWidth[r];
+        }
       }
-      // Reject weak monotonic origin-tail shoulder directly touching startRow without a real dip
-      if (
-        reg.minY <= startRow + 2 &&
-        spotCorePeak - neckMin < Math.max(2.6 * effSigma, 0.16 * spotCorePeak)
-      ) {
-        continue;
+      let origLatW = 0;
+      for (let r = Math.max(0, originRow - 1); r <= Math.min(startRow, originRow + 2); r++) {
+        if (rowRawHalfWidth[r] > origLatW) origLatW = rowRawHalfWidth[r];
+      }
+      const hasLateralExpansion =
+        spotLatW >= 4 &&
+        ((neckLatW > 0 && spotLatW >= neckLatW * 1.12) ||
+          (origLatW > 0 && spotLatW >= origLatW * 1.12));
+
+      // Concentrated low-Rf compound extending clearly above the origin zone (Rf >= 0.072 or
+      // 50%-height body reaching Rf >= 0.105): when both origin and spot are optically saturated,
+      // an 8–30% raw intensity dip (neckVsAnchor <= 0.92) represents a deep Beer-Lambert OD valley.
+      const isDistinctElutedLowRf =
+        (rf >= 0.072 || maxY50Rf >= 0.105) &&
+        spotCorePeak >= Math.max(peakThr * 2.2, 28) &&
+        ((neckVsAnchor <= 0.92 && spotCorePeak - neckMin >= Math.max(2.8 * effSigma, 8)) ||
+          (hasLateralExpansion && spotCorePeak >= originPeakVal * 0.72 && rf >= 0.072));
+
+      if (!isDistinctElutedLowRf) {
+        // Reject continuous dark teardrop bridge attached to the origin dot (no genuine silica valley)
+        if (neckVsOrigin > 0.25 && neckVsAnchor > 0.66) {
+          continue;
+        }
+        // Reject weak monotonic origin-tail shoulder directly touching startRow without a real dip
+        if (
+          reg.minY <= startRow + 2 &&
+          spotCorePeak - neckMin < Math.max(2.6 * effSigma, 0.16 * spotCorePeak)
+        ) {
+          continue;
+        }
       }
     }
 
@@ -1523,13 +1717,19 @@ export function segmentLaneSpots2d(
     ).toFixed(2);
   }
 
-  const maxPeak = Math.max(...deduped.map((c) => c.peakVal), 1e-6);
+  // Drop ultra-low-confidence background mottling / noise ghosts (< 14–18%) while keeping genuine
+  // faint spots (even a barely-visible deltaG=-14 UV254 smudge scores ~0.24+).
+  const minConfGate = 0.14 + 0.04 * t;
+  const surviving = deduped.filter((c) => c.confidence >= minConfGate);
+  if (surviving.length === 0) return [];
+
+  const maxPeak = Math.max(...surviving.map((c) => c.peakVal), 1e-6);
   const totalMass = Math.max(
-    deduped.reduce((acc, c) => acc + c.mass, 0),
+    surviving.reduce((acc, c) => acc + c.mass, 0),
     1e-6
   );
 
-  return deduped.map((c) => ({
+  return surviving.map((c) => ({
     pos: c.pos,
     rf: c.rf,
     strength: +Math.min(1, c.peakVal / maxPeak).toFixed(3),

@@ -11,7 +11,9 @@ import {
   findMultiChannelSpots,
   getLoadedTlcChannels,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getLane2dMetrics,
+  tlcHalf,
   hasCompositeChannels,
   getEffectiveLaneSpots,
   TLC_SIGNAL,
@@ -418,6 +420,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
           const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
           const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
           const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+          const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+          const halfIdx = tlcHalf(l);
           for (const ch of loadedChannels) {
             const p = getProfile(currentSet, ch, l);
             if (p && p.length > 0) {
@@ -426,6 +430,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               if (chHist) histograms[ch] = chHist;
               const m2d = getLane2dMetrics(currentSet, ch, l);
               if (m2d) lane2dByChannel[ch] = m2d;
+              const fBg = getChannelFrontBandProfile(currentSet, ch, halfIdx, getProfile);
+              if (fBg) frontBandByChannel[ch] = fBg;
             }
           }
           autoSpots = findMultiChannelSpots({
@@ -436,6 +442,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             minProminence: spotProminence,
             histograms,
             lane2dByChannel,
+            frontBandByChannel,
             detectorMode: currentSet.spotDetectorMode,
           });
         }

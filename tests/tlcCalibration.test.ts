@@ -1070,6 +1070,357 @@ describe('rigorous multi-plate validation, canonical grouping & 2D tailing feedb
   });
 });
 
+describe('Stage 1 plate-wide cross-well compound consensus matching', () => {
+  it('locks a compound shifted by +0.30 Rf (beyond single-well ±0.24 cutoff) when confirmed across its wells and absent elsewhere', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+
+    const mols = [
+      { code: 'A', name: 'Shifted Benzamide', smiles: 'NC(=O)c1ccccc1' },
+      { code: 'B', name: 'Acetanilide', smiles: 'CC(=O)Nc1ccccc1' },
+      { code: 'C', name: 'Acetophenone', smiles: 'CC(=O)c1ccccc1' },
+      { code: 'D', name: '4-Nitroanisole', smiles: 'COc1ccc([N+](=O)[O-])cc1' },
+    ];
+    state.reagents = mols.map((m) => ({
+      code: m.code,
+      name: m.name,
+      smiles: m.smiles,
+      molarMass: 140,
+      density: 1.1,
+      stock: 500,
+      solvent: 'DMSO',
+    }));
+
+    const sys25 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_25')!;
+    const predRfByCode = new Map<string, number>(
+      mols.map((m) => [m.code, predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys25).rf])
+    );
+
+    // Observed Rf for A is +0.32 Rf above its raw prediction (strictly outside ±0.24 per-well gate)
+    const predA = predRfByCode.get('A')!;
+    const obsA = Math.min(0.86, predA + 0.32);
+    expect(Math.abs(obsA - predA)).toBeGreaterThan(0.28);
+
+    // 24 wells: wells 0..9 contain A (+ B in 0..4, + C in 5..9); wells 10..23 do NOT contain A
+    const rows = Array.from({ length: 24 }, (_, w) => {
+      const recipe =
+        w < 5
+          ? [
+              { code: 'A', name: mols[0].name, target_concentration: 50, equivalence: 1 },
+              { code: 'B', name: mols[1].name, target_concentration: 50, equivalence: 1 },
+            ]
+          : w < 10
+          ? [
+              { code: 'A', name: mols[0].name, target_concentration: 50, equivalence: 1 },
+              { code: 'C', name: mols[2].name, target_concentration: 50, equivalence: 1 },
+            ]
+          : w < 17
+          ? [
+              { code: 'B', name: mols[1].name, target_concentration: 50, equivalence: 1 },
+              { code: 'D', name: mols[3].name, target_concentration: 50, equivalence: 1 },
+            ]
+          : [
+              { code: 'C', name: mols[2].name, target_concentration: 50, equivalence: 1 },
+              { code: 'D', name: mols[3].name, target_concentration: 50, equivalence: 1 },
+            ];
+      return {
+        local_index: w,
+        global_index: w,
+        combo_index: w,
+        plate_number: 0,
+        container_id: w,
+        recipe,
+      };
+    });
+    const fakeRun = { plates: 1, reactions: 24, rows } as unknown as RunResult;
+
+    const lanes = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      const r = rows[w];
+      const spots: Array<{ pos: number; rf: number; strength: number; source: 'manual' }> = [];
+      if (r) {
+        for (const item of r.recipe) {
+          const rf =
+            item.code === 'A'
+              ? obsA + ((w % 3) - 1) * 0.008
+              : Math.max(0.08, Math.min(0.88, predRfByCode.get(item.code)! + 0.02));
+          spots.push({
+            pos: Math.round(40 + rf * 320),
+            rf,
+            strength: 0.9,
+            source: 'manual',
+          });
+        }
+      }
+      return {
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+        customSpots: spots,
+      };
+    });
+
+    const measSet: TlcSet = {
+      uid: 'set_consensus_shift',
+      name: '25% EtOAc / Hexanes',
+      cfg: { lanes },
+      cfgName: 'consensus_shift',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [measSet],
+    });
+
+    const fit = model.byPhase.SiO2!;
+    expect(fit).toBeDefined();
+    expect(fit.consensusCompoundCount).toBeGreaterThanOrEqual(1);
+
+    const plate = model.plates[0];
+    expect(plate.consensusMatchCount).toBeGreaterThanOrEqual(10);
+    const summaryA = plate.compoundSummaries?.find((c) => c.label.includes('Shifted Benzamide'));
+    expect(summaryA).toBeDefined();
+    expect(summaryA!.matchMethod).toBe('consensus');
+    expect(summaryA!.wellsMatched).toBe(10);
+    expect(summaryA!.wellsPresent).toBe(10);
+    expect(summaryA!.observedRfMean).toBeCloseTo(obsA, 1);
+    expect(summaryA!.rfShift).toBeGreaterThan(0.25);
+
+    const phaseSummaryA = fit.compoundSummaries?.find((c) => c.label.includes('Shifted Benzamide'));
+    expect(phaseSummaryA?.matchMethod).toBe('consensus');
+  });
+
+  it('tolerates partial reaction conversion (60% wells retaining SM) and rejects random uncorrelated spots', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+
+    const mols = [
+      { code: 'A', name: 'Partial-Conv Amide', smiles: 'NC(=O)c1ccccc1' },
+      { code: 'B', name: 'Random-Only Ester', smiles: 'COC(=O)c1ccc(O)cc1' },
+      { code: 'C', name: 'Reference Ketone', smiles: 'CC(=O)c1ccccc1' },
+    ];
+    state.reagents = mols.map((m) => ({
+      code: m.code,
+      name: m.name,
+      smiles: m.smiles,
+      molarMass: 140,
+      density: 1.1,
+      stock: 500,
+      solvent: 'DMSO',
+    }));
+
+    const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const predA = predictTlcRf(profileMoleculeForTlc(rdkit, mols[0].smiles), sys50).rf;
+    const predC = predictTlcRf(profileMoleculeForTlc(rdkit, mols[2].smiles), sys50).rf;
+    const obsA = Math.min(0.84, predA + 0.30);
+
+    const rows = Array.from({ length: 20 }, (_, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe:
+        w < 10
+          ? [
+              { code: 'A', name: mols[0].name, target_concentration: 50, equivalence: 1 },
+              { code: 'C', name: mols[2].name, target_concentration: 50, equivalence: 1 },
+            ]
+          : [
+              { code: 'B', name: mols[1].name, target_concentration: 50, equivalence: 1 },
+              { code: 'C', name: mols[2].name, target_concentration: 50, equivalence: 1 },
+            ],
+    }));
+    const fakeRun = { plates: 1, reactions: 20, rows } as unknown as RunResult;
+
+    const lanes = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      const spots: Array<{ pos: number; rf: number; strength: number; source: 'manual' }> = [];
+      if (w < 20) {
+        spots.push({ pos: Math.round(40 + predC * 320), rf: predC, strength: 0.9, source: 'manual' });
+        if (w < 6) {
+          spots.push({ pos: Math.round(40 + obsA * 320), rf: obsA, strength: 0.85, source: 'manual' });
+        }
+        if (w % 2 === 0) {
+          spots.push({ pos: Math.round(40 + 0.19 * 320), rf: 0.19, strength: 0.7, source: 'manual' });
+        }
+      }
+      return {
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+        customSpots: spots,
+      };
+    });
+
+    const measSet: TlcSet = {
+      uid: 'set_partial_conv',
+      name: '50% EtOAc / Hexanes',
+      cfg: { lanes },
+      cfgName: 'partial_conv',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [measSet],
+    });
+
+    const plate = model.plates[0];
+    const summaryA = plate.compoundSummaries?.find((c) => c.label.includes('Partial-Conv Amide'));
+    expect(summaryA).toBeDefined();
+    expect(summaryA!.matchMethod).toBe('consensus');
+    expect(summaryA!.wellsMatched).toBe(6);
+    expect(summaryA!.wellsPresent).toBe(10);
+
+    const summaryB = plate.compoundSummaries?.find((c) => c.label.includes('Random-Only Ester'));
+    expect(summaryB?.matchMethod).not.toBe('consensus');
+  });
+
+  it('models 6-membered intramolecular H-bonding so 2-hydroxyacetophenone predicts ~0.65-0.75 in 25% EtOAc/Hex while 4-hydroxyacetophenone stays polar', () => {
+    const sys25 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_25')!;
+    const orthoProf = profileMoleculeForTlc(rdkit, 'CC(=O)c1ccccc1O'); // 2'-hydroxyacetophenone
+    const paraProf = profileMoleculeForTlc(rdkit, 'CC(=O)c1ccc(O)cc1'); // 4'-hydroxyacetophenone
+
+    expect(orthoProf.intraHbondOhCount).toBe(1);
+    expect(paraProf.intraHbondOhCount).toBe(0);
+
+    const orthoRf = predictTlcRf(orthoProf, sys25).rf;
+    const paraRf = predictTlcRf(paraProf, sys25).rf;
+    expect(orthoRf).toBeGreaterThan(0.60);
+    expect(orthoRf).toBeLessThan(0.80);
+    expect(orthoRf - paraRf).toBeGreaterThan(0.18);
+  });
+
+  it('locks a universal shifted substrate (+0.30 Rf) on a plate with dark origin spots and never assigns 6 sparse Rf 0.55 spots to it', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+
+    // Use 4'-hydroxyacetophenone (predicted ~0.40 in 25% EtOAc/Hex) + polar origin-pinned partner (Benzamide/benzoic acid)
+    // Simulate a universal substrate present in ALL 24 wells running at Rf 0.70, dark origin deposits on every lane,
+    // plus 6 sparse product spots at Rf 0.55 (and a hypothetical predicted product near 0.70).
+    const smShifted = 'CC(=O)c1ccc(O)cc1'; // predicted ~0.40 in 25% EtOAc/Hex
+    const smPolar = 'O=C(O)c1ccc(N)cc1'; // polar origin-pinned partner
+    const prodSpeculative = 'COc1ccc(C(C)=O)cc1'; // speculative nonpolar product near 0.68
+
+    state.reagents = [
+      { code: 'A', name: 'Universal Ketone', smiles: smShifted, molarMass: 136, density: 1.1, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: 'Polar Partner', smiles: smPolar, molarMass: 137, density: 1.1, stock: 500, solvent: 'DMSO' },
+    ];
+
+    const rows = Array.from({ length: 24 }, (_, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: [
+        { code: 'A', name: 'Universal Ketone', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: 'Polar Partner', target_concentration: 50, equivalence: 1 },
+      ],
+    }));
+    const fakeRun = { plates: 1, reactions: 24, rows } as unknown as RunResult;
+
+    const cachedPredictions: Record<string, any> = {};
+    for (let w = 0; w < 24; w++) {
+      cachedPredictions[`0-${w}`] = {
+        substrates: [
+          { code: 'A', name: 'Universal Ketone', neutralSmiles: smShifted, valid: true },
+          { code: 'B', name: 'Polar Partner', neutralSmiles: smPolar, valid: true },
+        ],
+        species: [
+          {
+            key: 'spec_prod',
+            tautomerKey: 'spec_prod',
+            smiles: prodSpeculative,
+            formula: 'C9H10O2',
+            mechanismSummary: 'Speculative High-Rf Product',
+            tier: 'High',
+            score: 0.8,
+          },
+        ],
+      };
+    }
+
+    const lanes = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      const spots: Array<{ pos: number; rf: number; strength: number; source: 'manual' }> = [];
+      if (w < 24) {
+        // Dark origin deposit on every lane (Rf 0.02)
+        spots.push({ pos: 46, rf: 0.02, strength: 0.95, source: 'manual' });
+        // Universal Rf 0.70 band present in 22/24 wells (2 wells consumed)
+        if (w < 22) {
+          const rf70 = 0.70 + ((w % 3) - 1) * 0.012;
+          spots.push({ pos: Math.round(40 + rf70 * 320), rf: rf70, strength: 0.9, source: 'manual' });
+        }
+        // Sparse Rf 0.55 spots in ONLY 6 wells (including the 2 consumed wells!)
+        if (w < 4 || w >= 22) {
+          spots.push({ pos: Math.round(40 + 0.55 * 320), rf: 0.55, strength: 0.75, source: 'manual' });
+        }
+      }
+      return {
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+        customSpots: spots,
+      };
+    });
+
+    const measSet: TlcSet = {
+      uid: 'set_univ_origin_sparse',
+      name: '25% EtOAc / Hexanes',
+      cfg: { lanes },
+      cfgName: 'univ_origin_sparse',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [measSet],
+      cachedPredictions,
+    });
+
+    const plate = model.plates[0];
+    const summaryA = plate.compoundSummaries?.find((c) => c.label.includes('Universal Ketone'));
+    expect(summaryA).toBeDefined();
+    expect(summaryA!.matchMethod).toBe('consensus');
+    // Must match the 22 wells at Rf ~0.70, NOT the 6 sparse Rf 0.55 spots (and NOT steal 0.55 in the 2 consumed wells!)
+    expect(summaryA!.wellsMatched).toBe(22);
+    expect(summaryA!.observedRfMean).toBeCloseTo(0.70, 1);
+  });
+});
+
 
 
 

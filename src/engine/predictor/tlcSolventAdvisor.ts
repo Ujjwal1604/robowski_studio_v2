@@ -16,8 +16,10 @@ import {
 } from './solventSystemModel';
 
 export type TlcStationaryPhase = 'SiO2' | 'C18';
+export type ConcreteStationaryPhase = 'SiO2' | 'C18' | 'Al2O3_neutral' | 'Al2O3_basic';
 export type TlcStationaryPhasePreference =
   | 'auto'
+  | 'all_equal'
   | 'SiO2'
   | 'C18'
   | 'Al2O3_neutral'
@@ -44,6 +46,8 @@ export interface TlcSolventSystemDef {
   ratio: string;
   chamberPrep50mL: string;
   stationaryPhase: TlcStationaryPhase;
+  /** Optional concrete stationary phase (e.g. 'Al2O3_neutral' or 'Al2O3_basic' when comparing all phases equally). */
+  effectivePhase?: ConcreteStationaryPhase;
   preferenceTier: SolventPreferenceTier;
   family: SolventFamily;
   strength: number; // Effective eluent strength (~0.00 to ~0.92 within its stationary phase)
@@ -70,6 +74,17 @@ export interface TlcSolventSystemDef {
     strongPct: number;
     modifierId: string;
   };
+}
+
+export function resolveSystemPhase(
+  system: Pick<TlcSolventSystemDef, 'stationaryPhase' | 'effectivePhase'>,
+  stationaryPhasePref: TlcStationaryPhasePreference = 'auto'
+): ConcreteStationaryPhase {
+  if (system.effectivePhase) return system.effectivePhase;
+  if (system.stationaryPhase === 'C18') return 'C18';
+  if (stationaryPhasePref === 'Al2O3_neutral') return 'Al2O3_neutral';
+  if (stationaryPhasePref === 'Al2O3_basic') return 'Al2O3_basic';
+  return 'SiO2';
 }
 
 export const TLC_SOLVENT_LIBRARY: TlcSolventSystemDef[] =
@@ -99,7 +114,17 @@ export const ALL_KNOWN_SOLVENT_SYSTEMS: TlcSolventSystemDef[] = [
 ];
 
 export function findSolventSystemById(id: string): TlcSolventSystemDef | undefined {
-  return ALL_KNOWN_SOLVENT_SYSTEMS.find((s) => s.id === id);
+  const direct = ALL_KNOWN_SOLVENT_SYSTEMS.find((s) => s.id === id);
+  if (direct) return direct;
+  if (id.endsWith('__al2o3_neutral')) {
+    const base = ALL_KNOWN_SOLVENT_SYSTEMS.find((s) => s.id === id.slice(0, -'__al2o3_neutral'.length));
+    return base ? { ...base, id, effectivePhase: 'Al2O3_neutral' } : undefined;
+  }
+  if (id.endsWith('__al2o3_basic')) {
+    const base = ALL_KNOWN_SOLVENT_SYSTEMS.find((s) => s.id === id.slice(0, -'__al2o3_basic'.length));
+    return base ? { ...base, id, effectivePhase: 'Al2O3_basic' } : undefined;
+  }
+  return undefined;
 }
 
 export interface TlcMolLser {
@@ -139,6 +164,10 @@ export interface TlcMolProfile {
   cf3Count: number;
   nitroCount?: number;
   cyanoCount?: number;
+  /** Strong 6-membered intramolecular O-H...O=C / N=C / NO2 / n chelate rings (e.g. 2'-hydroxyacetophenone, salicylaldehyde, 2-nitrophenol) */
+  intraHbondOhCount?: number;
+  /** Moderate 6-membered intramolecular N-H...O=C / NO2 chelate rings (e.g. 2'-aminoacetophenone, anthranilates, 2-nitroaniline) */
+  intraHbondNhCount?: number;
   zwitterionOrQuatCount: number;
   /** True when the neutral structure carries both a strong basic site and an acidic group (e.g. amino acid) */
   isInternalZwitterion?: boolean;
@@ -260,12 +289,31 @@ export interface TlcCalibrationSpotPair {
   wellCoord: string;
   speciesLabel: string;
   speciesKind: 'substrate' | 'product';
+  compoundKey?: string;
   observedRf: number;
   predictedRfBefore: number;
   predictedRfAfter: number;
   residualRf: number; // observedRf - predictedRfBefore
   residualDemand: number; // inferredDemand - predictedDemand
   weight: number;
+  matchMethod?: 'consensus' | 'per_well';
+  consensusWellCount?: number;
+  consensusTotalWells?: number;
+}
+
+export interface CalibratedCompoundSummary {
+  compoundKey: string;
+  label: string;
+  kind: 'substrate' | 'product';
+  wellsPresent: number;
+  wellsMatched: number;
+  predictedRfBefore: number;
+  predictedRfAfter: number;
+  observedRfMean: number;
+  observedRfSpread: number;
+  rfShift: number; // observedRfMean - predictedRfBefore
+  matchMethod: 'consensus' | 'per_well';
+  channels?: Array<'UV254' | 'UV366' | 'White'>;
 }
 
 export interface CalibratedLaneComparison {
@@ -290,6 +338,7 @@ export interface CalibratedLaneComparison {
     matchedKind?: 'substrate' | 'product';
     matchedPredRfBefore?: number;
     matchedPredRfAfter?: number;
+    matchMethod?: 'consensus' | 'per_well';
   }>;
   predictedSpots: Array<{
     label: string;
@@ -300,6 +349,7 @@ export interface CalibratedLaneComparison {
     found: boolean;
     boundaryStatus?: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing';
     matchedObsRf?: number;
+    matchMethod?: 'consensus' | 'per_well';
   }>;
 }
 
@@ -315,6 +365,7 @@ export interface CalibratedPlateSummary {
   matchSource: 'auto' | 'manual';
   laneCountWithSpots: number;
   pairedCount: number;
+  consensusMatchCount?: number;
   frontCensoredCount?: number;
   baselineCensoredCount?: number;
   tailingLaneCount?: number;
@@ -325,6 +376,7 @@ export interface CalibratedPlateSummary {
   demandShift: number;
   pairs: TlcCalibrationSpotPair[];
   lanes: CalibratedLaneComparison[];
+  compoundSummaries?: CalibratedCompoundSummary[];
 }
 
 export interface TlcCalibrationFeatureWeights {
@@ -359,6 +411,10 @@ export interface TlcCalibrationPhaseFit {
   rmseAfter: number;
   /** number of distinct compounds behind the fit (a compound seen in many wells counts once) */
   uniqueCompounds?: number;
+  /** number of distinct compounds confirmed via plate-wide cross-well presence/absence consensus */
+  consensusCompoundCount?: number;
+  /** per-compound summary of predicted vs measured Rf across the phase's plates */
+  compoundSummaries?: CalibratedCompoundSummary[];
   /** true when a leave-compounds-out check could be run */
   validated?: boolean;
   /** held-out Rf error of the fitted model / of the uncalibrated model (only when validated) */
@@ -514,6 +570,8 @@ type MotifCountKey = keyof Pick<
   | 'cf3Count'
   | 'nitroCount'
   | 'cyanoCount'
+  | 'intraHbondOhCount'
+  | 'intraHbondNhCount'
   | 'zwitterionOrQuatCount'
 >;
 
@@ -541,6 +599,16 @@ const TLCMOTIF_SMARTS: Array<[MotifCountKey, string]> = [
   ['cf3Count', '[CX4;$(C(F)(F)F)]'],
   ['nitroCount', '[$([NX3](=O)=O),$([NX3+](=O)[O-])]'],
   ['cyanoCount', '[CX2]#[NX1]'],
+  [
+    'intraHbondOhCount',
+    // 6-membered intramolecular O-H...O=C / N=C / NO2 / aza-ring chelate (masks OH & acceptor from silica Si-OH)
+    '[OX2H1;$([O]c:c[CX3]=[OX1,NX2]),$([O]c:c[$([NX3](=O)=O),$([NX3+](=O)[O-])]),$([O]c:c[c,n]:[nX2]),$([O][CX3]=[CX3][CX3]=[OX1])]',
+  ],
+  [
+    'intraHbondNhCount',
+    // 6-membered intramolecular N-H...O=C / NO2 chelate (o-aminoaryl carbonyls, anthranilates, 2-nitroanilines)
+    '[NX3;H2,H1;+0;$([N]c:c[CX3]=[OX1]),$([N]c:c[$([NX3](=O)=O),$([NX3+](=O)[O-])])]',
+  ],
   ['zwitterionOrQuatCount', '[NX4+]'],
 ];
 
@@ -726,6 +794,8 @@ export function profileMoleculeForTlc(
       cf3Count: 0,
       nitroCount: 0,
       cyanoCount: 0,
+      intraHbondOhCount: 0,
+      intraHbondNhCount: 0,
       zwitterionOrQuatCount: 0,
     };
     for (const [k, sma] of TLCMOTIF_SMARTS) {
@@ -823,14 +893,29 @@ export function profileMoleculeForTlc(
         1000
     ) / 1000;
     const lserA = Math.round(
-      Math.min(2.4, hbd * 0.42 + counts.phenolCount * 0.22 + counts.carboxylicAcidCount * 0.25 + counts.boronicCount * 0.20) *
-        1000
+      Math.max(
+        0,
+        Math.min(
+          2.4,
+          hbd * 0.42 +
+            counts.phenolCount * 0.22 +
+            counts.carboxylicAcidCount * 0.25 +
+            counts.boronicCount * 0.20 -
+            counts.intraHbondOhCount * 0.48 -
+            counts.intraHbondNhCount * 0.20
+        )
+      ) * 1000
     ) / 1000;
     const lserB = Math.round(
-      Math.min(
-        2.8,
-        (hba * 0.32 + counts.aliphAmineCount * 0.35 + counts.basicAzoleNCount * 0.20 + counts.pyridineCount * 0.22) *
-          inductiveAtten
+      Math.max(
+        0,
+        Math.min(
+          2.8,
+          (hba * 0.32 + counts.aliphAmineCount * 0.35 + counts.basicAzoleNCount * 0.20 + counts.pyridineCount * 0.22) *
+            inductiveAtten -
+            counts.intraHbondOhCount * 0.22 -
+            counts.intraHbondNhCount * 0.10
+        )
       ) * 1000
     ) / 1000;
 
@@ -884,6 +969,8 @@ export function profileMoleculeForTlc(
       cf3Count: counts.cf3Count,
       nitroCount: counts.nitroCount,
       cyanoCount: counts.cyanoCount,
+      intraHbondOhCount: counts.intraHbondOhCount,
+      intraHbondNhCount: counts.intraHbondNhCount,
       zwitterionOrQuatCount: counts.zwitterionOrQuatCount,
       isInternalZwitterion,
       ewgAttenuatedBasicity,
@@ -1177,6 +1264,8 @@ export function predictTlcRf(
   const cf3 = profile.cf3Count || 0;
   const nitro = profile.nitroCount || 0;
   const cyano = profile.cyanoCount || 0;
+  const intraOh = profile.intraHbondOhCount || 0;
+  const intraNh = profile.intraHbondNhCount || 0;
   const quat = profile.zwitterionOrQuatCount || 0;
   const isInternalZwitterion = Boolean(
     profile.isInternalZwitterion ||
@@ -1199,19 +1288,23 @@ export function predictTlcRf(
     const isAcidic = Boolean(system.acidModifier);
 
     // Lipophilicity increases C18 binding; TPSA/HBD/ionizable groups decrease C18 binding
-    let polarRelease =
+    // Intramolecular H-bonds reduce aqueous solvation (lower polarRelease -> slightly tighter C18 retention)
+    let polarRelease = Math.max(
+      0,
       Math.min(0.45, profile.tpsa * 0.0042) +
-      profile.hbd * 0.055 +
-      profile.aliphAmineCount * (isAcidic ? 0.24 : 0.14) +
-      profile.azoleCount * 0.07 +
-      profile.carboxylicAcidCount * (isAcidic ? 0.04 : 0.14) +
-      primAmide * 0.055 +
-      urea * 0.065 +
-      sulfonamide * 0.045 +
-      boronic * 0.09 +
-      phosphonate * 0.08 +
-      quat * 0.28 +
-      (isInternalZwitterion ? 0.22 : 0);
+        profile.hbd * 0.055 +
+        profile.aliphAmineCount * (isAcidic ? 0.24 : 0.14) +
+        profile.azoleCount * 0.07 +
+        profile.carboxylicAcidCount * (isAcidic ? 0.04 : 0.14) +
+        primAmide * 0.055 +
+        urea * 0.065 +
+        sulfonamide * 0.045 +
+        boronic * 0.09 +
+        phosphonate * 0.08 +
+        quat * 0.28 +
+        (isInternalZwitterion ? 0.22 : 0) -
+        Math.min(0.09, intraOh * 0.055 + intraNh * 0.025)
+    );
 
     // Protonated basic sites from acid/salt reaction wells elute earlier on C18
     if (wellAcid.hasAcidEffect) {
@@ -1256,8 +1349,9 @@ export function predictTlcRf(
   // Modeled independently from SiO2: stronger dipole/pi/ester/nitro & phenol/acid
   // binding, much weaker basic-amine/pyridine silanol retention.
   // -------------------------------------------------------------------------
-  const isNeutralAlumina = stationaryPhasePref === 'Al2O3_neutral';
-  const isBasicAlumina = stationaryPhasePref === 'Al2O3_basic';
+  const resolvedPhase = resolveSystemPhase(system, stationaryPhasePref);
+  const isNeutralAlumina = resolvedPhase === 'Al2O3_neutral';
+  const isBasicAlumina = resolvedPhase === 'Al2O3_basic';
   const isAlumina = isNeutralAlumina || isBasicAlumina;
 
   const lipophilicityOffset = Math.max(-0.14, Math.min(0.22, (profile.clogP - 1.4) * 0.04));
@@ -1271,6 +1365,14 @@ export function predictTlcRf(
   const azoleNH = Math.max(0, profile.azoleCount - basicAzoleN);
   // Tautomeric NH + basic =N- azoles (imidazole, benzimidazole, pyrazole, triazole) form strong H-bond chains
   const nhBasicAzole = Math.min(basicAzoleN, azoleNH);
+
+  // Protic alcohol eluents (MeOH/EtOH) partially compete with and disrupt intramolecular H-bonds
+  const intraProticFactor =
+    system.alcoholPct > 0 ? Math.max(0.55, 1 - system.alcoholPct * 0.035) : 1.0;
+  const intraHbondReliefSiO2 =
+    (Math.min(0.24, intraOh * 0.165) + Math.min(0.14, intraNh * 0.08)) * intraProticFactor;
+  const intraHbondReliefAlumina =
+    (Math.min(0.20, intraOh * 0.125) + Math.min(0.11, intraNh * 0.06)) * intraProticFactor;
 
   let demand = 0;
   if (isAlumina) {
@@ -1291,7 +1393,8 @@ export function predictTlcRf(
       Math.min(0.26, boronic * 0.14) +
       dipolePiRetention +
       mwAdsorption -
-      halogenCf3Relief * 0.85;
+      halogenCf3Relief * 0.85 -
+      intraHbondReliefAlumina;
 
     demand =
       (isBasicAlumina ? 0.02 : 0.03) +
@@ -1319,7 +1422,8 @@ export function predictTlcRf(
       Math.min(0.11, aniline * basicityAtten * 0.045) +
       Math.min(0.18, phosphonate * 0.075) +
       mwAdsorption -
-      halogenCf3Relief;
+      halogenCf3Relief -
+      intraHbondReliefSiO2;
 
     demand =
       0.04 +
@@ -1607,9 +1711,11 @@ export function predictTlcRf(
   // applies ONLY to H-bonding/amine/acid polar solutes (demand >= 0.32) that depend on adsorbed MeOH to move,
   // never artificially dragging non-HBD lipophilic azoles/ketones down out of the front band.
   if (!isAlumina && desc?.betaFrontCeiling !== undefined) {
+    const freeHbd = Math.max(0, profile.hbd - intraOh);
+    const effectivePolarDemand = demand + (freeHbd > 0 ? intraHbondReliefSiO2 * 0.65 : 0);
     const isAlcoholDependent =
-      demand >= 0.32 &&
-      (profile.hbd >= 1 ||
+      effectivePolarDemand >= 0.32 &&
+      (freeHbd >= 1 ||
         profile.aliphAmineCount >= 1 ||
         primAmide >= 1 ||
         urea >= 1 ||
@@ -1755,11 +1861,8 @@ interface WellCandidateData {
 function calibrationPhaseKeyForSystem(
   system: TlcSolventSystemDef,
   stationaryPhasePref: TlcStationaryPhasePreference
-): TlcStationaryPhasePreference {
-  if (system.stationaryPhase === 'C18') return 'C18';
-  if (stationaryPhasePref === 'Al2O3_neutral') return 'Al2O3_neutral';
-  if (stationaryPhasePref === 'Al2O3_basic') return 'Al2O3_basic';
-  return 'SiO2';
+): ConcreteStationaryPhase {
+  return resolveSystemPhase(system, stationaryPhasePref);
 }
 
 function resolveCalibrationOffsets(
@@ -1809,10 +1912,11 @@ function evaluateWellInSolvent(
   stationaryPhasePref: TlcStationaryPhasePreference = 'auto',
   calibration?: TlcCalibrationModel
 ): WellSolventEvaluation {
+  const resolvedPhase = resolveSystemPhase(system, stationaryPhasePref);
   const { demandShift, demandSlope, sigma, featureWeights, familyCalibrated } = resolveCalibrationOffsets(
     calibration,
     system,
-    stationaryPhasePref
+    resolvedPhase
   );
   const usesAcetone = systemUsesAcetone(system);
   const usesMeOH = systemUsesMeOH(system);
@@ -1838,7 +1942,7 @@ function evaluateWellInSolvent(
       s.profile,
       system,
       well.wellCtx,
-      stationaryPhasePref,
+      resolvedPhase,
       demandShift,
       demandSlope,
       featureWeights,
@@ -1869,7 +1973,7 @@ function evaluateWellInSolvent(
       p.profile,
       system,
       well.wellCtx,
-      stationaryPhasePref,
+      resolvedPhase,
       demandShift,
       demandSlope,
       featureWeights,
@@ -2093,8 +2197,9 @@ function generateCombinations(n: number, k: number): number[][] {
 }
 
 function polarityBand(sys: TlcSolventSystemDef, stationaryPhasePref: TlcStationaryPhasePreference = 'auto'): string {
-  if (sys.stationaryPhase === 'C18') {
-    if (stationaryPhasePref === 'C18') {
+  const effPhase = resolveSystemPhase(sys, stationaryPhasePref);
+  if (effPhase === 'C18') {
+    if (stationaryPhasePref === 'C18' || stationaryPhasePref === 'all_equal') {
       if (sys.acidModifier) return 'c18_tfa';
       if (sys.strength < 0.35) return 'c18_aq';
       if (sys.strength < 0.65) return 'c18_med';
@@ -2102,11 +2207,13 @@ function polarityBand(sys: TlcSolventSystemDef, stationaryPhasePref: TlcStationa
     }
     return 'c18';
   }
-  if (sys.baseModifier) return sys.strength < 0.65 ? 'basic_low_med' : 'basic_polar';
-  if (sys.acidModifier) return sys.strength < 0.65 ? 'acid_low_med' : 'acid_polar';
-  if (sys.strength < 0.35) return 'low_np';
-  if (sys.strength < 0.65) return 'med_np';
-  return 'polar_np';
+  const phasePrefix =
+    stationaryPhasePref === 'all_equal' && effPhase !== 'SiO2' ? `${effPhase}_` : '';
+  if (sys.baseModifier) return `${phasePrefix}${sys.strength < 0.65 ? 'basic_low_med' : 'basic_polar'}`;
+  if (sys.acidModifier) return `${phasePrefix}${sys.strength < 0.65 ? 'acid_low_med' : 'acid_polar'}`;
+  if (sys.strength < 0.35) return `${phasePrefix}low_np`;
+  if (sys.strength < 0.65) return `${phasePrefix}med_np`;
+  return `${phasePrefix}polar_np`;
 }
 
 function buildSystemPlanEntry(
@@ -2216,8 +2323,17 @@ function buildSystemPlanEntry(
       `Uniquely resolves ${uniqueWellIndices.length} well${uniqueWellIndices.length > 1 ? 's' : ''} (${uniqueWellCoords.slice(0, 5).join(', ')}${uniqueWellCoords.length > 5 ? ', …' : ''})`
     );
   }
-  if (sys.stationaryPhase === 'C18') {
-    rationaleParts.push('reverse-phase rescue for highly polar/ionic species');
+  const effPhase = resolveSystemPhase(sys, extra?.stationaryPhasePref ?? 'auto');
+  if (effPhase === 'C18') {
+    rationaleParts.push(
+      extra?.stationaryPhasePref === 'all_equal'
+        ? 'reverse-phase C18 separation for polar/ionizable or lipophilic species'
+        : 'reverse-phase rescue for highly polar/ionic species'
+    );
+  } else if (effPhase === 'Al2O3_basic') {
+    rationaleParts.push('Basic Al₂O₃ releases basic amines & azoles cleanly in neat organic eluent');
+  } else if (effPhase === 'Al2O3_neutral') {
+    rationaleParts.push('Neutral Al₂O₃ provides silanol-free separation in neat organic eluent');
   } else if (sys.baseModifier?.includes('NH₃')) {
     rationaleParts.push('2M NH₃/MeOH neutralizes protonated amines & azoles cleanly');
   } else if (sys.baseModifier) {
@@ -2484,6 +2600,16 @@ export async function optimizePlateTlcSolvents(
   }
 
   // 2. Compose plate-tailored dynamic candidates alongside core library & score across every active well
+  const isAllEqual = stationaryPhasePref === 'all_equal';
+  const cloneForAlumina = (
+    sys: TlcSolventSystemDef,
+    phase: 'Al2O3_neutral' | 'Al2O3_basic'
+  ): TlcSolventSystemDef => ({
+    ...sys,
+    id: `${sys.id}__${phase === 'Al2O3_basic' ? 'al2o3_basic' : 'al2o3_neutral'}`,
+    effectivePhase: phase,
+  });
+
   const phaseFilter = (sys: TlcSolventSystemDef): boolean => {
     if (stationaryPhasePref === 'SiO2') return sys.stationaryPhase === 'SiO2';
     if (stationaryPhasePref === 'C18') return sys.stationaryPhase === 'C18';
@@ -2493,7 +2619,21 @@ export async function optimizePlateTlcSolvents(
     return true;
   };
 
-  const phaseFilteredLibrary = TLC_SOLVENT_LIBRARY.filter(phaseFilter);
+  const baseFilteredLibrary = TLC_SOLVENT_LIBRARY.filter(phaseFilter);
+  const phaseFilteredLibrary: TlcSolventSystemDef[] = isAllEqual
+    ? [
+        ...baseFilteredLibrary.map((s) => ({
+          ...s,
+          effectivePhase: (s.stationaryPhase === 'C18' ? 'C18' : 'SiO2') as ConcreteStationaryPhase,
+        })),
+        ...baseFilteredLibrary
+          .filter((s) => s.stationaryPhase === 'SiO2' && !s.acidModifier && !s.baseModifier)
+          .map((s) => cloneForAlumina(s, 'Al2O3_neutral')),
+        ...baseFilteredLibrary
+          .filter((s) => s.stationaryPhase === 'SiO2' && !s.acidModifier && !s.baseModifier)
+          .map((s) => cloneForAlumina(s, 'Al2O3_basic')),
+      ]
+    : baseFilteredLibrary;
 
   const activeWells = activeIndices
     .map((w) => wellDataByIdx.get(w))
@@ -2531,7 +2671,7 @@ export async function optimizePlateTlcSolvents(
     let wBestStr = 0.50;
     let wBestSmSc = -1;
     let wBestSmStr = 0.30;
-    for (const cs of phaseFilteredLibrary) {
+    for (const cs of baseFilteredLibrary) {
       if (cs.stationaryPhase !== 'SiO2') continue;
       const ev = evaluateWellInSolvent(w, cs, stationaryPhasePref, options.calibration);
       if (ev.score > wBestSc) {
@@ -2572,7 +2712,7 @@ export async function optimizePlateTlcSolvents(
   const targetStrengthMin = wellBestStrengths.length > 0 ? Math.min(wellBestStrengths[0], wellSmTrackStrengths[0] ?? wellBestStrengths[0]) : 0.25;
   const targetStrengthMax = wellBestStrengths.length > 0 ? wellBestStrengths[wellBestStrengths.length - 1] : 0.75;
 
-  const coreIds = new Set(phaseFilteredLibrary.map((s) => s.id));
+  const coreIds = new Set(baseFilteredLibrary.map((s) => s.id));
   const compKey = (c?: {
     strongSolvent: string;
     weakSolvent: string;
@@ -2583,7 +2723,7 @@ export async function optimizePlateTlcSolvents(
     c
       ? `${c.strongSolvent}:${c.ternaryCoSolvent?.solvent ?? ''}:${c.ternaryCoSolvent?.pct ?? 0}:${c.weakSolvent}:${c.strongPct}:${c.modifierId}`
       : '';
-  const seenCompKeys = new Set(phaseFilteredLibrary.map((s) => compKey(s.composition)).filter(Boolean));
+  const seenCompKeys = new Set(baseFilteredLibrary.map((s) => compKey(s.composition)).filter(Boolean));
 
   const synthInput = {
     targetStrengths,
@@ -2612,11 +2752,27 @@ export async function optimizePlateTlcSolvents(
     if (coreIds.has(spec.id)) continue;
     const ck = `${spec.strongSolvent}:${spec.ternaryCoSolvent?.solvent ?? ''}:${spec.ternaryCoSolvent?.pct ?? 0}:${spec.weakSolvent}:${spec.strongPct}:${spec.modifierId}`;
     if (seenCompKeys.has(ck)) continue;
-    if (!validateEluentCompatibility(spec, stationaryPhasePref).valid) continue;
+    if (!validateEluentCompatibility(spec, isAllEqual ? 'auto' : stationaryPhasePref).valid) continue;
     const composed = composeSolventSystem(spec);
     if (!phaseFilter(composed)) continue;
     seenCompKeys.add(ck);
-    dynamicSystems.push(composed);
+    if (isAllEqual) {
+      dynamicSystems.push({
+        ...composed,
+        effectivePhase: composed.stationaryPhase === 'C18' ? 'C18' : 'SiO2',
+      });
+      if (
+        composed.stationaryPhase === 'SiO2' &&
+        !composed.acidModifier &&
+        !composed.baseModifier &&
+        validateEluentCompatibility(spec, 'Al2O3_neutral').valid
+      ) {
+        dynamicSystems.push(cloneForAlumina(composed, 'Al2O3_neutral'));
+        dynamicSystems.push(cloneForAlumina(composed, 'Al2O3_basic'));
+      }
+    } else {
+      dynamicSystems.push(composed);
+    }
   }
 
   const allCandidateSystems = [...phaseFilteredLibrary, ...dynamicSystems];
@@ -2632,14 +2788,17 @@ export async function optimizePlateTlcSolvents(
   }
 
   // 3. Filter candidate search pool by poolMode and enrich with top plate-tailored dynamic candidates
+  const isPrimaryEligible = (s: TlcSolventSystemDef) =>
+    s.preferenceTier === 'primary' || (isAllEqual && s.stationaryPhase === 'C18');
+
   const corePool =
     stationaryPhasePref !== 'C18' && poolMode === 'primary_only'
-      ? phaseFilteredLibrary.filter((s) => s.preferenceTier === 'primary')
+      ? phaseFilteredLibrary.filter(isPrimaryEligible)
       : phaseFilteredLibrary;
 
   const eligibleDynamic =
     stationaryPhasePref !== 'C18' && poolMode === 'primary_only'
-      ? dynamicSystems.filter((s) => s.preferenceTier === 'primary')
+      ? dynamicSystems.filter(isPrimaryEligible)
       : dynamicSystems;
 
   const coreBestByWell = new Map<number, number>();
@@ -2677,8 +2836,91 @@ export async function optimizePlateTlcSolvents(
   const pickedDynamic = rankedDynamic.slice(0, maxDynAdd).map((d) => d.sys);
   let searchPool = [...corePool, ...pickedDynamic];
 
-  // Keep combinatorial search fast when poolMode exposes full library + dynamic specs at K=4
-  if (requestedK >= 4 && searchPool.length > 36 && activeWells.length > 0) {
+  // In all_equal mode, all 4 stationary phases (SiO2, C18, Neutral Al2O3, Basic Al2O3) enter the search.
+  // Select the strongest, well-covering, polarity-diverse representatives from each phase so the
+  // combinatorial search evaluates all 4 phases on equal footing while staying fast (< 100 ms).
+  if (isAllEqual && activeWells.length > 0) {
+    const phases: ConcreteStationaryPhase[] = ['SiO2', 'C18', 'Al2O3_neutral', 'Al2O3_basic'];
+    const perPhaseCap = requestedK >= 4 ? 6 : 8;
+    const balancedPool: TlcSolventSystemDef[] = [];
+    const seenIds = new Set<string>();
+
+    for (const ph of phases) {
+      const phCandidates = searchPool.filter((s) => resolveSystemPhase(s, stationaryPhasePref) === ph);
+      if (phCandidates.length <= perPhaseCap) {
+        for (const s of phCandidates) {
+          if (!seenIds.has(s.id)) {
+            seenIds.add(s.id);
+            balancedPool.push(s);
+          }
+        }
+        continue;
+      }
+
+      // Count how many wells each candidate wins within its own phase (protects niche/orthogonal rescuers)
+      const phaseWins = new Map<string, number>();
+      for (const w of activeWells) {
+        let bestId = '';
+        let bestSc = -1;
+        for (const s of phCandidates) {
+          const sc = evalMatrix.get(s.id)!.get(w.wellIndex)!.score;
+          if (sc > bestSc) {
+            bestSc = sc;
+            bestId = s.id;
+          }
+        }
+        if (bestId && bestSc >= 0.35) {
+          phaseWins.set(bestId, (phaseWins.get(bestId) ?? 0) + 1);
+        }
+      }
+
+      const scored = phCandidates
+        .map((s) => {
+          const sysMap = evalMatrix.get(s.id)!;
+          let sum = 0;
+          let maxSc = 0;
+          for (const w of activeWells) {
+            const sc = sysMap.get(w.wellIndex)!.score;
+            sum += sc;
+            if (sc > maxSc) maxSc = sc;
+          }
+          const mean = sum / activeWells.length;
+          const wins = phaseWins.get(s.id) ?? 0;
+          const rankVal = mean + Math.min(0.35, (wins / activeWells.length) * 0.7) + (maxSc >= RESOLVED_SCORE ? 0.05 : 0);
+          return { s, mean, wins, rankVal };
+        })
+        .sort((a, b) => b.rankVal - a.rankVal);
+
+      // Seed with best candidate in each polarity band of this phase, then fill up to perPhaseCap
+      const pickedForPhase: TlcSolventSystemDef[] = [];
+      const seenBands = new Set<string>();
+      for (const item of scored) {
+        if (pickedForPhase.length >= perPhaseCap) break;
+        const b = polarityBand(item.s, stationaryPhasePref);
+        if (!seenBands.has(b) && (item.wins > 0 || item.mean >= 0.30)) {
+          seenBands.add(b);
+          pickedForPhase.push(item.s);
+        }
+      }
+      for (const item of scored) {
+        if (pickedForPhase.length >= perPhaseCap) break;
+        if (!pickedForPhase.includes(item.s)) {
+          pickedForPhase.push(item.s);
+        }
+      }
+      for (const s of pickedForPhase) {
+        if (!seenIds.has(s.id)) {
+          seenIds.add(s.id);
+          balancedPool.push(s);
+        }
+      }
+    }
+
+    if (balancedPool.length >= requestedK) {
+      searchPool = balancedPool;
+    }
+  } else if (requestedK >= 4 && searchPool.length > 36 && activeWells.length > 0) {
+    // Keep combinatorial search fast when poolMode exposes full library + dynamic specs at K=4
     const activePool = searchPool.filter((sys) => {
       const sysMap = evalMatrix.get(sys.id)!;
       let maxSc = 0;
@@ -2834,12 +3076,14 @@ export async function optimizePlateTlcSolvents(
 
   for (let sIdx = 0; sIdx < poolLen; sIdx++) {
     const sys = searchPool[sIdx];
-    let fi = famIndexMap.get(sys.family);
+    const effPhase = resolveSystemPhase(sys, stationaryPhasePref);
+    const famKey = isAllEqual ? `${effPhase}:${sys.family}` : sys.family;
+    let fi = famIndexMap.get(famKey);
     if (fi === undefined) {
       fi = famIndexMap.size;
-      famIndexMap.set(sys.family, fi);
+      famIndexMap.set(famKey, fi);
     }
-    famBit[sIdx] = 1 << fi;
+    famBit[sIdx] = 1 << (fi % 31);
 
     const bKey = polarityBand(sys, stationaryPhasePref);
     let bi = bandIndexMap.get(bKey);
@@ -2847,11 +3091,13 @@ export async function optimizePlateTlcSolvents(
       bi = bandIndexMap.size;
       bandIndexMap.set(bKey, bi);
     }
-    bandBit[sIdx] = 1 << bi;
-    primaryFlag[sIdx] = sys.preferenceTier === 'primary' ? 1 : 0;
+    bandBit[sIdx] = 1 << (bi % 31);
+    // In all_equal mode, treat C18 core eluents on equal footing with primary SiO2/Al2O3 workhorses
+    primaryFlag[sIdx] =
+      sys.preferenceTier === 'primary' || (isAllEqual && effPhase === 'C18') ? 1 : 0;
 
     if (
-      sys.stationaryPhase === 'SiO2' &&
+      effPhase === 'SiO2' &&
       ((sys.baseModifier && !plateNeedsBasicMod) || (sys.acidModifier && !plateNeedsAcidMod))
     ) {
       unneededModFlag[sIdx] = 1;
@@ -2860,24 +3106,31 @@ export async function optimizePlateTlcSolvents(
 
   const practicalityArr = new Float64Array(poolLen);
   for (let sIdx = 0; sIdx < poolLen; sIdx++) {
-    practicalityArr[sIdx] = searchPool[sIdx].descriptors?.practicalityPenalty ?? 0.15;
+    const sys = searchPool[sIdx];
+    const rawPen = sys.descriptors?.practicalityPenalty ?? 0.15;
+    // In all_equal mode, strip the C18 plate-cost surcharge (+0.35) so C18 competes strictly on separation quality
+    practicalityArr[sIdx] = isAllEqual && sys.stationaryPhase === 'C18' ? Math.max(0.05, rawPen - 0.35) : rawPen;
   }
 
-  // Pairwise redundancy combines chemical similarity (family + strength) AND empirical well-outcome overlap
-  // (Jaccard overlap of which wells each pair resolves, so two different families that resolve the exact same
-  // wells and fail the exact same hard wells are penalized for redundancy rather than rewarded).
+  // Pairwise redundancy combines chemical similarity (family + strength within same stationary phase) AND empirical
+  // well-outcome overlap (Jaccard overlap of which wells each pair resolves, so two eluents that resolve the exact
+  // same wells and fail the exact same hard wells are penalized for redundancy rather than rewarded).
   const pairPenalty = new Float64Array(poolLen * poolLen);
   for (let i = 0; i < poolLen; i++) {
     const a = searchPool[i];
+    const pa = resolveSystemPhase(a, stationaryPhasePref);
     const sa = scoreGrid[i];
     for (let j = i + 1; j < poolLen; j++) {
       const b = searchPool[j];
+      const pb = resolveSystemPhase(b, stationaryPhasePref);
       const sb = scoreGrid[j];
       let pen = 0;
-      if (a.family === b.family && Math.abs(a.strength - b.strength) < 0.16) {
-        pen = 0.065;
-      } else if (a.stationaryPhase === 'C18' && b.stationaryPhase === 'C18' && Math.abs(a.strength - b.strength) < 0.25) {
-        pen = 0.05;
+      if (pa === pb) {
+        if (a.family === b.family && Math.abs(a.strength - b.strength) < 0.16) {
+          pen = 0.065;
+        } else if (pa === 'C18' && Math.abs(a.strength - b.strength) < 0.25) {
+          pen = 0.05;
+        }
       }
       if (numActive >= 4) {
         let bothRes = 0;
@@ -3153,8 +3406,10 @@ export async function optimizePlateTlcSolvents(
     let topScore = -1;
     for (const sys of chosenSystems) {
       const sc = evalMatrix.get(sys.id)!.get(w.wellIndex)!.score;
-      const tieBias = sys.preferenceTier === 'primary' ? 0.015 : 0;
-      const prevBias = topSys.preferenceTier === 'primary' ? 0.015 : 0;
+      const tieBias =
+        sys.preferenceTier === 'primary' || (isAllEqual && sys.stationaryPhase === 'C18') ? 0.015 : 0;
+      const prevBias =
+        topSys.preferenceTier === 'primary' || (isAllEqual && topSys.stationaryPhase === 'C18') ? 0.015 : 0;
       if (sc + tieBias > topScore + prevBias) {
         topScore = sc;
         topSys = sys;
@@ -3186,18 +3441,36 @@ export async function optimizePlateTlcSolvents(
     uniqueWellsBySystem.set(sys.id, uniq);
   }
 
-  // Order final recommended plates Weak-to-Strong (SiO2 ascending strength, C18 fallback after SiO2)
-  // so Plate #1 serves as the mild SM-tracking plate and Plate #2/#3 rescue polar/ionic products.
-  const recommendedSystems = chosenSystems
-    .map((sys) =>
-      buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, bestOwnerByWell, {
-        uniqueWellIndices: uniqueWellsBySystem.get(sys.id) ?? [],
-        stationaryPhasePref,
-        calibration: options.calibration,
-      })
-    )
+  // Order final recommended plates: weak-to-strong within each stationary phase;
+  // in all_equal mode, lead with the phase covering the most wells (tie-break: SiO2 -> Basic Al2O3 -> Neutral Al2O3 -> C18).
+  const rawRecommended = chosenSystems.map((sys) =>
+    buildSystemPlanEntry(sys, 0, activeWells.length, wellDataByIdx, evalMatrix.get(sys.id)!, bestOwnerByWell, {
+      uniqueWellIndices: uniqueWellsBySystem.get(sys.id) ?? [],
+      stationaryPhasePref,
+      calibration: options.calibration,
+    })
+  );
+  const phaseAssignedTotal = new Map<ConcreteStationaryPhase, number>();
+  for (const entry of rawRecommended) {
+    const ph = resolveSystemPhase(entry.system, stationaryPhasePref);
+    phaseAssignedTotal.set(ph, (phaseAssignedTotal.get(ph) ?? 0) + entry.assignedWellIndices.length);
+  }
+  const phaseOrderRank: Record<ConcreteStationaryPhase, number> = {
+    SiO2: 0,
+    Al2O3_basic: 1,
+    Al2O3_neutral: 2,
+    C18: 3,
+  };
+  const recommendedSystems = rawRecommended
     .sort((a, b) => {
-      if (a.system.stationaryPhase !== b.system.stationaryPhase) {
+      const pa = resolveSystemPhase(a.system, stationaryPhasePref);
+      const pb = resolveSystemPhase(b.system, stationaryPhasePref);
+      if (pa !== pb) {
+        if (isAllEqual) {
+          const totDiff = (phaseAssignedTotal.get(pb) ?? 0) - (phaseAssignedTotal.get(pa) ?? 0);
+          if (totDiff !== 0) return totDiff;
+          return phaseOrderRank[pa] - phaseOrderRank[pb];
+        }
         return a.system.stationaryPhase === 'SiO2' ? -1 : 1;
       }
       if (Math.abs(a.system.strength - b.system.strength) > 0.02) {
@@ -3223,11 +3496,12 @@ export async function optimizePlateTlcSolvents(
   for (const rec of recommendedSystems) {
     const kind = baseKind(rec.system);
     if (!kind || rec.assignedWellIndices.length === 0) continue;
+    const recPhase = resolveSystemPhase(rec.system, stationaryPhasePref);
     const need = Math.ceil(rec.assignedWellIndices.length * 0.9);
     const recFlagged = rec.assignedWellIndices.filter((wi) => wellFlagged(rec.system.id, wi)).length;
     const recCap = modCapacity(rec.system);
     const alts = allCandidateSystems
-      .filter((c) => c.stationaryPhase === rec.system.stationaryPhase && !recIds.has(c.id))
+      .filter((c) => resolveSystemPhase(c, stationaryPhasePref) === recPhase && !recIds.has(c.id))
       .map((c) => {
         const k = baseKind(c);
         if (k === null) return null;
@@ -3318,8 +3592,10 @@ export async function optimizePlateTlcSolvents(
         });
       })
       .sort((a, b) => {
-        if (a.system.stationaryPhase !== b.system.stationaryPhase) {
-          return a.system.stationaryPhase === 'SiO2' ? -1 : 1;
+        const pa = resolveSystemPhase(a.system, stationaryPhasePref);
+        const pb = resolveSystemPhase(b.system, stationaryPhasePref);
+        if (pa !== pb) {
+          return phaseOrderRank[pa] - phaseOrderRank[pb];
         }
         return a.system.strength - b.system.strength;
       })
@@ -3372,7 +3648,23 @@ export async function optimizePlateTlcSolvents(
       `${unresolvedWellIndices.length} well${unresolvedWellIndices.length > 1 ? 's' : ''} not resolved in any recommended eluent (${unresolvedWellIndices.slice(0, 12).map((i) => wellLabel(i)).join(', ')}${unresolvedWellIndices.length > 12 ? ', …' : ''}); try another solvent pool or run them by LCMS.`
     );
   }
-  if (stationaryPhasePref === 'Al2O3_basic') {
+  if (stationaryPhasePref === 'all_equal') {
+    const chosenPhases = Array.from(
+      new Set(recommendedSystems.map((r) => resolveSystemPhase(r.system, stationaryPhasePref)))
+    );
+    const phaseLabels = chosenPhases.map((p) =>
+      p === 'C18'
+        ? 'Reverse-Phase C18'
+        : p === 'Al2O3_basic'
+        ? 'Basic Al₂O₃'
+        : p === 'Al2O3_neutral'
+        ? 'Neutral Al₂O₃'
+        : 'SiO₂'
+    );
+    summaryNotes.push(
+      `All stationary phases evaluated equally (SiO₂, Neutral Al₂O₃, Basic Al₂O₃, C18) — best resolution selected ${phaseLabels.join(' + ')}.`
+    );
+  } else if (stationaryPhasePref === 'Al2O3_basic') {
     summaryNotes.push('Basic Al₂O₃ mode: basic surface elutes free amines & azoles cleanly using neat organic eluents (no NH₃, Et₃N, or AcOH).');
   } else if (stationaryPhasePref === 'Al2O3_neutral') {
     summaryNotes.push('Neutral Al₂O₃ mode: silanol-free support for acid/base-sensitive & amine substrates using neat organic eluents (no NH₃, Et₃N, or AcOH).');
@@ -3401,7 +3693,10 @@ export async function optimizePlateTlcSolvents(
       w.wellCtx.acidStrength === 'strong_nonvolatile' &&
       (w.wellCtx.acidLoadEq ?? 0) >= 0.35
   );
-  if (hasStrongAcidBasicWells && stationaryPhasePref !== 'Al2O3_basic') {
+  const includesBasicAlumina = recommendedSystems.some(
+    (s) => resolveSystemPhase(s.system, stationaryPhasePref) === 'Al2O3_basic'
+  );
+  if (hasStrongAcidBasicWells && stationaryPhasePref !== 'Al2O3_basic' && !includesBasicAlumina) {
     summaryNotes.push(
       'Strong non-volatile acid (e.g. TsOH) wells protonate basic N-heterocycles/anilines into tosylate salts; 1% Et₃N (~72 mM) may be overwhelmed by acid + silica Si–OH — prefer 2M NH₃/MeOH, Basic Al₂O₃, or pre-neutralize aliquots.'
     );
@@ -3409,7 +3704,7 @@ export async function optimizePlateTlcSolvents(
   if (stationaryPhasePref === 'auto' && recommendedSystems.some((s) => s.system.stationaryPhase === 'C18')) {
     summaryNotes.push('Includes C18 Reverse-Phase TLC to rescue ultra-polar/ionizable wells orthogonal to SiO₂.');
   }
-  if (recommendedSystems.some((s) => s.system.acidModifier && s.system.stationaryPhase === 'SiO2')) {
+  if (recommendedSystems.some((s) => s.system.acidModifier && resolveSystemPhase(s.system, stationaryPhasePref) === 'SiO2')) {
     summaryNotes.push('Includes 1% AcOH mobile phase to sharpen carboxylic acid spots.');
   }
 
@@ -3417,7 +3712,7 @@ export async function optimizePlateTlcSolvents(
     summaryNotes.push('Includes Nyiredy PRISMA ternary eluent to break co-eluting regioisomer/HBA overlaps.');
   }
 
-  const primaryPhaseKey: TlcStationaryPhasePreference =
+  let primaryPhaseKey: ConcreteStationaryPhase =
     stationaryPhasePref === 'C18'
       ? 'C18'
       : stationaryPhasePref === 'Al2O3_neutral'
@@ -3425,6 +3720,23 @@ export async function optimizePlateTlcSolvents(
       : stationaryPhasePref === 'Al2O3_basic'
       ? 'Al2O3_basic'
       : 'SiO2';
+  if (isAllEqual && options.calibration) {
+    const candidateKeys: ConcreteStationaryPhase[] = [
+      ...recommendedSystems.map((r) => resolveSystemPhase(r.system, stationaryPhasePref)),
+      'SiO2',
+      'Al2O3_basic',
+      'Al2O3_neutral',
+      'C18',
+    ];
+    for (const key of candidateKeys) {
+      const f = options.calibration.byPhase[key];
+      const ev = (f?.pairedSpotCount ?? 0) + (f?.frontCensoredCount ?? 0) + (f?.baselineCensoredCount ?? 0);
+      if (f && ev > 0) {
+        primaryPhaseKey = key;
+        break;
+      }
+    }
+  }
   const activePhaseFit = options.calibration?.byPhase[primaryPhaseKey];
   const matchedPhasePlates = (options.calibration?.plates || []).filter(
     (p) => p.stationaryPhase === primaryPhaseKey && (p.pairedCount > 0 || (p.frontCensoredCount ?? 0) > 0 || (p.baselineCensoredCount ?? 0) > 0)
@@ -3484,7 +3796,9 @@ export async function optimizePlateTlcSolvents(
   const relevantMeasuredPlates = (options.calibration?.plates || []).filter(
     (p) =>
       p.plateIndex === plateIndex &&
-      (stationaryPhasePref === 'auto' ? true : p.stationaryPhase === primaryPhaseKey)
+      (stationaryPhasePref === 'auto' || stationaryPhasePref === 'all_equal'
+        ? true
+        : p.stationaryPhase === primaryPhaseKey)
   );
 
   if (relevantMeasuredPlates.length > 0 && activeWells.length > 0) {
@@ -3633,13 +3947,14 @@ export async function optimizePlateTlcSolvents(
           const afterRfs: number[] = [];
 
           for (const wi of remaining) {
+            const candPhase = resolveSystemPhase(sys, stationaryPhasePref);
             // Respect empirical boundary exclusions from failed measured plates
             const fCeil = frontCeilingByWell.get(wi);
-            if (frontCrowdedSet.has(wi) && fCeil !== undefined && sys.stationaryPhase === 'SiO2' && sys.strength >= fCeil - 0.025) {
+            if (frontCrowdedSet.has(wi) && fCeil !== undefined && candPhase === 'SiO2' && sys.strength >= fCeil - 0.025) {
               continue;
             }
             const bFloor = baseFloorByWell.get(wi);
-            if (baselinePinnedSet.has(wi) && bFloor !== undefined && sys.stationaryPhase === 'SiO2' && sys.strength <= bFloor + 0.025 && !sys.baseModifier && !sys.acidModifier) {
+            if (baselinePinnedSet.has(wi) && bFloor !== undefined && candPhase === 'SiO2' && sys.strength <= bFloor + 0.025 && !sys.baseModifier && !sys.acidModifier) {
               continue;
             }
 
@@ -3647,7 +3962,7 @@ export async function optimizePlateTlcSolvents(
             if (!evalRes || evalRes.score < RESOLVED_SCORE) continue;
 
             // If this well empirically tailed on a previous plate, require a cleaner eluent (higher modifier capacity,
-            // protic MeOH/modifier switch, or C18) that does not predict tailing here. When front-crowding is the
+            // protic MeOH/modifier switch, Basic Al2O3, or C18) that does not predict tailing here. When front-crowding is the
             // primary failure on a neutral non-ionizable well, let weaker neutral eluents rescue it freely.
             if (tailingSet.has(wi)) {
               const wellObj = wellDataByIdx.get(wi);
@@ -3658,7 +3973,8 @@ export async function optimizePlateTlcSolvents(
                 const candCap = sys.descriptors?.modifierCapacity ?? 0;
                 const predictsTailing = evalRes.spots.some((sp) => sp.tailing);
                 const improvedBuffering =
-                  sys.stationaryPhase === 'C18' ||
+                  candPhase === 'C18' ||
+                  candPhase === 'Al2O3_basic' ||
                   candCap > prevCap + 0.05 ||
                   (prevCap === 0 && (Boolean(sys.baseModifier) || Boolean(sys.acidModifier) || sys.alcoholPct >= 5));
                 if (predictsTailing || !improvedBuffering) continue;
@@ -3689,7 +4005,8 @@ export async function optimizePlateTlcSolvents(
           }
 
           if (rescued.length === 0) continue;
-          const tierBonus = sys.preferenceTier === 'primary' ? 0.25 : 0;
+          const tierBonus =
+            sys.preferenceTier === 'primary' || (isAllEqual && sys.stationaryPhase === 'C18') ? 0.25 : 0;
           const scoreRank = weightedGain + tierBonus;
           if (scoreRank > bestGain) {
             bestGain = scoreRank;

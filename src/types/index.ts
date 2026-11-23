@@ -359,9 +359,11 @@ export interface TlcSpot {
   widthFrac?: number;
   /** Chromatographic asymmetry / tailing factor (~1.0 symmetric, >1.5 tailing/fronting) */
   tailing?: number;
-  /** Which spot detector produced this spot ('2d' watershed segmentation or '1d' legacy fallback) */
-  detector?: '2d' | '1d';
+  /** Which spot detector produced this spot ('2d' watershed segmentation, 'densitogram' cutoff peak picker, or '1d' legacy fallback) */
+  detector?: TlcSpotDetectorMode;
 }
+
+export type TlcSpotDetectorMode = '2d' | 'densitogram' | '1d';
 
 export interface ProfileHistogramStats {
   bgMode: number;
@@ -427,8 +429,10 @@ export interface TlcProfileOptions {
   plateHistogram?: ProfileHistogramStats;
   /** Optional 2D lateral lane strip metrics for neighbor-spillover & horizontal-band artifact rejection */
   lane2d?: Lane2dMetrics;
-  /** Spot detection engine: '2d' (default when spotMap2d is available) or '1d' (legacy fallback) */
-  detectorMode?: '2d' | '1d';
+  /** Optional plate-wide near-front background profile (41 Rf bins covering Rf 0.80..1.00) for meniscus vs real high-Rf spot separation */
+  frontBandBg?: number[];
+  /** Spot detection engine: '2d' (default when spotMap2d is available), 'densitogram' (direct densitogram cutoff peak picker), or '1d' (legacy fallback) */
+  detectorMode?: TlcSpotDetectorMode;
 }
 
 export interface TlcDensitogramPoint {
@@ -447,6 +451,12 @@ export interface TlcDensitogramData {
   front: number;
   maxSignal: number;
   totalArea: number;
+  /** Active intensity cutoff threshold when detectorMode === 'densitogram' (for plotting the cutoff guide line) */
+  densitogramCutoff?: number;
+  /** Plate contrast span used to calibrate densitogramCutoff (for 1-to-1 draggable cutoff conversion) */
+  densitogramPlateSpan?: number;
+  /** Minimum noise floor used to calibrate densitogramCutoff */
+  densitogramNoiseFloor?: number;
 }
 
 export interface TlcImageEntry {
@@ -509,8 +519,8 @@ export interface TlcPlateData {
   edgePicks?: EdgePick[];
   edgeSettings?: Record<number, EdgeSetting>;
   spotProminence?: number;
-  /** Spot detection mode ('2d' watershed segmentation default, or '1d' legacy fallback for A/B comparison) */
-  spotDetectorMode?: '2d' | '1d';
+  /** Spot detection mode ('2d' watershed segmentation default, 'densitogram' cutoff peak picker, or '1d' legacy fallback) */
+  spotDetectorMode?: TlcSpotDetectorMode;
 }
 
 export interface TlcSet extends TlcPlateData {

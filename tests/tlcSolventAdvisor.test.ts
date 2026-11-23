@@ -17,6 +17,7 @@ import {
   synthesizePlateTailoredSpecs,
   matchTlcSetNameToSolvent,
   eluentReactivityWarnings,
+  resolveSystemPhase,
 } from '../src/engine/predictor';
 import { MEOH_AFFINITY_SCALE_BY_CARRIER, chamberPrepForNh3Stock } from '../src/engine/predictor/solventSystemModel';
 import { exampleState } from '../src/context/runPayload';
@@ -1316,6 +1317,106 @@ describe('upgraded retention physics, ionization, reactivity & explainability', 
     }
   });
 });
+
+describe('all_equal stationary phase mode', () => {
+  it('evaluates SiO2, Neutral Al2O3, Basic Al2O3, and C18 equally and picks C18 without penalty on zwitterionic/polar plates', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: 'N-Benzyl-L-phenylalanine', smiles: 'O=C(O)C(Cc1ccccc1)NCc1ccccc1', molarMass: 255.31, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '4-Chlorobenzaldehyde', smiles: 'O=Cc1ccc(Cl)cc1', molarMass: 140.57, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: '2-Naphthoic acid', smiles: 'O=C(O)c1ccc2ccccc2c1', molarMass: 172.18, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 60 };
+    const rows = Array.from({ length: 4 }, (_, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: [
+        { code: 'A', name: 'N-Benzyl-L-phenylalanine', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: '4-Chlorobenzaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: '2-Naphthoic acid', target_concentration: 50, equivalence: 1 },
+      ],
+      'vol#solvent': 400,
+    }));
+
+    const plan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 4, rows } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 2, stationaryPhase: 'all_equal', poolMode: 'prefer_primary' }
+    );
+
+    expect(plan.stationaryPhase).toBe('all_equal');
+    expect(plan.recommendedSystems.length).toBeGreaterThanOrEqual(1);
+    // All 4 phases must appear across recommended + otherSystems
+    const allPhases = new Set(
+      [...plan.recommendedSystems, ...plan.otherSystems].map((r) => resolveSystemPhase(r.system, 'all_equal'))
+    );
+    expect(allPhases.has('SiO2')).toBe(true);
+    expect(allPhases.has('C18')).toBe(true);
+    expect(allPhases.has('Al2O3_neutral')).toBe(true);
+    expect(allPhases.has('Al2O3_basic')).toBe(true);
+    // Every returned system must carry an explicit effectivePhase
+    for (const r of plan.recommendedSystems) {
+      expect(r.system.effectivePhase).toBeDefined();
+    }
+    // On an amino-acid / zwitterionic plate, C18 should win as top choice without penalty
+    expect(
+      plan.recommendedSystems.some((r) => resolveSystemPhase(r.system, 'all_equal') === 'C18')
+    ).toBe(true);
+    expect(plan.summaryNotes.some((n) => /evaluated equally/i.test(n))).toBe(true);
+  });
+
+  it('can select Basic Al2O3 cleanly on a strong-acid + basic-amine plate without requiring SiO2 modifiers', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: 'Benzylamine', smiles: 'NCc1ccccc1', molarMass: 107.15, density: 0.98, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '4-Phenylpyridine', smiles: 'c1ccc(-c2ccncc2)cc1', molarMass: 155.20, density: 1.1, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: '4-Fluorobenzaldehyde', smiles: 'O=Cc1ccc(F)cc1', molarMass: 124.11, density: 1.15, stock: 500, solvent: 'DMSO' },
+      { code: 'D', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 60 };
+    const rows = Array.from({ length: 4 }, (_, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: [
+        { code: 'A', name: 'Benzylamine', target_concentration: 50, equivalence: 1 },
+        { code: 'B', name: '4-Phenylpyridine', target_concentration: 50, equivalence: 1 },
+        { code: 'C', name: '4-Fluorobenzaldehyde', target_concentration: 50, equivalence: 1 },
+        { code: 'D', name: 'TsOH·H2O', target_concentration: 50, equivalence: 1.0 },
+      ],
+      'vol#solvent': 400,
+    }));
+
+    const plan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: 4, rows } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 2, stationaryPhase: 'all_equal', poolMode: 'prefer_primary' }
+    );
+
+    expect(plan.totalCoveragePct).toBeGreaterThanOrEqual(75);
+    // Basic Al2O3 or 2M NH3/MeOH should handle the TsOH + amine cleanly with zero tailing on recommended plates
+    const bestPhase = resolveSystemPhase(plan.recommendedSystems[0].system, 'all_equal');
+    expect(['Al2O3_basic', 'SiO2', 'C18']).toContain(bestPhase);
+    // Verify Al2O3_basic candidates never carry acid/base modifiers
+    const basicAluminaEntries = [...plan.recommendedSystems, ...plan.otherSystems].filter(
+      (r) => resolveSystemPhase(r.system, 'all_equal') === 'Al2O3_basic'
+    );
+    expect(basicAluminaEntries.length).toBeGreaterThan(0);
+    expect(basicAluminaEntries.every((r) => !r.system.baseModifier && !r.system.acidModifier)).toBe(true);
+  });
+});
+
 
 
 

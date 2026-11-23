@@ -5,7 +5,9 @@ import {
   containerOfLane,
   findSpots,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getLane2dMetrics,
+  tlcHalf,
   TLC_SIGNAL,
   TlcChannelKey,
   tlcFront,
@@ -17,6 +19,7 @@ import { extractWellForPrediction } from './plateBridge';
 import { predictWellReactions } from './engine';
 import {
   buildWellTlcContext,
+  CalibratedCompoundSummary,
   CalibratedLaneComparison,
   CalibratedPlateSummary,
   computeCalibrationFeatureVector,
@@ -479,6 +482,7 @@ export function extractMeasuredWellSpotsForSet(
             minProminence: spotProm,
             plateHistogram: getChannelHistogram(setSlice, ch, getProf),
             lane2d: getLane2dMetrics(setSlice, ch, lane),
+            frontBandBg: getChannelFrontBandProfile(setSlice, ch, tlcHalf(lane), getProf),
             detectorMode: setSlice.spotDetectorMode,
           });
           for (const sp of chSpots) {
@@ -755,6 +759,381 @@ function pairMeasuredAndPredictedSpots(
   return bestPairs.map(({ oi, pi }) => ({ obs: obs[oi], pred: dedupPreds[pi] }));
 }
 
+interface PlateWellCollection {
+  wIdx: number;
+  measuredWell: MeasuredWellSpots | undefined;
+  anchors: PredAnchor[];
+  obsSpots: MeasuredTlcSpot[];
+}
+
+export interface CrossWellConsensusLock {
+  compoundKey: string;
+  observedRfMean: number;
+  observedRfSpread: number;
+  matchedWells: number;
+  totalWells: number;
+  precision: number;
+  youdenJ: number;
+  channels?: TlcChannelKey[];
+}
+
+/**
+ * Stage 1 plate-wide cross-well compound consensus matching.
+ * Uses presence/absence across all 54 wells (plus spot Rf consistency & channel signature) to
+ * identify shared compounds even when raw predicted Rf is off by 0.25–0.45 Rf (beyond the
+ * per-well ±0.24 Rf gate).
+ */
+function inferCrossWellConsensusLocks(
+  wells: PlateWellCollection[]
+): Map<string, CrossWellConsensusLock> {
+  const locks = new Map<string, CrossWellConsensusLock>();
+  const isInterior = (rf: number) => rf > 0.05 && rf < 0.92;
+
+  const activeWells = wells.filter((w) => w.obsSpots.some((sp) => isInterior(sp.rf)));
+  if (activeWells.length < 4) return locks;
+
+  // 1. Collect per-compound presence across active wells
+  interface CompoundInfo {
+    key: string;
+    kind: 'substrate' | 'product';
+    wellIndices: Set<number>;
+    predRfSum: number;
+    predRfCount: number;
+    aromaticRings: number;
+  }
+  const compMap = new Map<string, CompoundInfo>();
+  for (const w of activeWells) {
+    const seenInWell = new Map<string, PredAnchor>();
+    for (const a of w.anchors) {
+      const ck = a.profile.canonicalSmiles || a.profile.smiles;
+      if (!ck) continue;
+      const prev = seenInWell.get(ck);
+      if (!prev || (a.kind === 'substrate' && prev.kind !== 'substrate')) {
+        seenInWell.set(ck, a);
+      }
+    }
+    for (const [ck, a] of seenInWell.entries()) {
+      let info = compMap.get(ck);
+      if (!info) {
+        info = {
+          key: ck,
+          kind: a.kind,
+          wellIndices: new Set(),
+          predRfSum: 0,
+          predRfCount: 0,
+          aromaticRings: a.profile.aromaticRings || 0,
+        };
+        compMap.set(ck, info);
+      }
+      if (a.kind === 'substrate') info.kind = 'substrate';
+      info.wellIndices.add(w.wIdx);
+      info.predRfSum += a.rf;
+      info.predRfCount++;
+      if ((a.profile.aromaticRings || 0) > info.aromaticRings) {
+        info.aromaticRings = a.profile.aromaticRings || 0;
+      }
+    }
+  }
+
+  const candidateComps = Array.from(compMap.values()).filter((c) => c.wellIndices.size >= 3);
+  if (candidateComps.length === 0) return locks;
+
+  // 2. Discover candidate plate-wide Rf bands from all interior measured spots
+  const allObs: Array<{ wIdx: number; spot: TlcSpot }> = [];
+  for (const w of activeWells) {
+    for (const sp of w.obsSpots) {
+      if (isInterior(sp.rf)) allObs.push({ wIdx: w.wIdx, spot: sp });
+    }
+  }
+  allObs.sort((a, b) => a.spot.rf - b.spot.rf);
+
+  // 0.052 radius accommodates slight top-vs-bottom bowing across 54 lanes on a 20 cm HTE plate
+  const BAND_RADIUS = 0.052;
+  interface RfBand {
+    id: number;
+    centerRf: number;
+    wellSpots: Map<number, TlcSpot>;
+  }
+  const rawCenters: number[] = [];
+  for (let i = 0; i < allObs.length; i++) {
+    const rf = allObs[i].spot.rf;
+    let cnt = 0;
+    const wSeen = new Set<number>();
+    for (let j = i; j >= 0 && rf - allObs[j].spot.rf <= BAND_RADIUS; j--) {
+      if (!wSeen.has(allObs[j].wIdx)) {
+        wSeen.add(allObs[j].wIdx);
+        cnt++;
+      }
+    }
+    for (let j = i + 1; j < allObs.length && allObs[j].spot.rf - rf <= BAND_RADIUS; j++) {
+      if (!wSeen.has(allObs[j].wIdx)) {
+        wSeen.add(allObs[j].wIdx);
+        cnt++;
+      }
+    }
+    if (cnt >= 3) rawCenters.push(rf);
+  }
+
+  // Merge nearby candidate centers into distinct horizontal Rf bands
+  const bands: RfBand[] = [];
+  let cIdx = 0;
+  while (cIdx < rawCenters.length) {
+    let end = cIdx;
+    while (end + 1 < rawCenters.length && rawCenters[end + 1] - rawCenters[cIdx] <= 0.044) {
+      end++;
+    }
+    const seedRf = rawCenters[Math.floor((cIdx + end) / 2)];
+    const wellSpots = new Map<number, TlcSpot>();
+    for (const { wIdx, spot } of allObs) {
+      if (Math.abs(spot.rf - seedRf) <= BAND_RADIUS) {
+        const cur = wellSpots.get(wIdx);
+        if (!cur || Math.abs(spot.rf - seedRf) < Math.abs(cur.rf - seedRf)) {
+          wellSpots.set(wIdx, spot);
+        }
+      }
+    }
+    if (wellSpots.size >= 3) {
+      const rfs = Array.from(wellSpots.values())
+        .map((s) => s.rf)
+        .sort((a, b) => a - b);
+      const medRf = rfs[Math.floor(rfs.length / 2)];
+      if (!bands.some((b) => Math.abs(b.centerRf - medRf) < 0.032)) {
+        bands.push({ id: bands.length, centerRf: medRf, wellSpots });
+      }
+    }
+    cIdx = end + 1;
+  }
+  if (bands.length === 0) return locks;
+
+  // 3. Score (compound, band) candidates under presence/absence discrimination OR universal-substrate mode
+  interface ScoredEdge {
+    comp: CompoundInfo;
+    band: RfBand;
+    meanPredRf: number;
+    tp: number;
+    fp: number;
+    recall: number;
+    precision: number;
+    youdenJ: number;
+    score: number;
+  }
+  const frontOccupiedFrac =
+    activeWells.filter((w) => w.measuredWell?.frontOccupied).length / Math.max(1, activeWells.length);
+  const originOccupiedFrac =
+    activeWells.filter((w) => w.measuredWell?.originOccupied).length / Math.max(1, activeWells.length);
+
+  const isNearUniversalSubstrate = (c: CompoundInfo): boolean => {
+    if (c.kind !== 'substrate' || c.wellIndices.size < 6) return false;
+    const neg = activeWells.length - c.wellIndices.size;
+    return neg < 2 || (c.wellIndices.size >= 12 && c.wellIndices.size / activeWells.length >= 0.88);
+  };
+  const isExpectedBoundary = (meanPredRf: number): boolean =>
+    (frontOccupiedFrac >= 0.40 && meanPredRf >= 0.78) ||
+    (originOccupiedFrac >= 0.40 && meanPredRf <= 0.16);
+
+  // Exclude boundary-pinned / front-saturated universal substrates so dark origin deposits or
+  // nonpolar front-running partners never block interior universal substrates (e.g. 2'-hydroxyacetophenone)
+  const interiorUniversalComps = candidateComps
+    .filter((c) => {
+      if (!isNearUniversalSubstrate(c)) return false;
+      const mPred = c.predRfSum / Math.max(1, c.predRfCount);
+      return !isExpectedBoundary(mPred);
+    })
+    .sort((a, b) => a.predRfSum / Math.max(1, a.predRfCount) - b.predRfSum / Math.max(1, b.predRfCount));
+  const universalBands = bands
+    .filter((b) => b.wellSpots.size >= Math.max(6, Math.ceil(activeWells.length * 0.6)))
+    .sort((a, b) => a.centerRf - b.centerRf);
+
+  const edges: ScoredEdge[] = [];
+  for (const comp of candidateComps) {
+    const P = comp.wellIndices.size;
+    const N = activeWells.length - P;
+    const meanPredRf = comp.predRfSum / Math.max(1, comp.predRfCount);
+    const nearUniv = isNearUniversalSubstrate(comp);
+
+    for (const band of bands) {
+      let tp = 0;
+      let fp = 0;
+      for (const wIdx of band.wellSpots.keys()) {
+        if (comp.wellIndices.has(wIdx)) tp++;
+        else fp++;
+      }
+      if (tp < 3) continue;
+      const recall = tp / P;
+      const precision = tp / Math.max(1, tp + fp);
+      const rfGap = Math.abs(band.centerRf - meanPredRf);
+
+      let addedDiscrim = false;
+      if (N >= 2) {
+        // Discriminatory presence/absence mode
+        const fpRate = fp / N;
+        const youdenJ = recall - fpRate;
+        const minPrec = comp.kind === 'substrate' ? 0.70 : 0.75;
+        const minJ = comp.kind === 'substrate' ? 0.45 : 0.50;
+        if (recall >= 0.45 && precision >= minPrec && youdenJ >= minJ && rfGap <= 0.48) {
+          // Substrates are physically dispensed into wells while predicted products are hypothetical;
+          // give substrates decisive priority so a speculative product near Rf 0.70 cannot steal an SM band.
+          const score =
+            0.55 * youdenJ +
+            0.30 * precision +
+            0.15 * Math.max(0, 1 - rfGap / 0.50) +
+            (comp.kind === 'substrate' ? 0.25 : 0);
+          edges.push({ comp, band, meanPredRf, tp, fp, recall, precision, youdenJ, score });
+          addedDiscrim = true;
+        }
+      }
+
+      if (!addedDiscrim && nearUniv && !isExpectedBoundary(meanPredRf)) {
+        // Universal / near-universal substrate mode (e.g. fixed substrate present in 88-100% of wells).
+        if (recall >= 0.60 && tp >= 6 && rfGap <= 0.45) {
+          const boundaryAmbiguous =
+            (frontOccupiedFrac >= 0.45 && meanPredRf >= 0.76 && band.centerRf < meanPredRf - 0.04) ||
+            (originOccupiedFrac >= 0.45 && meanPredRf <= 0.20 && band.centerRf > meanPredRf + 0.04);
+          if (boundaryAmbiguous) continue;
+
+          if (interiorUniversalComps.length === 1) {
+            const closerCompeting = universalBands.some(
+              (ob) => ob.id !== band.id && Math.abs(ob.centerRf - meanPredRf) + 0.08 < rfGap
+            );
+            const soleDominantBand =
+              recall >= 0.80 &&
+              universalBands.filter((ob) => ob.wellSpots.size >= Math.ceil(activeWells.length * 0.8)).length === 1;
+            if (!closerCompeting && (universalBands.length <= 2 || soleDominantBand)) {
+              const score = 0.60 * recall + 0.35 * Math.max(0, 1 - rfGap / 0.48) + 0.25;
+              edges.push({ comp, band, meanPredRf, tp, fp, recall, precision, youdenJ: recall, score });
+            }
+          } else if (
+            interiorUniversalComps.length >= 2 &&
+            universalBands.length === interiorUniversalComps.length
+          ) {
+            const compRank = interiorUniversalComps.findIndex((c) => c.key === comp.key);
+            const bandRank = universalBands.findIndex((b) => b.id === band.id);
+            if (compRank >= 0 && compRank === bandRank) {
+              const score = 0.60 * recall + 0.35 * Math.max(0, 1 - rfGap / 0.48) + 0.25;
+              edges.push({ comp, band, meanPredRf, tp, fp, recall, precision, youdenJ: recall, score });
+            }
+          } else if (
+            interiorUniversalComps.length >= 2 &&
+            universalBands.length === 1 &&
+            universalBands[0].id === band.id &&
+            recall >= 0.75 &&
+            rfGap <= 0.42
+          ) {
+            // Multiple interior universal substrates but ONLY ONE universal band exists on the plate
+            // (e.g. partner substrate was consumed or lacks strong UV254 chromophore):
+            // lock only if this substrate is unambiguously the closest or the sole aromatic chromophore.
+            const otherGaps = interiorUniversalComps
+              .filter((c) => c.key !== comp.key)
+              .map((c) => Math.abs(band.centerRf - c.predRfSum / Math.max(1, c.predRfCount)));
+            const bestOtherGap = Math.min(...otherGaps);
+            const strictlyClosest = rfGap + 0.06 < bestOtherGap;
+            const uniquelyAromatic =
+              comp.aromaticRings > 0 &&
+              interiorUniversalComps.every((c) => c.key === comp.key || c.aromaticRings === 0);
+            if (strictlyClosest || uniquelyAromatic) {
+              const score = 0.55 * recall + 0.30 * Math.max(0, 1 - rfGap / 0.45) + 0.25;
+              edges.push({ comp, band, meanPredRf, tp, fp, recall, precision, youdenJ: recall, score });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  edges.sort((a, b) => b.score - a.score);
+
+  // 4. Greedy conflict-free lock selection (co-occurring compounds cannot share the same Rf band or cross order)
+  const chosen: Array<{ edge: ScoredEdge; obsMean: number; obsSpread: number; channels?: TlcChannelKey[] }> = [];
+  const lockedComps = new Set<string>();
+
+  const sharedWellCount = (a: Set<number>, b: Set<number>): number => {
+    let cnt = 0;
+    for (const x of a) if (b.has(x)) cnt++;
+    return cnt;
+  };
+
+  for (const edge of edges) {
+    if (lockedComps.has(edge.comp.key)) continue;
+
+    // Prevent co-occurring compounds from claiming the same Rf band, and preserve predicted Rf
+    // order when presence/absence across distinct wells cannot independently prove an inversion.
+    let conflict = false;
+    for (const prev of chosen) {
+      const overlap = sharedWellCount(edge.comp.wellIndices, prev.edge.comp.wellIndices);
+      if (overlap >= 2) {
+        if (Math.abs(edge.band.centerRf - prev.edge.band.centerRf) < 0.04) {
+          conflict = true;
+          break;
+        }
+        const sameWellMask =
+          overlap === edge.comp.wellIndices.size && overlap === prev.edge.comp.wellIndices.size;
+        const stronglyDiscriminated =
+          !sameWellMask &&
+          edge.youdenJ >= 0.65 &&
+          edge.precision >= 0.80 &&
+          prev.edge.youdenJ >= 0.65 &&
+          prev.edge.precision >= 0.80;
+        if (!stronglyDiscriminated) {
+          const predDiff = edge.meanPredRf - prev.edge.meanPredRf;
+          const obsDiff = edge.band.centerRf - prev.edge.band.centerRf;
+          if (Math.abs(predDiff) >= 0.14 && predDiff * obsDiff < 0 && Math.abs(obsDiff) >= 0.08) {
+            conflict = true;
+            break;
+          }
+        }
+      }
+    }
+    if (conflict) continue;
+
+    // Compute exact observed Rf mean, spread, and dominant channels over this compound's wells
+    const matchedSpots: TlcSpot[] = [];
+    for (const wIdx of edge.comp.wellIndices) {
+      const sp = edge.band.wellSpots.get(wIdx);
+      if (sp) matchedSpots.push(sp);
+    }
+    if (matchedSpots.length < 3) continue;
+
+    const meanRf = matchedSpots.reduce((s, sp) => s + sp.rf, 0) / matchedSpots.length;
+    const varRf =
+      matchedSpots.reduce((s, sp) => s + (sp.rf - meanRf) ** 2, 0) / matchedSpots.length;
+    const spreadRf = Math.sqrt(varRf);
+
+    const chCounts = new Map<TlcChannelKey, number>();
+    for (const sp of matchedSpots) {
+      for (const ch of sp.channels || []) {
+        chCounts.set(ch, (chCounts.get(ch) ?? 0) + 1);
+      }
+    }
+    const domChannels: TlcChannelKey[] = [];
+    for (const [ch, c] of chCounts.entries()) {
+      if (c >= matchedSpots.length * 0.4) domChannels.push(ch);
+    }
+
+    lockedComps.add(edge.comp.key);
+    chosen.push({
+      edge,
+      obsMean: Math.round(meanRf * 1000) / 1000,
+      obsSpread: Math.round(spreadRf * 1000) / 1000,
+      ...(domChannels.length > 0 ? { channels: domChannels } : {}),
+    });
+  }
+
+  for (const item of chosen) {
+    locks.set(item.edge.comp.key, {
+      compoundKey: item.edge.comp.key,
+      observedRfMean: item.obsMean,
+      observedRfSpread: item.obsSpread,
+      matchedWells: item.edge.tp,
+      totalWells: item.edge.comp.wellIndices.size,
+      precision: Math.round(item.edge.precision * 1000) / 1000,
+      youdenJ: Math.round(item.edge.youdenJ * 1000) / 1000,
+      ...(item.channels ? { channels: item.channels } : {}),
+    });
+  }
+
+  return locks;
+}
+
 export interface CalibrateTlcParams {
   rdkit: any;
   state: RunState;
@@ -843,6 +1222,13 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
   const pairsByPhase = new Map<TlcStationaryPhasePreference, RawPairRecord[]>();
   const censoredByPhase = new Map<TlcStationaryPhasePreference, CensoredBoundaryRecord[]>();
   const plateAnchorProfiles = new Map<number, Map<number, TlcMolProfile[]>>();
+  const plateCompoundMeta = new Map<
+    number,
+    {
+      wellsPresentByCompound: Map<string, Set<number>>;
+      consensusLocks: Map<string, CrossWellConsensusLock>;
+    }
+  >();
   const plateLevelByPhase = new Map<
     TlcStationaryPhasePreference,
     Array<{ family: SolventFamily; shift: number; n: number; obsCount: number }>
@@ -891,7 +1277,10 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       const platePredSmRf: number[] = [];
       const laneCompMap = new Map<number, CalibratedLaneComparison>();
       const laneProfilesMap = new Map<number, TlcMolProfile[]>();
+      const collectedWells: PlateWellCollection[] = [];
+      const wellsPresentByCompound = new Map<string, Set<number>>();
 
+      // Pass A: Extract predicted anchors & observed spots for all 54 wells on this plate
       for (let wIdx = 0; wIdx < PLATE_SIZE; wIdx++) {
         const measuredWell = extracted.wells.get(wIdx);
         const r = plateRows.get(wIdx);
@@ -1009,28 +1398,182 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         }
         laneProfilesMap.set(wIdx, anchors.map((a) => a.profile));
 
+        for (const a of anchors) {
+          const ck = a.profile.canonicalSmiles || a.profile.smiles;
+          if (!ck) continue;
+          let ws = wellsPresentByCompound.get(ck);
+          if (!ws) {
+            ws = new Set();
+            wellsPresentByCompound.set(ck, ws);
+          }
+          ws.add(wIdx);
+        }
+
         const obsSpots = measuredWell?.spots || [];
         for (const sp of obsSpots) plateObsRf.push(sp.rf);
         for (const a of anchors) if (a.kind === 'substrate') platePredSmRf.push(a.rf);
-        const matchedPairs = pairMeasuredAndPredictedSpots(obsSpots, anchors);
-        const pairedByObs = new Map<TlcSpot, PredAnchor>();
-        const pairedByPred = new Map<PredAnchor, TlcSpot>();
-        const isFrontPegged = (rf: number) => rf >= 0.92;
-        const isBasePegged = (rf: number) => rf <= 0.05;
+        collectedWells.push({ wIdx, measuredWell, anchors, obsSpots });
+      }
 
-        for (const { obs, pred: pAnchor } of matchedPairs) {
-          pairedByObs.set(obs, pAnchor);
-          pairedByPred.set(pAnchor, obs);
+      // Stage 1: Infer plate-wide cross-well compound consensus locks before per-well pairing
+      const consensusLocks = inferCrossWellConsensusLocks(collectedWells);
+      let plateConsensusMatchCount = 0;
+
+      // Pass B1: Pair each well using consensus locks first, then conservative per-well DP matching
+      const isFrontPegged = (rf: number) => rf >= 0.92;
+      const isBasePegged = (rf: number) => rf <= 0.05;
+
+      interface WellMatchBundle {
+        well: PlateWellCollection;
+        matchedPairs: Array<{
+          obs: TlcSpot;
+          pred: PredAnchor;
+          matchMethod: 'consensus' | 'per_well';
+          consensusWellCount?: number;
+          consensusTotalWells?: number;
+        }>;
+      }
+      const wellMatchBundles: WellMatchBundle[] = [];
+
+      for (const well of collectedWells) {
+        const { anchors, obsSpots } = well;
+        const usedObs = new Set<TlcSpot>();
+        const usedPred = new Set<PredAnchor>();
+        const matchedPairs: WellMatchBundle['matchedPairs'] = [];
+
+        // 1. Apply cross-well consensus locks closest-distance-first so a consumed compound never
+        // steals a neighboring locked compound's spot due to arbitrary anchor ordering.
+        const consensusCandidates: Array<{
+          anc: PredAnchor;
+          sp: TlcSpot;
+          dist: number;
+          lock: CrossWellConsensusLock;
+        }> = [];
+        for (const anc of anchors) {
+          const ck = anc.profile.canonicalSmiles || anc.profile.smiles;
+          const lock = ck ? consensusLocks.get(ck) : undefined;
+          if (!lock) continue;
+          // Once a compound's true Rf band is confirmed across the plate, never let Stage 2 steal a
+          // completely different Rf spot (e.g. a reaction product) in wells where this compound was consumed.
+          usedPred.add(anc);
+          const maxRadius = Math.min(0.062, Math.max(0.042, lock.observedRfSpread * 3 + 0.025));
+          for (const sp of obsSpots) {
+            if (isFrontPegged(sp.rf) || isBasePegged(sp.rf)) continue;
+            const d = Math.abs(sp.rf - lock.observedRfMean);
+            if (d <= maxRadius) {
+              consensusCandidates.push({ anc, sp, dist: d, lock });
+            }
+          }
+        }
+        consensusCandidates.sort((a, b) => a.dist - b.dist);
+        const matchedConsensusAnc = new Set<PredAnchor>();
+        for (const cand of consensusCandidates) {
+          if (matchedConsensusAnc.has(cand.anc) || usedObs.has(cand.sp)) continue;
+          matchedConsensusAnc.add(cand.anc);
+          usedObs.add(cand.sp);
+          matchedPairs.push({
+            obs: cand.sp,
+            pred: cand.anc,
+            matchMethod: 'consensus',
+            consensusWellCount: cand.lock.matchedWells,
+            consensusTotalWells: cand.lock.totalWells,
+          });
+          plateConsensusMatchCount++;
+        }
+
+        // 2. Per-well order-preserving DP matching for remaining unmatched spots & anchors
+        const remObs = obsSpots.filter((sp) => !usedObs.has(sp));
+        const remAnchors = anchors.filter((a) => !usedPred.has(a));
+        for (const p of pairMeasuredAndPredictedSpots(remObs, remAnchors)) {
+          matchedPairs.push({ obs: p.obs, pred: p.pred, matchMethod: 'per_well' });
+        }
+
+        wellMatchBundles.push({ well, matchedPairs });
+      }
+
+      // Pass B2: Sparse-substrate anti-hallucination guard.
+      // If an unlocked substrate is present in >= 10 active wells, Stage 2 only matched it in a tiny
+      // minority (< 25%), AND an unclaimed horizontal band exists in >= 55% of its wells (>= 2.5x more),
+      // those sparse Stage 2 matches are almost certainly reaction products rather than the SM.
+      const stage2SubstrateCounts = new Map<string, { count: number; predRfSum: number }>();
+      const unclaimedByWell = new Map<number, TlcSpot[]>();
+      for (const { well, matchedPairs } of wellMatchBundles) {
+        const claimedObs = new Set(matchedPairs.map((m) => m.obs));
+        const remInterior = well.obsSpots.filter(
+          (sp) => !claimedObs.has(sp) && !isFrontPegged(sp.rf) && !isBasePegged(sp.rf)
+        );
+        if (remInterior.length > 0) unclaimedByWell.set(well.wIdx, remInterior);
+        for (const mp of matchedPairs) {
+          if (mp.matchMethod !== 'per_well' || mp.pred.kind !== 'substrate') continue;
+          const ck = mp.pred.profile.canonicalSmiles || mp.pred.profile.smiles;
+          if (!ck || consensusLocks.has(ck)) continue;
+          const cur = stage2SubstrateCounts.get(ck) || { count: 0, predRfSum: 0 };
+          cur.count++;
+          cur.predRfSum += mp.pred.rf;
+          stage2SubstrateCounts.set(ck, cur);
+        }
+      }
+
+      const rejectedSparseSubstrates = new Set<string>();
+      for (const [ck, st] of stage2SubstrateCounts.entries()) {
+        const presentWells = wellsPresentByCompound.get(ck);
+        if (!presentWells || presentWells.size < 10) continue;
+        const P = presentWells.size;
+        if (st.count >= Math.max(4, Math.ceil(P * 0.25))) continue;
+        const meanPred = st.predRfSum / Math.max(1, st.count);
+
+        // Scan unclaimed interior spots in this substrate's wells for a dominant unclaimed Rf band
+        const candRfs: number[] = [];
+        for (const wIdx of presentWells) {
+          for (const sp of unclaimedByWell.get(wIdx) || []) {
+            if (Math.abs(sp.rf - meanPred) <= 0.48) candRfs.push(sp.rf);
+          }
+        }
+        let maxBandWells = 0;
+        for (const seed of candRfs) {
+          let hits = 0;
+          for (const wIdx of presentWells) {
+            if ((unclaimedByWell.get(wIdx) || []).some((sp) => Math.abs(sp.rf - seed) <= 0.055)) {
+              hits++;
+            }
+          }
+          if (hits > maxBandWells) maxBandWells = hits;
+        }
+        if (maxBandWells >= Math.max(6, Math.ceil(P * 0.55)) && maxBandWells >= st.count * 2.5) {
+          rejectedSparseSubstrates.add(ck);
+        }
+      }
+
+      for (const { well, matchedPairs: rawMatchedPairs } of wellMatchBundles) {
+        const { wIdx, measuredWell, anchors, obsSpots } = well;
+        const matchedPairs =
+          rejectedSparseSubstrates.size > 0
+            ? rawMatchedPairs.filter((mp) => {
+                if (mp.matchMethod !== 'per_well' || mp.pred.kind !== 'substrate') return true;
+                const ck = mp.pred.profile.canonicalSmiles || mp.pred.profile.smiles;
+                return !ck || !rejectedSparseSubstrates.has(ck);
+              })
+            : rawMatchedPairs;
+
+        const pairedByObs = new Map<TlcSpot, { pred: PredAnchor; matchMethod: 'consensus' | 'per_well' }>();
+        const pairedByPred = new Map<PredAnchor, { obs: TlcSpot; matchMethod: 'consensus' | 'per_well' }>();
+
+        for (const { obs, pred: pAnchor, matchMethod, consensusWellCount, consensusTotalWells } of matchedPairs) {
+          pairedByObs.set(obs, { pred: pAnchor, matchMethod });
+          pairedByPred.set(pAnchor, { obs, matchMethod });
 
           // Interior quantitative pairs enter least-squares residual minimization;
           // boundary-pegged peaks (>=0.92 or <=0.05) enter as one-sided censored bounds below.
           if (isFrontPegged(obs.rf) || isBasePegged(obs.rf)) continue;
 
           const dispN = pAnchor.profile.lser?.displacementN ?? 1.0;
-          const kEff = (isC18 ? 4.8 * (0.6 + 0.4 * dispN) : 6.2 * dispN);
+          const kEff = isC18 ? 4.8 * (0.6 + 0.4 * dispN) : 6.2 * dispN;
           const resRf = obs.rf - pAnchor.rf;
-          const rawResDem = clamp(-(logitRf(obs.rf) - logitRf(pAnchor.rf)) / kEff, -0.32, 0.32);
-          const huberW = Math.abs(rawResDem) <= 0.14 ? 1.0 : 0.14 / Math.abs(rawResDem);
+          const rawResDem = clamp(-(logitRf(obs.rf) - logitRf(pAnchor.rf)) / kEff, -0.35, 0.35);
+          // Consensus-locked compounds are verified across multiple wells, so use a gentler Huber cutoff
+          const huberCut = matchMethod === 'consensus' ? 0.24 : 0.14;
+          const huberW = Math.abs(rawResDem) <= huberCut ? 1.0 : huberCut / Math.abs(rawResDem);
+          const ck = pAnchor.profile.canonicalSmiles || pAnchor.profile.smiles;
           platePairs.push({
             profile: pAnchor.profile,
             pair: {
@@ -1038,11 +1581,15 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
               wellCoord: wellLabel(wIdx),
               speciesLabel: pAnchor.label,
               speciesKind: pAnchor.kind,
+              compoundKey: ck,
               observedRf: Math.round(obs.rf * 100) / 100,
               predictedRfBefore: pAnchor.rf,
               residualRf: Math.round(resRf * 1000) / 1000,
               residualDemand: Math.round(rawResDem * 10000) / 10000,
               weight: Math.round(pAnchor.weight * huberW * 1000) / 1000,
+              matchMethod,
+              ...(consensusWellCount !== undefined ? { consensusWellCount } : {}),
+              ...(consensusTotalWells !== undefined ? { consensusTotalWells } : {}),
             },
           });
         }
@@ -1057,7 +1604,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         let maxTailing = 0;
         let maxRfSpan = 0;
         const compMeasured = obsSpots.map((sp) => {
-          const pMatch = pairedByObs.get(sp);
+          const pMatchEntry = pairedByObs.get(sp);
+          const pMatch = pMatchEntry?.pred;
           const isInterior = sp.rf > 0.08 && sp.rf < 0.90;
           if (isInterior) {
             if (sp.tailing !== undefined && sp.tailing > maxTailing) maxTailing = sp.tailing;
@@ -1075,6 +1623,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
                   matchedKind: pMatch.kind,
                   matchedPredRfBefore: pMatch.rf,
                   matchedPredRfAfter: pMatch.rf,
+                  matchMethod: pMatchEntry?.matchMethod,
                 }
               : {}),
           };
@@ -1086,16 +1635,17 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         const laneCensoredRecords: Array<Omit<CensoredBoundaryRecord, 'plateSummaryIdx'>> = [];
 
         const compPredicted = anchors.map((anc) => {
-          let obsMatch = pairedByPred.get(anc);
-          if (!obsMatch) {
+          let obsEntry = pairedByPred.get(anc);
+          if (!obsEntry) {
             // If a near-coeluting representative replaced `anc` during dedup, still mark it found
-            for (const [pUsed, obsUsed] of pairedByPred.entries()) {
+            for (const [pUsed, entryUsed] of pairedByPred.entries()) {
               if (Math.abs(pUsed.rf - anc.rf) < 0.04) {
-                obsMatch = obsUsed;
+                obsEntry = entryUsed;
                 break;
               }
             }
           }
+          const obsMatch = obsEntry?.obs;
           let boundaryStatus: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing' = 'missing';
           let boundaryObsRf: number | undefined;
           const ancCompoundKey = anc.profile.canonicalSmiles || anc.profile.smiles;
@@ -1145,7 +1695,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
             found: Boolean(obsMatch || boundaryObsRf !== undefined),
             boundaryStatus,
             ...(obsMatch
-              ? { matchedObsRf: Math.round(obsMatch.rf * 100) / 100 }
+              ? { matchedObsRf: Math.round(obsMatch.rf * 100) / 100, matchMethod: obsEntry?.matchMethod }
               : boundaryObsRf !== undefined
               ? { matchedObsRf: boundaryObsRf }
               : {}),
@@ -1198,6 +1748,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
 
       const plateSummaryIdx = model.plates.length;
       plateAnchorProfiles.set(plateSummaryIdx, laneProfilesMap);
+      // Stash per-plate compound well counts & consensus channel info for summary building after fit
+      plateCompoundMeta.set(plateSummaryIdx, { wellsPresentByCompound, consensusLocks });
       model.plates.push({
         setUid: set.uid,
         setName: set.name,
@@ -1210,6 +1762,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         matchSource: matched.matchSource,
         laneCountWithSpots: extracted.laneCountWithSpots,
         pairedCount: platePairs.length,
+        consensusMatchCount: plateConsensusMatchCount,
         frontCensoredCount: plateFrontCensCount,
         baselineCensoredCount: plateBaseCensCount,
         tailingLaneCount: plateTailingLaneCount,
@@ -1769,7 +2322,162 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           );
         });
       }
+
+      // Build per-compound summaries for this plate (human-readable breakdown for chemists)
+      const compMeta = plateCompoundMeta.get(pIdxSummary);
+      const byCompound = new Map<
+        string,
+        {
+          label: string;
+          kind: 'substrate' | 'product';
+          obsRfs: number[];
+          predBefores: number[];
+          predAfters: number[];
+          hasConsensus: boolean;
+          wellsPresent: number;
+          channels?: Array<'UV254' | 'UV366' | 'White'>;
+        }
+      >();
+      for (const fp of pEntry.pairs) {
+        const ck = fp.compoundKey || fp.speciesLabel;
+        let entry = byCompound.get(ck);
+        if (!entry) {
+          const lock = compMeta?.consensusLocks.get(ck);
+          const presentCount =
+            compMeta?.wellsPresentByCompound.get(ck)?.size ??
+            fp.consensusTotalWells ??
+            1;
+          const lockCh = lock?.channels?.filter(
+            (ch): ch is 'UV254' | 'UV366' | 'White' =>
+              ch === 'UV254' || ch === 'UV366' || ch === 'White'
+          );
+          entry = {
+            label: fp.speciesLabel,
+            kind: fp.speciesKind,
+            obsRfs: [],
+            predBefores: [],
+            predAfters: [],
+            hasConsensus: fp.matchMethod === 'consensus',
+            wellsPresent: presentCount,
+            channels: lockCh && lockCh.length > 0 ? lockCh : undefined,
+          };
+          byCompound.set(ck, entry);
+        }
+        if (fp.speciesKind === 'substrate') entry.kind = 'substrate';
+        if (fp.matchMethod === 'consensus') entry.hasConsensus = true;
+        entry.obsRfs.push(fp.observedRf);
+        entry.predBefores.push(fp.predictedRfBefore);
+        entry.predAfters.push(fp.predictedRfAfter);
+      }
+
+      const plateSummaries: CalibratedCompoundSummary[] = [];
+      for (const [ck, e] of byCompound.entries()) {
+        const m = e.obsRfs.length;
+        if (m === 0) continue;
+        const obsMean = e.obsRfs.reduce((a, b) => a + b, 0) / m;
+        const predBeforeMean = e.predBefores.reduce((a, b) => a + b, 0) / m;
+        const predAfterMean = e.predAfters.reduce((a, b) => a + b, 0) / m;
+        const variance = e.obsRfs.reduce((a, b) => a + (b - obsMean) ** 2, 0) / m;
+        plateSummaries.push({
+          compoundKey: ck,
+          label: e.label,
+          kind: e.kind,
+          wellsPresent: Math.max(e.wellsPresent, m),
+          wellsMatched: m,
+          predictedRfBefore: Math.round(predBeforeMean * 100) / 100,
+          predictedRfAfter: Math.round(predAfterMean * 100) / 100,
+          observedRfMean: Math.round(obsMean * 100) / 100,
+          observedRfSpread: Math.round(Math.sqrt(variance) * 1000) / 1000,
+          rfShift: Math.round((obsMean - predBeforeMean) * 100) / 100,
+          matchMethod: e.hasConsensus ? 'consensus' : 'per_well',
+          ...(e.channels ? { channels: e.channels } : {}),
+        });
+      }
+      plateSummaries.sort((a, b) => {
+        if (a.matchMethod !== b.matchMethod) return a.matchMethod === 'consensus' ? -1 : 1;
+        if (b.wellsMatched !== a.wellsMatched) return b.wellsMatched - a.wellsMatched;
+        return Math.abs(b.rfShift) - Math.abs(a.rfShift);
+      });
+      pEntry.compoundSummaries = plateSummaries;
     }
+
+    // Aggregate compound summaries across all plates in this phase
+    const phaseCompAccum = new Map<
+      string,
+      {
+        label: string;
+        kind: 'substrate' | 'product';
+        wellsPresent: number;
+        wellsMatched: number;
+        obsWeighted: number;
+        predBeforeWeighted: number;
+        predAfterWeighted: number;
+        spreadWeighted: number;
+        hasConsensus: boolean;
+        channels: Set<'UV254' | 'UV366' | 'White'>;
+      }
+    >();
+    for (const pEntry of model.plates) {
+      if (pEntry.stationaryPhase !== phase || !pEntry.compoundSummaries) continue;
+      for (const cs of pEntry.compoundSummaries) {
+        let agg = phaseCompAccum.get(cs.compoundKey);
+        if (!agg) {
+          agg = {
+            label: cs.label,
+            kind: cs.kind,
+            wellsPresent: 0,
+            wellsMatched: 0,
+            obsWeighted: 0,
+            predBeforeWeighted: 0,
+            predAfterWeighted: 0,
+            spreadWeighted: 0,
+            hasConsensus: false,
+            channels: new Set(),
+          };
+          phaseCompAccum.set(cs.compoundKey, agg);
+        }
+        if (cs.kind === 'substrate') agg.kind = 'substrate';
+        if (cs.matchMethod === 'consensus') agg.hasConsensus = true;
+        agg.wellsPresent += cs.wellsPresent;
+        agg.wellsMatched += cs.wellsMatched;
+        agg.obsWeighted += cs.observedRfMean * cs.wellsMatched;
+        agg.predBeforeWeighted += cs.predictedRfBefore * cs.wellsMatched;
+        agg.predAfterWeighted += cs.predictedRfAfter * cs.wellsMatched;
+        agg.spreadWeighted += cs.observedRfSpread * cs.wellsMatched;
+        if (cs.channels) {
+          for (const ch of cs.channels) agg.channels.add(ch);
+        }
+      }
+    }
+
+    const phaseCompoundSummaries: CalibratedCompoundSummary[] = [];
+    for (const [ck, agg] of phaseCompAccum.entries()) {
+      const m = Math.max(1, agg.wellsMatched);
+      const obsMean = agg.obsWeighted / m;
+      const predBeforeMean = agg.predBeforeWeighted / m;
+      const predAfterMean = agg.predAfterWeighted / m;
+      const chArr = Array.from(agg.channels);
+      phaseCompoundSummaries.push({
+        compoundKey: ck,
+        label: agg.label,
+        kind: agg.kind,
+        wellsPresent: Math.max(agg.wellsPresent, agg.wellsMatched),
+        wellsMatched: agg.wellsMatched,
+        predictedRfBefore: Math.round(predBeforeMean * 100) / 100,
+        predictedRfAfter: Math.round(predAfterMean * 100) / 100,
+        observedRfMean: Math.round(obsMean * 100) / 100,
+        observedRfSpread: Math.round((agg.spreadWeighted / m) * 1000) / 1000,
+        rfShift: Math.round((obsMean - predBeforeMean) * 100) / 100,
+        matchMethod: agg.hasConsensus ? 'consensus' : 'per_well',
+        ...(chArr.length > 0 ? { channels: chArr } : {}),
+      });
+    }
+    phaseCompoundSummaries.sort((a, b) => {
+      if (a.matchMethod !== b.matchMethod) return a.matchMethod === 'consensus' ? -1 : 1;
+      if (b.wellsMatched !== a.wellsMatched) return b.wellsMatched - a.wellsMatched;
+      return Math.abs(b.rfShift) - Math.abs(a.rfShift);
+    });
+    const consensusCompoundCount = phaseCompoundSummaries.filter((c) => c.matchMethod === 'consensus').length;
 
     const frontCensoredCount = censRecords.filter((c) => c.kind === 'front').length;
     const baselineCensoredCount = censRecords.filter((c) => c.kind === 'baseline').length;
@@ -1790,6 +2498,8 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       rmseBefore,
       rmseAfter,
       uniqueCompounds,
+      consensusCompoundCount,
+      ...(phaseCompoundSummaries.length > 0 ? { compoundSummaries: phaseCompoundSummaries } : {}),
       validated,
       ...(cvRmse !== undefined ? { cvRmse: Math.round(cvRmse * 1000) / 1000 } : {}),
       ...(cvRmseBaseline !== undefined ? { cvRmseBaseline: Math.round(cvRmseBaseline * 1000) / 1000 } : {}),

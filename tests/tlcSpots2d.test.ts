@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
+  FRONT_BAND_BINS,
+  FRONT_BAND_RF_MIN,
   analyzeLaneStripRgb,
   buildLaneSpotMap2d,
   computeArplsBaseline,
@@ -7,8 +9,10 @@ import {
   findMultiChannelSpots,
   findSpots,
   mergeMultiChannelSpots,
+  rescueSharedReagentSpots,
   rgbLabDeltaE,
   segmentLaneSpots2d,
+  spotProminenceForDensitogramCutoff,
 } from '../src/engine';
 import { getSpotConfidenceStyle } from '../src/utils/spotConfidence';
 
@@ -948,4 +952,294 @@ describe('Step 3: arPLS Baseline, Channel-Calibrated 2D Maps & Watershed Spot Se
     expect(uv366NearUv254.length).toBe(2);
     expect(uv366NearUv254.some((s) => Math.abs(s.rf - 0.57) < 0.01 && s.channels?.includes('UV366'))).toBe(true);
   });
+
+  it('detects concentrated low-Rf spots (Rf ~0.09–0.10) bridging a saturated origin dot in both Standard and Sensitive modes', () => {
+    const origin = 30;
+    const front = 320;
+    const span = front - origin; // 290
+    const strip = makeLaneStrip(26, 330, [8, 182, 10]);
+
+    // Heavy saturated origin dot centered slightly above origin (Rf ~0.025)
+    paintSpot(strip, { pos: origin + Math.round(0.022 * span), cxFrac: 0.5, sigmaY: 6.5, sigmaXFrac: 0.24, deltaRgb: [0, -142, 0] });
+    // Large concentrated eluted low-Rf spot centered at Rf 0.098 whose lower edge overlaps the origin dot
+    // (creating a saturated neck around Rf 0.06 where G only rises from ~44 to ~66, while the eluted head
+    // diffuses laterally wider and extends up to Rf 0.145)
+    paintSpot(strip, { pos: origin + Math.round(0.098 * span), cxFrac: 0.5, sigmaY: 8.0, sigmaXFrac: 0.30, deltaRgb: [0, -138, 0] });
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+
+    for (const prom of [0.28, 0.08]) {
+      const spots = findSpots(profile, { sign: -1, origin, front, minProminence: prom, lane2d: metrics });
+      expect(spots.length).toBe(1);
+      expect(Math.abs(spots[0].rf - 0.098)).toBeLessThanOrEqual(0.02);
+      expect(spots[0].confidence!).toBeGreaterThanOrEqual(0.70);
+    }
+  });
+
+  it('eliminates wavy/tilted UV254 solvent-front meniscus bands at Rf 0.95–0.99 while keeping isolated high-Rf spots', () => {
+    const origin = 32;
+    const front = 318;
+    const span = front - origin; // 286
+    const strip = makeLaneStrip(28, 330, [8, 180, 10]);
+
+    // Tilted/wavy dark solvent-front accumulation band right against front (Rf ~0.96–1.00):
+    // Slightly higher/brighter on the right flank than the left flank so min-flank localMap retains
+    // residual darkness, matching real uneven TLC solvent fronts.
+    for (let pos = origin + Math.round(0.92 * span); pos <= front + 4; pos++) {
+      const y = strip.length - 1 - pos;
+      for (let x = 0; x < strip.width; x++) {
+        const tilt = (x / Math.max(1, strip.width - 1)) * 3.5; // tilted 3.5 px across lane
+        const bandCenter = origin + 0.978 * span + tilt;
+        const dy = (pos - bandCenter) / 5.5;
+        const drop = 88 * Math.exp(-0.5 * dy * dy);
+        const idx = (y * strip.width + x) * 4;
+        strip.rgba[idx + 1] = Math.max(20, Math.round(strip.rgba[idx + 1] - drop));
+      }
+    }
+
+    // Real isolated high-Rf compound spot cleanly below the front at Rf 0.88
+    paintSpot(strip, {
+      pos: origin + Math.round(0.88 * span),
+      cxFrac: 0.5,
+      sigmaY: 7,
+      sigmaXFrac: 0.22,
+      deltaRgb: [0, -75, 0],
+    });
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+    for (const prom of [0.28, 0.08]) {
+      const spots = findSpots(profile, { sign: -1, origin, front, minProminence: prom, lane2d: metrics });
+      expect(spots.filter((s) => s.rf >= 0.93).length).toBe(0);
+      expect(spots.length).toBe(1);
+      expect(Math.abs(spots[0].rf - 0.88)).toBeLessThanOrEqual(0.025);
+    }
+  });
+
+  it('suppresses ultra-low-confidence (<14%) noise ghosts in Sensitive mode across UV254 and UV366 without losing real faint spots', () => {
+    const origin = 40;
+    const front = 350;
+
+    // Noisy blank UV366 lane with subtle ±4 camera sensor mottling (no real compound)
+    const blank366 = makeLaneStrip(30, 390, [6, 22, 18]);
+    for (let pos = 0; pos < blank366.length; pos++) {
+      const y = blank366.length - 1 - pos;
+      for (let x = 0; x < blank366.width; x++) {
+        const mottle = Math.round(
+          2.2 * Math.sin(pos * 0.11 + x * 0.25) + 1.8 * Math.cos(pos * 0.23 - x * 0.19)
+        );
+        const idx = (y * blank366.width + x) * 4;
+        blank366.rgba[idx + 1] = Math.max(0, Math.min(255, blank366.rgba[idx + 1] + mottle));
+        blank366.rgba[idx + 2] = Math.max(0, Math.min(255, blank366.rgba[idx + 2] + mottle));
+      }
+    }
+    const res366 = analyzeLaneStripRgb(blank366.rgba, blank366.width, blank366.length, 'UV366', 0.35);
+    const ghostSpots366 = findSpots(res366.profile, {
+      sign: 1,
+      origin,
+      front,
+      minProminence: 0.08,
+      lane2d: res366.metrics,
+    });
+    expect(ghostSpots366.length).toBe(0);
+
+    // Noisy blank UV254 lane with gentle illumination mottle + real faint spot (-15 counts)
+    const faint254 = makeLaneStrip(30, 390, [8, 186, 10]);
+    for (let pos = 0; pos < faint254.length; pos++) {
+      const y = faint254.length - 1 - pos;
+      for (let x = 0; x < faint254.width; x++) {
+        const mottle = Math.round(2.5 * Math.sin(pos * 0.09 + x * 0.21) + (((pos * 31 + x * 17) % 5) - 2));
+        const idx = (y * faint254.width + x) * 4;
+        faint254.rgba[idx + 1] = Math.max(0, Math.min(255, faint254.rgba[idx + 1] + mottle));
+      }
+    }
+    paintSpot(faint254, { pos: 195, cxFrac: 0.5, sigmaY: 9, sigmaXFrac: 0.22, deltaRgb: [0, -16, 0] });
+    const res254 = analyzeLaneStripRgb(faint254.rgba, faint254.width, faint254.length, 'UV254', 0.35);
+    const faintSpots = findSpots(res254.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.08,
+      lane2d: res254.metrics,
+    });
+    expect(faintSpots.length).toBe(1);
+    expect(Math.abs(faintSpots[0].pos - 195)).toBeLessThanOrEqual(5);
+    expect(faintSpots[0].confidence!).toBeGreaterThanOrEqual(0.14);
+  });
+
+  it('rescueSharedReagentSpots refuses to self-bootstrap relaxed-only noise, sub-18% ghosts, or near-front band hits', () => {
+    const mk = (rf: number, confidence: number) => ({
+      pos: Math.round(50 + rf * 350),
+      rf,
+      strength: 0.15,
+      confidence,
+      source: 'auto' as const,
+    });
+
+    const rescued = rescueSharedReagentSpots([
+      // Correlated relaxed-only noise at Rf 0.30 across 4 wells (ZERO solo anchors) -> must NOT rescue
+      // Near-front band at Rf 0.96 even with solo anchors -> must NOT rescue
+      // Ultra-weak ghost (conf 0.11) at Rf 0.50 even with solo anchors -> must NOT rescue
+      { laneId: 0, reagentCodes: ['A'], origin: 50, front: 400, soloSpots: [mk(0.50, 0.85), mk(0.96, 0.45)], relaxedCandidates: [mk(0.30, 0.25)] },
+      { laneId: 1, reagentCodes: ['A'], origin: 50, front: 400, soloSpots: [mk(0.50, 0.80), mk(0.96, 0.42)], relaxedCandidates: [mk(0.30, 0.24)] },
+      { laneId: 2, reagentCodes: ['A'], origin: 50, front: 400, soloSpots: [], relaxedCandidates: [mk(0.30, 0.23), mk(0.50, 0.11), mk(0.96, 0.35)] },
+      { laneId: 3, reagentCodes: ['A'], origin: 50, front: 400, soloSpots: [], relaxedCandidates: [mk(0.30, 0.22), mk(0.50, 0.28)] },
+    ]);
+
+    expect(rescued.get(2) ?? []).toEqual([]);
+    // Lane 3's valid Rf 0.50 candidate (conf 0.28, backed by 2 solo anchors) IS rescued, but NOT Rf 0.30
+    expect(rescued.get(3)?.length).toBe(1);
+    expect(rescued.get(3)?.[0].rf).toBeCloseTo(0.50, 2);
+  });
+
+  it('recovers real high-Rf spots sitting against a solvent-front meniscus when plate frontBandBg confirms they exceed the plate-wide meniscus (both 2D Seg and Densitogram)', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    // Build a plate-wide front-band background profile (Rf 0.80..1.00):
+    // clean green silica through Rf 0.95, dark plate-wide solvent-front meniscus at Rf 0.97..1.00 (~38 counts)
+    const frontBandBg = Array.from({ length: FRONT_BAND_BINS }, (_, b) => {
+      const rf = FRONT_BAND_RF_MIN + (b / (FRONT_BAND_BINS - 1)) * (1 - FRONT_BAND_RF_MIN);
+      const meniscus = 38 * Math.exp(-0.5 * Math.pow((rf - 0.985) / 0.014, 2));
+      return meniscus;
+    });
+
+    // Lane A: REAL high-Rf spot at Rf 0.935 sitting in a 3-adjacent-lane shared cluster (wings darken flanks)
+    // directly adjacent to the dark Rf 0.985 solvent-front meniscus band
+    const laneWithSpot = makeLaneStrip(34, 420, [8, 192, 10]);
+    const spotPos = Math.round(origin + 0.935 * span);
+    const frontBandPos = Math.round(origin + 0.985 * span);
+    // Neighboring shared spots darken the left and right flanks at the same Rf 0.935
+    paintSpot(laneWithSpot, { pos: spotPos, cxFrac: 0.5, sigmaY: 6.5, sigmaXFrac: 0.36, deltaRgb: [0, -72, 0] });
+    paintSpot(laneWithSpot, { pos: spotPos, cxFrac: 0.02, sigmaY: 6.5, sigmaXFrac: 0.26, deltaRgb: [0, -48, 0] });
+    paintSpot(laneWithSpot, { pos: spotPos, cxFrac: 0.98, sigmaY: 6.5, sigmaXFrac: 0.26, deltaRgb: [0, -48, 0] });
+    // Plate-wide horizontal meniscus right behind it at Rf 0.985
+    for (let pos = frontBandPos - 8; pos <= front; pos++) {
+      const rf = (pos - origin) / span;
+      const dG = -Math.round(38 * Math.exp(-0.5 * Math.pow((rf - 0.985) / 0.014, 2)));
+      const y = laneWithSpot.length - 1 - pos;
+      if (y < 0 || y >= laneWithSpot.length) continue;
+      for (let x = 0; x < laneWithSpot.width; x++) {
+        const idx = (y * laneWithSpot.width + x) * 4;
+        laneWithSpot.rgba[idx + 1] = Math.max(0, laneWithSpot.rgba[idx + 1] + dG);
+      }
+    }
+
+    const resSpot = analyzeLaneStripRgb(laneWithSpot.rgba, laneWithSpot.width, laneWithSpot.length, 'UV254', 0.35);
+
+    // 2D Seg with frontBandBg MUST detect the Rf 0.935 compound spot and NOT the Rf 0.985 meniscus
+    const spots2d = findSpots(resSpot.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: resSpot.metrics,
+      frontBandBg,
+      detectorMode: '2d',
+    });
+    expect(spots2d.some((s) => Math.abs(s.rf - 0.935) < 0.025)).toBe(true);
+    expect(spots2d.some((s) => s.rf >= 0.975)).toBe(false);
+
+    // Densitogram mode with frontBandBg MUST also detect Rf 0.935 and ignore the Rf 0.985 meniscus
+    const spotsDens = findSpots(resSpot.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: resSpot.metrics,
+      frontBandBg,
+      detectorMode: 'densitogram',
+    });
+    expect(spotsDens.length).toBe(1);
+    expect(spotsDens[0].rf).toBeCloseTo(0.935, 1);
+    expect(spotsDens[0].detector).toBe('densitogram');
+
+    // Lane B: EMPTY lane that ONLY has the plate-wide Rf 0.985 solvent-front meniscus -> 0 spots in BOTH modes
+    const emptyLane = makeLaneStrip(34, 420, [8, 192, 10]);
+    for (let pos = frontBandPos - 8; pos <= front; pos++) {
+      const rf = (pos - origin) / span;
+      const dG = -Math.round(38 * Math.exp(-0.5 * Math.pow((rf - 0.985) / 0.014, 2)));
+      const y = emptyLane.length - 1 - pos;
+      if (y < 0 || y >= emptyLane.length) continue;
+      for (let x = 0; x < emptyLane.width; x++) {
+        const idx = (y * emptyLane.width + x) * 4;
+        emptyLane.rgba[idx + 1] = Math.max(0, emptyLane.rgba[idx + 1] + dG);
+      }
+    }
+    const resEmpty = analyzeLaneStripRgb(emptyLane.rgba, emptyLane.width, emptyLane.length, 'UV254', 0.35);
+    expect(
+      findSpots(resEmpty.profile, {
+        sign: -1,
+        origin,
+        front,
+        minProminence: 0.28,
+        lane2d: resEmpty.metrics,
+        frontBandBg,
+        detectorMode: '2d',
+      })
+    ).toEqual([]);
+    expect(
+      findSpots(resEmpty.profile, {
+        sign: -1,
+        origin,
+        front,
+        minProminence: 0.28,
+        lane2d: resEmpty.metrics,
+        frontBandBg,
+        detectorMode: 'densitogram',
+      })
+    ).toEqual([]);
+  });
+
+  it('Densitogram cutoff mode picks peaks strictly inside [origin..front], splits doublets, rejects origin tails, and exposes live densitogramCutoff', () => {
+    const origin = 45;
+    const front = 375;
+    const strip = makeLaneStrip(34, 420, [8, 194, 10]);
+    // Heavy origin dot with monotonically falling shoulder
+    paintSpot(strip, { pos: origin, cxFrac: 0.5, sigmaY: 11, sigmaXFrac: 0.28, deltaRgb: [0, -145, 0] });
+    // Close doublet at pos 180 and 205 (Rf ~0.41 and ~0.48)
+    paintSpot(strip, { pos: 180, cxFrac: 0.5, sigmaY: 6.5, sigmaXFrac: 0.22, deltaRgb: [0, -78, 0] });
+    paintSpot(strip, { pos: 205, cxFrac: 0.5, sigmaY: 6.5, sigmaXFrac: 0.22, deltaRgb: [0, -68, 0] });
+    // Faint-medium spot at pos 300 (Rf ~0.77)
+    paintSpot(strip, { pos: 300, cxFrac: 0.5, sigmaY: 7, sigmaXFrac: 0.22, deltaRgb: [0, -24, 0] });
+    // Handwriting / smudge ABOVE solvent front (pos 402) must be ignored
+    paintSpot(strip, { pos: 402, cxFrac: 0.5, sigmaY: 6, sigmaXFrac: 0.3, deltaRgb: [0, -90, 0] });
+
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+
+    const densDefault = extractDensitogram(profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: metrics,
+      detectorMode: 'densitogram',
+    });
+    expect(densDefault.densitogramCutoff).toBeGreaterThan(4);
+    expect(densDefault.spots.length).toBe(3);
+    expect(densDefault.spots.every((s) => s.pos > origin && s.pos < front)).toBe(true);
+    expect(Math.abs(densDefault.spots[0].pos - 180)).toBeLessThanOrEqual(4);
+    expect(Math.abs(densDefault.spots[1].pos - 205)).toBeLessThanOrEqual(4);
+    expect(Math.abs(densDefault.spots[2].pos - 300)).toBeLessThanOrEqual(4);
+
+    // Raising the Cutoff slider to 65% filters out the fainter -24 spot while keeping the two strong spots
+    const densStrict = extractDensitogram(profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.65,
+      lane2d: metrics,
+      detectorMode: 'densitogram',
+    });
+    expect(densStrict.densitogramCutoff!).toBeGreaterThan(densDefault.densitogramCutoff!);
+    expect(densStrict.spots.length).toBe(2);
+
+    // Round-trip inverse math for dragging the Cutoff guide line on the SVG densitogram
+    const roundTrip = spotProminenceForDensitogramCutoff(
+      densDefault.densitogramCutoff!,
+      densDefault.densitogramPlateSpan!,
+      densDefault.densitogramNoiseFloor!
+    );
+    expect(roundTrip).toBeCloseTo(0.28, 2);
+  });
 });
+

@@ -9,8 +9,10 @@ import {
   extractDensitogram,
   findMultiChannelSpots,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getEffectiveLaneSpots,
   getLane2dMetrics,
+  tlcHalf,
   laneMatrix,
   renderFalseColorLane,
   tlcFront,
@@ -125,6 +127,8 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
     const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
     const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+    const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+    const halfIdx = tlcHalf(lane);
     for (const ch of availableChannels) {
       const p = extractLaneProfileLocal(tlcSet, ch, lane);
       if (p.length) {
@@ -133,6 +137,8 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
         if (chHist) histograms[ch] = chHist;
         const m2d = getLane2dMetrics(tlcSet, ch, lane);
         if (m2d) lane2dByChannel[ch] = m2d;
+        const fBg = getChannelFrontBandProfile(tlcSet, ch, halfIdx, extractLaneProfileLocal);
+        if (fBg) frontBandByChannel[ch] = fBg;
       }
     }
 
@@ -144,6 +150,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       minProminence: minProm,
       plateHistogram: histograms[traceKey],
       lane2d: lane2dByChannel[traceKey],
+      frontBandBg: frontBandByChannel[traceKey],
       detectorMode: tlcSet.spotDetectorMode,
     });
 
@@ -159,6 +166,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           minProminence: minProm,
           plateHistogram: histograms.UV366,
           lane2d: lane2dByChannel.UV366,
+          frontBandBg: frontBandByChannel.UV366,
           detectorMode: tlcSet.spotDetectorMode,
         });
       }
@@ -171,6 +179,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           minProminence: minProm,
           plateHistogram: histograms.White,
           lane2d: lane2dByChannel.White,
+          frontBandBg: frontBandByChannel.White,
           detectorMode: tlcSet.spotDetectorMode,
         });
       }
@@ -183,6 +192,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       minProminence: minProm,
       histograms,
       lane2dByChannel,
+      frontBandByChannel,
       detectorMode: tlcSet.spotDetectorMode,
     });
     const effectiveSpots = getEffectiveLaneSpots(lane, multiSpots);

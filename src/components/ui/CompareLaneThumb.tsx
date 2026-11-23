@@ -8,8 +8,10 @@ import {
   extractLaneProfile2d,
   findMultiChannelSpots,
   getChannelHistogram,
+  getChannelFrontBandProfile,
   getEffectiveLaneSpots,
   getLane2dMetrics,
+  tlcHalf,
   laneMatrix,
   renderFalseColorLane,
   tlcFront,
@@ -68,6 +70,8 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
     const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
     const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
     const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
+    const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
+    const halfIdx = tlcHalf(lane);
     for (const ch of availableChannels) {
       const p = extractProfile(tlcSet, ch, lane);
       if (p.length) {
@@ -76,6 +80,8 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
         if (chHist) histograms[ch] = chHist;
         const m2d = getLane2dMetrics(tlcSet, ch, lane);
         if (m2d) lane2dByChannel[ch] = m2d;
+        const fBg = getChannelFrontBandProfile(tlcSet, ch, halfIdx, extractProfile);
+        if (fBg) frontBandByChannel[ch] = fBg;
       }
     }
     const autoSpots = findMultiChannelSpots({
@@ -86,6 +92,7 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
       minProminence: tlcSet.spotProminence ?? 0.28,
       histograms,
       lane2dByChannel,
+      frontBandByChannel,
       detectorMode: tlcSet.spotDetectorMode,
     });
     const spots = getEffectiveLaneSpots(lane, autoSpots);

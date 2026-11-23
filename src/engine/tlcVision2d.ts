@@ -1016,32 +1016,48 @@ function measureLocalRidgeAndStep(
   let stepAmp = 0;
   const effBgNearAfter = Math.min(bgNear, Math.max(3, topLim - i));
   if (i + effBgNearAfter <= topLim && i - bgNear >= 0) {
+    const cleanQ = sign < 0 ? 0.75 : 0.25;
     const medAfter = winMedF(s, i + effBgNearAfter, Math.min(topLim, i + bgMid), buf);
     const medBefore = winMedF(s, Math.max(0, i - bgMid), i - bgNear, buf);
     const farBefore =
       i - Math.round(n * 0.06) >= 3
         ? winMedF(s, Math.max(0, i - bgFarLo), i - Math.max(bgNear + 2, Math.round(n * 0.06)), buf)
         : medBefore;
+    const nearBeforeSpan = Math.max(12, Math.round(n * 0.045));
+    const nearBeforeClean = winQuantF(s, Math.max(0, i - nearBeforeSpan), i - bgNear, cleanQ, buf);
     const edgeL = winMeanF(s, Math.max(0, i - rCore - eWin), Math.max(0, i - rCore - 1));
     const edgeR = winMeanF(s, Math.min(topLim, i + rCore + 1), Math.min(topLim, i + rCore + eWin));
     const macroDelta = medAfter - medBefore;
     const farDelta = medAfter - farBefore;
+    const nearDelta = medAfter - nearBeforeClean;
+    const edgeLeftBelowDry = medAfter - edgeL;
     const localDelta = edgeR - edgeL;
-    // Guard against dark 2-4 px graphite pencil lines sitting right between slightly darker wet silica
-    // and brighter dry middle silica: exiting a deep thin pencil trough creates a huge fake localDelta
-    // even though edgeL plunged far below the wet background medBefore.
-    const troughDepth = sign * (edgeL - medBefore);
+    // Guard against dark 2-4 px graphite pencil lines or handwriting strokes sitting in/near the dry gap:
+    // exiting a deep thin trough creates a huge fake localDelta even though edgeL plunged far below the
+    // wet background (medBefore or farBefore). Checking farBefore prevents a dark solvent-front band
+    // 10-30 px behind the pencil line from corrupting medBefore and hiding the trough exit.
+    const troughDepthMed = sign * (edgeL - medBefore);
+    const troughDepthFar = sign * (edgeL - farBefore);
     const pencilTroughExit =
       dryEdgeAmp <= 0 &&
-      troughDepth > Math.max(6.0, 1.5 * Math.abs(macroDelta));
+      (troughDepthMed > Math.max(6.0, 1.5 * Math.abs(macroDelta)) ||
+        troughDepthFar > Math.max(6.0, 1.5 * Math.abs(farDelta)));
     if (
       !pencilTroughExit &&
       macroDelta * dirSign > 0 &&
       farDelta * dirSign > 0 &&
+      nearDelta * dirSign > 0 &&
+      edgeLeftBelowDry * dirSign > 0 &&
       localDelta * dirSign > 0 &&
       Math.abs(macroDelta) >= 0.38 * Math.abs(farDelta)
     ) {
-      stepAmp = Math.min(Math.abs(macroDelta), Math.abs(farDelta), Math.abs(localDelta));
+      stepAmp = Math.min(
+        Math.abs(macroDelta),
+        Math.abs(farDelta),
+        Math.abs(nearDelta),
+        Math.abs(edgeLeftBelowDry),
+        Math.abs(localDelta)
+      );
     }
   }
 
@@ -1100,7 +1116,7 @@ function computeFrontEvidenceStrip(
   const bgMid = Math.max(24, Math.round(n * 0.14));
   const bgFarLo = Math.max(36, Math.round(n * 0.22));
   const eWin = Math.max(2, Math.round(n * 0.006));
-  const dryEdgeWin = Math.max(2, Math.min(5, Math.round(n * 0.004)));
+  const dryEdgeWin = Math.max(2, Math.min(8, Math.round(n * 0.0045)));
   const bandInNear = Math.max(2, Math.round(n * 0.002));
   const bandDeepStart = Math.max(5, Math.round(n * 0.006));
   const bandInFar = bandDeepStart + Math.max(4, Math.round(n * 0.005));
@@ -1596,7 +1612,7 @@ function detectStraightPencilLine(
   // graphite pencil line is ~6-10 px FWHM; a blunt wooden pencil is up to ~13 px FWHM, whereas a
   // real capillary solvent front band is typically ~20-65 px wide).
   const pencilLo = Math.max(lo + 4, Math.floor(minLen * 0.78));
-  const maxHalfW = Math.max(3, Math.round(minLen * 0.01));
+  const maxHalfW = Math.max(3, Math.round(minLen * 0.0085));
   const maxFwhmConfirmed = Math.max(6, Math.round(minLen * 0.013));
   const maxFwhmUnconfirmed = Math.max(5, Math.round(minLen * 0.0105));
   const searchHi = Math.min(hi + Math.max(4, Math.round(minLen * 0.006)), minLen - 4);
@@ -2374,10 +2390,11 @@ function detectCurvedFrontSeamCore(
     };
   };
 
-  // Shift-aligned cross-plate median + 70%-coverage quantile stack verification for very light outer fronts:
+  // Shift-aligned cross-plate median + 85%-coverage quantile stack verification for very light outer fronts:
   // Aligns all active columns onto `laneY`, checks BOTH the cross-plate median (cuts camera noise by ~sqrt(N))
-  // AND the coverage quantile (p70 for dark UV254/White fronts, p30 for bright UV366 fronts), which stays clean
-  // on any true plate-wide solvent front while erasing patchy compound spot bands covering < 70% of lanes.
+  // AND the coverage quantile (p85 for dark UV254/White fronts, p15 for bright UV366 fronts), which stays clean
+  // on any true plate-wide solvent front (~95-100% continuity) while rejecting patchy compound spot bands
+  // and middle-gap handwriting (which always leave word/letter/margin gaps across >= 15-20% of columns).
   const verifyAlignedBandStack = (
     laneY: Float64Array,
     anchorPos: number
@@ -2403,7 +2420,7 @@ function detectCurvedFrontSeamCore(
 
       const stackedMed = new Array<number>(minLen);
       const stackedCov = new Array<number>(minLen);
-      const covQ = ch.sign < 0 ? 0.70 : 0.30;
+      const covQ = ch.sign < 0 ? 0.85 : 0.15;
       for (let y = 0; y < minLen; y++) {
         let cnt = 0;
         for (let k = 0; k < validCols.length; k++) {
@@ -2430,8 +2447,8 @@ function detectCurvedFrontSeamCore(
           localCovSnr = stCov.snr[j];
         }
       }
-      // Require BOTH the cross-plate median (>= 4.5 SNR) AND the 70%-coverage quantile (>= 3.0 SNR)
-      // to confirm a sustained band/step so 55-65% patchy spot bands are strictly rejected.
+      // Require BOTH the cross-plate median (>= 4.5 SNR) AND the 85%-coverage quantile (>= 3.0 SNR)
+      // to confirm a sustained plate-wide band/step so patchy spot bands and handwriting are strictly rejected.
       if (localMedSnr >= 4.5 && localCovSnr >= 3.0 && localMedSnr > bestStackSnr) {
         bestStackSnr = localMedSnr;
       }
@@ -2708,13 +2725,20 @@ export function rescueSharedReagentSpots(
     const minAgree = Math.max(3, Math.ceil(groupLanes.length * 0.45));
     for (const anchor of allObs) {
       if (anchor.isSolo) continue; // only need to decide whether to promote relaxed candidates
+      // Never cross-lane promote solvent-front meniscus artifacts or ultra-weak noise ghosts
+      if (anchor.spot.rf >= 0.92) continue;
+      if (typeof anchor.spot.confidence === 'number' && anchor.spot.confidence < 0.18) continue;
       const agreeingLanes = new Set<number>();
+      let soloAgreeCount = 0;
       for (const other of allObs) {
         if (Math.abs(other.spot.rf - anchor.spot.rf) <= rfTol) {
           agreeingLanes.add(other.laneId);
+          if (other.isSolo) soloAgreeCount++;
         }
       }
-      if (agreeingLanes.size >= minAgree) {
+      // Require >= 1 genuine solo detection in the reagent group so correlated plate noise/bands
+      // cannot bootstrap themselves solely from relaxed candidates.
+      if (soloAgreeCount >= 1 && agreeingLanes.size >= minAgree) {
         const list = promoted.get(anchor.laneId) || [];
         if (!list.some((s) => Math.abs(s.rf - anchor.spot.rf) < rfTol)) {
           list.push(anchor.spot);

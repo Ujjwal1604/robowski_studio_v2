@@ -5,6 +5,7 @@ import {
   TlcLaneConfig,
   TlcLaneRow,
   TlcSpot,
+  TlcSpotDetectorMode,
   TlcProfileOptions,
   TlcDensitogramData,
   TlcSet,
@@ -907,6 +908,7 @@ export function getChannelHistogram(
     set.originAutoByLane = {};
     set.autoConf = {};
     (set as any)._histCache = {};
+    (set as any)._frontBandCache = {};
     (set as any)._prof2d = {};
     (set as any)._autoCacheSig = sig;
   }
@@ -922,6 +924,107 @@ export function getChannelHistogram(
   const stats = analyzeProfileHistogram(profiles, TLC_SIGNAL[key]?.sign ?? -1, 0.06, 0.94);
   cache[key] = stats;
   return stats;
+}
+
+export const FRONT_BAND_RF_MIN = 0.80;
+export const FRONT_BAND_BINS = 41;
+
+/**
+ * Linearly interpolates a plate-wide near-front background profile (Rf 0.80..1.00).
+ */
+export function sampleFrontBandBg(
+  frontBandBg: number[] | undefined,
+  rf: number
+): number | undefined {
+  if (!frontBandBg || frontBandBg.length < 2) return undefined;
+  if (rf <= FRONT_BAND_RF_MIN) return 0;
+  const clamped = Math.min(1, rf);
+  const pos = ((clamped - FRONT_BAND_RF_MIN) / (1 - FRONT_BAND_RF_MIN)) * (frontBandBg.length - 1);
+  const lo = Math.max(0, Math.min(frontBandBg.length - 1, Math.floor(pos)));
+  const hi = Math.min(frontBandBg.length - 1, lo + 1);
+  const frac = pos - lo;
+  return frontBandBg[lo] * (1 - frac) + frontBandBg[hi] * frac;
+}
+
+/**
+ * Computes the cached plate-wide 25th-percentile near-front densitogram background profile
+ * (Rf 0.80..1.00, 41 bins) across all valid lanes on the same plate half.
+ *
+ * A true solvent-front meniscus band or horizontal pencil line spans >=75% of lanes (including
+ * blank/empty wells), so it appears at full strength in the 25th percentile. Real high-Rf
+ * compound spots (even when 2-3 adjacent wells share the same product) are absent in >25% of
+ * lanes and therefore see ~0 background subtraction.
+ */
+export function getChannelFrontBandProfile(
+  set: TlcSet,
+  key: TlcChannelKey,
+  half: number,
+  getProfile: (set: TlcSet, key: TlcChannelKey, lane: TlcLane) => number[]
+): number[] | undefined {
+  if (!set.cfg?.lanes?.length || !set.imgs?.[key]) return undefined;
+  const sig = autoCacheSignature(set);
+  if ((set as any)._autoCacheSig !== sig) {
+    (set as any)._frontBandCache = {};
+  }
+  const cache: Record<string, number[] | null> = ((set as any)._frontBandCache =
+    (set as any)._frontBandCache || {});
+  const cacheKey = `${key}|h${half}|o:${set.originPx ?? ''}|f:${set.frontPx ?? ''}|fh:${set.frontHalfPx?.[half] ?? ''}`;
+  if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) {
+    return cache[cacheKey] ?? undefined;
+  }
+
+  const sign = TLC_SIGNAL[key]?.sign ?? -1;
+  const binValues: number[][] = Array.from({ length: FRONT_BAND_BINS }, () => []);
+  let validLanes = 0;
+
+  for (const l of set.cfg.lanes) {
+    if (tlcHalf(l) !== half) continue;
+    const m2d = getLane2dMetrics(set, key, l);
+    if (m2d?.offPlate || m2d?.borderStraddle) continue;
+    const prof = getProfile(set, key, l);
+    if (!prof || prof.length < 20) continue;
+    const origin = tlcOrigin(set, l, getProfile);
+    const front = tlcFront(set, l, getProfile);
+    const span = front - origin;
+    if (span < 20) continue;
+
+    const chromLo = Math.max(0, Math.round(origin));
+    const chromHi = Math.min(prof.length - 1, Math.round(front));
+    if (chromHi - chromLo < 20) continue;
+    const bounded = prof.map((v, i) => (i < chromLo ? prof[chromLo] : i > chromHi ? prof[chromHi] : v));
+    const smWin = span < 450 ? 5 : 7;
+    const sm = movingAvg(bounded, smWin);
+    const base = computeArplsBaseline(sm, sign, origin, front);
+
+    for (let b = 0; b < FRONT_BAND_BINS; b++) {
+      const rf = FRONT_BAND_RF_MIN + (b / (FRONT_BAND_BINS - 1)) * (1 - FRONT_BAND_RF_MIN);
+      const posF = origin + rf * span;
+      const pLo = Math.max(chromLo, Math.min(chromHi, Math.floor(posF)));
+      const pHi = Math.max(chromLo, Math.min(chromHi, pLo + 1));
+      const frac = posF - pLo;
+      const smVal = sm[pLo] * (1 - frac) + sm[pHi] * frac;
+      const baseVal = base[pLo] * (1 - frac) + base[pHi] * frac;
+      const sVal = Math.max(0, sign < 0 ? baseVal - smVal : smVal - baseVal);
+      binValues[b].push(sVal);
+    }
+    validLanes++;
+  }
+
+  if (validLanes < 6) {
+    cache[cacheKey] = null;
+    return undefined;
+  }
+
+  const rawBins = binValues.map((vals) => pctile(vals, 0.25));
+  // Gentle 3-bin smoothing [0.25, 0.5, 0.25] removes single-bin jitter
+  const smoothBins = rawBins.map((v, idx) => {
+    const prev = idx > 0 ? rawBins[idx - 1] : v;
+    const next = idx < rawBins.length - 1 ? rawBins[idx + 1] : v;
+    return 0.25 * prev + 0.5 * v + 0.25 * next;
+  });
+
+  cache[cacheKey] = smoothBins;
+  return smoothBins;
 }
 
 // Detect solvent front from thin meniscus line (sharp local ridge) and/or persistent wet-vs-dry background step
@@ -1569,13 +1672,272 @@ export function analyzeLaneBoundaryOccupancy(
   return out;
 }
 
-// Find spots in a lane: uses true 2D connected-region & intensity-guided watershed segmentation
-// whenever a 2D lane strip map is available (detectorMode !== '1d'), with a unified arPLS-baseline
-// 1D detector as clean fallback for pure-1D profiles or legacy comparison.
+function buildDensitogramSignal(
+  profile: number[],
+  o: TlcProfileOptions
+): {
+  sm: number[];
+  base: Float64Array;
+  rawSig: number[];
+  cleanSig: number[];
+  chromLo: number;
+  chromHi: number;
+  span: number;
+  dynSpan: number;
+} {
+  const n = profile.length;
+  const span = Math.max(1, o.front - o.origin);
+  const chromLo = Math.max(0, Math.round(o.origin));
+  const chromHi = Math.min(n - 1, Math.round(o.front));
+  const useChromClamp = chromHi - chromLo >= 20;
+  const boundedProf = useChromClamp
+    ? profile.map((v, i) => (i < chromLo ? profile[chromLo] : i > chromHi ? profile[chromHi] : v))
+    : profile;
+
+  const smWin = span < 450 ? 5 : 7;
+  const sm = movingAvg(boundedProf, smWin);
+  const base = computeArplsBaseline(sm, o.sign, o.origin, o.front);
+
+  const rawSig = new Array<number>(n).fill(0);
+  const cleanSig = new Array<number>(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const s =
+      useChromClamp && (i < chromLo - 1 || i > chromHi)
+        ? 0
+        : Math.max(0, o.sign < 0 ? base[i] - sm[i] : sm[i] - base[i]);
+    rawSig[i] = s;
+    if (o.frontBandBg && i >= chromLo && i <= chromHi) {
+      const rf = (i - o.origin) / span;
+      if (rf >= 0.88) {
+        const ramp = Math.min(1, Math.max(0, (rf - 0.88) / 0.04));
+        const bg = sampleFrontBandBg(o.frontBandBg, rf) ?? 0;
+        cleanSig[i] = Math.max(0, s - ramp * bg * 1.15);
+      } else {
+        cleanSig[i] = s;
+      }
+    } else {
+      cleanSig[i] = s;
+    }
+  }
+
+  const profSlice = profile.slice(chromLo, Math.min(n, chromHi + 1));
+  const dynSpan =
+    profSlice.length > 4
+      ? Math.abs(pctile(profSlice, 0.98) - pctile(profSlice, 0.02))
+      : 80;
+
+  return { sm, base, rawSig, cleanSig, chromLo, chromHi, span, dynSpan };
+}
+
+/**
+ * Computes the plate-calibrated intensity cutoff for 'densitogram' detector mode
+ * from the user's cutoff slider (minProminence in [0.04..0.95], default 0.28).
+ */
+export function computeDensitogramCutoff(
+  o: TlcProfileOptions,
+  dynSpan: number
+): { cutoff: number; noiseFloor: number; plateSpan: number } {
+  const h = o.plateHistogram;
+  const bgSigma = h && h.sampleCount >= 8 ? Math.min(h.bgSigma, 2.8) : 1.5;
+  const noiseFloor =
+    o.sign < 0 ? Math.max(4.5, 3.0 * bgSigma) : Math.max(2.5, 2.8 * bgSigma);
+  const plateSpan =
+    h && h.sampleCount >= 8 && h.contrastSpan > 8
+      ? h.contrastSpan
+      : Math.max(45, dynSpan);
+  const minProm = Math.min(0.95, Math.max(0.04, o.minProminence ?? 0.28));
+  const frac =
+    minProm >= 0.08
+      ? 0.045 + 0.42 * Math.pow((minProm - 0.08) / 0.62, 1.6)
+      : 0.045 * (minProm / 0.08);
+  const cutoff = Math.max(noiseFloor, frac * plateSpan);
+  return { cutoff, noiseFloor, plateSpan };
+}
+
+/**
+ * Exact inverse of computeDensitogramCutoff: maps a dragged cutoff intensity on the
+ * densitogram plot back to the corresponding spotProminence slider value in [0.04..0.95].
+ */
+export function spotProminenceForDensitogramCutoff(
+  targetCutoff: number,
+  plateSpan: number,
+  noiseFloor: number
+): number {
+  const safeSpan = Math.max(1e-6, plateSpan);
+  const clampedCutoff = Math.max(noiseFloor, targetCutoff);
+  const frac = clampedCutoff / safeSpan;
+  let minProm: number;
+  if (frac <= 0.045) {
+    minProm = 0.08 * (frac / 0.045);
+  } else {
+    const t = Math.pow((frac - 0.045) / 0.42, 1 / 1.6);
+    minProm = 0.08 + 0.62 * t;
+  }
+  return Math.round(Math.min(0.95, Math.max(0.04, minProm)) * 1000) / 1000;
+}
+
+/**
+ * Transparent 1D Densitogram Cutoff Peak Detector:
+ * Searches strictly between detected origin and solvent front on the smoothed, arPLS-baseline-
+ * subtracted densitogram curve (with plate-wide near-front meniscus subtraction when available),
+ * selecting every local peak above the intensity cutoff with a real topographic valley.
+ */
+export function findSpotsDensitogram(
+  profile: number[],
+  o: TlcProfileOptions
+): TlcSpot[] {
+  const n = profile.length;
+  if (n < 10) return [];
+  if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return [];
+
+  const { cleanSig, chromLo, chromHi, span, dynSpan } = buildDensitogramSignal(profile, o);
+  const start = Math.round(o.origin + Math.max(3, Math.round(0.025 * span)));
+  const end = Math.round(o.origin + Math.min(span - 2, 0.985 * span));
+  if (end <= start) return [];
+
+  // 1D off-plate guard for UV254/White (bright-silica channels)
+  const profSlice = profile.slice(Math.max(0, start), Math.min(n, end));
+  if (o.sign < 0 && profSlice.length >= 10 && pctile(profSlice, 0.80) < 35) return [];
+
+  const { cutoff, noiseFloor, plateSpan } = computeDensitogramCutoff(o, dynSpan);
+
+  // Light 3-point smoothing removes 1px staircase jitter without flattening narrow peaks
+  const d = new Array<number>(n).fill(0);
+  for (let i = chromLo; i <= chromHi; i++) {
+    const prev = i > chromLo ? cleanSig[i - 1] : cleanSig[i];
+    const next = i < chromHi ? cleanSig[i + 1] : cleanSig[i];
+    d[i] = 0.25 * prev + 0.5 * cleanSig[i] + 0.25 * next;
+  }
+
+  // Extract local maxima strictly inside [start .. end] above cutoff (handling flat plateaus)
+  const candidates: Array<{ pos: number; val: number; prom: number }> = [];
+  let i = start;
+  while (i <= end) {
+    if (d[i] < cutoff) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < end && Math.abs(d[j + 1] - d[i]) <= 1e-6) j++;
+    const leftVal = i > chromLo ? d[i - 1] : -Infinity;
+    const rightVal = j < chromHi ? d[j + 1] : -Infinity;
+    if (d[i] > leftVal && d[i] > rightVal) {
+      const peakPos = Math.round(0.5 * (i + j));
+      const peakVal = d[peakPos];
+
+      // Exact topographic prominence inside [chromLo .. chromHi]:
+      // automatically rejects monotonically falling origin-dot shoulders and tiny noise ripples
+      // while splitting closely spaced doublets cleanly.
+      let leftMin = peakVal;
+      for (let k = peakPos - 1; k >= chromLo; k--) {
+        if (d[k] < leftMin) leftMin = d[k];
+        if (d[k] > peakVal) break;
+      }
+      let rightMin = peakVal;
+      for (let k = peakPos + 1; k <= chromHi; k++) {
+        if (d[k] < rightMin) rightMin = d[k];
+        if (d[k] > peakVal) break;
+      }
+      const refCol = Math.max(leftMin, rightMin);
+      const prom = Math.max(0, peakVal - refCol);
+      const minPromReq = Math.max(noiseFloor * 0.65, cutoff * 0.35);
+
+      if (prom >= minPromReq) {
+        candidates.push({ pos: peakPos, val: peakVal, prom });
+      }
+    }
+    i = j + 1;
+  }
+
+  if (!candidates.length) return [];
+
+  // Enforce minimum peak separation (keeping taller peak first)
+  const minDist = o.minDistance ?? Math.max(4, Math.round(0.022 * span));
+  candidates.sort((a, b) => b.val - a.val || b.prom - a.prom);
+  const kept: typeof candidates = [];
+  for (const c of candidates) {
+    if (!kept.some((k) => Math.abs(k.pos - c.pos) < minDist)) {
+      kept.push(c);
+    }
+  }
+  kept.sort((a, b) => a.pos - b.pos);
+
+  let totalChromArea = 0;
+  for (let k = chromLo; k <= chromHi; k++) totalChromArea += cleanSig[k];
+
+  const maxPeakVal = Math.max(...kept.map((k) => k.val), 1e-6);
+
+  return kept.map((c, idx) => {
+    const prevPos = idx > 0 ? kept[idx - 1].pos : chromLo;
+    const nextPos = idx < kept.length - 1 ? kept[idx + 1].pos : chromHi;
+    const edgeFloor = cutoff * 0.25;
+
+    let leftBound = c.pos;
+    for (let k = c.pos - 1; k >= prevPos; k--) {
+      if (d[k] <= edgeFloor) {
+        leftBound = k;
+        break;
+      }
+      if (idx > 0 && d[k] > d[k + 1] && d[k + 1] < c.val * 0.85) {
+        leftBound = k + 1;
+        break;
+      }
+      leftBound = k;
+    }
+
+    let rightBound = c.pos;
+    for (let k = c.pos + 1; k <= nextPos; k++) {
+      if (d[k] <= edgeFloor) {
+        rightBound = k;
+        break;
+      }
+      if (idx < kept.length - 1 && d[k] > d[k - 1] && d[k - 1] < c.val * 0.85) {
+        rightBound = k - 1;
+        break;
+      }
+      rightBound = k;
+    }
+
+    let peakArea = 0;
+    for (let k = leftBound; k <= rightBound; k++) peakArea += cleanSig[k];
+    const areaPct =
+      totalChromArea > 1e-6
+        ? Math.max(1, Math.min(100, Math.round((peakArea / totalChromArea) * 100)))
+        : 100;
+
+    const rf = Math.max(0, Math.min(1, (c.pos - o.origin) / span));
+    const strength = Math.max(0.05, Math.min(1, c.val / Math.max(plateSpan * 0.65, maxPeakVal)));
+    const snr = c.val / Math.max(1, noiseFloor);
+    const cutoffRatio = c.val / Math.max(1e-6, cutoff);
+    const confidence = Math.max(
+      0.15,
+      Math.min(0.96, 0.28 + 0.34 * Math.min(1, Math.log1p(snr) / Math.log1p(12)) + 0.34 * Math.min(1, (cutoffRatio - 0.85) / 2.2))
+    );
+
+    return {
+      pos: c.pos,
+      rf,
+      prom: Math.min(1, c.prom / Math.max(1e-6, plateSpan)),
+      strength,
+      confidence,
+      areaPct,
+      extentStart: leftBound,
+      extentEnd: rightBound,
+      detector: 'densitogram' as const,
+    };
+  });
+}
+
+// Find spots in a lane: supports '2d' watershed segmentation (default when 2D map is available),
+// 'densitogram' direct cutoff peak picker, and '1d' legacy fallback.
 export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
   const n = profile.length;
   if (n < 10) return [];
   if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return [];
+
+  if (o.detectorMode === 'densitogram') {
+    return findSpotsDensitogram(profile, o);
+  }
 
   if (o.detectorMode !== '1d' && o.lane2d?.spotMap2d) {
     return segmentLaneSpots2d(o.lane2d.spotMap2d, {
@@ -1585,6 +1947,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       minDistance: o.minDistance,
       radius: o.radius,
       plateHistogram: o.plateHistogram,
+      frontBandBg: o.frontBandBg,
       offPlate: o.lane2d.offPlate,
       borderStraddle: o.lane2d.borderStraddle,
     });
@@ -2410,7 +2773,8 @@ export interface MultiChannelSpotsOptions {
   rfMergeTolerance?: number;
   histograms?: Partial<Record<TlcChannelKey, ProfileHistogramStats>>;
   lane2dByChannel?: Partial<Record<TlcChannelKey, Lane2dMetrics>>;
-  detectorMode?: '2d' | '1d';
+  frontBandByChannel?: Partial<Record<TlcChannelKey, number[]>>;
+  detectorMode?: TlcSpotDetectorMode;
 }
 
 /**
@@ -2428,6 +2792,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
     rfMergeTolerance = 0.035,
     histograms,
     lane2dByChannel,
+    frontBandByChannel,
     detectorMode,
   } = options;
 
@@ -2444,6 +2809,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
       minDistance,
       plateHistogram: histograms?.[ch],
       lane2d: lane2dByChannel?.[ch],
+      frontBandBg: frontBandByChannel?.[ch],
       detectorMode,
     });
   }
@@ -2476,9 +2842,11 @@ export function getLaneMultiChannelSpots(
 
   const oVal = options.origin ?? tlcOrigin(set, lane, getProfile);
   const fVal = options.front ?? tlcFront(set, lane, getProfile);
+  const half = tlcHalf(lane);
   const profiles: Partial<Record<TlcChannelKey, number[]>> = {};
   const histograms: Partial<Record<TlcChannelKey, ProfileHistogramStats>> = {};
   const lane2dByChannel: Partial<Record<TlcChannelKey, Lane2dMetrics>> = {};
+  const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
   const cf = options.coreFraction ?? 0.35;
   for (const ch of channels) {
     const p = getProfile(set, ch, lane);
@@ -2488,6 +2856,8 @@ export function getLaneMultiChannelSpots(
       if (chHist) histograms[ch] = chHist;
       const m2d = getLane2dMetrics(set, ch, lane, cf);
       if (m2d) lane2dByChannel[ch] = m2d;
+      const fBg = getChannelFrontBandProfile(set, ch, half, getProfile);
+      if (fBg) frontBandByChannel[ch] = fBg;
     }
   }
 
@@ -2501,6 +2871,7 @@ export function getLaneMultiChannelSpots(
     rfMergeTolerance: options.rfMergeTolerance,
     histograms,
     lane2dByChannel,
+    frontBandByChannel,
     detectorMode: set.spotDetectorMode,
   });
 }
@@ -2523,17 +2894,16 @@ export function extractDensitogram(
     };
   }
 
-  const span = Math.max(1, o.front - o.origin);
-  const chromLo = Math.max(0, Math.round(o.origin));
-  const chromHi = Math.min(n - 1, Math.round(o.front));
-  const useChromClamp = chromHi - chromLo >= 20;
-  const boundedProf = useChromClamp
-    ? profile.map((v, i) => (i < chromLo ? profile[chromLo] : i > chromHi ? profile[chromHi] : v))
-    : profile;
-
-  const smWin = span < 450 ? 5 : 7;
-  const sm = movingAvg(boundedProf, smWin);
-  const base = computeArplsBaseline(sm, o.sign, o.origin, o.front);
+  const { sm, base, rawSig, cleanSig, chromLo, chromHi, span, dynSpan } = buildDensitogramSignal(
+    profile,
+    o
+  );
+  const useCleanSignal = o.detectorMode === 'densitogram';
+  const activeSig = useCleanSignal ? cleanSig : rawSig;
+  const cutoffInfo = useCleanSignal ? computeDensitogramCutoff(o, dynSpan) : undefined;
+  const densitogramCutoff = cutoffInfo?.cutoff;
+  const densitogramPlateSpan = cutoffInfo?.plateSpan;
+  const densitogramNoiseFloor = cutoffInfo?.noiseFloor;
 
   const spots = findSpots(profile, o);
 
@@ -2545,10 +2915,7 @@ export function extractDensitogram(
     const rawVal = profile[i];
     const smoothVal = sm[i];
     const baseVal = base[i];
-    const sig =
-      useChromClamp && (i < chromLo - 1 || i > chromHi)
-        ? 0
-        : Math.max(0, o.sign < 0 ? baseVal - smoothVal : smoothVal - baseVal);
+    const sig = activeSig[i];
     const rf = (i - o.origin) / span;
 
     if (sig > maxSignal) maxSignal = sig;
@@ -2628,6 +2995,9 @@ export function extractDensitogram(
     front: o.front,
     maxSignal: Math.max(maxSignal, 1e-6),
     totalArea,
+    ...(densitogramCutoff !== undefined ? { densitogramCutoff } : {}),
+    ...(densitogramPlateSpan !== undefined ? { densitogramPlateSpan } : {}),
+    ...(densitogramNoiseFloor !== undefined ? { densitogramNoiseFloor } : {}),
   };
 }
 
@@ -3218,28 +3588,38 @@ export function tlcFront(
         // pencil mark ahead of the front), without letting an inner spot band beat a strong
         // outer UV ridge front.
         if (cand.bandOrStepBacked && !cur.bandOrStepBacked && cand.score >= 3.8) {
+          const minRidgeScore = cand.score >= 11.0 ? Math.max(5.0, cand.score * 0.85) : 5.0;
           const curIsStrongOuterUvRidge =
             !curIsWhiteOnly &&
             cur.medianPos > cand.medianPos + minFrontGap &&
-            cur.score >= 5.0;
+            cur.score >= minRidgeScore;
           if (!curIsStrongOuterUvRidge) return true;
         }
         if (cur.bandOrStepBacked && !cand.bandOrStepBacked && cur.score >= 3.8) {
+          const minRidgeScore = cur.score >= 11.0 ? Math.max(5.0, cur.score * 0.85) : 5.0;
           const candIsStrongOuterUvRidge =
             !candIsWhiteOnly &&
             cand.medianPos > cur.medianPos + minFrontGap &&
-            cand.score >= 5.0;
+            cand.score >= minRidgeScore;
           if (!candIsStrongOuterUvRidge) return false;
         }
         // Chromatography physics: a confirmed continuous outer front physically outranks an
-        // inner high-Rf compound spot band.
+        // inner high-Rf compound spot band. Never let a White-only hit (commonly middle-gap
+        // graphite handwriting or ruler marks) jump ahead of a strong UV-backed solvent front,
+        // and never let a weak ridge-only artifact override a strong band/step-backed front.
         if (cand.medianPos > cur.medianPos + minFrontGap && cand.score >= 3.8) {
-          if (cand.bandOrStepBacked || (!candIsWhiteOnly && cand.score >= 5.0)) {
+          const whiteJumpingOverStrongUv =
+            candIsWhiteOnly && !curIsWhiteOnly && cur.bandOrStepBacked && cur.score >= 9.5;
+          const minRidgeScore = cur.bandOrStepBacked && cur.score >= 11.0 ? Math.max(5.0, cur.score * 0.85) : 5.0;
+          if (!whiteJumpingOverStrongUv && (cand.bandOrStepBacked || (!candIsWhiteOnly && cand.score >= minRidgeScore))) {
             return true;
           }
         }
         if (cur.medianPos > cand.medianPos + minFrontGap && cur.score >= 3.8) {
-          if (cur.bandOrStepBacked || (!curIsWhiteOnly && cur.score >= 5.0)) {
+          const whiteJumpingOverStrongUv =
+            curIsWhiteOnly && !candIsWhiteOnly && cand.bandOrStepBacked && cand.score >= 9.5;
+          const minRidgeScore = cand.bandOrStepBacked && cand.score >= 11.0 ? Math.max(5.0, cand.score * 0.85) : 5.0;
+          if (!whiteJumpingOverStrongUv && (cur.bandOrStepBacked || (!curIsWhiteOnly && cur.score >= minRidgeScore))) {
             return false;
           }
         }

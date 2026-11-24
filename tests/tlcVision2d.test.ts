@@ -2165,9 +2165,90 @@ describe('tlcVision2d: Step 2 origin detection (plate-space CSV alignment, huge/
     expect(parseTlcStorageKey(k2Dev)).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: false });
     expect(parseTlcStorageKey(k2Pre)).toEqual({ plateIndex: 2, channel: 'UV366', isPreRun: true });
   });
+
+  it('rejects a full-width horizontal pencil/dip/bezel band outer to the origin dots in Pass 1 of detectChannelOrigin', () => {
+    const W = 72;
+    const L = 1000;
+    const bandPos = 64; // full-width horizontal line at 6.4% (outer to real dots)
+    const dotPos = 128; // real circular origin dots at 12.8%
+    const cx = (W - 1) / 2;
+    const blankCols = new Set([16, 20, 21]);
+
+    const entries = Array.from({ length: 27 }, (_, id) => {
+      const rgba = makeLaneStrip(W, L, [8, 255, 16], (x, pos) => {
+        // Horizontal line spanning 100% of lane width (equal in center and flanks)
+        const hBand = 58 * Math.exp(-(((pos - bandPos) / 4.5) ** 2));
+        let dot = 0;
+        if (!blankCols.has(id)) {
+          const r = Math.hypot(x - cx, pos - dotPos) / 11;
+          dot = 185 * Math.exp(-(r * r) / 2);
+        }
+        return [8, Math.max(8, 255 - Math.max(hBand, dot)), 16];
+      });
+      const { profile, metrics } = analyzeLaneStripRgb(rgba, W, L, 'UV254', 0.35, false);
+      return {
+        laneId: id,
+        profile,
+        lane: { x0: 400 + id * 76, y0: 2200, angle: 0, width: W, length: L },
+        metrics,
+      };
+    });
+
+    const res = detectChannelOrigin(entries, -1, L);
+    expect(Math.abs(res.pos - dotPos)).toBeLessThanOrEqual(4);
+    expect(Math.abs((res.byLane?.[0] ?? 0) - dotPos)).toBeLessThanOrEqual(4);
+    expect(Math.abs((res.byLane?.[16] ?? 0) - dotPos)).toBeLessThanOrEqual(4);
+    expect(Math.abs((res.byLane?.[20] ?? 0) - dotPos)).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps bright-green saturated UV254 origin dots instead of letting a weak unclipped secondary-channel artifact hijack tlcOrigin', () => {
+    const cfg = createDefaultLaneConfig(3280, 'two-tier');
+    cfg.lanes.forEach((l) => {
+      l.zeroRf = null;
+    });
+    const rand = rng(2540);
+    const trueOrigin = 126;
+    const fakeArtifact = 58;
+    const blankCols = new Set([16, 20, 21]);
+
+    const set: TlcSet = {
+      uid: 'saturated-uv254-priority',
+      name: 'Saturated UV254 Priority',
+      frameW: 3280,
+      frontPx: null,
+      frontAuto: {},
+      frontAutoByLane: {},
+      originPx: null,
+      originAuto: {},
+      originAutoByLane: {},
+      imgs: {
+        UV254: { name: 'uv254.png', bmp: {} as any },
+        White: { name: 'white.png', bmp: {} as any },
+      },
+      cfg,
+    };
+
+    const getProfile = (_s: TlcSet, key: string, l: TlcLane) => {
+      const col = l.id % 27;
+      const L = l.length;
+      if (key === 'UV254') {
+        // Bare fluorescent green silica saturated at 255 (clipHighFrac > 0.70),
+        // with razor-sharp dark origin dots at trueOrigin on 24/27 lanes.
+        return Array.from({ length: L }, (_, i) => {
+          const dark = !blankCols.has(col) ? 185 * Math.exp(-(((i - trueOrigin) / 8) ** 2)) : 0;
+          return Math.max(10, Math.min(255, 255 - dark));
+        });
+      }
+      // Unclipped White channel with a weak spurious dip/shadow line at fakeArtifact (amp ~12)
+      return Array.from({ length: L }, (_, i) => {
+        const dip = 12 * Math.exp(-(((i - fakeArtifact) / 6) ** 2));
+        return Math.max(10, 215 - dip + (rand() - 0.5) * 1.0);
+      });
+    };
+
+    const o0 = tlcOrigin(set, cfg.lanes[0], getProfile as any);
+    const oBlank16 = tlcOrigin(set, cfg.lanes[16], getProfile as any);
+    expect(Math.abs(o0 - trueOrigin)).toBeLessThanOrEqual(4);
+    expect(Math.abs(oBlank16 - trueOrigin)).toBeLessThanOrEqual(4);
+  });
 });
-
-
-
-
-

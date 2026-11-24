@@ -1255,12 +1255,27 @@ export const TlcView: React.FC = () => {
         const getProf = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
         const halfMultiOk = new Set<number>();
         for (const hIdx of [0, 1]) {
+          const halfLanes = cfg.lanes.filter((l) => tlcHalf(l) === hIdx);
           const sample = probeCfg.lanes.find((l) => tlcHalf(l) === hIdx);
-          if (!sample) continue;
+          if (!sample || !halfLanes.length) continue;
           tlcOrigin(probeSet, sample, getProf);
-          if (probeSet.autoConf?.[`origin${hIdx}`]?.detected && (probeSet.originAuto?.[hIdx] ?? 0) > 10) {
-            halfMultiOk.add(hIdx);
+          const probeOrigin = probeSet.originAuto?.[hIdx] ?? 0;
+          if (!probeSet.autoConf?.[`origin${hIdx}`]?.detected || probeOrigin <= 10) continue;
+          // If autoDetectLanes already locked onto a strong 2D circular origin-dot comb on this
+          // half (and no pre-run photo is active), only hand off to tlcOrigin when it agrees
+          // within +/-3.5% of the detected 2D origin row rather than jumping off the dots.
+          const detRow = hIdx === 0 ? best.det.lower : best.det.upper;
+          if (!hasActivePreRun && detRow && detRow.seen >= 10) {
+            const detZeros = halfLanes
+              .map((l) => l.zeroRf ?? 0)
+              .filter((z) => z > 0)
+              .sort((a, b) => a - b);
+            const detZeroMed = detZeros.length ? detZeros[detZeros.length >> 1] : 0;
+            if (detZeroMed > 0 && Math.abs(probeOrigin - detZeroMed) > Math.max(25, sample.length * 0.035)) {
+              continue;
+            }
           }
+          halfMultiOk.add(hIdx);
         }
         if (halfMultiOk.size > 0) {
           cfg = {

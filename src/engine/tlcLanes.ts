@@ -1474,6 +1474,43 @@ interface OriginCandidate extends FrontDetectionResult {
   isTailing?: boolean;
 }
 
+function isOrigin2dArtifact(
+  metrics: Lane2dMetrics | undefined,
+  pos: number,
+  feat: number
+): boolean {
+  if (!metrics || pos < 0 || pos >= metrics.edgeRatio.length) return false;
+  const latMid = metrics.lateralExcess[pos];
+  // Narrow synthetic strips without flanks set lateralExcess = 999 -> skip lateral rejection
+  if (!(latMid < 900)) return false;
+
+  const erWin: number[] = [];
+  const leWin: number[] = [];
+  const swWin: number[] = [];
+  const kLo = Math.max(0, pos - 2);
+  const kHi = Math.min(metrics.edgeRatio.length - 1, pos + 2);
+  for (let k = kLo; k <= kHi; k++) {
+    erWin.push(metrics.edgeRatio[k]);
+    leWin.push(metrics.lateralExcess[k]);
+    if (k < metrics.spotWidth.length) swWin.push(metrics.spotWidth[k]);
+  }
+  erWin.sort((a, b) => a - b);
+  leWin.sort((a, b) => a - b);
+  swWin.sort((a, b) => a - b);
+  const medEr = erWin[erWin.length >> 1];
+  const medLe = leWin[leWin.length >> 1];
+  const medSw = swWin.length ? swWin[swWin.length >> 1] : 0;
+
+  // Reject dust specks / adjacent-lane spillover peaking on lane borders
+  if (medEr > 1.35) return true;
+  // Reject faint-to-moderate horizontal bands/streaks lacking center-vs-flank contrast
+  if (medLe < Math.max(2.0, 0.12 * feat) && feat < 45) return true;
+  // Reject strong full-width horizontal lines (pencil baselines, dip lines, plate-edge bezels)
+  // whose signal is uniform across both lane flanks and spans >=88% of lane width
+  if (feat >= 45 && medLe < Math.max(2.5, 0.06 * feat) && medSw >= 0.88) return true;
+  return false;
+}
+
 // Detect up to `maxPeaks` separated compact deposit peaks in the lower 3%-25% of a lane.
 function detectOriginCandidates(
   profile: number[],
@@ -1559,6 +1596,9 @@ function detectOriginCandidates(
     const ref = refineOriginCoreDetailed(s, pk.idx, sign, refineOpts);
     const pos = ref.pos;
     if (pos <= 0 || out.some((kept) => Math.abs(kept.pos - pos) < minSep)) continue;
+    // Reject horizontal bands (pencil/dip/bezel lines) and border dust specks in Pass 1 so
+    // they can never win lane-consensus clustering over real circular origin dots.
+    if (isOrigin2dArtifact(refineOpts?.metrics, pos, pk.feat)) continue;
     out.push({ pos, score: pk.feat / noiseFloor, feat: pk.feat, fwhm: ref.fwhm, isTailing: ref.isTailing });
     if (out.length >= maxPeaks) break;
   }
@@ -4186,25 +4226,8 @@ function detectOriginNearDetailed(
   if (refRes.fwhm < minFwhm) return empty;
 
   // 2D lateral centering & edge-speck guard: reject dust specks sitting on lane borders and
-  // horizontal illumination/silica streaks that lack center-vs-flank contrast.
-  if (opts?.metrics && refined >= 0 && refined < opts.metrics.edgeRatio.length) {
-    const m = opts.metrics;
-    const latMid = m.lateralExcess[refined];
-    if (latMid < 900) {
-      const erWin: number[] = [];
-      const leWin: number[] = [];
-      for (let k = Math.max(0, refined - 2); k <= Math.min(m.edgeRatio.length - 1, refined + 2); k++) {
-        erWin.push(m.edgeRatio[k]);
-        leWin.push(m.lateralExcess[k]);
-      }
-      erWin.sort((a, b) => a - b);
-      leWin.sort((a, b) => a - b);
-      const medEr = erWin[erWin.length >> 1];
-      const medLe = leWin[leWin.length >> 1];
-      if (medEr > 1.35) return empty;
-      if (medLe < Math.max(2.0, 0.12 * bestRawFeat) && bestRawFeat < 45) return empty;
-    }
-  }
+  // horizontal illumination/pencil/dip bands that lack center-vs-flank contrast.
+  if (isOrigin2dArtifact(opts?.metrics, refined, bestRawFeat)) return empty;
 
   const devFromRef = Math.abs(refined - refPos);
   const fwdShift = refined - refPos;
@@ -4364,6 +4387,22 @@ export function detectChannelOrigin(
   }
 
   let best: ChannelOriginResult = detectOriginDetailed(medProfile, sign, h);
+  if (best.pos > 10 && laneEntries.length >= 3) {
+    // Verify the 1D lane-median fallback against 2D metrics so a full-width horizontal band
+    // (pencil/dip/bezel line) on a channel with no real circular dots cannot leak through.
+    let checked2d = 0;
+    let artifact2d = 0;
+    const medFeatEst = Math.max(10, best.score * Math.max(1.0, histBgSigma ?? 1.5));
+    for (const e of laneEntries) {
+      const m = e.metrics;
+      if (!m || best.pos >= m.lateralExcess.length || !(m.lateralExcess[best.pos] < 900)) continue;
+      checked2d++;
+      if (isOrigin2dArtifact(m, best.pos, medFeatEst)) artifact2d++;
+    }
+    if (checked2d >= Math.ceil(laneEntries.length * 0.5) && artifact2d >= Math.ceil(checked2d * 0.65)) {
+      best = { pos: 0, score: 0 };
+    }
+  }
 
   if (laneEntries.length >= 3) {
     const laneHits: Array<{
@@ -4782,7 +4821,11 @@ function solveMultiChannelHalfOrigin(
         bestSourceId = src.id;
       }
     } else if (
-      (bestClipped && !src.clipped && res.score >= 8 && (res.validFrac ?? 0) >= 0.22) ||
+      (bestClipped &&
+        !src.clipped &&
+        res.score >= Math.max(8, Math.min(best.score, 120) * 0.5) &&
+        (res.validFrac ?? 0) >= Math.max(0.22, (best.validFrac ?? 0) * 0.65) &&
+        (res.medFeat ?? 0) >= Math.max(15, (best.medFeat ?? 0) * 0.45)) ||
       ((res.validFrac ?? 0) > (best.validFrac ?? 0) + 0.15 &&
         (src.isComposite || (res.medFeat ?? 0) > (best.medFeat ?? 0) * 1.1) &&
         res.score >= (src.isComposite ? best.score * 0.85 : best.score * 1.25))

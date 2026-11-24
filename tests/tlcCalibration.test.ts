@@ -238,6 +238,12 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
     expect(sio2Fit!.globalDemandShift).toBeLessThan(0);
     expect(sio2Fit!.midplateRfShift).toBeGreaterThan(0.05);
     expect(sio2Fit!.rmseAfter).toBeLessThan(sio2Fit!.rmseBefore);
+    // Structures & compound identity keys must be preserved for Real TLC Matches inspection
+    const firstLane = model.plates[0].lanes.find((l) => !l.isBlank && l.predictedSpots.length > 0);
+    expect(firstLane).toBeDefined();
+    expect(firstLane!.predictedSpots[0].smiles).toBeTruthy();
+    expect(firstLane!.predictedSpots[0].compoundKey).toBeTruthy();
+    expect(model.plates[0].compoundSummaries?.[0]?.smiles).toBeTruthy();
     // Phase isolation: C18 and Al2O3 remain uncalibrated
     expect(model.byPhase.C18).toBeUndefined();
     expect(model.byPhase.Al2O3_neutral).toBeUndefined();
@@ -701,7 +707,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
       solvent: 'DMSO',
     }));
 
-    const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const sys25 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_25')!;
     // 30 single-substrate wells (3 replicates of 10 distinct molecules): ridge needs >= 30 pairs and >= 8 distinct compounds
     const rows = Array.from({ length: 30 }, (_, w) => {
       const m = mols[w % mols.length];
@@ -732,7 +738,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
       });
       if (wellIdx < 30) {
         const m = mols[wellIdx % mols.length];
-        const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys50).rf;
+        const baseRf = predictTlcRf(profileMoleculeForTlc(rdkit, m.smiles), sys25).rf;
         const obsRf = Math.max(0.08, Math.min(0.9, baseRf + m.aromBias));
         prof[`UV254:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
         prof[`White:${laneId}:0.35`] = buildSyntheticPlateProfile([obsRf], 400, 40, 360);
@@ -744,7 +750,7 @@ describe('Empirical TLC Self-Calibration (#7)', () => {
 
     const measSet: TlcSet = {
       uid: 'set_ridge',
-      name: '50% EtOAc / Hexanes',
+      name: '25% EtOAc / Hexanes',
       cfg: { lanes },
       cfgName: 'ridge',
       frameW: LANE_FRAME_WIDTH,
@@ -1079,7 +1085,7 @@ describe('Stage 1 plate-wide cross-well compound consensus matching', () => {
       { code: 'A', name: 'Shifted Benzamide', smiles: 'NC(=O)c1ccccc1' },
       { code: 'B', name: 'Acetanilide', smiles: 'CC(=O)Nc1ccccc1' },
       { code: 'C', name: 'Acetophenone', smiles: 'CC(=O)c1ccccc1' },
-      { code: 'D', name: '4-Nitroanisole', smiles: 'COc1ccc([N+](=O)[O-])cc1' },
+      { code: 'D', name: 'Methyl benzoate', smiles: 'COC(=O)c1ccccc1' },
     ];
     state.reagents = mols.map((m) => ({
       code: m.code,
@@ -1418,6 +1424,303 @@ describe('Stage 1 plate-wide cross-well compound consensus matching', () => {
     // Must match the 22 wells at Rf ~0.70, NOT the 6 sparse Rf 0.55 spots (and NOT steal 0.55 in the 2 consumed wells!)
     expect(summaryA!.wellsMatched).toBe(22);
     expect(summaryA!.observedRfMean).toBeCloseTo(0.70, 1);
+  });
+
+  it('never marks BOTH a starting material and a co-eluting predicted product as Found from a single real TLC spot', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    // Choose a polar acid SM and a closely co-eluting polar product (within ΔRf <= 0.05) in 50% EtOAc/Hexanes
+    const smSmiles = 'O=C(O)c1ccc(Br)cc1N'; // 5-bromoanthranilic acid (low Rf)
+    const prodSmiles = 'O=C(O)c1ccc(Cl)cc1N'; // 5-chloroanthranilic acid (nearly identical Rf!)
+    state.reagents = [
+      {
+        code: 'A',
+        name: '5-Bromoanthranilic acid',
+        smiles: smSmiles,
+        molarMass: 216.03,
+        density: 1.5,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+    ];
+
+    const sys50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const smRf = predictTlcRf(profileMoleculeForTlc(rdkit, smSmiles)!, sys50).rf;
+    const prodRf = predictTlcRf(profileMoleculeForTlc(rdkit, prodSmiles)!, sys50).rf;
+    expect(Math.abs(smRf - prodRf)).toBeLessThan(0.05);
+
+    const rows = [
+      {
+        local_index: 0,
+        global_index: 0,
+        combo_index: 0,
+        plate_number: 0,
+        container_id: 0,
+        recipe: [{ code: 'A', name: '5-Bromoanthranilic acid', target_concentration: 50, equivalence: 1 }],
+      },
+    ];
+    const fakeRun = { plates: 1, reactions: 1, rows } as unknown as RunResult;
+
+    const cachedPredictions: any = {
+      '0-0': {
+        substrates: [{ code: 'A', name: '5-Bromoanthranilic acid', neutralSmiles: smSmiles, valid: true }],
+        species: [
+          {
+            key: 'prod_coelute',
+            tautomerKey: 'prod_coelute',
+            smiles: prodSmiles,
+            formula: 'C7H6ClNO2',
+            mechanismSummary: 'Co-eluting Predicted Product',
+            tier: 'Medium',
+            score: 0.7,
+          },
+        ],
+      },
+    };
+
+    // Real lane has ONLY ONE observed spot at Rf 0.07 (matching the user's exact scenario!)
+    const obsRf = Math.max(0.07, Math.min(0.85, smRf + 0.04));
+    const lanes = Array.from({ length: 54 }, (_, laneId) => ({
+      id: laneId,
+      x0: 10 + laneId * 20,
+      y0: 0,
+      x1: 10 + laneId * 20,
+      y1: 400,
+      width: 14,
+      length: 400,
+      zeroRf: 40,
+      customSpots:
+        containerOfLane(laneId) === 0
+          ? [{ pos: Math.round(40 + obsRf * 320), rf: obsRf, strength: 0.85, source: 'manual' as const }]
+          : [],
+    }));
+
+    const measSet: TlcSet = {
+      uid: 'set_coelute_single',
+      name: '50% EtOAc / Hexanes',
+      cfg: { lanes },
+      cfgName: 'coelute_single',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [measSet],
+      cachedPredictions,
+    });
+
+    const w0 = model.plates[0].lanes[0];
+    const smPred = w0.predictedSpots.find((p) => p.kind === 'substrate');
+    const prodPred = w0.predictedSpots.find((p) => p.kind === 'product');
+    expect(smPred).toBeDefined();
+    expect(prodPred).toBeDefined();
+
+    // Neither should claim unambiguous "found" on a single ambiguous per-well spot — BOTH are co-eluting!
+    expect(smPred!.boundaryStatus).toBe('coeluted');
+    expect(smPred!.found).toBe(false);
+    expect(smPred!.coelutedWith).toContain('Co-eluting Predicted Product');
+
+    expect(prodPred!.boundaryStatus).toBe('coeluted');
+    expect(prodPred!.found).toBe(false);
+    expect(prodPred!.coelutedWith).toContain('5-Bromoanthranilic acid');
+
+    // Measured spot carries the co-elution overlap label
+    expect(w0.measuredSpots[0].coelutedLabels).toContain('Co-eluting Predicted Product');
+  });
+
+  it('flags cross-plate contradictions when a product appears on System A in one well and only on System B in another, while preserving legitimate boundary complementarity', () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+
+    const smSmiles = 'CC(=O)Nc1ccccc1'; // Acetanilide (reference SM present in both wells, stays below 0.92 front)
+    const prodMidSmiles = 'NC(=O)c1ccccc1'; // Benzamide (elutes cleanly mid-plate on both 25% EtOAc/Hex & 3% MeOH/DCM)
+    const prodPolarSmiles = 'NC(=O)c1cc(O)c(O)cc1'; // 3,4-Dihydroxybenzamide (pinned at baseline on 25% EtOAc/Hex, mobile on 3% MeOH/DCM)
+
+    state.reagents = [
+      {
+        code: 'A',
+        name: 'Acetanilide',
+        smiles: smSmiles,
+        molarMass: 135.17,
+        density: 1.22,
+        stock: 500,
+        solvent: 'DMSO',
+      },
+    ];
+
+    const rows = [0, 1].map((w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: [{ code: 'A', name: 'Acetanilide', target_concentration: 50, equivalence: 1 }],
+    }));
+    const fakeRun = { plates: 1, reactions: 2, rows } as unknown as RunResult;
+
+    const cachedPredictions: Record<string, any> = {};
+    for (const w of [0, 1]) {
+      cachedPredictions[`0-${w}`] = {
+        substrates: [{ code: 'A', name: 'Acetanilide', neutralSmiles: smSmiles, valid: true }],
+        species: [
+          {
+            key: 'prod_conflict',
+            tautomerKey: 'prod_conflict',
+            smiles: prodMidSmiles,
+            formula: 'C7H7NO',
+            mechanismSummary: 'Mid-Polarity Product',
+            tier: 'High',
+            score: 0.9,
+          },
+          {
+            key: 'prod_polar',
+            tautomerKey: 'prod_polar',
+            smiles: prodPolarSmiles,
+            formula: 'C7H7NO3',
+            mechanismSummary: 'Polar Amide Product',
+            tier: 'Medium',
+            score: 0.75,
+          },
+        ],
+      };
+    }
+
+    const sysA = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const sysB = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'meoh_dcm_7')!;
+
+    const smRfA = predictTlcRf(profileMoleculeForTlc(rdkit, smSmiles)!, sysA).rf;
+    const prodMidRfA = predictTlcRf(profileMoleculeForTlc(rdkit, prodMidSmiles)!, sysA).rf;
+    const prodPolarRfA = predictTlcRf(profileMoleculeForTlc(rdkit, prodPolarSmiles)!, sysA).rf;
+
+    const smRfB = predictTlcRf(profileMoleculeForTlc(rdkit, smSmiles)!, sysB).rf;
+    const prodMidRfB = predictTlcRf(profileMoleculeForTlc(rdkit, prodMidSmiles)!, sysB).rf;
+    const prodPolarRfB = predictTlcRf(profileMoleculeForTlc(rdkit, prodPolarSmiles)!, sysB).rf;
+
+    // Sanity: Polar Amide Product is baseline-pinned on 25% EtOAc/Hex and mid-plate on 3% MeOH/DCM,
+    // while Mid-Polarity Product elutes cleanly inside the interior on both plates without co-eluting with SM.
+    expect(prodPolarRfA).toBeLessThanOrEqual(0.08);
+    expect(prodPolarRfB).toBeGreaterThan(0.12);
+    expect(prodMidRfA).toBeGreaterThan(0.15);
+    expect(prodMidRfA).toBeLessThan(0.85);
+    expect(prodMidRfB).toBeGreaterThan(0.15);
+    expect(prodMidRfB).toBeLessThan(0.85);
+    expect(smRfB).toBeLessThan(0.92);
+
+    // Plate A (25% EtOAc/Hexanes):
+    // - Well 0: SM present + Mid-Polarity Product spot present + origin spot for Polar Amide Product
+    // - Well 1: SM present ONLY (Mid-Polarity Product ABSENT on Plate A!)
+    const lanesA = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      const spots: Array<{ pos: number; rf: number; strength: number; source: 'manual' }> = [];
+      if (w === 0) {
+        spots.push({ pos: Math.round(40 + smRfA * 320), rf: smRfA, strength: 0.9, source: 'manual' });
+        spots.push({ pos: Math.round(40 + prodMidRfA * 320), rf: prodMidRfA, strength: 0.85, source: 'manual' });
+        spots.push({ pos: 45, rf: 0.02, strength: 0.8, source: 'manual' }); // origin deposit -> baseline_pinned
+      } else if (w === 1) {
+        spots.push({ pos: Math.round(40 + smRfA * 320), rf: smRfA, strength: 0.9, source: 'manual' });
+      }
+      return {
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+        customSpots: spots,
+      };
+    });
+
+    // Plate B (3% MeOH/DCM):
+    // - Well 0: SM present + Polar Amide Product cleanly resolved (Mid-Polarity Product ABSENT on Plate B!)
+    // - Well 1: SM present + Mid-Polarity Product spot present
+    const lanesB = Array.from({ length: 54 }, (_, laneId) => {
+      const w = containerOfLane(laneId);
+      const spots: Array<{ pos: number; rf: number; strength: number; source: 'manual' }> = [];
+      if (w === 0) {
+        spots.push({ pos: Math.round(40 + smRfB * 320), rf: smRfB, strength: 0.9, source: 'manual' });
+        spots.push({ pos: Math.round(40 + prodPolarRfB * 320), rf: prodPolarRfB, strength: 0.85, source: 'manual' });
+      } else if (w === 1) {
+        spots.push({ pos: Math.round(40 + smRfB * 320), rf: smRfB, strength: 0.9, source: 'manual' });
+        spots.push({ pos: Math.round(40 + prodMidRfB * 320), rf: prodMidRfB, strength: 0.85, source: 'manual' });
+      }
+      return {
+        id: laneId,
+        x0: 10 + laneId * 20,
+        y0: 0,
+        x1: 10 + laneId * 20,
+        y1: 400,
+        width: 14,
+        length: 400,
+        zeroRf: 40,
+        customSpots: spots,
+      };
+    });
+
+    const setA: TlcSet = {
+      uid: 'set_conflict_a',
+      name: '50% EtOAc / Hexanes',
+      cfg: { lanes: lanesA },
+      cfgName: 'conflict_a',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+    const setB: TlcSet = {
+      uid: 'set_conflict_b',
+      name: '7% MeOH / DCM',
+      cfg: { lanes: lanesB },
+      cfgName: 'conflict_b',
+      frameW: LANE_FRAME_WIDTH,
+      frontPx: 360,
+      originPx: 40,
+      imgs: {},
+    };
+
+    const { model } = calibrateTlcModelFromCampaign({
+      rdkit,
+      state,
+      run: fakeRun,
+      tlcSets: [setA, setB],
+      cachedPredictions,
+    });
+
+    const plateA = model.plates.find((p) => p.setUid === 'set_conflict_a')!;
+    const plateB = model.plates.find((p) => p.setUid === 'set_conflict_b')!;
+
+    // 1. Mid-Polarity Product: found on Plate A in Well 0 (absent on B) & on Plate B in Well 1 (absent on A)
+    //    -> BOTH single-plate hits are physically contradictory and MUST be downgraded to 'inconsistent'!
+    const midWell0PlateA = plateA.lanes[0].predictedSpots.find((p) => p.label === 'Mid-Polarity Product')!;
+    const midWell1PlateB = plateB.lanes[1].predictedSpots.find((p) => p.label === 'Mid-Polarity Product')!;
+    expect(midWell0PlateA.boundaryStatus).toBe('inconsistent');
+    expect(midWell0PlateA.found).toBe(false);
+    expect(midWell0PlateA.conflictPlates).toContain(plateB.matchedSystemName);
+
+    expect(midWell1PlateB.boundaryStatus).toBe('inconsistent');
+    expect(midWell1PlateB.found).toBe(false);
+    expect(midWell1PlateB.conflictPlates).toContain(plateA.matchedSystemName);
+
+    // 2. Polar Amide Product in Well 0: pinned at baseline on 25% EtOAc/Hex AND cleanly resolved on 50% EtOAc/Hex
+    //    -> Legitimate cross-plate complementarity! Must STAY 'found' on Plate B!
+    const polarWell0PlateA = plateA.lanes[0].predictedSpots.find((p) => p.label === 'Polar Amide Product')!;
+    const polarWell0PlateB = plateB.lanes[0].predictedSpots.find((p) => p.label === 'Polar Amide Product')!;
+    expect(polarWell0PlateA.boundaryStatus).toBe('baseline_pinned');
+    expect(polarWell0PlateB.boundaryStatus).toBe('found');
+    expect(polarWell0PlateB.found).toBe(true);
+    expect(polarWell0PlateB.conflictPlates).toBeUndefined();
+
+    // 3. Starting material Acetophenone: present in BOTH wells on BOTH plates -> stays cleanly 'found'
+    const smWell0PlateA = plateA.lanes[0].predictedSpots.find((p) => p.kind === 'substrate')!;
+    const smWell0PlateB = plateB.lanes[0].predictedSpots.find((p) => p.kind === 'substrate')!;
+    expect(smWell0PlateA.boundaryStatus).toBe('found');
+    expect(smWell0PlateB.boundaryStatus).toBe('found');
   });
 });
 

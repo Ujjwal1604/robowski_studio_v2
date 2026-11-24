@@ -34,7 +34,14 @@ import {
   inspectLabTlcFilename,
   sampleFloatRgbLaneStrip,
 } from './tlcLabPipeline';
-import { computeArplsBaseline, segmentLaneSpots2d } from './tlcSpots2d';
+import {
+  computeArplsBaseline,
+  computeCleanFlankBaseline2d,
+  DEFAULT_MIN_SPOT_WIDTH_FRAC,
+  measureSpotLateralWidth2d,
+  segmentLaneSpots2d,
+} from './tlcSpots2d';
+export { DEFAULT_MIN_SPOT_WIDTH_FRAC };
 
 export const LANE_FRAME_WIDTH = 3280;
 export const TLC_ROWS = 6;
@@ -1776,28 +1783,26 @@ export function spotProminenceForDensitogramCutoff(
   return Math.round(Math.min(0.95, Math.max(0.04, minProm)) * 1000) / 1000;
 }
 
-/**
- * Transparent 1D Densitogram Cutoff Peak Detector:
- * Searches strictly between detected origin and solvent front on the smoothed, arPLS-baseline-
- * subtracted densitogram curve (with plate-wide near-front meniscus subtraction when available),
- * selecting every local peak above the intensity cutoff with a real topographic valley.
- */
-export function findSpotsDensitogram(
+type RejectedNarrowPeak = NonNullable<TlcDensitogramData['rejectedNarrowPeaks']>[number];
+
+function detectDensitogramPeaks(
   profile: number[],
   o: TlcProfileOptions
-): TlcSpot[] {
+): { spots: TlcSpot[]; rejectedNarrowPeaks: RejectedNarrowPeak[] } {
   const n = profile.length;
-  if (n < 10) return [];
-  if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return [];
+  if (n < 10) return { spots: [], rejectedNarrowPeaks: [] };
+  if (o.lane2d?.offPlate || o.lane2d?.borderStraddle) return { spots: [], rejectedNarrowPeaks: [] };
 
   const { cleanSig, chromLo, chromHi, span, dynSpan } = buildDensitogramSignal(profile, o);
   const start = Math.round(o.origin + Math.max(3, Math.round(0.025 * span)));
   const end = Math.round(o.origin + Math.min(span - 2, 0.985 * span));
-  if (end <= start) return [];
+  if (end <= start) return { spots: [], rejectedNarrowPeaks: [] };
 
   // 1D off-plate guard for UV254/White (bright-silica channels)
   const profSlice = profile.slice(Math.max(0, start), Math.min(n, end));
-  if (o.sign < 0 && profSlice.length >= 10 && pctile(profSlice, 0.80) < 35) return [];
+  if (o.sign < 0 && profSlice.length >= 10 && pctile(profSlice, 0.80) < 35) {
+    return { spots: [], rejectedNarrowPeaks: [] };
+  }
 
   const { cutoff, noiseFloor, plateSpan } = computeDensitogramCutoff(o, dynSpan);
 
@@ -1809,8 +1814,33 @@ export function findSpotsDensitogram(
     d[i] = 0.25 * prev + 0.5 * cleanSig[i] + 0.25 * next;
   }
 
+  // Optional 2D lateral-width microdroplet filter (zero extra image reads — reuses cached spotMap2d)
+  const spotMap2d = o.lane2d?.spotMap2d;
+  const minWidthFrac =
+    o.minSpotWidthFrac !== undefined ? o.minSpotWidthFrac : DEFAULT_MIN_SPOT_WIDTH_FRAC;
+  const canMeasureWidth = Boolean(spotMap2d && spotMap2d.w >= 10 && spotMap2d.h >= 10);
+  const cleanFlankBase =
+    canMeasureWidth && spotMap2d
+      ? computeCleanFlankBaseline2d(spotMap2d, o.origin, o.front)
+      : undefined;
+  const originLat =
+    canMeasureWidth && minWidthFrac > 0 && spotMap2d
+      ? measureSpotLateralWidth2d(spotMap2d, o.origin, { halfRowWin: 2, cleanFlankBase })
+      : null;
+  const hasTinyMicrodropletOrigin = Boolean(
+    originLat &&
+      spotMap2d &&
+      originLat.corePeak >= Math.max(12, spotMap2d.bgSigma * 3.0) &&
+      originLat.fwhmXFrac > 0 &&
+      originLat.fwhmXFrac < Math.min(0.24, minWidthFrac * 0.88)
+  );
+  const effMinWidthFrac = hasTinyMicrodropletOrigin
+    ? Math.min(0.65, minWidthFrac * 1.14)
+    : minWidthFrac;
+
   // Extract local maxima strictly inside [start .. end] above cutoff (handling flat plateaus)
-  const candidates: Array<{ pos: number; val: number; prom: number }> = [];
+  const candidates: Array<{ pos: number; val: number; prom: number; widthFrac?: number }> = [];
+  const rawRejected: RejectedNarrowPeak[] = [];
   let i = start;
   while (i <= end) {
     if (d[i] < cutoff) {
@@ -1843,16 +1873,56 @@ export function findSpotsDensitogram(
       const minPromReq = Math.max(noiseFloor * 0.65, cutoff * 0.35);
 
       if (prom >= minPromReq) {
-        candidates.push({ pos: peakPos, val: peakVal, prom });
+        let widthFrac: number | undefined;
+        let rejectAsArtifact = false;
+        if (canMeasureWidth && spotMap2d) {
+          const lat = measureSpotLateralWidth2d(spotMap2d, peakPos, {
+            origin: o.origin,
+            front: o.front,
+            cleanFlankBase,
+          });
+          if (lat) {
+            if (lat.corePeak > 0) {
+              widthFrac = +lat.fwhmXFrac.toFixed(2);
+            }
+            if (lat.edgeSpillover) {
+              rejectAsArtifact = true;
+            } else if (effMinWidthFrac > 0 && lat.corePeak > 0 && lat.fwhmXFrac < effMinWidthFrac) {
+              rejectAsArtifact = true;
+              rawRejected.push({
+                pos: peakPos,
+                rf: Math.max(0, Math.min(1, (peakPos - o.origin) / span)),
+                widthFrac: +lat.fwhmXFrac.toFixed(2),
+                signal: peakVal,
+                reason: hasTinyMicrodropletOrigin ? 'microdroplet-run' : 'narrow',
+              });
+            }
+          }
+        }
+        if (!rejectAsArtifact) {
+          candidates.push({ pos: peakPos, val: peakVal, prom, widthFrac });
+        }
       }
     }
     i = j + 1;
   }
 
-  if (!candidates.length) return [];
+  // Deduplicate rejected microdroplet markers by minDist so the densitogram overlay stays clean
+  const minDist = o.minDistance ?? Math.max(4, Math.round(0.022 * span));
+  const rejectedNarrowPeaks: RejectedNarrowPeak[] = [];
+  if (rawRejected.length > 0) {
+    rawRejected.sort((a, b) => b.signal - a.signal);
+    for (const r of rawRejected) {
+      if (!rejectedNarrowPeaks.some((k) => Math.abs(k.pos - r.pos) < minDist)) {
+        rejectedNarrowPeaks.push(r);
+      }
+    }
+    rejectedNarrowPeaks.sort((a, b) => a.pos - b.pos);
+  }
+
+  if (!candidates.length) return { spots: [], rejectedNarrowPeaks };
 
   // Enforce minimum peak separation (keeping taller peak first)
-  const minDist = o.minDistance ?? Math.max(4, Math.round(0.022 * span));
   candidates.sort((a, b) => b.val - a.val || b.prom - a.prom);
   const kept: typeof candidates = [];
   for (const c of candidates) {
@@ -1867,7 +1937,7 @@ export function findSpotsDensitogram(
 
   const maxPeakVal = Math.max(...kept.map((k) => k.val), 1e-6);
 
-  return kept.map((c, idx) => {
+  const spots: TlcSpot[] = kept.map((c, idx) => {
     const prevPos = idx > 0 ? kept[idx - 1].pos : chromLo;
     const nextPos = idx < kept.length - 1 ? kept[idx + 1].pos : chromHi;
     const edgeFloor = cutoff * 0.25;
@@ -1923,9 +1993,26 @@ export function findSpotsDensitogram(
       areaPct,
       extentStart: leftBound,
       extentEnd: rightBound,
+      ...(c.widthFrac !== undefined ? { widthFrac: c.widthFrac } : {}),
       detector: 'densitogram' as const,
     };
   });
+
+  return { spots, rejectedNarrowPeaks };
+}
+
+/**
+ * Transparent 1D Densitogram Cutoff Peak Detector (with 2D lateral microdroplet width guard):
+ * Searches strictly between detected origin and solvent front on the smoothed, arPLS-baseline-
+ * subtracted densitogram curve (with plate-wide near-front meniscus subtraction when available),
+ * selecting every local peak above the intensity cutoff with a real topographic valley that
+ * satisfies the minimum 2D horizontal spot width (when 2D image data is available).
+ */
+export function findSpotsDensitogram(
+  profile: number[],
+  o: TlcProfileOptions
+): TlcSpot[] {
+  return detectDensitogramPeaks(profile, o).spots;
 }
 
 // Find spots in a lane: supports '2d' watershed segmentation (default when 2D map is available),
@@ -1950,6 +2037,7 @@ export function findSpots(profile: number[], o: TlcProfileOptions): TlcSpot[] {
       frontBandBg: o.frontBandBg,
       offPlate: o.lane2d.offPlate,
       borderStraddle: o.lane2d.borderStraddle,
+      minSpotWidthFrac: o.minSpotWidthFrac,
     });
   }
 
@@ -2632,13 +2720,27 @@ export function hasCompositeChannels(
   return getLoadedTlcChannels(imgs, requireBitmap).length >= 2;
 }
 
+function peakSitsOutsideBody(peakPos: number, host: TlcSpot): boolean {
+  if (
+    host.extentStart == null ||
+    host.extentEnd == null ||
+    host.extentEnd <= host.extentStart + 2
+  ) {
+    return false;
+  }
+  const innerLo = host.extentStart + Math.max(1, (host.pos - host.extentStart) * 0.25);
+  const innerHi = host.extentEnd - Math.max(1, (host.extentEnd - host.pos) * 0.25);
+  return peakPos < innerLo || peakPos > innerHi;
+}
+
 /**
- * Merges spot lists across multiple channels, deduplicating co-eluting peaks within rfMergeTolerance
- * while preserving channel provenance on each spot.
+ * Merges spot lists across multiple channels, deduplicating genuinely co-eluting peaks within
+ * rfMergeTolerance while preserving channel provenance and keeping closely-spaced distinct
+ * compounds resolved when one channel's peak sits in another channel's valley.
  */
 export function mergeMultiChannelSpots(
   channelSpots: Partial<Record<TlcChannelKey, TlcSpot[]>>,
-  rfMergeTolerance: number = 0.035
+  rfMergeTolerance: number = 0.024
 ): TlcSpot[] {
   const merged: TlcSpot[] = [];
 
@@ -2648,16 +2750,17 @@ export function mergeMultiChannelSpots(
 
     for (const sp of spots) {
       const incomingChannels = sp.channels && sp.channels.length ? sp.channels : [ch];
-      // Pick closest matching Rf within tolerance (never collapse two already-resolved spots from the same channel)
+      // Pick closest matching Rf within tolerance (never collapse two already-resolved spots from the same channel,
+      // and never merge a spot whose apex sits on or outside the valley edge of the candidate match)
       let bestMatch: TlcSpot | null = null;
       let bestDelta = Infinity;
       for (const m of merged) {
         if (m.channels && incomingChannels.some((ic) => m.channels!.includes(ic))) continue;
         const d = Math.abs(m.rf - sp.rf);
-        if (d < rfMergeTolerance && d < bestDelta) {
-          bestDelta = d;
-          bestMatch = m;
-        }
+        if (d >= rfMergeTolerance || d >= bestDelta) continue;
+        if (peakSitsOutsideBody(sp.pos, m) || peakSitsOutsideBody(m.pos, sp)) continue;
+        bestDelta = d;
+        bestMatch = m;
       }
       if (!bestMatch) {
         merged.push({
@@ -2775,6 +2878,7 @@ export interface MultiChannelSpotsOptions {
   lane2dByChannel?: Partial<Record<TlcChannelKey, Lane2dMetrics>>;
   frontBandByChannel?: Partial<Record<TlcChannelKey, number[]>>;
   detectorMode?: TlcSpotDetectorMode;
+  minSpotWidthFrac?: number;
 }
 
 /**
@@ -2789,11 +2893,12 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
     radius = 24,
     minProminence,
     minDistance,
-    rfMergeTolerance = 0.035,
+    rfMergeTolerance = 0.024,
     histograms,
     lane2dByChannel,
     frontBandByChannel,
     detectorMode,
+    minSpotWidthFrac,
   } = options;
 
   const perChannel: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
@@ -2811,6 +2916,7 @@ export function findMultiChannelSpots(options: MultiChannelSpotsOptions): TlcSpo
       lane2d: lane2dByChannel?.[ch],
       frontBandBg: frontBandByChannel?.[ch],
       detectorMode,
+      minSpotWidthFrac,
     });
   }
 
@@ -2832,6 +2938,7 @@ export function getLaneMultiChannelSpots(
     minDistance?: number;
     rfMergeTolerance?: number;
     coreFraction?: number;
+    minSpotWidthFrac?: number;
   } = {}
 ): TlcSpot[] {
   if (lane.customSpots !== undefined && Array.isArray(lane.customSpots)) {
@@ -2873,6 +2980,7 @@ export function getLaneMultiChannelSpots(
     lane2dByChannel,
     frontBandByChannel,
     detectorMode: set.spotDetectorMode,
+    minSpotWidthFrac: options.minSpotWidthFrac ?? set.minSpotWidthFrac,
   });
 }
 
@@ -2905,7 +3013,15 @@ export function extractDensitogram(
   const densitogramPlateSpan = cutoffInfo?.plateSpan;
   const densitogramNoiseFloor = cutoffInfo?.noiseFloor;
 
-  const spots = findSpots(profile, o);
+  let spots: TlcSpot[];
+  let rejectedNarrowPeaks: RejectedNarrowPeak[] | undefined;
+  if (o.detectorMode === 'densitogram') {
+    const det = detectDensitogramPeaks(profile, o);
+    spots = det.spots;
+    if (det.rejectedNarrowPeaks.length > 0) rejectedNarrowPeaks = det.rejectedNarrowPeaks;
+  } else {
+    spots = findSpots(profile, o);
+  }
 
   const points: TlcDensitogramData['points'] = [];
   let totalArea = 0;
@@ -2998,6 +3114,7 @@ export function extractDensitogram(
     ...(densitogramCutoff !== undefined ? { densitogramCutoff } : {}),
     ...(densitogramPlateSpan !== undefined ? { densitogramPlateSpan } : {}),
     ...(densitogramNoiseFloor !== undefined ? { densitogramNoiseFloor } : {}),
+    ...(rejectedNarrowPeaks ? { rejectedNarrowPeaks } : {}),
   };
 }
 

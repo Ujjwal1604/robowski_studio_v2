@@ -147,6 +147,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
             lane2dByChannel,
             frontBandByChannel,
             detectorMode: activeTlcSet.spotDetectorMode,
+            minSpotWidthFrac: activeTlcSet.minSpotWidthFrac,
           });
         } else if (channelsToCheck.length === 1) {
           const ch = channelsToCheck[0];
@@ -162,6 +163,7 @@ export const PlateHeatmap: React.FC<PlateHeatmapProps> = ({
               lane2d: getLane2dMetrics(activeTlcSet, ch, lane, 0.35),
               frontBandBg: getChannelFrontBandProfile(activeTlcSet, ch, tlcHalf(lane), getProf),
               detectorMode: activeTlcSet.spotDetectorMode,
+              minSpotWidthFrac: activeTlcSet.minSpotWidthFrac,
             });
           }
         }

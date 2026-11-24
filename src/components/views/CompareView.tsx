@@ -102,6 +102,7 @@ function resolveSpotsForSnapshot(
     lane2dByChannel,
     frontBandByChannel,
     detectorMode: tlcSet.spotDetectorMode,
+    minSpotWidthFrac: tlcSet.minSpotWidthFrac,
   });
   return getEffectiveLaneSpots(lane, merged);
 }

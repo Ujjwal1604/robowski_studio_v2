@@ -433,6 +433,8 @@ export interface TlcProfileOptions {
   frontBandBg?: number[];
   /** Spot detection engine: '2d' (default when spotMap2d is available), 'densitogram' (direct densitogram cutoff peak picker), or '1d' (legacy fallback) */
   detectorMode?: TlcSpotDetectorMode;
+  /** Minimum 2D horizontal spot width (FWHM fraction of lane width, 0..0.65). Rejects narrow spotter microdroplets & their skinny vertical runs (0 = Off, default 0.28). */
+  minSpotWidthFrac?: number;
 }
 
 export interface TlcDensitogramPoint {
@@ -457,6 +459,14 @@ export interface TlcDensitogramData {
   densitogramPlateSpan?: number;
   /** Minimum noise floor used to calibrate densitogramCutoff */
   densitogramNoiseFloor?: number;
+  /** Peaks above cutoff that were rejected by the 2D microdroplet / minimum-width filter (for transparent UI inspection) */
+  rejectedNarrowPeaks?: Array<{
+    pos: number;
+    rf: number;
+    widthFrac: number;
+    signal: number;
+    reason: 'narrow' | 'microdroplet-run';
+  }>;
 }
 
 export interface TlcImageEntry {
@@ -521,6 +531,8 @@ export interface TlcPlateData {
   spotProminence?: number;
   /** Spot detection mode ('2d' watershed segmentation default, 'densitogram' cutoff peak picker, or '1d' legacy fallback) */
   spotDetectorMode?: TlcSpotDetectorMode;
+  /** Minimum 2D horizontal spot width (FWHM fraction of lane width, 0..0.65) to filter out narrow spotter microdroplets & their runs (0 = Off) */
+  minSpotWidthFrac?: number;
 }
 
 export interface TlcSet extends TlcPlateData {

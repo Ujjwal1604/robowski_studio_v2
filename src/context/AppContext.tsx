@@ -142,8 +142,8 @@ export interface AppContextType {
   activeTlcStatus: 'ready' | 'pending';
   exportRobowskiArchive: () => Promise<boolean>;
   importRobowskiArchiveFile: (f: File) => Promise<boolean>;
-  targetWell: { wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null;
-  setTargetWell: (w: { wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null) => void;
+  targetWell: { wellIndex: number; plateIndex?: number; setUid?: string; source?: 'palette' | 'heatmap' | 'combinations' | 'advisor' } | null;
+  setTargetWell: (w: { wellIndex: number; plateIndex?: number; setUid?: string; source?: 'palette' | 'heatmap' | 'combinations' | 'advisor' } | null) => void;
 }
 
 const AppContext: React.Context<AppContextType | null> =
@@ -191,7 +191,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Spot-detection sensitivity shared by the TLC view, CSV export and the plate heatmap.
   const [spotProminence, setSpotProminence] = useState<number>(0.28);
   const [vialFocus, setVialFocus] = useState<{ label: string; rows: Set<number> } | null>(null);
-  const [targetWell, setTargetWell] = useState<{ wellIndex: number; plateIndex?: number; source?: 'palette' | 'heatmap' | 'combinations' } | null>(null);
+  const [targetWell, setTargetWell] = useState<{ wellIndex: number; plateIndex?: number; setUid?: string; source?: 'palette' | 'heatmap' | 'combinations' | 'advisor' } | null>(null);
   const [runFilter, setRunFilter] = useState<string>('all');
   const [runSearch, setRunSearch] = useState<string>('');
   const [compareIds, setCompareIds] = useState<string[]>([]);

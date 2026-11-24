@@ -444,6 +444,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             lane2dByChannel,
             frontBandByChannel,
             detectorMode: currentSet.spotDetectorMode,
+            minSpotWidthFrac: currentSet.minSpotWidthFrac,
           });
         }
       }

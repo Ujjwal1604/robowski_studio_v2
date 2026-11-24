@@ -156,8 +156,8 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
   DCM: {
     id: 'DCM',
     shortName: 'DCM',
-    epsSio2: 0.36,
-    silanolAffinity: 1.55,
+    epsSio2: 0.28,
+    silanolAffinity: 1.5,
     alphaHbd: 0.13,
     betaHba: 0.1,
     piStar: 0.82,
@@ -168,8 +168,8 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
   Et2O: {
     id: 'Et2O',
     shortName: 'Et₂O',
-    epsSio2: 0.46,
-    silanolAffinity: 1.85,
+    epsSio2: 0.64,
+    silanolAffinity: 1.2,
     alphaHbd: 0.0,
     betaHba: 0.47,
     piStar: 0.27,
@@ -180,8 +180,8 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
   MTBE: {
     id: 'MTBE',
     shortName: 'MTBE',
-    epsSio2: 0.44,
-    silanolAffinity: 1.9,
+    epsSio2: 0.6,
+    silanolAffinity: 1.3,
     alphaHbd: 0.0,
     betaHba: 0.49,
     piStar: 0.27,
@@ -192,8 +192,8 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
   EtOAc: {
     id: 'EtOAc',
     shortName: 'EtOAc',
-    epsSio2: 0.69,
-    silanolAffinity: 1.95,
+    epsSio2: 0.72,
+    silanolAffinity: 2.85,
     alphaHbd: 0.0,
     betaHba: 0.45,
     piStar: 0.55,
@@ -228,8 +228,10 @@ export const NEAT_SOLVENTS: Record<NeatSolventId, NeatSolventDescriptor> = {
   MeOH: {
     id: 'MeOH',
     shortName: 'MeOH',
-    epsSio2: 1.04,
-    silanolAffinity: 21.5,
+    epsSio2: 1.05,
+    // Calibrated on Xu & Mo (4,939 SiO2 measurements): preserves initial Langmuir steepness
+    // (d5-d1 > d12-d5) while keeping 6% MeOH (94:2:4) well below 100% EtOAc (0.565 vs 0.720).
+    silanolAffinity: 13.8,
     alphaHbd: 0.93,
     betaHba: 0.66,
     piStar: 0.6,
@@ -427,7 +429,7 @@ export function validateEluentCompatibility(
  * refit when more toluene/MeOH plates are measured.
  */
 export const MEOH_AFFINITY_SCALE_BY_CARRIER: Partial<Record<NeatSolventId, number>> = {
-  Toluene: 0.1,
+  Toluene: 0.15,
 };
 function meohAffinityScale(carrier: NeatSolventId): number {
   return MEOH_AFFINITY_SCALE_BY_CARRIER[carrier] ?? 1;
@@ -579,13 +581,10 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
   let shortLabel = spec.shortLabelOverride || '';
   let ratio = spec.ratioOverride || '';
   let chamberPrep50mL = '';
-  // A 7 M NH₃/MeOH stock delivers the same NH₃ in 2/7 of the volume; the MeOH it no longer brings is added neat,
-  // so the final chamber (NH₃ molarity and total MeOH) is identical to the 2 M recipe.
+  // Treat commercial 7N (7M) NH₃/MeOH as a direct 1:1 v/v bench drop-in for 2M NH₃/MeOH
+  // (avoids impractical sub-mL pipetting of volatile 7N stock while preserving exact MeOH % and cleaner volumes).
   const stockM = spec.nh3StockM && spec.nh3StockM > 2 ? spec.nh3StockM : 2;
-  const nh3Split = (vol2M: number): { stockVol: number; extraMeoh: number } =>
-    stockM === 2
-      ? { stockVol: vol2M, extraMeoh: 0 }
-      : { stockVol: (vol2M * 2) / stockM, extraMeoh: vol2M - (vol2M * 2) / stockM };
+  const nh3StockLabel = stockM === 7 ? '7N NH₃ in MeOH' : `${stockM}M NH₃ in MeOH`;
   const volTxt = (mL: number): string => (mL > 0 && mL < 0.9995 ? `${Math.round(mL * 1000)} µL` : `${f1(mL)} mL`);
 
   if (spec.stationaryPhase === 'C18') {
@@ -621,11 +620,11 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
     const terVol = (terPct / 100) * 50;
     const weakVol = (weakPct / 100) * 50;
     const modVol = (modPct / 100) * 50;
-    const modToken = mod.kind === 'base_nh3' ? '(2M NH₃ in MeOH)' : mod.id === 'acoh_1' ? 'AcOH' : 'Et₃N';
-    const prepToken = mod.kind === 'base_nh3' ? `(${stockM}M NH₃ in MeOH)` : modToken;
+    const modToken = mod.kind === 'base_nh3' ? `(${nh3StockLabel})` : mod.id === 'acoh_1' ? 'AcOH' : 'Et₃N';
 
     if (!name) {
-      name = `${spec.strongPct}% ${strong.shortName} / ${terPct}% ${ter.shortName} / ${spec.weakSolvent}${mod.label ? ` + ${mod.label}` : ''}`;
+      const modLabel = mod.kind === 'base_nh3' ? `${mod.volPct}% (${nh3StockLabel})` : mod.label;
+      name = `${spec.strongPct}% ${strong.shortName} / ${terPct}% ${ter.shortName} / ${spec.weakSolvent}${modLabel ? ` + ${modLabel}` : ''}`;
     }
     if (!shortLabel) {
       shortLabel = `${spec.strongPct}/${terPct}/${weakPct} ${strong.shortName}/${ter.shortName}/${weak.shortName}${mod.shortSuffix ? ` ${mod.shortSuffix}` : ''}`;
@@ -637,20 +636,10 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
           : `${spec.strongPct}:${terPct}:${weakPct} v/v/v ${strong.shortName} / ${ter.shortName} / ${spec.weakSolvent}`;
     }
     const parts: string[] = [];
-    const split = mod.kind === 'base_nh3' ? nh3Split(modVol) : { stockVol: modVol, extraMeoh: 0 };
-    let strongVolP = strongVol;
-    let terVolP = terVol;
-    let looseMeoh = 0;
-    if (split.extraMeoh > 0) {
-      if (strong.id === 'MeOH') strongVolP += split.extraMeoh;
-      else if (ter.id === 'MeOH') terVolP += split.extraMeoh;
-      else looseMeoh = split.extraMeoh;
-    }
-    if (strongVolP > 0) parts.push(`${volTxt(strongVolP)} ${strong.shortName}`);
-    if (terVolP > 0) parts.push(`${volTxt(terVolP)} ${ter.shortName}`);
+    if (strongVol > 0) parts.push(`${volTxt(strongVol)} ${strong.shortName}`);
+    if (terVol > 0) parts.push(`${volTxt(terVol)} ${ter.shortName}`);
     if (weakVol > 0) parts.push(`${volTxt(weakVol)} ${spec.weakSolvent}`);
-    if (looseMeoh > 0) parts.push(`${volTxt(looseMeoh)} MeOH`);
-    if (modVol > 0) parts.push(`${volTxt(split.stockVol)} ${prepToken}`);
+    if (modVol > 0) parts.push(`${volTxt(modVol)} ${modToken}`);
     chamberPrep50mL = parts.join(' + ');
   } else if (mod.kind === 'base_nh3') {
     const meohNeatPct = Math.max(0, spec.strongPct);
@@ -665,8 +654,8 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
     if (!name) {
       name =
         meohNeatPct === 0
-          ? `${wkName} / (2M NH₃ in MeOH) (${weakPct}:${nh3Pct})`
-          : `${wkName} / MeOH / (2M NH₃ in MeOH) (${weakPct}:${meohNeatPct}:${nh3Pct})`;
+          ? `${wkName} / (${nh3StockLabel}) (${weakPct}:${nh3Pct})`
+          : `${wkName} / MeOH / (${nh3StockLabel}) (${weakPct}:${meohNeatPct}:${nh3Pct})`;
     }
     if (!shortLabel) {
       shortLabel =
@@ -677,15 +666,13 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
     if (!ratio) {
       ratio =
         meohNeatPct === 0
-          ? `${weakPct}:${nh3Pct} v/v ${wkName} / (2M NH₃ in MeOH)`
-          : `${weakPct}:${meohNeatPct}:${nh3Pct} v/v/v ${wkName} / MeOH / (2M NH₃ in MeOH)`;
+          ? `${weakPct}:${nh3Pct} v/v ${wkName} / (${nh3StockLabel})`
+          : `${weakPct}:${meohNeatPct}:${nh3Pct} v/v/v ${wkName} / MeOH / (${nh3StockLabel})`;
     }
-    const nh3 = nh3Split(nh3Vol);
-    const meohTotalVol = meohVol + nh3.extraMeoh;
     chamberPrep50mL =
-      meohTotalVol > 0
-        ? `${volTxt(weakVol)} ${wkName} + ${volTxt(meohTotalVol)} MeOH + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`
-        : `${volTxt(weakVol)} ${wkName} + ${volTxt(nh3.stockVol)} (${stockM}M NH₃ in MeOH)`;
+      meohVol > 0
+        ? `${volTxt(weakVol)} ${wkName} + ${volTxt(meohVol)} MeOH + ${volTxt(nh3Vol)} (${nh3StockLabel})`
+        : `${volTxt(weakVol)} ${wkName} + ${volTxt(nh3Vol)} (${nh3StockLabel})`;
     void totalMeohPct;
   } else {
     const modPct = mod.volPct;
@@ -787,13 +774,23 @@ export function composeSolventSystem(spec: DynamicEluentSpec): TlcSolventSystemD
   };
 }
 
+/** Replaces 2M NH₃/MeOH wording with the chosen bench stock label (e.g. 7N NH₃ in MeOH) on a 1:1 v/v drop-in basis. */
+export function formatNh3TextForStock(text: string | undefined, stockM: number): string {
+  if (!text) return '';
+  if (!(stockM > 2)) return text;
+  const stockTag = stockM === 7 ? '7N' : `${stockM}M`;
+  return text.replace(/2M(?=\s*NH[₃3])/gi, stockTag);
+}
+
 /**
  * The 50 mL chamber recipe for a system when the NH₃/MeOH stock is not the default 2 M.
- * Final composition is unchanged; names and ratios stay in 2 M-equivalent terms.
+ * Commercial 7N NH₃/MeOH is treated as a direct 1:1 v/v drop-in for 2M NH₃/MeOH so bench
+ * volumes stay practical (e.g. 1.0 mL rather than 286 µL).
  */
 export function chamberPrepForNh3Stock(system: TlcSolventSystemDef, stockM: number): string {
   const c = system.composition;
-  if (!c || !(stockM > 2) || !system.baseModifier?.includes('NH₃')) return system.chamberPrep50mL;
+  if (!(stockM > 2) || !system.baseModifier?.includes('NH₃')) return system.chamberPrep50mL;
+  if (!c) return formatNh3TextForStock(system.chamberPrep50mL, stockM);
   try {
     return composeSolventSystem({
       id: system.id,
@@ -810,7 +807,7 @@ export function chamberPrepForNh3Stock(system: TlcSolventSystemDef, stockM: numb
       nh3StockM: stockM,
     }).chamberPrep50mL;
   } catch {
-    return system.chamberPrep50mL;
+    return formatNh3TextForStock(system.chamberPrep50mL, stockM);
   }
 }
 
@@ -1346,6 +1343,17 @@ export function generateExtendedDynamicSpecs(context?: {
       family: 'meoh_dcm',
       preferenceTier: 'primary',
     },
+    {
+      id: 'meoh_dcm_16',
+      strongSolvent: 'MeOH',
+      weakSolvent: 'DCM',
+      strongPct: 16,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'meoh_dcm',
+      preferenceTier: 'primary',
+      bestForOverride: 'High-polarity 16% MeOH/DCM (within 18% SiO₂ binder limit) for polar amides & heterocycles',
+    },
     // Toluene aromatic pi-pi sharpening rungs (clean intermediate + basic-modified options)
     {
       id: 'meoh_toluene_3',
@@ -1443,6 +1451,17 @@ export function generateExtendedDynamicSpecs(context?: {
         preferenceTier: 'primary',
       },
       {
+        id: 'nh3_meoh_dcm_16',
+        strongSolvent: 'MeOH',
+        weakSolvent: 'DCM',
+        strongPct: 14,
+        modifierId: 'nh3_meoh_2',
+        stationaryPhase: 'SiO2',
+        family: 'basic_mod',
+        preferenceTier: 'primary',
+        bestForOverride: 'High-polarity 16% total MeOH + 2% (2M NH₃/MeOH) for strongly retained basic heterocycles & polyamines',
+      },
+      {
         id: 'meoh_toluene_5_et3n',
         strongSolvent: 'MeOH',
         weakSolvent: 'Toluene',
@@ -1480,6 +1499,17 @@ export function generateExtendedDynamicSpecs(context?: {
         family: 'basic_mod',
         preferenceTier: 'primary',
         bestForOverride: 'High-capacity 4% (2M NH₃/MeOH) at 12% total MeOH for polar bis-azoles & polyamines in TsOH wells',
+      },
+      {
+        id: 'nh3_meoh_dcm_high_16',
+        strongSolvent: 'MeOH',
+        weakSolvent: 'DCM',
+        strongPct: 12,
+        modifierId: 'nh3_meoh_4',
+        stationaryPhase: 'SiO2',
+        family: 'basic_mod',
+        preferenceTier: 'primary',
+        bestForOverride: 'High-polarity 16% total MeOH + 4% (2M NH₃/MeOH) for strongly retained basic heterocycles in TsOH/MsOH wells',
       }
     );
   }
@@ -1515,6 +1545,17 @@ export function generateExtendedDynamicSpecs(context?: {
         stationaryPhase: 'SiO2',
         family: 'acid_mod',
         preferenceTier: 'primary',
+      },
+      {
+        id: 'meoh_dcm_14_acoh',
+        strongSolvent: 'MeOH',
+        weakSolvent: 'DCM',
+        strongPct: 14,
+        modifierId: 'acoh_1',
+        stationaryPhase: 'SiO2',
+        family: 'acid_mod',
+        preferenceTier: 'primary',
+        bestForOverride: 'High-polarity 14% MeOH/DCM + 1% AcOH for polar carboxylic acids & heterocyclic acids',
       }
     );
   }
@@ -1557,7 +1598,7 @@ export function invertLangmuirForPct(
     return strongSolvent === 'MeOH' ? 1 : 2;
   }
   if (neededBase >= strong.epsSio2 - 0.01) {
-    return strongSolvent === 'MeOH' ? Math.max(1, 14 - mod.meohContributionPct) : 95;
+    return strongSolvent === 'MeOH' ? Math.max(1, 16 - mod.meohContributionPct) : 95;
   }
 
   const fEff = Math.max(0.01, Math.min(0.98, (neededBase - weak.epsSio2) / span));
@@ -1569,7 +1610,7 @@ export function invertLangmuirForPct(
 
   if (strongSolvent === 'MeOH') {
     rawPct -= mod.meohContributionPct;
-    const maxNeat = Math.max(0, 14 - mod.meohContributionPct);
+    const maxNeat = Math.max(0, 16 - mod.meohContributionPct);
     const clamped = Math.max(0, Math.min(maxNeat, Math.round(rawPct)));
     return clamped;
   }

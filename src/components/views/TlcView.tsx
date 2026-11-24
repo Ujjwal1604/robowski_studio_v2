@@ -43,6 +43,7 @@ import {
   rescueSharedReagentSpots,
   hasCompositeChannels,
   extractDensitogram,
+  DEFAULT_MIN_SPOT_WIDTH_FRAC,
   spotProminenceForDensitogramCutoff,
   tlcHalf,
   tlcFront,
@@ -558,6 +559,10 @@ export const TlcView: React.FC = () => {
   // Handle external well jump commands directed to TLC Map
   useEffect(() => {
     if (targetWell && view === 'tlc') {
+      if (targetWell.setUid) {
+        const idx = sets.findIndex((s) => s.uid === targetWell.setUid);
+        if (idx >= 0) setCur(idx);
+      }
       if (targetWell.plateIndex !== undefined) {
         setPlate(targetWell.plateIndex);
       }
@@ -567,7 +572,7 @@ export const TlcView: React.FC = () => {
       }, 0);
       return () => clearTimeout(timer);
     }
-  }, [targetWell, view, setTargetWell]);
+  }, [targetWell, view, sets, setTargetWell]);
 
   // Multi-Channel Densitometry Data Dictionary
   const [channelDensitograms, setChannelDensitograms] = useState<{
@@ -1474,6 +1479,7 @@ export const TlcView: React.FC = () => {
           lane2d,
           frontBandBg,
           detectorMode: set.spotDetectorMode,
+          minSpotWidthFrac: set.minSpotWidthFrac,
         },
       };
     },
@@ -1488,7 +1494,7 @@ export const TlcView: React.FC = () => {
       const emptyMap = new Map<number, TlcSpot[]>();
       if (!run?.rows?.length || !set.cfg?.lanes?.length || !set.imgs?.[key]?.bmp) return emptyMap;
       const cacheId = `${set.uid}:p${plate}:${key}`;
-      const sig = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${JSON.stringify(set.frontHalfPx || '')}|${set.originPx ?? ''}`;
+      const sig = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${set.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC}|${set.imgs[key]?.name || ''}|${set.cfg.lanes.length}|${run.rows.length}|${set.frontPx ?? ''}|${JSON.stringify(set.frontHalfPx || '')}|${set.originPx ?? ''}`;
       const hit = coherenceCache.current.get(cacheId);
       if (hit && hit.key === sig) return hit.map;
 
@@ -1526,6 +1532,7 @@ export const TlcView: React.FC = () => {
           lane2d,
           frontBandBg,
           detectorMode: set.spotDetectorMode,
+          minSpotWidthFrac: set.minSpotWidthFrac,
         });
         const relaxedCandidates =
           relaxedProm < spotProminence - 0.02
@@ -1539,6 +1546,7 @@ export const TlcView: React.FC = () => {
                 lane2d,
                 frontBandBg,
                 detectorMode: set.spotDetectorMode,
+                minSpotWidthFrac: set.minSpotWidthFrac,
               })
             : [];
         inputs.push({
@@ -1563,7 +1571,7 @@ export const TlcView: React.FC = () => {
     (set: TlcSet): (EdgeFit | null)[] => {
       const picks = set.edgePicks || [];
       const cacheMapKey = `${set.uid}:p${plate}`;
-      const key = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
+      const key = `${spotProminence}|${coreFraction}|${set.spotDetectorMode || '2d'}|${set.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC}|${JSON.stringify(picks)}|${Object.keys(set.imgs || {}).join()}|${set.cfg?.lanes?.length || 0}`;
       const hit = edgeCache.current.get(cacheMapKey);
       if (hit && hit.key === key) return hit.fits;
       const loadedChs = getLoadedTlcChannels(set.imgs, false);
@@ -1606,6 +1614,7 @@ export const TlcView: React.FC = () => {
               lane2dByChannel,
               frontBandByChannel,
               detectorMode: set.spotDetectorMode,
+              minSpotWidthFrac: set.minSpotWidthFrac,
             });
           }
           for (const sp of laneSpots) {
@@ -1757,6 +1766,7 @@ export const TlcView: React.FC = () => {
         lane2dByChannel,
         frontBandByChannel,
         detectorMode: set.spotDetectorMode,
+        minSpotWidthFrac: set.minSpotWidthFrac,
       });
       // Include cross-lane shared-reagent rescued spots from any loaded channel
       const rescuedByCh: Partial<Record<TlcChannelKey, TlcSpot[]>> = {};
@@ -1769,10 +1779,10 @@ export const TlcView: React.FC = () => {
         }
       }
       if (hasRescued) {
-        const mergedRescued = mergeMultiChannelSpots(rescuedByCh, 0.035);
+        const mergedRescued = mergeMultiChannelSpots(rescuedByCh, 0.024);
         const combined = [...autoSpots];
         for (const sp of mergedRescued) {
-          if (!combined.some((m) => Math.abs(m.rf - sp.rf) < 0.03)) {
+          if (!combined.some((m) => Math.abs(m.rf - sp.rf) < 0.024)) {
             combined.push(sp);
           }
         }
@@ -1985,6 +1995,7 @@ export const TlcView: React.FC = () => {
               lane2d: getLane2dMetrics(s, k, l, coreFraction),
               frontBandBg: getChannelFrontBandProfile(s, k, h, getDensProf),
               detectorMode: s.spotDetectorMode,
+              minSpotWidthFrac: s.minSpotWidthFrac,
             });
             const baseSpots = getEffectiveLaneSpots(l, rawDens.spots);
             const corrSpots = isCorr ? correctSpots(baseSpots, gain, offset) : baseSpots;
@@ -3839,6 +3850,61 @@ export const TlcView: React.FC = () => {
                 </span>
               </div>
 
+              {(activePlateSet.spotDetectorMode ?? '2d') !== '1d' && (() => {
+                const minW = activePlateSet.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC;
+                return (
+                  <div
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      paddingLeft: '6px',
+                      borderLeft: '1px solid var(--line)',
+                      marginLeft: '2px',
+                    }}
+                  >
+                    <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>
+                      Min W:
+                    </span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="0.56"
+                      step="0.02"
+                      value={minW}
+                      onChange={(e) => {
+                        const v = Math.round(parseFloat(e.target.value) * 100) / 100;
+                        const uid = currentSet.uid;
+                        setSets((prev) =>
+                          prev.map((s) =>
+                            s.uid === uid
+                              ? updateTlcPlateSlice(s, plate, { minSpotWidthFrac: v })
+                              : s
+                          )
+                        );
+                      }}
+                      style={{ width: '52px', height: '14px', cursor: 'pointer' }}
+                      title={
+                        minW <= 0
+                          ? 'Microdroplet Filter: OFF (accepts all narrow vertical streaks & microdroplets)'
+                          : `Microdroplet Filter (2D Min Spot Width): ${Math.round(minW * 100)}% of lane width — ignores narrow spotter microdroplets & their skinny eluted runs (drag to 0% to disable)`
+                      }
+                    />
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: '10px',
+                        minWidth: '26px',
+                        color: minW > 0 ? 'var(--fg)' : 'var(--mut)',
+                        fontWeight: minW > 0 ? 700 : 500,
+                      }}
+                    >
+                      {minW <= 0 ? 'Off' : `${Math.round(minW * 100)}%`}
+                    </span>
+                  </div>
+                );
+              })()}
+
               <div
                 style={{
                   display: 'inline-flex',
@@ -5478,19 +5544,62 @@ export const TlcView: React.FC = () => {
                             fontSize: '10px',
                             fontWeight: 700,
                             color: '#94a3b8',
-                            padding: '3px 8px 1px',
-                            textAlign: 'center',
-                            textTransform: 'uppercase',
-                            letterSpacing: '0.5px',
+                            padding: '3px 8px 3px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: '6px',
                             borderBottom: '1px solid rgba(255,255,255,0.08)',
                           }}
                         >
-                          Parallel 1D Densitogram (Base ➔ Front)
-                          {activePlateSet.spotDetectorMode === 'densitogram' && (
-                            <span style={{ color: '#fbbf24', marginLeft: '6px', fontWeight: 600, textTransform: 'none' }}>
-                              · Drag Cutoff ↔
-                            </span>
-                          )}
+                          <span style={{ textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                            Densitogram
+                            {activePlateSet.spotDetectorMode === 'densitogram' && (
+                              <span style={{ color: '#fbbf24', marginLeft: '5px', fontWeight: 600, textTransform: 'none', letterSpacing: 0 }}>
+                                · Drag Cutoff ↔
+                              </span>
+                            )}
+                          </span>
+                          {(activePlateSet.spotDetectorMode ?? '2d') !== '1d' && (() => {
+                            const minW = activePlateSet.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC;
+                            return (
+                              <label
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  fontWeight: 600,
+                                  color: '#cbd5e1',
+                                  cursor: 'pointer',
+                                }}
+                                title="Microdroplet Filter (2D Min Spot Width): rejects narrow spotter microdroplets & skinny vertical runs narrower than X% of lane width (0% = Off)"
+                              >
+                                <span style={{ fontSize: '9.5px', color: '#94a3b8' }}>Min W</span>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="0.56"
+                                  step="0.02"
+                                  value={minW}
+                                  onChange={(e) => {
+                                    const v = Math.round(parseFloat(e.target.value) * 100) / 100;
+                                    const uid = currentSet.uid;
+                                    setSets((prev) =>
+                                      prev.map((s) =>
+                                        s.uid === uid
+                                          ? updateTlcPlateSlice(s, plate, { minSpotWidthFrac: v })
+                                          : s
+                                      )
+                                    );
+                                  }}
+                                  style={{ width: '46px', height: '12px', cursor: 'pointer' }}
+                                />
+                                <span className="mono" style={{ fontSize: '9.5px', minWidth: '24px', textAlign: 'right', color: minW > 0 ? '#38bdf8' : '#64748b' }}>
+                                  {minW <= 0 ? 'Off' : `${Math.round(minW * 100)}%`}
+                                </span>
+                              </label>
+                            );
+                          })()}
                         </div>
 
                         {/* Interactive Pixel-Matched SVG Densitogram */}
@@ -5662,8 +5771,16 @@ export const TlcView: React.FC = () => {
                                       return (
                                         <g key={ch}>
                                           {chSpots.map((sp, idx) => {
-                                            // Prefer this channel's own segmented extent if a raw channel peak matches sp
-                                            const rawMatch = d.spots.find((rs) => Math.abs(rs.rf - sp.rf) < 0.045);
+                                            // Prefer this channel's closest matching segmented extent (never steal an adjacent doublet's fill)
+                                            let rawMatch: TlcSpot | undefined;
+                                            let bestMatchDiff = 0.026;
+                                            for (const rs of d.spots) {
+                                              const diff = Math.abs(rs.rf - sp.rf);
+                                              if (diff < bestMatchDiff) {
+                                                bestMatchDiff = diff;
+                                                rawMatch = rs;
+                                              }
+                                            }
                                             const lo = Math.max(0, rawMatch?.extentStart ?? sp.extentStart ?? sp.pos - 8);
                                             const hi = Math.min(pts.length - 1, rawMatch?.extentEnd ?? sp.extentEnd ?? sp.pos + 8);
                                             if (hi <= lo) return null;
@@ -5754,6 +5871,40 @@ export const TlcView: React.FC = () => {
                                               />
                                             </g>
                                           )}
+                                        </g>
+                                      );
+                                    })}
+
+                                    {/* Filtered Narrow Microdroplet Markers (subtle slate × on the curve) */}
+                                    {visibleChannels.map((ch) => {
+                                      const d = channelDensitograms[ch];
+                                      if (!d?.rejectedNarrowPeaks?.length) return null;
+                                      const scaleMax = channelScaleMap[ch] ?? Math.max(d.maxSignal, 28);
+                                      const activeMinW = activePlateSet.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC;
+                                      return (
+                                        <g key={`rejected-narrow-${ch}`}>
+                                          {d.rejectedNarrowPeaks.map((rej, rIdx) => {
+                                            const rx = curveXAtPos(d, rej.pos, scaleMax);
+                                            const ry = ph - rej.pos;
+                                            return (
+                                              <g key={`rej-${ch}-${rIdx}`} opacity="0.82">
+                                                <title>
+                                                  {`Filtered ${rej.reason === 'microdroplet-run' ? 'microdroplet run' : 'narrow peak'} at Rf ${rej.rf.toFixed(2)} (2D width ${Math.round(rej.widthFrac * 100)}% < min ${Math.round(activeMinW * 100)}%)`}
+                                                </title>
+                                                <line x1={rx - 3.5} y1={ry - 3.5} x2={rx + 3.5} y2={ry + 3.5} stroke="#94a3b8" strokeWidth="1.6" />
+                                                <line x1={rx + 3.5} y1={ry - 3.5} x2={rx - 3.5} y2={ry + 3.5} stroke="#94a3b8" strokeWidth="1.6" />
+                                                <text
+                                                  x={Math.min(266, rx + 6)}
+                                                  y={ry + 3}
+                                                  fill="#94a3b8"
+                                                  fontSize="8"
+                                                  fontFamily="monospace"
+                                                >
+                                                  × W{Math.round(rej.widthFrac * 100)}%
+                                                </text>
+                                              </g>
+                                            );
+                                          })}
                                         </g>
                                       );
                                     })}
@@ -5874,6 +6025,14 @@ export const TlcView: React.FC = () => {
                             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24' }}>
                               <span style={{ width: '10px', height: '2px', background: '#f59e0b', borderTop: densViewMode === 'overlay' ? '1px dotted #f59e0b' : undefined }} />
                               Visible (Stain)
+                            </span>
+                          )}
+                          {(['UV254', 'UV366', 'White'] as const).some(
+                            (ch) => (densViewMode === 'overlay' || densViewMode === ch) && (channelDensitograms[ch]?.rejectedNarrowPeaks?.length ?? 0) > 0
+                          ) && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#94a3b8' }}>
+                              <span style={{ fontWeight: 700 }}>×</span>
+                              Filtered microdroplet
                             </span>
                           )}
                         </div>

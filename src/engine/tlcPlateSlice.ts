@@ -169,6 +169,7 @@ function serializePlateData(pd: TlcPlateData, defaultProminence?: number) {
     edgeSettings: pd.edgeSettings || {},
     spotProminence: pd.spotProminence ?? defaultProminence,
     ...(pd.spotDetectorMode ? { spotDetectorMode: pd.spotDetectorMode } : {}),
+    ...(typeof pd.minSpotWidthFrac === 'number' ? { minSpotWidthFrac: pd.minSpotWidthFrac } : {}),
     imgMeta: Object.entries(pd.imgs || {}).map(([k, im]) => ({
       key: k,
       name: im.name,
@@ -204,6 +205,10 @@ function deserializePlateData(raw: any): TlcPlateData {
         ? 'densitogram'
         : raw?.spotDetectorMode === '2d'
         ? '2d'
+        : undefined,
+    minSpotWidthFrac:
+      typeof raw?.minSpotWidthFrac === 'number' && Number.isFinite(raw.minSpotWidthFrac)
+        ? Math.max(0, Math.min(0.65, raw.minSpotWidthFrac))
         : undefined,
     imgs: {},
     preRunImgs: {},

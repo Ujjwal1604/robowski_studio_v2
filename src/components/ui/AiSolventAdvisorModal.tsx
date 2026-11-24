@@ -12,6 +12,7 @@ import {
   chamberPrepForNh3Stock,
   containerOfLane,
   extractLaneProfile2d,
+  formatNh3TextForStock,
   isKnownAdditiveReagent,
   LANE_FRAME_WIDTH,
   optimizePlateTlcSolvents,
@@ -35,6 +36,7 @@ import {
 import { TlcLane, TlcSet } from '../../types';
 import { getRDKitInstance } from '../../utils/rdkit';
 import { ChemicalStructure } from './ChemicalStructure';
+import { TlcAdvisorMatchesTab } from './TlcAdvisorMatchesTab';
 
 function extractLaneProfileForCalibration(
   set: TlcSet,
@@ -165,10 +167,10 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   initialPlateIndex = 0,
   conditionOverrides,
 }) => {
-  const { state, run, triMeta, tlcSets, setTlcSets, spotProminence, view, setView } = useApp();
+  const { state, run, triMeta, tlcSets, setTlcSets, spotProminence, view, setView, setTargetWell } = useApp();
   const hasPlateRun = Boolean(run && run.rows && run.rows.length > 0);
 
-  const [advisorMode, setAdvisorMode] = useState<'plate54' | 'singleAi'>(
+  const [advisorMode, setAdvisorMode] = useState<'plate54' | 'tlcMatches' | 'singleAi'>(
     hasPlateRun ? 'plate54' : 'singleAi'
   );
 
@@ -181,7 +183,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
   const [stationaryPhasePref, setStationaryPhasePref] = useState<TlcStationaryPhasePreference>('auto');
   const [includeSpeculative, setIncludeSpeculative] = useState<boolean>(false);
   const [lowWeightPct, setLowWeightPct] = useState<number>(20);
-  // NH3/MeOH stock on the bench. Same final chamber composition; only the 50 mL recipe changes.
+  // NH3/MeOH stock on the bench. 7N is treated as a direct 1:1 v/v drop-in for 2M (same bench volumes).
   const [nh3StockM, setNh3StockM] = useState<number>(() => {
     try {
       const v = Number(localStorage.getItem('rs.nh3StockM'));
@@ -199,6 +201,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     }
   };
   const prepOf = (sys: any): string => chamberPrepForNh3Stock(sys, nh3StockM);
+  const nh3Label = (text: string | undefined): string => formatNh3TextForStock(text, nh3StockM);
   const [calibrationEnabled, setCalibrationEnabled] = useState<boolean>(true);
   const [showCalibVisuals, setShowCalibVisuals] = useState<boolean>(true);
   const [showTechCalibDetails, setShowTechCalibDetails] = useState<boolean>(false);
@@ -418,9 +421,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     cacheSignature,
   ]);
 
-  // Auto-run 54-well optimizer when modal opens in 54-well mode cleanly, and abort on close/change
+  const needsPlateOptimization = advisorMode === 'plate54' || advisorMode === 'tlcMatches';
+
+  // Auto-run 54-well optimizer when modal opens in 54-well or Real TLC Matches mode, without re-running when toggling between them
   useEffect(() => {
-    if (!isOpen || advisorMode !== 'plate54' || !hasPlateRun) {
+    if (!isOpen || !needsPlateOptimization || !hasPlateRun) {
       abortRef.current?.abort();
       return;
     }
@@ -428,7 +433,23 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     return () => {
       abortRef.current?.abort();
     };
-  }, [isOpen, advisorMode, hasPlateRun, run54WellOptimization]);
+  }, [isOpen, needsPlateOptimization, hasPlateRun, run54WellOptimization]);
+
+  const tlcFoundCompoundCount = useMemo(() => {
+    if (!calibrationModel?.plates?.length) return 0;
+    const keys = new Set<string>();
+    for (const p of calibrationModel.plates) {
+      for (const lane of p.lanes) {
+        if (lane.isBlank) continue;
+        for (const ps of lane.predictedSpots) {
+          if (ps.boundaryStatus === 'found' || (ps.found && !ps.boundaryStatus)) {
+            keys.add(ps.compoundKey || `${ps.kind}:${ps.label}`);
+          }
+        }
+      }
+    }
+    return keys.size;
+  }, [calibrationModel]);
 
   const activeSystemPlan: RecommendedPlateSolvent | null = useMemo(() => {
     if (!platePlan) return null;
@@ -458,7 +479,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
     if (!platePlan || platePlan.recommendedSystems.length === 0) return;
     const planPhase = platePlan.stationaryPhase || stationaryPhasePref;
     const sysNames = platePlan.recommendedSystems.map((r) =>
-      formatTlcTabName(r.system.name, resolveSystemPhase(r.system, planPhase))
+      formatTlcTabName(nh3Label(r.system.name), resolveSystemPhase(r.system, planPhase))
     );
     setTlcSets((prev) => {
       const existingNames = new Set(prev.map((s) => s.name.trim().toLowerCase()));
@@ -565,7 +586,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
           border: '1px solid var(--line)',
           borderRadius: '14px',
           width: '100%',
-          maxWidth: advisorMode === 'plate54' ? '1140px' : '920px',
+          maxWidth: advisorMode === 'singleAi' ? '920px' : '1180px',
           maxHeight: '92vh',
           display: 'flex',
           flexDirection: 'column',
@@ -612,6 +633,8 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
               <p style={{ margin: '1px 0 0', fontSize: '12px', color: 'var(--mut)' }}>
                 {advisorMode === 'plate54'
                   ? 'Selects a finite set of mobile phases across all 54 wells (prioritizing High & Medium ranked products).'
+                  : advisorMode === 'tlcMatches'
+                  ? 'Inspect starting materials and predicted products found on your real TLC plates with structures and per-well strips.'
                   : 'AI single-reaction mobile phase recommender.'}
               </p>
             </div>
@@ -627,6 +650,20 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                 title={hasPlateRun ? 'Optimize 2–4 eluents across all 54 plate wells' : 'Configure a plate run first'}
               >
                 ▦ 54-Well Optimizer
+              </button>
+              <button
+                type="button"
+                className={advisorMode === 'tlcMatches' ? 'on' : ''}
+                disabled={!hasPlateRun}
+                onClick={() => setAdvisorMode('tlcMatches')}
+                title={
+                  hasPlateRun
+                    ? 'Inspect reactants & products matched on real uploaded TLC plates with chemical structures and wells'
+                    : 'Configure a plate run first'
+                }
+              >
+                ◎ Real TLC Matches
+                {tlcFoundCompoundCount > 0 ? ` (${tlcFoundCompoundCount})` : ''}
               </button>
               <button
                 type="button"
@@ -766,12 +803,12 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
 
                   <label
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
-                    title="Names stay in 2 M-equivalent terms. With a 7 M stock the 50 mL recipe uses 2/7 of the volume and adds the missing MeOH, so the chamber is identical."
+                    title="Commercial 7N NH₃/MeOH is used 1:1 v/v in place of 2M NH₃/MeOH (same bench volumes, no sub-mL pipetting)."
                   >
                     <span style={{ color: 'var(--mut)', fontWeight: 600 }}>NH₃/MeOH stock</span>
                     <select value={nh3StockM} onChange={(e) => chooseNh3Stock(Number(e.target.value))}>
                       <option value={2}>2 M</option>
-                      <option value={7}>7 M</option>
+                      <option value={7}>7 N</option>
                     </select>
                   </label>
 
@@ -1548,7 +1585,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                 opacity: calibrationEnabled ? 1 : 0.65,
                               }}
                             >
-                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: '6px' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                                 <div>
                                   <strong style={{ fontSize: '11.5px' }}>
                                     Compounds Matched on Your Plate ({displayedCompoundSummaries.length})
@@ -1558,10 +1595,18 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                       · {activePlateForSummary.setName}
                                     </span>
                                   )}
+                                  <div style={{ fontSize: '10.5px', color: 'var(--mut)', marginTop: '1px' }}>
+                                    Shared compounds are confirmed across multiple wells, even when shifted well beyond ±0.25 Rf.
+                                  </div>
                                 </div>
-                                <span style={{ fontSize: '10.5px', color: 'var(--mut)' }}>
-                                  Shared compounds are confirmed across multiple wells, even when shifted well beyond ±0.25 Rf.
-                                </span>
+                                <button
+                                  type="button"
+                                  className="btn sm pri"
+                                  style={{ height: '24px', fontSize: '11px', padding: '0 9px' }}
+                                  onClick={() => setAdvisorMode('tlcMatches')}
+                                >
+                                  Inspect Structures &amp; Wells →
+                                </button>
                               </div>
 
                               <div style={{ overflowX: 'auto' }}>
@@ -2018,10 +2063,18 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                             p.boundaryStatus === 'front_saturated' ||
                                             p.boundaryStatus === 'baseline_pinned'
                                         ).length;
+                                        const nCoeluted = lane.predictedSpots.filter(
+                                          (p) => p.boundaryStatus === 'coeluted'
+                                        ).length;
+                                        const nConflict = lane.predictedSpots.filter(
+                                          (p) => p.boundaryStatus === 'inconsistent'
+                                        ).length;
                                         const nSmNotSeen = lane.predictedSpots.filter(
                                           (p) =>
                                             !p.found &&
                                             p.kind === 'substrate' &&
+                                            p.boundaryStatus !== 'coeluted' &&
+                                            p.boundaryStatus !== 'inconsistent' &&
                                             p.boundaryStatus !== 'front_saturated' &&
                                             p.boundaryStatus !== 'baseline_pinned'
                                         ).length;
@@ -2029,11 +2082,15 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                           (p) =>
                                             !p.found &&
                                             p.kind === 'product' &&
+                                            p.boundaryStatus !== 'coeluted' &&
+                                            p.boundaryStatus !== 'inconsistent' &&
                                             p.boundaryStatus !== 'front_saturated' &&
                                             p.boundaryStatus !== 'baseline_pinned'
                                         ).length;
                                         const nExtra = lane.measuredSpots.filter((m) => !m.matchedLabel).length;
                                         const tipParts: string[] = [`${nFound} matched`];
+                                        if (nCoeluted > 0) tipParts.push(`${nCoeluted} co-eluting`);
+                                        if (nConflict > 0) tipParts.push(`${nConflict} cross-plate conflict`);
                                         if (nBoundary > 0) tipParts.push(`${nBoundary} at front/base`);
                                         if (nSmNotSeen > 0) tipParts.push(`${nSmNotSeen} SM not seen`);
                                         if (nProdNotSeen > 0) tipParts.push(`${nProdNotSeen} cand. prod not seen`);
@@ -2397,21 +2454,27 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                                   const predRf = calibrationEnabled ? p.rfAfter : p.rfBefore;
                                                   const isFrontSat = p.boundaryStatus === 'front_saturated';
                                                   const isBasePin = p.boundaryStatus === 'baseline_pinned';
+                                                  const isCoeluted = p.boundaryStatus === 'coeluted';
+                                                  const isConflict = p.boundaryStatus === 'inconsistent';
                                                   return (
                                                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
                                                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                        <strong style={{ color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : p.kind === 'product' ? '#10b981' : '#f59e0b' }}>
+                                                        <strong style={{ color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : isCoeluted ? '#8b5cf6' : isConflict ? '#ef4444' : p.kind === 'product' ? '#10b981' : '#f59e0b' }}>
                                                           {isFrontSat
                                                             ? `▲ Front-Sat (${p.kind === 'product' ? 'Prod' : 'SM'})`
                                                             : isBasePin
                                                             ? `▼ Base-Pin (${p.kind === 'product' ? 'Prod' : 'SM'})`
+                                                            : isCoeluted
+                                                            ? `≈ Co-elutes (${p.kind === 'product' ? 'Prod' : 'SM'})`
+                                                            : isConflict
+                                                            ? `✕ Conflict (${p.kind === 'product' ? 'Prod' : 'SM'})`
                                                             : p.kind === 'product'
                                                             ? `◌ Prod (${p.tier || 'Med'})`
                                                             : '◌ SM (Consumed?)'}
                                                         </strong>{' '}
                                                         {p.label}
                                                       </span>
-                                                      <span className="mono" style={{ flexShrink: 0, color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : 'var(--mut)' }}>
+                                                      <span className="mono" style={{ flexShrink: 0, color: isFrontSat ? '#38bdf8' : isBasePin ? '#fb7185' : isCoeluted ? '#8b5cf6' : isConflict ? '#ef4444' : 'var(--mut)' }}>
                                                         {isFrontSat
                                                           ? p.matchedObsRf !== undefined
                                                             ? `Obs ${p.matchedObsRf.toFixed(2)} ≥0.92 (exp ${predRf.toFixed(2)})`
@@ -2420,6 +2483,14 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                                           ? p.matchedObsRf !== undefined
                                                             ? `Obs ${p.matchedObsRf.toFixed(2)} ≤0.05 (exp ${predRf.toFixed(2)})`
                                                             : `Rf ≤ 0.05 (exp ${predRf.toFixed(2)})`
+                                                          : isCoeluted
+                                                          ? p.matchedObsRf !== undefined
+                                                            ? `Obs ${p.matchedObsRf.toFixed(2)} (overlaps ${p.coelutedWith?.[0] || 'spot'})`
+                                                            : `Co-elutes (exp ${predRf.toFixed(2)})`
+                                                          : isConflict
+                                                          ? p.matchedObsRf !== undefined
+                                                            ? `Obs ${p.matchedObsRf.toFixed(2)} (absent on ${p.conflictPlates?.[0] || 'other plate'})`
+                                                            : `Conflict (absent on ${p.conflictPlates?.[0] || 'other plate'})`
                                                           : `exp. Rf ${predRf.toFixed(2)}`}
                                                       </span>
                                                     </div>
@@ -2556,7 +2627,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             platePlan.stationaryPhase || stationaryPhasePref
                           );
                           const optBadge = stationaryPhaseBadge(opt.system.stationaryPhase, optPhase);
-                          const tabName = formatTlcTabName(opt.system.name, optPhase);
+                          const tabName = formatTlcTabName(nh3Label(opt.system.name), optPhase);
                           const isPreview = activeSystemPlan?.system.id === opt.system.id;
                           return (
                             <div
@@ -2573,7 +2644,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             >
                               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-                                  <strong style={{ fontSize: '13px' }}>{opt.system.name}</strong>
+                                  <strong style={{ fontSize: '13px' }}>{nh3Label(opt.system.name)}</strong>
                                   <span
                                     className="mono"
                                     style={{
@@ -2703,11 +2774,11 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                       const planPhase = platePlan.stationaryPhase || stationaryPhasePref;
                       const recPhase = resolveSystemPhase(rec.system, planPhase);
                       const badge = stationaryPhaseBadge(rec.system.stationaryPhase, recPhase);
-                      const tabName = formatTlcTabName(rec.system.name, recPhase);
+                      const tabName = formatTlcTabName(nh3Label(rec.system.name), recPhase);
                       const alt = rec.alternatives?.[0];
                       const altSel = alt ? activeSystemPlan?.system.id === alt.id : false;
                       const altTabName = alt
-                        ? formatTlcTabName(alt.name, resolveSystemPhase(alt, planPhase))
+                        ? formatTlcTabName(nh3Label(alt.name), resolveSystemPhase(alt, planPhase))
                         : '';
                       return (
                         <div key={rec.system.id} style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -2776,7 +2847,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                     color: rec.system.baseModifier ? '#38bdf8' : '#f59e0b',
                                   }}
                                 >
-                                  + {rec.system.baseModifier || rec.system.acidModifier}
+                                  + {nh3Label(rec.system.baseModifier || rec.system.acidModifier)}
                                 </span>
                               )}
                               {rec.system.family === 'prisma_ternary' && (
@@ -2827,7 +2898,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             </span>
                           </div>
 
-                          <div style={{ fontSize: '15px', fontWeight: 700 }}>{rec.system.name}</div>
+                          <div style={{ fontSize: '15px', fontWeight: 700 }}>{nh3Label(rec.system.name)}</div>
 
                           <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
                             50 mL: {prepOf(rec.system)}
@@ -3031,7 +3102,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             <div style={{ fontSize: '10.5px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--mut)' }}>
                               {rec.alternativeNote ? 'OR · same wells, less streaking' : 'OR · same wells, other base'}
                             </div>
-                            <div style={{ fontSize: '13px', fontWeight: 700 }}>{alt.name}</div>
+                            <div style={{ fontSize: '13px', fontWeight: 700 }}>{nh3Label(alt.name)}</div>
                             <div className="mono" style={{ fontSize: '11px', color: 'var(--fg2)' }}>
                               50 mL: {prepOf(alt)}
                             </div>
@@ -3180,7 +3251,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                         <div>
                           <div style={{ fontSize: '13px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                             <span>
-                              Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{activeSystemPlan.system.name}</span>
+                              Simulated 54-Well TLC Plate — <span style={{ color: '#10b981' }}>{nh3Label(activeSystemPlan.system.name)}</span>
                             </span>
                             {platePlan.calibrationApplied?.active && (
                               <span
@@ -3226,7 +3297,7 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                             style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                             onClick={() => {
                               const name = formatTlcTabName(
-                                activeSystemPlan.system.name,
+                                nh3Label(activeSystemPlan.system.name),
                                 resolveSystemPhase(activeSystemPlan.system, platePlan.stationaryPhase || stationaryPhasePref)
                               );
                               setTlcSets((prev) => {
@@ -3724,7 +3795,37 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
           )}
 
           {/* =============================================================== */}
-          {/* MODE 2: SINGLE-REACTION AI SOLVENT ADVISOR (EXISTING GEMINI)    */}
+          {/* MODE 2: REAL TLC MATCHES (STRUCTURES & WELLS CLOSE INSPECTOR)   */}
+          {/* =============================================================== */}
+          {advisorMode === 'tlcMatches' && (
+            <TlcAdvisorMatchesTab
+              calibrationModel={calibrationModel}
+              tlcSets={tlcSets}
+              plateLoading={plateLoading}
+              setSolventOverrides={setSolventOverrides}
+              onSetSolventOverride={(key, solventId) => {
+                setSetSolventOverrides((prev) => ({
+                  ...prev,
+                  [key]: solventId,
+                }));
+              }}
+              onSwitchToOptimizer={() => setAdvisorMode('plate54')}
+              onInspectWellInTlc={({ setUid, plateIndex, wellIndex }) => {
+                setTargetWell({
+                  wellIndex,
+                  plateIndex,
+                  setUid,
+                  source: 'advisor',
+                });
+                setView('tlc');
+                onClose();
+              }}
+              toast={toast}
+            />
+          )}
+
+          {/* =============================================================== */}
+          {/* MODE 3: SINGLE-REACTION AI SOLVENT ADVISOR (EXISTING GEMINI)    */}
           {/* =============================================================== */}
           {advisorMode === 'singleAi' && (
             <>

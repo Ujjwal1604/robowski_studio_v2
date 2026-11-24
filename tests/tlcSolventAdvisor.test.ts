@@ -716,7 +716,8 @@ describe('54-Well Normal-Phase TLC Solvent Advisor', () => {
     const imidNeutral = predictNormalPhaseRf(imidAld, meoh5Et3n);
     const imidHalfEt3n = predictNormalPhaseRf(imidAld, meoh5Et3n, ctxHalf);
     const imidHalfNh3 = predictNormalPhaseRf(imidAld, meoh5Nh3, ctxHalf);
-    expect(imidHalfEt3n.rf).toBeLessThan(imidNeutral.rf - 0.15);
+    expect(imidHalfEt3n.rf).toBeLessThan(imidNeutral.rf - 0.10);
+    expect(imidHalfEt3n.rf).toBeLessThan(imidNeutral.rf * 0.45);
     expect(imidHalfEt3n.mildStreak || imidHalfEt3n.tailing).toBe(true);
     expect(imidHalfNh3.tailing).toBe(false);
     expect(imidHalfNh3.rf).toBeGreaterThan(imidHalfEt3n.rf);
@@ -1179,32 +1180,59 @@ describe('clean-spot coverage in eluent selection', () => {
   }, 120000);
 });
 
-describe('7 M NH3/MeOH stock option', () => {
+describe('7N NH3/MeOH stock option (1:1 v/v bench drop-in)', () => {
   const vol = (txt: string, token: RegExp): number => {
     const m = txt.match(new RegExp(`([\\d.]+) (mL|µL) ${token.source}`));
     if (!m) throw new Error(`no ${token} in ${txt}`);
     return m[2] === 'µL' ? Number(m[1]) / 1000 : Number(m[1]);
   };
-  it('keeps NH3 amount and total MeOH identical, using 2/7 the volume of stock', () => {
-    const sys = composeSolventSystem({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 3, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' } as any);
+  it('treats commercial 7N NH3/MeOH as a direct 1:1 v/v drop-in for 2M with practical mL volumes', () => {
+    const sys = composeSolventSystem({ strongSolvent: 'MeOH', weakSolvent: 'DCM', strongPct: 10, modifierId: 'nh3_meoh_2', stationaryPhase: 'SiO2' } as any);
     const p2 = chamberPrepForNh3Stock(sys, 2);
     const p7 = chamberPrepForNh3Stock(sys, 7);
     expect(p2).toBe(sys.chamberPrep50mL);
-    expect(p7).toContain('7M NH₃ in MeOH');
-    // 50 mL of 95:3:2: 1.0 mL of 2 M = 2 mmol NH3, same in 7 M stock
-    const nh3_2 = vol(p2, /\(2M/) * 2;
-    const nh3_7 = vol(p7, /\(7M/) * 7;
-    expect(nh3_7).toBeCloseTo(nh3_2, 1);
-    const meoh2 = vol(p2, /MeOH \+/) + vol(p2, /\(2M/);
-    const meoh7 = vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
-    expect(meoh7).toBeCloseTo(meoh2, 1);
-    // total still 50 mL
-    const total7 = vol(p7, /DCM/) + vol(p7, /MeOH \+/) + vol(p7, /\(7M/);
-    expect(total7).toBeCloseTo(50, 1);
+    expect(p7).toContain('7N NH₃ in MeOH');
+    expect(p7).not.toContain('µL');
+    // 50 mL of 88:10:2: same 44.0 mL DCM + 5.0 mL MeOH + 1.0 mL (7N NH3 in MeOH)
+    expect(vol(p7, /DCM/)).toBeCloseTo(vol(p2, /DCM/), 2);
+    expect(vol(p7, /MeOH \+/)).toBeCloseTo(vol(p2, /MeOH \+/), 2);
+    expect(vol(p7, /\(7N/)).toBeCloseTo(vol(p2, /\(2M/), 2);
+    expect(vol(p7, /DCM/) + vol(p7, /MeOH \+/) + vol(p7, /\(7N/)).toBeCloseTo(50, 1);
   });
   it('leaves non-ammonia systems and the default untouched', () => {
     const et = TLC_SOLVENT_LIBRARY.find((x) => x.id === 'etoac_hex_25')!;
     expect(chamberPrepForNh3Stock(et, 7)).toBe(et.chamberPrep50mL);
+  });
+});
+
+describe('Xu & Mo real-world SiO2 calibration structural distinctions', () => {
+  it('separates weakly basic O/S-azoles (thiazole) from strongly basic imidazoles and shields 2,6-lutidine vs 4-acetylpyridine', () => {
+    const ea50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const thiazole = profileMoleculeForTlc(rdkit, 'CCC(=O)c1nccs1');
+    const imidazole = profileMoleculeForTlc(rdkit, 'O=Cc1c[nH]cn1');
+    expect(thiazole.weakAzoleNCount).toBe(1);
+    expect(imidazole.weakAzoleNCount).toBe(0);
+    expect(predictNormalPhaseRf(thiazole, ea50).rf).toBeGreaterThan(0.65);
+    expect(predictNormalPhaseRf(imidazole, ea50).rf).toBeLessThan(0.20);
+
+    const lutidine = profileMoleculeForTlc(rdkit, 'Cc1cccc(C)n1');
+    const pyr4 = profileMoleculeForTlc(rdkit, 'CC(=O)c1ccncc1');
+    expect(lutidine.ortho2PyridineCount).toBe(1);
+    expect(pyr4.ortho1PyridineCount).toBe(0);
+    expect(pyr4.ortho2PyridineCount).toBe(0);
+    expect(predictNormalPhaseRf(lutidine, ea50).rf).toBeGreaterThan(predictNormalPhaseRf(pyr4, ea50).rf + 0.45);
+  });
+
+  it('elutes neutral carboxylic acids cleanly in 100% EtOAc while still pinning carboxylate salts in NH3 eluent', () => {
+    const benzoic = profileMoleculeForTlc(rdkit, 'O=C(O)c1ccccc1');
+    const ea100 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_100')!;
+    const nh3_5 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'nh3_meoh_dcm_5')!;
+    const inNeutral = predictNormalPhaseRf(benzoic, ea100);
+    const inBasic = predictNormalPhaseRf(benzoic, nh3_5);
+    expect(inNeutral.tailing).toBe(true);
+    expect(inNeutral.rf).toBeGreaterThan(0.65);
+    expect(inBasic.tailing).toBe(true);
+    expect(inBasic.rf).toBeLessThan(0.25);
   });
 });
 
@@ -1414,6 +1442,123 @@ describe('all_equal stationary phase mode', () => {
     );
     expect(basicAluminaEntries.length).toBeGreaterThan(0);
     expect(basicAluminaEntries.every((r) => !r.system.baseModifier && !r.system.acidModifier)).toBe(true);
+  });
+});
+
+describe('Uncalibrated first-pass SiO2 Rf accuracy & polar heterocycle advisor', () => {
+  it('predicts realistic low Rf in 94:2:4 (6% MeOH) and mid-plate lift in 88:8:4 (12%) / 84:12:4 (16%) for polar heterocycles, amides, and amines', () => {
+    const ext = generateExtendedDynamicSpecs({ hasStrongWellAcid: true, needsBasicMod: true }).map(composeSolventSystem);
+    const sys6 = ext.find((s) => s.id === 'nh3_meoh_dcm_high_6')!;   // 94:2:4 (6% total MeOH)
+    const sys12 = ext.find((s) => s.id === 'nh3_meoh_dcm_high_12')!; // 88:8:4 (12% total MeOH)
+    const sys16 = ext.find((s) => s.id === 'nh3_meoh_dcm_high_16')!; // 84:12:4 (16% total MeOH)
+    const etoac50 = TLC_SOLVENT_LIBRARY.find((s) => s.id === 'etoac_hex_50')!;
+    const etoac100 = composeSolventSystem({
+      id: 'etoac_100_test',
+      strongSolvent: 'EtOAc',
+      weakSolvent: 'Hexanes',
+      strongPct: 100,
+      modifierId: 'none',
+      stationaryPhase: 'SiO2',
+      family: 'etoac_hex',
+      preferenceTier: 'primary',
+    });
+
+    expect(sys6).toBeDefined();
+    expect(sys12).toBeDefined();
+    expect(sys16).toBeDefined();
+    // 6% MeOH/DCM (94:2:4) must NOT outrank 100% EtOAc in base eluent strength
+    expect(sys6.strength).toBeLessThan(etoac100.strength);
+    expect(sys12.strength).toBeGreaterThan(sys6.strength + 0.10);
+    expect(sys16.strength).toBeGreaterThan(sys12.strength + 0.04);
+
+    // Classic bench benchmarks: no longer systematically +0.40..+0.70 Rf too high
+    const p4Pyr = profileMoleculeForTlc(rdkit, 'c1ccc(-c2ccncc2)cc1');
+    const pBenzamide = profileMoleculeForTlc(rdkit, 'NC(=O)c1ccccc1');
+    const pCaffeine = profileMoleculeForTlc(rdkit, 'Cn1cnc2c1c(=O)n(C)c(=O)n2C');
+    const p5Nh2Benz = profileMoleculeForTlc(rdkit, 'Nc1ccc2[nH]cnc2c1');
+    const pImidCho = profileMoleculeForTlc(rdkit, 'O=Cc1c[nH]cn1');
+    const p4Ap = profileMoleculeForTlc(rdkit, 'Nc1ccncc1');
+    const pPolyImine = profileMoleculeForTlc(rdkit, 'c1ccc2[nH]cnc2c1N=Cc1c[nH]cn1');
+    const pHistamine = profileMoleculeForTlc(rdkit, 'NCCc1c[nH]cn1');
+    const pBenzoic = profileMoleculeForTlc(rdkit, 'O=C(O)c1ccccc1');
+
+    expect(predictNormalPhaseRf(p4Pyr, etoac50).rf).toBeLessThan(0.50);
+    expect(predictNormalPhaseRf(pBenzamide, etoac50).rf).toBeLessThan(0.32);
+    expect(predictNormalPhaseRf(pCaffeine, etoac100).rf).toBeLessThan(0.30);
+
+    // Polar basic heterocycles sit low in 94:2:4 (6% MeOH) and lift cleanly into mid-plate in 88:8:4 (12%) / 84:12:4 (16%)
+    const benz6 = predictNormalPhaseRf(p5Nh2Benz, sys6).rf;
+    const benz12 = predictNormalPhaseRf(p5Nh2Benz, sys12).rf;
+    expect(benz6).toBeLessThanOrEqual(0.28);
+    expect(benz12).toBeGreaterThanOrEqual(0.35);
+    expect(benz12).toBeLessThanOrEqual(0.65);
+
+    const imid6 = predictNormalPhaseRf(pImidCho, sys6).rf;
+    const imid12 = predictNormalPhaseRf(pImidCho, sys12).rf;
+    expect(imid6).toBeLessThanOrEqual(0.35);
+    expect(imid12).toBeGreaterThan(imid6 + 0.15);
+
+    expect(predictNormalPhaseRf(p4Ap, sys6).rf).toBeLessThanOrEqual(0.35);
+    expect(predictNormalPhaseRf(p4Ap, sys12).rf).toBeGreaterThanOrEqual(0.40);
+
+    // Strongly retained poly-basic cascade imine & histamine stay baseline-pinned in 94:2:4 and lift in 84:12:4 (16% MeOH)
+    expect(predictNormalPhaseRf(pPolyImine, sys6).rf).toBeLessThanOrEqual(0.18);
+    expect(predictNormalPhaseRf(pPolyImine, sys16).rf).toBeGreaterThanOrEqual(0.35);
+    expect(predictNormalPhaseRf(pHistamine, sys6).rf).toBeLessThanOrEqual(0.15);
+    expect(predictNormalPhaseRf(pHistamine, sys16).rf).toBeGreaterThanOrEqual(0.25);
+
+    // Carboxylic acid in basic NH3/MeOH forms ionic ammonium carboxylate and pins near baseline
+    const acidInNh3 = predictNormalPhaseRf(pBenzoic, sys6);
+    expect(acidInNh3.rf).toBeLessThanOrEqual(0.18);
+    expect(acidInNh3.tailing).toBe(true);
+  });
+
+  it('recommends a genuinely polar >= 12% MeOH system on the VERY FIRST PASS (uncalibrated) for polar heterocycle + TsOH plates', async () => {
+    const state = exampleState();
+    state.mode = 'concentration';
+    state.reagents = [
+      { code: 'A', name: '4-Imidazolecarboxaldehyde', smiles: 'O=Cc1c[nH]cn1', molarMass: 96.09, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'B', name: '5-Aminobenzimidazole', smiles: 'Nc1ccc2[nH]cnc2c1', molarMass: 133.15, density: 1.2, stock: 500, solvent: 'DMSO' },
+      { code: 'C', name: '4-Aminopyridine', smiles: 'Nc1ccncc1', molarMass: 94.11, density: 1.1, stock: 500, solvent: 'DMSO' },
+      { code: 'D', name: 'Benzamide', smiles: 'NC(=O)c1ccccc1', molarMass: 121.14, density: 1.15, stock: 500, solvent: 'DMSO' },
+      { code: 'E', name: 'TsOH·H2O', smiles: '', molarMass: 190.22, density: 1.2, stock: 500, solvent: 'DMSO' },
+    ];
+    state.eln = { ...state.eln!, temperatureC: 80 };
+    const combos = [
+      ['A', 'B', 'E'],
+      ['A', 'C', 'E'],
+      ['A', 'D', 'E'],
+      ['B', 'C', 'E'],
+      ['B', 'D', 'E'],
+      ['A', 'B', 'C', 'E'],
+    ];
+    const rows = combos.map((codes, w) => ({
+      local_index: w,
+      global_index: w,
+      combo_index: w,
+      plate_number: 0,
+      container_id: w,
+      recipe: codes.map((code) => ({
+        code,
+        name: state.reagents.find((r) => r.code === code)!.name,
+        target_concentration: 50,
+        equivalence: 1.0,
+      })),
+      'vol#solvent': 400,
+    }));
+
+    // Uncalibrated first-pass plan (NO calibration plates uploaded!)
+    const plan = await optimizePlateTlcSolvents(
+      rdkit,
+      state,
+      { plates: 1, reactions: rows.length, rows } as unknown as RunResult,
+      [],
+      { plateIndex: 0, maxSystems: 3, stationaryPhase: 'SiO2', poolMode: 'prefer_primary' }
+    );
+
+    const maxAlcPct = Math.max(...plan.recommendedSystems.map((r) => r.system.alcoholPct));
+    expect(maxAlcPct).toBeGreaterThanOrEqual(12);
+    expect(plan.recommendedSystems.some((r) => r.system.baseModifier?.includes('NH₃') && r.system.alcoholPct >= 12)).toBe(true);
   });
 });
 

@@ -94,6 +94,7 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
       lane2dByChannel,
       frontBandByChannel,
       detectorMode: tlcSet.spotDetectorMode,
+      minSpotWidthFrac: tlcSet.minSpotWidthFrac,
     });
     const spots = getEffectiveLaneSpots(lane, autoSpots);
     return { origin, front, spots };

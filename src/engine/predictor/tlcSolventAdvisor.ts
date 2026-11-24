@@ -149,15 +149,21 @@ export interface TlcMolProfile {
   aliphAmineCount: number;
   azoleCount: number;
   basicAzoleNCount?: number; // [nX2r5] sp2 basic nitrogen (excludes non-basic pyrrole/indole NH)
+  weakAzoleNCount?: number; // weakly basic O/S-containing 5-ring azole N (thiazole, oxazole, isoxazole)
   anilineCount?: number; // aromatic amine Ar-NH2 / Ar-NHR (protonates in strong acid wells)
   imineCount?: number; // acyclic C=N basic nitrogen
   pyridineCount: number;
+  ortho1PyridineCount?: number; // 2-substituted pyridine (sterically attenuated Si-OH binding)
+  ortho2PyridineCount?: number; // 2,6-disubstituted pyridine (strongly shielded lone pair)
   carboxylicAcidCount: number;
   primaryAmideCount: number;
   secondaryAmideCount: number;
+  tertiaryAmideCount?: number;
   ureaCount: number;
   sulfonamideCount: number;
+  alcoholCount?: number;
   phenolCount: number;
+  carbonylCount?: number; // ketone or aldehyde C=O (strong localized HBA dipole)
   boronicCount: number;
   phosphonateCount: number;
   heavyHalogenCount: number; // Cl, Br, I
@@ -168,6 +174,8 @@ export interface TlcMolProfile {
   intraHbondOhCount?: number;
   /** Moderate 6-membered intramolecular N-H...O=C / NO2 chelate rings (e.g. 2'-aminoacetophenone, anthranilates, 2-nitroaniline) */
   intraHbondNhCount?: number;
+  /** 5-membered ortho-aminophenol or peri-aminoaza (e.g. 8-aminoquinoline) intramolecular H-bond chelate */
+  intraHbond5Count?: number;
   zwitterionOrQuatCount: number;
   /** True when the neutral structure carries both a strong basic site and an acidic group (e.g. amino acid) */
   isInternalZwitterion?: boolean;
@@ -290,6 +298,7 @@ export interface TlcCalibrationSpotPair {
   speciesLabel: string;
   speciesKind: 'substrate' | 'product';
   compoundKey?: string;
+  smiles?: string;
   observedRf: number;
   predictedRfBefore: number;
   predictedRfAfter: number;
@@ -303,6 +312,7 @@ export interface TlcCalibrationSpotPair {
 
 export interface CalibratedCompoundSummary {
   compoundKey: string;
+  smiles?: string;
   label: string;
   kind: 'substrate' | 'product';
   wellsPresent: number;
@@ -339,17 +349,22 @@ export interface CalibratedLaneComparison {
     matchedPredRfBefore?: number;
     matchedPredRfAfter?: number;
     matchMethod?: 'consensus' | 'per_well';
+    coelutedLabels?: string[];
   }>;
   predictedSpots: Array<{
+    compoundKey?: string;
+    smiles?: string;
     label: string;
     kind: 'substrate' | 'product';
     tier?: PredictedSpecies['tier'];
     rfBefore: number;
     rfAfter: number;
     found: boolean;
-    boundaryStatus?: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing';
+    boundaryStatus?: 'found' | 'coeluted' | 'inconsistent' | 'front_saturated' | 'baseline_pinned' | 'missing';
     matchedObsRf?: number;
     matchMethod?: 'consensus' | 'per_well';
+    coelutedWith?: string[];
+    conflictPlates?: string[];
   }>;
 }
 
@@ -555,15 +570,21 @@ type MotifCountKey = keyof Pick<
   | 'aliphAmineCount'
   | 'azoleCount'
   | 'basicAzoleNCount'
+  | 'weakAzoleNCount'
   | 'anilineCount'
   | 'imineCount'
   | 'pyridineCount'
+  | 'ortho1PyridineCount'
+  | 'ortho2PyridineCount'
   | 'carboxylicAcidCount'
   | 'primaryAmideCount'
   | 'secondaryAmideCount'
+  | 'tertiaryAmideCount'
   | 'ureaCount'
   | 'sulfonamideCount'
+  | 'alcoholCount'
   | 'phenolCount'
+  | 'carbonylCount'
   | 'boronicCount'
   | 'phosphonateCount'
   | 'heavyHalogenCount'
@@ -572,6 +593,7 @@ type MotifCountKey = keyof Pick<
   | 'cyanoCount'
   | 'intraHbondOhCount'
   | 'intraHbondNhCount'
+  | 'intraHbond5Count'
   | 'zwitterionOrQuatCount'
 >;
 
@@ -584,15 +606,21 @@ const TLCMOTIF_SMARTS: Array<[MotifCountKey, string]> = [
   ],
   ['azoleCount', '[nX2r5,nX3H1r5]'],
   ['basicAzoleNCount', '[nX2r5]'],
+  ['weakAzoleNCount', '[nX2r5;$([n]1~*~*~[o,s]~*~1),$([n]1~*~[o,s]~*~*~1)]'],
   ['anilineCount', '[NX3;H2,H1,H0;+0;$(N-c);!$(N-C=[O,S,N]);!$(N-S=O);!$(N-[#7,#8]);!$(N=[*])]'],
   ['imineCount', '[NX2;$(N=[CX3]);!$(N-O);!$(N-N);!$([n])]'],
   ['pyridineCount', '[nX2r6]'],
+  ['ortho1PyridineCount', '[nX2r6;$([n]([c;D3])[c;D2])]'],
+  ['ortho2PyridineCount', '[nX2r6;$([n]([c;D3])[c;D3])]'],
   ['carboxylicAcidCount', '[CX3](=[OX1])[OX2H1]'],
   ['primaryAmideCount', '[CX3;$([C](=[OX1])([NX3;H2;+0])[#6])]'],
   ['secondaryAmideCount', '[CX3;$([C](=[OX1])([NX3;H1;+0])[#6])]'],
+  ['tertiaryAmideCount', '[CX3;$([C](=[OX1])([NX3;H0;+0;!$(N-[OX2]);!$(N=[OX1])])[#6])]'],
   ['ureaCount', '[CX3;$([C](=[OX1])([NX3])[NX3])]'],
   ['sulfonamideCount', '[SX4;$([S](=[OX1])(=[OX1])[NX3;H2,H1;+0])]'],
+  ['alcoholCount', '[OX2H1;$([O][#6;X4])]'],
   ['phenolCount', '[OX2H1;$([O]c)]'],
+  ['carbonylCount', '[CX3;$([C](=[OX1])([#6])[#6]),$([CX3H1](=[OX1])[#6])]'],
   ['boronicCount', '[BX3;$([B]([OX2H1])[OX2])]'],
   ['phosphonateCount', '[PX4;$([P](=[OX1])([OX2])[OX2])]'],
   ['heavyHalogenCount', '[Cl,Br,I]'],
@@ -608,6 +636,11 @@ const TLCMOTIF_SMARTS: Array<[MotifCountKey, string]> = [
     'intraHbondNhCount',
     // 6-membered intramolecular N-H...O=C / NO2 chelate (o-aminoaryl carbonyls, anthranilates, 2-nitroanilines)
     '[NX3;H2,H1;+0;$([N]c:c[CX3]=[OX1]),$([N]c:c[$([NX3](=O)=O),$([NX3+](=O)[O-])])]',
+  ],
+  [
+    'intraHbond5Count',
+    // 5-membered ortho-aminophenol or 8-aminoquinoline intramolecular H-bond chelate
+    '[NX3;H2,H1;+0;$([N]c:c[OX2H1]),$([N]c:c:c:[nX2])]',
   ],
   ['zwitterionOrQuatCount', '[NX4+]'],
 ];
@@ -754,8 +787,10 @@ export function profileMoleculeForTlc(
     carboxylicAcidCount: 0,
     primaryAmideCount: 0,
     secondaryAmideCount: 0,
+    tertiaryAmideCount: 0,
     ureaCount: 0,
     sulfonamideCount: 0,
+    alcoholCount: 0,
     phenolCount: 0,
     boronicCount: 0,
     phosphonateCount: 0,
@@ -779,15 +814,21 @@ export function profileMoleculeForTlc(
       aliphAmineCount: 0,
       azoleCount: 0,
       basicAzoleNCount: 0,
+      weakAzoleNCount: 0,
       anilineCount: 0,
       imineCount: 0,
       pyridineCount: 0,
+      ortho1PyridineCount: 0,
+      ortho2PyridineCount: 0,
       carboxylicAcidCount: 0,
       primaryAmideCount: 0,
       secondaryAmideCount: 0,
+      tertiaryAmideCount: 0,
       ureaCount: 0,
       sulfonamideCount: 0,
+      alcoholCount: 0,
       phenolCount: 0,
+      carbonylCount: 0,
       boronicCount: 0,
       phosphonateCount: 0,
       heavyHalogenCount: 0,
@@ -796,6 +837,7 @@ export function profileMoleculeForTlc(
       cyanoCount: 0,
       intraHbondOhCount: 0,
       intraHbondNhCount: 0,
+      intraHbond5Count: 0,
       zwitterionOrQuatCount: 0,
     };
     for (const [k, sma] of TLCMOTIF_SMARTS) {
@@ -954,15 +996,21 @@ export function profileMoleculeForTlc(
       aliphAmineCount: counts.aliphAmineCount,
       azoleCount: counts.azoleCount,
       basicAzoleNCount: counts.basicAzoleNCount,
+      weakAzoleNCount: counts.weakAzoleNCount,
       anilineCount: counts.anilineCount,
       imineCount: counts.imineCount,
       pyridineCount: counts.pyridineCount,
+      ortho1PyridineCount: counts.ortho1PyridineCount,
+      ortho2PyridineCount: counts.ortho2PyridineCount,
       carboxylicAcidCount: counts.carboxylicAcidCount,
       primaryAmideCount: counts.primaryAmideCount,
       secondaryAmideCount: counts.secondaryAmideCount,
+      tertiaryAmideCount: counts.tertiaryAmideCount,
       ureaCount: counts.ureaCount,
       sulfonamideCount: counts.sulfonamideCount,
+      alcoholCount: counts.alcoholCount,
       phenolCount: counts.phenolCount,
+      carbonylCount: counts.carbonylCount,
       boronicCount: counts.boronicCount,
       phosphonateCount: counts.phosphonateCount,
       heavyHalogenCount: counts.heavyHalogenCount,
@@ -971,6 +1019,7 @@ export function profileMoleculeForTlc(
       cyanoCount: counts.cyanoCount,
       intraHbondOhCount: counts.intraHbondOhCount,
       intraHbondNhCount: counts.intraHbondNhCount,
+      intraHbond5Count: counts.intraHbond5Count,
       zwitterionOrQuatCount: counts.zwitterionOrQuatCount,
       isInternalZwitterion,
       ewgAttenuatedBasicity,
@@ -1255,9 +1304,12 @@ export function predictTlcRf(
 ): { rf: number; rfSigma: number; tailing: boolean; tailingReason?: string; mildStreak?: boolean } {
   const primAmide = profile.primaryAmideCount || 0;
   const secAmide = profile.secondaryAmideCount || 0;
+  const tertAmide = Math.max(0, (profile.tertiaryAmideCount || 0) - (profile.ureaCount || 0));
   const urea = profile.ureaCount || 0;
   const sulfonamide = profile.sulfonamideCount || 0;
+  const alcohol = profile.alcoholCount || 0;
   const phenol = profile.phenolCount || 0;
+  const carbonyl = profile.carbonylCount || 0;
   const boronic = profile.boronicCount || 0;
   const phosphonate = profile.phosphonateCount || 0;
   const heavyHalogen = profile.heavyHalogenCount || 0;
@@ -1266,6 +1318,7 @@ export function predictTlcRf(
   const cyano = profile.cyanoCount || 0;
   const intraOh = profile.intraHbondOhCount || 0;
   const intraNh = profile.intraHbondNhCount || 0;
+  const intra5 = profile.intraHbond5Count || 0;
   const quat = profile.zwitterionOrQuatCount || 0;
   const isInternalZwitterion = Boolean(
     profile.isInternalZwitterion ||
@@ -1354,23 +1407,30 @@ export function predictTlcRf(
   const isBasicAlumina = resolvedPhase === 'Al2O3_basic';
   const isAlumina = isNeutralAlumina || isBasicAlumina;
 
-  const lipophilicityOffset = Math.max(-0.14, Math.min(0.22, (profile.clogP - 1.4) * 0.04));
+  const lipophilicityOffset = Math.max(-0.14, Math.min(0.22, (profile.clogP - 1.4) * (isAlumina ? 0.04 : 0.028)));
   // Heavy halogens & -CF3 reduce adjacent heteroatom H-bond basicity; keep -NO2/-CN dipole neutral
-  const halogenCf3Relief = Math.min(0.09, cf3 * 0.036 + heavyHalogen * 0.016);
+  const halogenCf3Relief = Math.min(0.12, cf3 * 0.036 + heavyHalogen * (isAlumina ? 0.016 : 0.035));
   // Larger MW (> 450 Da) adds modest nonspecific adsorption unless already very lipophilic
   const mwAdsorption = exactmw > 450 ? Math.min(0.055, (exactmw - 450) * 0.00016) : 0;
 
   const aniline = profile.anilineCount || 0;
-  const basicAzoleN = profile.basicAzoleNCount ?? profile.azoleCount * 0.5;
-  const azoleNH = Math.max(0, profile.azoleCount - basicAzoleN);
+  const weakAzoleN = profile.weakAzoleNCount || 0;
+  const basicAzoleN = Math.max(0, (profile.basicAzoleNCount ?? profile.azoleCount * 0.5) - weakAzoleN);
+  const azoleNH = Math.max(0, profile.azoleCount - (profile.basicAzoleNCount ?? profile.azoleCount * 0.5));
   // Tautomeric NH + basic =N- azoles (imidazole, benzimidazole, pyrazole, triazole) form strong H-bond chains
   const nhBasicAzole = Math.min(basicAzoleN, azoleNH);
+  // Steric shielding of 2- and 2,6-ortho-substituted pyridines sharply weakens Si-OH lone-pair binding
+  const ortho1Pyr = profile.ortho1PyridineCount || 0;
+  const ortho2Pyr = profile.ortho2PyridineCount || 0;
+  const unshieldedPyr = Math.max(0, profile.pyridineCount - ortho1Pyr - ortho2Pyr);
+  const effPyrCount = unshieldedPyr + ortho1Pyr * 0.53 + ortho2Pyr * 0.15;
 
   // Protic alcohol eluents (MeOH/EtOH) partially compete with and disrupt intramolecular H-bonds
   const intraProticFactor =
     system.alcoholPct > 0 ? Math.max(0.55, 1 - system.alcoholPct * 0.035) : 1.0;
   const intraHbondReliefSiO2 =
-    (Math.min(0.24, intraOh * 0.165) + Math.min(0.14, intraNh * 0.08)) * intraProticFactor;
+    (Math.min(0.24, intraOh * 0.095) + Math.min(0.14, intraNh * 0.14) + Math.min(0.18, intra5 * 0.16)) *
+    intraProticFactor;
   const intraHbondReliefAlumina =
     (Math.min(0.20, intraOh * 0.125) + Math.min(0.11, intraNh * 0.06)) * intraProticFactor;
 
@@ -1412,28 +1472,43 @@ export function predictTlcRf(
   } else {
     // -------------------------------------------------------------------------
     // CASE C: NORMAL-PHASE SILICA (SiO2 — acidic Si-OH silanol surface)
+    // Calibrated on Xu & Mo (4,939 SiO2 measurements, 5-fold compound-grouped CV)
     // -------------------------------------------------------------------------
+    // Diminishing returns for multiple equivalent basic N centers (conformational surface contact)
+    const multiBasic = (n: number): number =>
+      n <= 0 ? 0 : n === 1 ? 1.0 : 1.0 + (0.40 * (n - 1)) / (1 + 0.32 * (n - 2));
+
+    const tpsaDemand =
+      profile.tpsa <= 125
+        ? profile.tpsa * 0.0033
+        : 0.4125 + Math.min(0.32, (profile.tpsa - 125) * 0.0017);
+
+    const freePhenol = Math.max(0, phenol - intraOh);
     const functionalGroupDemand =
-      Math.min(0.18, primAmide * 0.075) +
-      Math.min(0.11, secAmide * 0.035) +
-      Math.min(0.22, urea * 0.095) +
-      Math.min(0.16, sulfonamide * 0.06) +
-      Math.min(0.12, phenol * 0.045) +
-      Math.min(0.11, aniline * basicityAtten * 0.045) +
-      Math.min(0.18, phosphonate * 0.075) +
+      Math.min(0.56, primAmide * 0.42) +
+      Math.min(0.46, secAmide * 0.34) +
+      Math.min(0.24, tertAmide * 0.13) +
+      Math.min(0.40, urea * 0.24) +
+      Math.min(0.22, sulfonamide * 0.12) +
+      Math.min(0.26, alcohol * 0.23) +
+      Math.min(0.22, freePhenol * 0.165) +
+      Math.min(0.24, aniline * basicityAtten * 0.15) +
+      Math.min(0.18, carbonyl * 0.075) +
+      Math.min(0.20, weakAzoleN * 0.03) +
+      Math.min(0.22, phosphonate * 0.10) +
       mwAdsorption -
       halogenCf3Relief -
       intraHbondReliefSiO2;
 
     demand =
-      0.04 +
-      Math.min(0.55, profile.tpsa * 0.0044) +
-      profile.hbd * 0.062 +
-      Math.max(0, profile.hba - 1) * 0.018 +
-      Math.min(0.22, profile.azoleCount * 0.040) +
-      Math.min(0.14, basicAzoleN * basicityAtten * 0.045) +
-      Math.min(0.18, nhBasicAzole * 0.095) +
-      profile.pyridineCount * basicityAtten * 0.055 +
+      0.09 +
+      tpsaDemand +
+      profile.hbd * 0.044 +
+      Math.max(0, profile.hba - 1) * 0.008 +
+      Math.min(0.18, azoleNH * 0.055) +
+      Math.min(0.70, multiBasic(basicAzoleN) * basicityAtten * 0.51) +
+      Math.min(0.22, nhBasicAzole * 0.11) +
+      Math.min(0.68, multiBasic(effPyrCount) * basicityAtten * 0.50) +
       functionalGroupDemand -
       lipophilicityOffset +
       demandShift +
@@ -1452,11 +1527,27 @@ export function predictTlcRf(
     // Acetone carbonyl competes selectively against HBD, phenols, primary amides & ureas relative to EtOAc
     const betaScale = desc ? Math.min(1.12, 0.55 + desc.betaMix * 1.35) : 1.0;
     demand -= Math.min(0.105, (profile.hbd * 0.028 + (primAmide + urea + phenol) * 0.02) * betaScale);
-  } else if (system.family === 'mtbe_hex' || system.composition?.strongSolvent === 'MTBE') {
-    // Pure ether HBA (beta=0.49, low pi*=0.27): lifts HBD solutes selectively while retaining non-HBD dipolar aromatics slightly tighter than EtOAc
-    const betaScale = desc ? Math.min(1.15, 0.6 + desc.betaMix * 1.25) : 1.0;
-    const hbdLift = Math.min(0.085, ((profile.lser?.A ?? profile.hbd * 0.42) * 0.065 + (phenol + primAmide) * 0.015) * betaScale);
-    const dipolarHold = profile.hbd === 0 ? Math.min(0.03, (profile.lser?.S ?? 0) * 0.015) : 0;
+  } else if (
+    system.family === 'mtbe_hex' ||
+    system.family === 'ether_pentane' ||
+    system.composition?.strongSolvent === 'MTBE' ||
+    system.composition?.strongSolvent === 'Et2O'
+  ) {
+    // Pure ether HBA (Et2O beta=0.47, MTBE beta=0.49; low pi*=0.27): lifts HBD solutes (phenols, alcohols,
+    // carboxylic acids, anilines) selectively while retaining non-HBD dipolar aromatics slightly tighter than EtOAc
+    const freeHbd = Math.max(0, profile.hbd - intraOh);
+    const freePhenol = Math.max(0, phenol - intraOh);
+    const betaFrac = desc ? Math.min(1.15, desc.betaMix / 0.47) : 1.0;
+    const hbdLift =
+      freeHbd > 0
+        ? Math.min(
+            0.18,
+            (freeHbd * 0.6 + profile.carboxylicAcidCount * 0.9 + freePhenol * 0.35 + primAmide * 0.25) *
+              0.11 *
+              betaFrac
+          )
+        : 0;
+    const dipolarHold = profile.hbd === 0 ? Math.min(0.025, (profile.lser?.S ?? 0) * 0.012) : 0;
     demand -= hbdLift - dipolarHold;
   } else if (system.family === 'meoh_etoac' || (desc && desc.alcoholPct > 0 && desc.betaMix >= 0.44)) {
     demand -= Math.min(0.08, profile.hbd * 0.022 + profile.hba * 0.008 + (primAmide + urea) * 0.018);
@@ -1529,14 +1620,21 @@ export function predictTlcRf(
         : 'Carboxylic acid pins/tails on Neutral Al₂O₃ — switch to SiO₂ (+ 1% AcOH) or C18';
     }
   } else {
-    // Aliphatic amines / guanidines / amidines pin tightly to silanols unless base modifier is present
+    // Electrostatic/ionic salt pinning (unmodified amine protonation, carboxylate-NH4+ salt, quat, zwitterion)
+    // is accumulated separately so it bypasses neutral conformational multi-site H-bond saturation below.
+    let ionicPinning = 0;
+    const multiBasicAmine = (n: number): number =>
+      n <= 0 ? 0 : n === 1 ? 1.0 : 1.0 + (0.40 * (n - 1)) / (1 + 0.32 * (n - 2));
+
+    // Aliphatic amines / guanidines / amidines pin tightly to silanols unless base modifier is present;
+    // even with NH3/Et3N suppressing tailing, free primary/secondary amines still bind silica strongly.
     if (profile.aliphAmineCount > 0) {
       if (system.baseModifier) {
         const isNh3 = system.baseModifier.includes('NH₃');
-        demand += Math.min(isNh3 ? 0.14 : 0.17, profile.aliphAmineCount * (isNh3 ? 0.055 : 0.07));
+        demand += Math.min(isNh3 ? 0.68 : 0.76, multiBasicAmine(profile.aliphAmineCount) * (isNh3 ? 0.54 : 0.60));
       } else {
-        demand += Math.min(0.58, 0.30 + profile.aliphAmineCount * 0.16);
-        if (system.acidModifier) demand += 0.08;
+        ionicPinning += Math.min(0.88, 0.54 + profile.aliphAmineCount * 0.20);
+        if (system.acidModifier) ionicPinning += 0.08;
         tailing = true;
         tailingReason = system.acidModifier
           ? 'Acidic modifier protonates basic amine — use Et₃N or NH₃-MeOH'
@@ -1556,8 +1654,8 @@ export function predictTlcRf(
       const modCap = desc?.modifierCapacity;
 
       if (!system.baseModifier) {
-        demand += Math.min(0.46, 0.12 + 0.24 * wellAcid.acidStress);
-        if (system.acidModifier) demand += 0.04;
+        ionicPinning += Math.min(0.46, 0.12 + 0.24 * wellAcid.acidStress);
+        if (system.acidModifier) ionicPinning += 0.04;
         tailing = true;
         if (!tailingReason) {
           tailingReason =
@@ -1575,15 +1673,15 @@ export function predictTlcRf(
             : baseCap * (1.10 / 0.46);
         const preCapCoeff =
           wellAcid.acidStrength === 'strong_nonvolatile'
-            ? 0.24
+            ? 0.28
             : wellAcid.acidStrength === 'strong_volatile'
             ? 0.14
             : 0;
-        const preCapDrag = preCapCoeff > 0 ? Math.min(0.14, wellAcid.acidStress * preCapCoeff) : 0;
+        const preCapDrag = preCapCoeff > 0 ? Math.min(0.16, wellAcid.acidStress * preCapCoeff) : 0;
         const overload = Math.max(0, wellAcid.acidStress - et3nCap);
-        demand += preCapDrag;
+        ionicPinning += preCapDrag;
         if (overload > 0) {
-          demand += Math.min(0.24, 0.04 + overload * 0.28);
+          ionicPinning += Math.min(0.24, 0.04 + overload * 0.28);
           if (overload >= 0.12) {
             tailing = true;
             if (!tailingReason) {
@@ -1608,9 +1706,9 @@ export function predictTlcRf(
         const preCapDrag =
           wellAcid.acidStrength === 'strong_nonvolatile' ? Math.min(0.05, wellAcid.acidStress * 0.04) : 0;
         const overload = Math.max(0, wellAcid.acidStress - nh3Cap);
-        demand += preCapDrag;
+        ionicPinning += preCapDrag;
         if (overload > 0) {
-          demand += Math.min(0.14, 0.025 + overload * 0.18);
+          ionicPinning += Math.min(0.14, 0.025 + overload * 0.18);
           if (overload >= 0.35) {
             tailing = true;
             if (!tailingReason) {
@@ -1629,25 +1727,34 @@ export function predictTlcRf(
       }
     }
 
-    // Carboxylic acids dimerize & streak unless AcOH modifier is present;
-    // excess strong non-volatile base (KOH, DBU, Cs2CO3 >= 1.2 eq) can overwhelm 1% AcOH too.
+    // Carboxylic acids dimerize & streak unless AcOH modifier is present, and form ionic carboxylate
+    // salts (-COO⁻ NH₄⁺ / Et₃NH⁺) that pin tightly near the origin in basic mobile phases.
     if (profile.carboxylicAcidCount > 0) {
       const baseLoad = Math.max(0, wellCtx?.baseLoadEq ?? (wellCtx?.hasBaseAdditive ? 0.3 : 0));
       const baseSeverity = wellCtx?.baseStrength === 'strong' ? 1.0 : 0.45;
       if (system.acidModifier) {
-        demand += Math.min(0.18, profile.carboxylicAcidCount * 0.08);
+        demand += Math.min(0.24, profile.carboxylicAcidCount * 0.11);
         if (wellCtx?.hasBaseAdditive && baseLoad * baseSeverity >= 0.95) {
           const baseOverload = Math.min(0.14, (baseLoad * baseSeverity - 0.95) * 0.10 + 0.04);
-          demand += baseOverload;
+          ionicPinning += baseOverload;
           mildStreak = true;
           if (!tailingReason) {
             tailingReason = `1% AcOH may not fully acidify excess ${wellCtx.additiveLabel || 'base'} (${baseLoad.toFixed(1)} eq) — pre-acidify or use C18`;
           }
         }
-      } else {
-        demand += Math.min(0.55, 0.28 + profile.carboxylicAcidCount * 0.15);
+      } else if (system.baseModifier) {
+        ionicPinning += Math.min(0.72, 0.52 + profile.carboxylicAcidCount * 0.18);
         if (wellCtx?.hasBaseAdditive) {
-          demand += Math.min(0.22, 0.08 + 0.10 * baseLoad * baseSeverity);
+          ionicPinning += Math.min(0.16, 0.06 + 0.08 * baseLoad * baseSeverity);
+        }
+        tailing = true;
+        tailingReason = `Carboxylic acid forms ionic carboxylate salt in ${system.baseModifier} and pins at baseline — switch to AcOH modifier or C18`;
+      } else {
+        // Unmodified neutral eluent: carboxylic acid runs as H-bonded acid/dimer (tails, so advisor
+        // still recommends AcOH), NOT an origin-pinned ionic carboxylate salt unless well base is present.
+        demand += Math.min(0.55, profile.carboxylicAcidCount * 0.31);
+        if (wellCtx?.hasBaseAdditive) {
+          ionicPinning += Math.min(0.38, 0.18 + 0.14 * baseLoad * baseSeverity);
         }
         tailing = true;
         tailingReason = wellCtx?.hasBaseAdditive
@@ -1661,13 +1768,21 @@ export function predictTlcRf(
       if (system.acidModifier || system.alcoholPct >= 7) {
         demand += Math.min(0.20, boronic * 0.11);
       } else {
-        demand += Math.min(0.38, 0.18 + boronic * 0.15);
+        ionicPinning += Math.min(0.38, 0.18 + boronic * 0.15);
         tailing = true;
         if (!tailingReason) {
           tailingReason = 'Free boronic acid can streak on SiO₂ — add MeOH/AcOH or use C18';
         }
       }
     }
+
+    // Conformational multi-site surface contact saturation on SiO2: a single neutral molecule cannot
+    // simultaneously plant > ~2.5 polar patches onto planar silanols, so poly-functional scaffolds
+    // stay pinned in weak 6% MeOH yet still elute cleanly in 12–16% MeOH.
+    if (demand > 0.92) {
+      demand = 0.92 + (demand - 0.92) * 0.38;
+    }
+    demand += ionicPinning;
   }
 
   // Quaternary ammonium / permanently charged N & internal zwitterions (e.g. amino acids) pin near baseline on normal-phase plates
@@ -1686,11 +1801,30 @@ export function predictTlcRf(
     tailingReason = 'Internal zwitterion (amine + acid) pins/tails on normal phase — prefer C18 RP (+ 0.1% TFA)';
   }
 
-  // Protic MeOH competes strongly against normal-phase H-bonding (including primary amides & ureas)
-  const proticSites = profile.hbd + basicAzoleN * 0.20 + primAmide * 0.45 + urea * 0.6;
+  // Protic MeOH (alpha = 0.93, beta = 0.66) selectively solvates basic sp2/sp3 N acceptors (which
+  // aprotic EtOAc cannot H-bond donate to) and disrupts amide/urea H-bond chains, growing smoothly
+  // across 2% -> 6% -> 12% -> 16% MeOH without prematurely saturating at 6%.
+  const proticBasicSites =
+    basicAzoleN * 1.15 +
+    effPyrCount * 0.72 +
+    profile.aliphAmineCount * (system.baseModifier ? 0.85 : 0.25);
+  const proticHbdSites =
+    profile.hbd * 0.45 +
+    primAmide * 0.75 +
+    secAmide * 0.50 +
+    tertAmide * 0.90 +
+    urea * 0.80 +
+    Math.max(0, profile.hba - 2) * 0.22;
+  const alcCurve = system.alcoholPct > 0 ? system.alcoholPct / (system.alcoholPct + 9.0) : 0;
   const proticBoost =
     system.alcoholPct > 0
-      ? Math.min(0.18, system.alcoholPct * 0.0105 * Math.max(0.4, proticSites * 0.45))
+      ? Math.min(
+          0.38,
+          alcCurve *
+            (0.08 +
+              Math.min(0.36, proticBasicSites * 0.22) +
+              Math.min(0.22, proticHbdSites * 0.125))
+        )
       : 0;
 
   const effectiveStrength = system.strength + proticBoost;
@@ -1701,7 +1835,7 @@ export function predictTlcRf(
   const effDispN =
     effectiveStrength > demand
       ? isApolarMobile && effectiveStrength >= 0.35
-        ? Math.max(1.18, rawDispN)
+        ? Math.max(1.38, rawDispN)
         : Math.max(1.0, rawDispN)
       : rawDispN;
   const z = Math.max(-12, Math.min(12, 6.2 * demandSlope * effDispN * (effectiveStrength - demand)));
@@ -3126,7 +3260,13 @@ export async function optimizePlateTlcSolvents(
       const sb = scoreGrid[j];
       let pen = 0;
       if (pa === pb) {
-        if (a.family === b.family && Math.abs(a.strength - b.strength) < 0.16) {
+        const bothMeoh = a.alcoholPct > 0 && b.alcoholPct > 0;
+        const distinctMeohRungs = bothMeoh && Math.abs(a.alcoholPct - b.alcoholPct) >= 5;
+        if (
+          a.family === b.family &&
+          !distinctMeohRungs &&
+          Math.abs(a.strength - b.strength) < (bothMeoh ? 0.11 : 0.16)
+        ) {
           pen = 0.065;
         } else if (pa === 'C18' && Math.abs(a.strength - b.strength) < 0.25) {
           pen = 0.05;

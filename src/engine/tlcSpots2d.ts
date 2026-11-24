@@ -462,6 +462,215 @@ function smooth2dLight(src: Float32Array, w: number, h: number, rLo: number, rHi
 
 // ---- 2D Connected-Region & Marker-Controlled Watershed Spot Segmentation -------------------------
 
+/**
+ * Default minimum 2D horizontal FWHM (fraction of lane width) for genuine eluted spots.
+ * Normal robotic/capillary TLC spots span ~40–80% of lane width after chromatographic diffusion;
+ * accidental spotter microdroplets and their narrow vertical streaks span ~14–26% of lane width.
+ * Set `minSpotWidthFrac: 0` to disable width-based microdroplet filtering.
+ */
+export const DEFAULT_MIN_SPOT_WIDTH_FRAC = 0.28;
+
+export interface SpotLateralWidth2d {
+  /** Sub-pixel horizontal Full-Width at Half-Maximum as a fraction of full lane width (0..1) */
+  fwhmXFrac: number;
+  /** Sub-pixel horizontal width at 30% peak height as a fraction of full lane width (0..1) */
+  w30Frac: number;
+  /** Horizontal peak center position as a fraction of lane width (0..1) */
+  centroidXFrac: number;
+  /** Flank-subtracted interior peak intensity on the 2D spot-likelihood map */
+  corePeak: number;
+  /** True when the horizontal cross-section increases monotonically into a lane border (neighbor spillover) */
+  edgeSpillover: boolean;
+}
+
+/**
+ * Estimates the smooth vertical clean-silica flank baseline across `[origin..front]` on `spotMap.map`
+ * using arPLS on the quieter outer flank of each row. Unlike subtracting the same-row flank directly,
+ * this tracks vertical plate illumination drift while ignoring wide full-lane spots whose wings
+ * cover both outer flanks (preventing wide 80–100% bands from being mismeasured as narrow bumps).
+ */
+export function computeCleanFlankBaseline2d(
+  spotMap: LaneSpotMap2d,
+  origin?: number,
+  front?: number
+): Float64Array {
+  const { w, h, origLen, map } = spotMap;
+  const out = new Float64Array(h);
+  if (w < 4 || h < 4 || origLen < 4) return out;
+
+  const invScaleY = (h - 1) / Math.max(1, origLen - 1);
+  const minRow =
+    origin !== undefined ? Math.max(0, Math.min(h - 1, Math.round(origin * invScaleY))) : 0;
+  const maxRow =
+    front !== undefined ? Math.max(minRow, Math.min(h - 1, Math.round(front * invScaleY))) : h - 1;
+  const flankCols = Math.max(1, Math.min(3, Math.round(w * 0.14)));
+
+  const minFlankAll = new Float64Array(h);
+  for (let r = 0; r < h; r++) {
+    const off = r * w;
+    let lSum = 0;
+    let rSum = 0;
+    for (let x = 0; x < flankCols; x++) {
+      lSum += map[off + x];
+      rSum += map[off + (w - 1 - x)];
+    }
+    minFlankAll[r] = Math.min(lSum / flankCols, rSum / flankCols);
+  }
+
+  return maxRow - minRow >= 8
+    ? computeArplsBaseline(minFlankAll, 1, minRow, maxRow, { lambda: 1e4, iterations: 14 })
+    : minFlankAll;
+}
+
+/**
+ * Measures the sub-pixel 2D horizontal cross-section width (FWHM) of a peak at `posOrig`
+ * directly from `spotMap.map` above the lane's clean-silica baseline.
+ * Used by both Densitogram mode and 2D Seg mode to distinguish full-width eluted spots (40–100% W)
+ * from narrow spotter microdroplets and their skinny vertical runs (14–26% W).
+ */
+export function measureSpotLateralWidth2d(
+  spotMap: LaneSpotMap2d,
+  posOrig: number,
+  opts: { origin?: number; front?: number; halfRowWin?: number; cleanFlankBase?: Float64Array } = {}
+): SpotLateralWidth2d | null {
+  const { w, h, origLen, map, bgSigma } = spotMap;
+  if (w < 10 || h < 10 || origLen < 10) return null;
+
+  const invScaleY = (h - 1) / Math.max(1, origLen - 1);
+  const peakRow = Math.max(0, Math.min(h - 1, Math.round(posOrig * invScaleY)));
+  const minRow =
+    opts.origin !== undefined
+      ? Math.max(0, Math.min(h - 1, Math.round(opts.origin * invScaleY)))
+      : 0;
+  const maxRow =
+    opts.front !== undefined
+      ? Math.max(minRow, Math.min(h - 1, Math.round(opts.front * invScaleY)))
+      : h - 1;
+
+  const hw = opts.halfRowWin ?? 2;
+  const rLo = Math.max(minRow, peakRow - hw);
+  const rHi = Math.min(maxRow, peakRow + hw);
+  const rowCount = Math.max(1, rHi - rLo + 1);
+
+  const rawX = new Float64Array(w);
+  for (let r = rLo; r <= rHi; r++) {
+    const off = r * w;
+    for (let x = 0; x < w; x++) {
+      rawX[x] += map[off + x];
+    }
+  }
+  for (let x = 0; x < w; x++) rawX[x] /= rowCount;
+
+  // Light 3-point horizontal smoothing suppresses 1px grain without materially widening bands
+  const smX = new Float64Array(w);
+  for (let x = 0; x < w; x++) {
+    const xm = x > 0 ? rawX[x - 1] : rawX[x];
+    const xp = x < w - 1 ? rawX[x + 1] : rawX[x];
+    smX[x] = 0.25 * xm + 0.5 * rawX[x] + 0.25 * xp;
+  }
+
+  // Subtract the clean-silica vertical baseline (clamped <= same-row min flank) rather than the
+  // same-row flanks alone, so a wide full-lane band covering both flanks measures ~90–100% wide
+  // instead of having its plateau subtracted away into a tiny narrow ripple.
+  const flankCols = Math.max(1, Math.min(3, Math.round(w * 0.14)));
+  let leftSum = 0;
+  let rightSum = 0;
+  for (let x = 0; x < flankCols; x++) {
+    leftSum += smX[x];
+    rightSum += smX[w - 1 - x];
+  }
+  const sameRowMinFlank = Math.min(leftSum / flankCols, rightSum / flankCols);
+  const cleanBaseArr =
+    opts.cleanFlankBase ?? computeCleanFlankBaseline2d(spotMap, opts.origin, opts.front);
+  const bg = Math.min(sameRowMinFlank, cleanBaseArr[peakRow]);
+
+  const s = new Float64Array(w);
+  for (let x = 0; x < w; x++) s[x] = Math.max(0, smX[x] - bg);
+
+  const xLo = Math.max(1, Math.floor(w * 0.14));
+  const xHi = Math.min(w - 2, Math.ceil(w * 0.86) - 1);
+  let peakX = Math.floor(w * 0.5);
+  let peakVal = -1;
+  for (let x = xLo; x <= xHi; x++) {
+    if (s[x] > peakVal) {
+      peakVal = s[x];
+      peakX = x;
+    }
+  }
+
+  const cLo = Math.max(xLo, Math.floor(w * 0.25));
+  const cHi = Math.min(xHi, Math.ceil(w * 0.75) - 1);
+  let centerPeak = 0;
+  for (let x = cLo; x <= cHi; x++) {
+    if (s[x] > centerPeak) centerPeak = s[x];
+  }
+
+  let edgePeak = 0;
+  for (let x = 0; x < xLo; x++) if (s[x] > edgePeak) edgePeak = s[x];
+  for (let x = xHi + 1; x < w; x++) if (s[x] > edgePeak) edgePeak = s[x];
+
+  const minMeasurable = Math.max(1.5, bgSigma * 0.8);
+  if (peakVal <= minMeasurable) {
+    return {
+      fwhmXFrac: 0,
+      w30Frac: 0,
+      centroidXFrac: (peakX + 0.5) / w,
+      corePeak: Math.max(0, peakVal),
+      edgeSpillover: edgePeak > minMeasurable * 2.0,
+    };
+  }
+
+  const widthAtFrac = (frac: number): [number, number] => {
+    const thr = peakVal * frac;
+    let leftPos = 0;
+    for (let x = peakX - 1; x >= 0; x--) {
+      if (s[x] < thr) {
+        const denom = Math.max(1e-6, s[x + 1] - s[x]);
+        leftPos = x + (thr - s[x]) / denom;
+        break;
+      }
+    }
+    let rightPos = w - 1;
+    for (let x = peakX + 1; x < w; x++) {
+      if (s[x] < thr) {
+        const denom = Math.max(1e-6, s[x - 1] - s[x]);
+        rightPos = x - (thr - s[x]) / denom;
+        break;
+      }
+    }
+    return [leftPos, rightPos];
+  };
+
+  const [l50, r50] = widthAtFrac(0.5);
+  const [l30, r30] = widthAtFrac(0.3);
+  const fwhmXFrac = Math.min(1, Math.max(0, (r50 - l50) / w));
+  const w30Frac = Math.min(1, Math.max(0, (r30 - l30) / w));
+
+  // Intensity-weighted horizontal centroid across the 30%-height core (or full profile for wide bands)
+  let sumX = 0;
+  let sumW = 0;
+  for (let x = Math.max(0, Math.floor(l30)); x <= Math.min(w - 1, Math.ceil(r30)); x++) {
+    sumX += (x + 0.5) * s[x];
+    sumW += s[x];
+  }
+  const centroidXFrac = sumW > 1e-6 ? sumX / (sumW * w) : (peakX + 0.5) / w;
+
+  // Genuine neighbor-lane spillover hugs an outer border (<20% or >80% centroid) and rises steeply
+  // at the edge compared to the lane center — a wide full-lane band with slight tilt has centroid ~0.40..0.60
+  // and is NEVER rejected as spillover.
+  const edgeSpillover =
+    (centroidXFrac < 0.20 || centroidXFrac > 0.80) &&
+    edgePeak > Math.max(centerPeak * 1.45, minMeasurable * 2.0);
+
+  return {
+    fwhmXFrac,
+    w30Frac,
+    centroidXFrac,
+    corePeak: peakVal,
+    edgeSpillover,
+  };
+}
+
 export interface SegmentSpots2dOptions {
   origin: number;
   front: number;
@@ -474,6 +683,8 @@ export interface SegmentSpots2dOptions {
   /** Optional raw 1D lateral metrics (for offPlate / borderStraddle checks) */
   offPlate?: boolean;
   borderStraddle?: boolean;
+  /** Minimum 2D horizontal FWHM (fraction of lane width, 0..0.65) to reject narrow spotter microdroplets & their vertical runs (0 = Off, default 0.28) */
+  minSpotWidthFrac?: number;
 }
 
 const FRONT_BAND_RF_START = 0.80;
@@ -1341,16 +1552,36 @@ export function segmentLaneSpots2d(
     originPeakVal >= Math.max(peakThr * 2.0, 20) &&
     (originCenterVal >= Math.max(peakThr * 1.8, 18) || originPeakVal >= originAboveVal * 0.92);
 
+  const minWidthFrac =
+    opts.minSpotWidthFrac !== undefined ? opts.minSpotWidthFrac : DEFAULT_MIN_SPOT_WIDTH_FRAC;
+  const cleanFlankBase =
+    minWidthFrac > 0 && w >= 12
+      ? computeCleanFlankBaseline2d(spotMap, opts.origin, opts.front)
+      : undefined;
+  const originLat2d =
+    minWidthFrac > 0 && w >= 12
+      ? measureSpotLateralWidth2d(spotMap, opts.origin, { halfRowWin: 2, cleanFlankBase })
+      : null;
+  const hasTinyMicrodropletOrigin = Boolean(
+    originLat2d &&
+      originLat2d.corePeak >= Math.max(12, bgSigma * 3.0) &&
+      originLat2d.fwhmXFrac > 0 &&
+      originLat2d.fwhmXFrac < Math.min(0.24, minWidthFrac * 0.88)
+  );
+  const effMinWidthFrac = hasTinyMicrodropletOrigin
+    ? Math.min(0.65, minWidthFrac * 1.14)
+    : minWidthFrac;
+
   for (const reg of finalMap.values()) {
     const pxCount = reg.pixels.length;
     if (pxCount < minSpotArea) continue;
     if (reg.peakVal < peakThr) continue;
 
-    // Sharp dust / pinhole / needle-splash artifact guard:
+    // Sharp dust / pinhole / needle-splash & spotter microdroplet-run artifact guard:
     // Real eluted TLC spots undergo lateral & longitudinal chromatographic diffusion, so their
-    // 50%-height core spans >= 25-65% of lane width and >= 2.2-8% of migration span. Tiny sharp
-    // dark specks / silica pinholes / splash droplets stay tightly pinpoint at 50% height even
-    // when high contrast gives them wide low-level wings above fgThr.
+    // 50%-height core spans >= 35-75% of lane width. Tiny sharp dark specks, silica pinholes,
+    // splash droplets, and accidental spotter microdroplets (plus their narrow vertical runs)
+    // remain tightly narrow horizontally (< 28% of lane width at 50% height).
     const halfCut = reg.peakVal * 0.50;
     let minX50 = w;
     let maxX50 = -1;
@@ -1374,15 +1605,28 @@ export function segmentLaneSpots2d(
         if (pr > maxY50) maxY50 = pr;
       }
     }
-    if (core50Count > 0 && w >= 12 && spanRows >= 80) {
+    if (core50Count > 0 && w >= 12) {
       const fwhmXFrac = (maxX50 - minX50 + 1) / w;
-      const fwhmYFrac = (maxY50 - minY50 + 1) / spanRows;
-      const coreArea50Frac = core50Count / (w * spanRows);
-      // Reject pinpoint dust/pinhole specks (narrow in both X and Y at 50% height)
-      if (fwhmXFrac < 0.22 && fwhmYFrac < 0.026) continue;
-      // Reject compact high-contrast splash droplets lacking chromatographic diffusion
-      if (fwhmXFrac < 0.26 && fwhmYFrac < 0.024 && coreArea50Frac < 0.0042 && reg.peakVal >= 35) {
-        continue;
+      if (spanRows >= 80) {
+        const fwhmYFrac = (maxY50 - minY50 + 1) / spanRows;
+        const coreArea50Frac = core50Count / (w * spanRows);
+        // Reject pinpoint dust/pinhole specks (narrow in both X and Y at 50% height)
+        if (fwhmXFrac < 0.22 && fwhmYFrac < 0.026) continue;
+        // Reject compact high-contrast splash droplets lacking chromatographic diffusion
+        if (fwhmXFrac < 0.26 && fwhmYFrac < 0.024 && coreArea50Frac < 0.0042 && reg.peakVal >= 35) {
+          continue;
+        }
+      }
+      // Reject narrow spotter microdroplets & their elongated skinny vertical runs at any resolution
+      if (effMinWidthFrac > 0 && fwhmXFrac < Math.max(0.42, effMinWidthFrac * 1.35)) {
+        const latAtPeak = measureSpotLateralWidth2d(spotMap, Math.round(reg.peakRow * scaleY), {
+          origin: opts.origin,
+          front: opts.front,
+          cleanFlankBase,
+        });
+        if (latAtPeak && latAtPeak.corePeak > 0 && latAtPeak.fwhmXFrac < effMinWidthFrac) {
+          continue;
+        }
       }
     }
 

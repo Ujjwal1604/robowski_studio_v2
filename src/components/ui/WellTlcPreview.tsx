@@ -152,6 +152,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       lane2d: lane2dByChannel[traceKey],
       frontBandBg: frontBandByChannel[traceKey],
       detectorMode: tlcSet.spotDetectorMode,
+      minSpotWidthFrac: tlcSet.minSpotWidthFrac,
     });
 
     let uv366Dens = null;
@@ -168,6 +169,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           lane2d: lane2dByChannel.UV366,
           frontBandBg: frontBandByChannel.UV366,
           detectorMode: tlcSet.spotDetectorMode,
+          minSpotWidthFrac: tlcSet.minSpotWidthFrac,
         });
       }
       if (availableChannels.includes('White') && profiles.White && traceKey !== 'White') {
@@ -181,6 +183,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           lane2d: lane2dByChannel.White,
           frontBandBg: frontBandByChannel.White,
           detectorMode: tlcSet.spotDetectorMode,
+          minSpotWidthFrac: tlcSet.minSpotWidthFrac,
         });
       }
     }
@@ -194,6 +197,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
       lane2dByChannel,
       frontBandByChannel,
       detectorMode: tlcSet.spotDetectorMode,
+      minSpotWidthFrac: tlcSet.minSpotWidthFrac,
     });
     const effectiveSpots = getEffectiveLaneSpots(lane, multiSpots);
 

@@ -296,6 +296,25 @@ export function matchTlcSetNameToSolvent(
   const isEtherPentane = /(et2o|ether).*pentane|pentane.*(et2o|ether)/.test(rawNorm);
   const isMtbeHex = /\bmtbe\b.*hex|hex.*\bmtbe\b/.test(rawNorm);
 
+  const pickClosestPct = (
+    pool: TlcSolventSystemDef[],
+    targetPct: number,
+    useAlcoholPct = false
+  ): TlcSolventSystemDef | null => {
+    if (pool.length === 0) return null;
+    let best = pool[0];
+    let bestDiff = Infinity;
+    for (const s of pool) {
+      const sPct = useAlcoholPct ? s.alcoholPct : (s.composition?.strongPct ?? s.strength * 100);
+      const diff = Math.abs(sPct - targetPct);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = s;
+      }
+    }
+    return best;
+  };
+
   if (isEtoacHex || isNeatEtOAc || isNeatHexanes) {
     const p = clamp(pct ?? 50, 0, 100);
     const pool = TLC_SOLVENT_LIBRARY.filter((s) => {
@@ -303,17 +322,10 @@ export function matchTlcSetNameToSolvent(
       if (hasAcOH) return s.family === 'acid_mod' && s.alcoholPct === 0;
       return s.family === 'etoac_hex';
     });
-    // Piecewise strength mapping so 0% (0.00), 2% (0.04), 5% (0.09), 10% (0.14), 25% (0.28), 50% (0.45), 100% (0.69) map accurately
-    const approxStrength =
-      p <= 10
-        ? (p / 10) * 0.14
-        : p <= 25
-        ? 0.14 + ((p - 10) / 15) * 0.14
-        : 0.28 + ((p - 25) / 75) * 0.41;
-    candidate = pickClosest(pool, approxStrength);
+    candidate = pickClosestPct(pool, p, false);
   } else if (isMeohDcm || isNeatDcm) {
-    const p = pct ?? 5;
-    const isHighNh3 = hasNh3 && (/4%\s*\(?2m\s*nh3|94\s*:\s*2\s*:\s*4|88\s*:\s*8\s*:\s*4|4%\s*nh3/.test(rawNorm));
+    const p = clamp(pct ?? 5, 0, 18);
+    const isHighNh3 = hasNh3 && (/4%\s*\(?[27][mn]\s*nh3|94\s*:\s*2\s*:\s*4|88\s*:\s*8\s*:\s*4|4%\s*nh3/.test(rawNorm));
     const poolSource = isHighNh3 ? DYNAMIC_SOLVENT_SYSTEMS : TLC_SOLVENT_LIBRARY;
     const pool = poolSource.filter((s) => {
       if (hasNh3) return Boolean(s.baseModifier?.includes('NH₃'));
@@ -321,24 +333,25 @@ export function matchTlcSetNameToSolvent(
       if (hasAcOH) return Boolean(s.acidModifier) && s.alcoholPct > 0;
       return s.family === 'meoh_dcm';
     });
-    const approxStrength = 0.43 + clamp(p, 0, 18) * 0.036;
-    candidate = pickClosest(pool, approxStrength);
+    candidate = pickClosestPct(pool, p, true);
   } else if (isAcetoneHex) {
-    const p = pct ?? 35;
-    candidate = pickClosest(
+    const p = clamp(pct ?? 35, 0, 100);
+    candidate = pickClosestPct(
       TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'acetone_hex'),
-      0.18 + (p / 100) * 0.56
+      p,
+      false
     );
   } else if (isMtbeHex) {
-    const p = pct ?? 25;
-    candidate = pickClosest(
+    const p = clamp(pct ?? 25, 0, 100);
+    candidate = pickClosestPct(
       TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'mtbe_hex'),
-      0.12 + (p / 100) * 0.34
+      p,
+      false
     );
   } else if (isMeohTol) {
     const p = clamp(pct ?? 6, 0, 18);
     if (hasNh3) {
-      const modId = /4%\s*\(?2m\s*nh3|4%\s*nh3/.test(rawNorm) ? 'nh3_meoh_4' : 'nh3_meoh_2';
+      const modId = /4%\s*\(?[27][mn]\s*nh3|4%\s*nh3/.test(rawNorm) ? 'nh3_meoh_4' : 'nh3_meoh_2';
       const modVol = modId === 'nh3_meoh_4' ? 4 : 2;
       const neatMeoh = Math.max(0, Math.round(p - modVol));
       candidate = composeSolventSystem({
@@ -356,31 +369,34 @@ export function matchTlcSetNameToSolvent(
       const tolPool = hasEt3N
         ? DYNAMIC_SOLVENT_SYSTEMS.filter((s) => s.family === 'meoh_toluene' && Boolean(s.baseModifier?.includes('Et₃N')))
         : TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'meoh_toluene');
-      candidate = pickClosest(tolPool, 0.23 + p * 0.012);
+      candidate = pickClosestPct(tolPool, p, true);
     }
   } else if (isEtoacTol) {
-    const p = pct ?? 25;
+    const p = clamp(pct ?? 25, 0, 100);
     const etTolPool = DYNAMIC_SOLVENT_SYSTEMS.filter(
       (s) => s.composition?.strongSolvent === 'EtOAc' && s.composition?.weakSolvent === 'Toluene'
     );
-    candidate = pickClosest(etTolPool, 0.23 + (p / 100) * 0.46);
+    candidate = pickClosestPct(etTolPool, p, false);
   } else if (isMeohEtoac) {
-    const p = pct ?? 8;
-    candidate = pickClosest(
+    const p = clamp(pct ?? 8, 0, 18);
+    candidate = pickClosestPct(
       TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'meoh_etoac'),
-      0.66 + p * 0.015
+      p,
+      true
     );
   } else if (isEtoacDcm) {
-    const p = pct ?? 20;
-    candidate = pickClosest(
+    const p = clamp(pct ?? 20, 0, 100);
+    candidate = pickClosestPct(
       TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'etoac_dcm'),
-      0.34 + (p / 100) * 0.45
+      p,
+      false
     );
   } else if (isEtherPentane) {
-    const p = pct ?? 30;
-    candidate = pickClosest(
+    const p = clamp(pct ?? 30, 0, 100);
+    candidate = pickClosestPct(
       TLC_SOLVENT_LIBRARY.filter((s) => s.family === 'ether_pentane'),
-      0.10 + (p / 100) * 0.45
+      p,
+      false
     );
   }
 
@@ -484,6 +500,7 @@ export function extractMeasuredWellSpotsForSet(
             lane2d: getLane2dMetrics(setSlice, ch, lane),
             frontBandBg: getChannelFrontBandProfile(setSlice, ch, tlcHalf(lane), getProf),
             detectorMode: setSlice.spotDetectorMode,
+            minSpotWidthFrac: setSlice.minSpotWidthFrac,
           });
           for (const sp of chSpots) {
             const rfSpan =
@@ -494,7 +511,32 @@ export function extractMeasuredWellSpotsForSet(
               ...sp,
               ...(rfSpan !== undefined ? { rfSpan } : {}),
             };
-            const match = mergedSpots.find((m) => Math.abs(m.rf - sp.rf) < 0.04);
+            let match: MeasuredTlcSpot | undefined;
+            let bestDelta = 0.024;
+            for (const m of mergedSpots) {
+              const delta = Math.abs(m.rf - sp.rf);
+              if (delta >= bestDelta) continue;
+              if (
+                m.extentStart != null &&
+                m.extentEnd != null &&
+                m.extentEnd > m.extentStart + 2
+              ) {
+                const lo = m.extentStart + Math.max(1, (m.pos - m.extentStart) * 0.25);
+                const hi = m.extentEnd - Math.max(1, (m.extentEnd - m.pos) * 0.25);
+                if (sp.pos < lo || sp.pos > hi) continue;
+              }
+              if (
+                sp.extentStart != null &&
+                sp.extentEnd != null &&
+                sp.extentEnd > sp.extentStart + 2
+              ) {
+                const lo = sp.extentStart + Math.max(1, (sp.pos - sp.extentStart) * 0.25);
+                const hi = sp.extentEnd - Math.max(1, (sp.extentEnd - sp.pos) * 0.25);
+                if (m.pos < lo || m.pos > hi) continue;
+              }
+              bestDelta = delta;
+              match = m;
+            }
             if (!match) {
               mergedSpots.push(enriched);
             } else {
@@ -1582,6 +1624,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
               speciesLabel: pAnchor.label,
               speciesKind: pAnchor.kind,
               compoundKey: ck,
+              smiles: pAnchor.profile.smiles,
               observedRf: Math.round(obs.rf * 100) / 100,
               predictedRfBefore: pAnchor.rf,
               residualRf: Math.round(resRf * 1000) / 1000,
@@ -1599,13 +1642,46 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         const hasFrontEvidence = Boolean(measuredWell?.frontOccupied || frontBoundarySpot);
         const hasOriginEvidence = Boolean(measuredWell?.originOccupied || originBoundarySpot);
 
-        // Build per-lane Found vs Boundary-Saturated vs Missing vs Extra comparison
+        // Detect predicted compounds that co-elute within ±0.05 Rf of a matched anchor on a single observed spot.
+        // Never allow ONE real TLC spot to mark BOTH a starting material and a predicted product as "Found".
+        const COELUTION_RF_TOL = 0.05;
+        const coelutersByMatchedPred = new Map<PredAnchor, PredAnchor[]>();
+        const overlapMatchedByUnmatchedPred = new Map<
+          PredAnchor,
+          { pred: PredAnchor; entry: { obs: TlcSpot; matchMethod: 'consensus' | 'per_well' } }
+        >();
+        for (const anc of anchors) {
+          if (pairedByPred.has(anc)) continue;
+          let bestPred: PredAnchor | null = null;
+          let bestEntry: { obs: TlcSpot; matchMethod: 'consensus' | 'per_well' } | null = null;
+          let bestDist = Infinity;
+          for (const [pUsed, entryUsed] of pairedByPred.entries()) {
+            const predGap = Math.abs(pUsed.rf - anc.rf);
+            const obsGap =
+              entryUsed.matchMethod === 'consensus' ? Math.abs(entryUsed.obs.rf - anc.rf) : Infinity;
+            const d = Math.min(predGap, obsGap);
+            if (d <= COELUTION_RF_TOL && d < bestDist) {
+              bestDist = d;
+              bestPred = pUsed;
+              bestEntry = entryUsed;
+            }
+          }
+          if (bestPred && bestEntry) {
+            overlapMatchedByUnmatchedPred.set(anc, { pred: bestPred, entry: bestEntry });
+            const arr = coelutersByMatchedPred.get(bestPred) || [];
+            arr.push(anc);
+            coelutersByMatchedPred.set(bestPred, arr);
+          }
+        }
+
+        // Build per-lane Found vs Co-eluted vs Boundary-Saturated vs Missing vs Extra comparison
         // Only evaluate tailing/streaking on interior spots (boundary bands at the front/origin are saturation, not streaking)
         let maxTailing = 0;
         let maxRfSpan = 0;
         const compMeasured = obsSpots.map((sp) => {
           const pMatchEntry = pairedByObs.get(sp);
           const pMatch = pMatchEntry?.pred;
+          const overlappingAnchors = pMatch ? coelutersByMatchedPred.get(pMatch) || [] : [];
           const isInterior = sp.rf > 0.08 && sp.rf < 0.90;
           if (isInterior) {
             if (sp.tailing !== undefined && sp.tailing > maxTailing) maxTailing = sp.tailing;
@@ -1624,6 +1700,9 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
                   matchedPredRfBefore: pMatch.rf,
                   matchedPredRfAfter: pMatch.rf,
                   matchMethod: pMatchEntry?.matchMethod,
+                  ...(overlappingAnchors.length > 0
+                    ? { coelutedLabels: overlappingAnchors.map((a) => a.label) }
+                    : {}),
                 }
               : {}),
           };
@@ -1635,22 +1714,38 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         const laneCensoredRecords: Array<Omit<CensoredBoundaryRecord, 'plateSummaryIdx'>> = [];
 
         const compPredicted = anchors.map((anc) => {
-          let obsEntry = pairedByPred.get(anc);
-          if (!obsEntry) {
-            // If a near-coeluting representative replaced `anc` during dedup, still mark it found
-            for (const [pUsed, entryUsed] of pairedByPred.entries()) {
-              if (Math.abs(pUsed.rf - anc.rf) < 0.04) {
-                obsEntry = entryUsed;
-                break;
-              }
-            }
-          }
+          const obsEntry = pairedByPred.get(anc);
           const obsMatch = obsEntry?.obs;
-          let boundaryStatus: 'found' | 'front_saturated' | 'baseline_pinned' | 'missing' = 'missing';
-          let boundaryObsRf: number | undefined;
           const ancCompoundKey = anc.profile.canonicalSmiles || anc.profile.smiles;
+          const overlapInfo = !obsEntry ? overlapMatchedByUnmatchedPred.get(anc) : undefined;
+          const overlappingOthers = obsEntry ? coelutersByMatchedPred.get(anc) || [] : [];
+
+          let boundaryStatus: 'found' | 'coeluted' | 'front_saturated' | 'baseline_pinned' | 'missing' = 'missing';
+          let boundaryObsRf: number | undefined;
+          let coelutedWith: string[] | undefined;
+
           if (obsMatch && !isFrontPegged(obsMatch.rf) && !isBasePegged(obsMatch.rf)) {
-            boundaryStatus = 'found';
+            const hasOppositeRoleOverlap = overlappingOthers.some((o) => o.kind !== anc.kind);
+            if (overlappingOthers.length > 0) {
+              coelutedWith = overlappingOthers.map((o) => o.label);
+            }
+            // If matched only per-well (not confirmed across other wells by plate consensus) and an
+            // opposite-role compound (SM vs Product) co-elutes on this same single spot, mark ambiguous/coeluted.
+            if (obsEntry?.matchMethod !== 'consensus' && hasOppositeRoleOverlap) {
+              boundaryStatus = 'coeluted';
+            } else {
+              boundaryStatus = 'found';
+            }
+          } else if (
+            overlapInfo &&
+            !isFrontPegged(overlapInfo.entry.obs.rf) &&
+            !isBasePegged(overlapInfo.entry.obs.rf)
+          ) {
+            // Another predicted species already claimed this single real spot within ±0.05 Rf:
+            // never double-claim the spot as "Found" for both compounds.
+            boundaryStatus = 'coeluted';
+            coelutedWith = [overlapInfo.pred.label];
+            boundaryObsRf = Math.round(overlapInfo.entry.obs.rf * 100) / 100;
           } else if (
             (obsMatch && isFrontPegged(obsMatch.rf)) ||
             (!obsMatch && hasFrontEvidence && anc.rf >= 0.72)
@@ -1686,19 +1781,27 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
               weight: anc.weight * 0.75,
             });
           }
+
+          const isUnambiguouslyFound =
+            boundaryStatus === 'found' ||
+            boundaryStatus === 'front_saturated' ||
+            boundaryStatus === 'baseline_pinned';
           return {
+            compoundKey: ancCompoundKey,
+            smiles: anc.profile.smiles,
             label: anc.label,
             kind: anc.kind,
             tier: anc.tier,
             rfBefore: anc.rf,
             rfAfter: anc.rf,
-            found: Boolean(obsMatch || boundaryObsRf !== undefined),
+            found: isUnambiguouslyFound,
             boundaryStatus,
             ...(obsMatch
               ? { matchedObsRf: Math.round(obsMatch.rf * 100) / 100, matchMethod: obsEntry?.matchMethod }
               : boundaryObsRf !== undefined
               ? { matchedObsRf: boundaryObsRf }
               : {}),
+            ...(coelutedWith && coelutedWith.length > 0 ? { coelutedWith } : {}),
           };
         });
 
@@ -2329,6 +2432,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         string,
         {
           label: string;
+          smiles?: string;
           kind: 'substrate' | 'product';
           obsRfs: number[];
           predBefores: number[];
@@ -2353,6 +2457,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           );
           entry = {
             label: fp.speciesLabel,
+            smiles: fp.smiles,
             kind: fp.speciesKind,
             obsRfs: [],
             predBefores: [],
@@ -2363,6 +2468,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           };
           byCompound.set(ck, entry);
         }
+        if (!entry.smiles && fp.smiles) entry.smiles = fp.smiles;
         if (fp.speciesKind === 'substrate') entry.kind = 'substrate';
         if (fp.matchMethod === 'consensus') entry.hasConsensus = true;
         entry.obsRfs.push(fp.observedRf);
@@ -2380,6 +2486,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         const variance = e.obsRfs.reduce((a, b) => a + (b - obsMean) ** 2, 0) / m;
         plateSummaries.push({
           compoundKey: ck,
+          ...(e.smiles ? { smiles: e.smiles } : {}),
           label: e.label,
           kind: e.kind,
           wellsPresent: Math.max(e.wellsPresent, m),
@@ -2406,6 +2513,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       string,
       {
         label: string;
+        smiles?: string;
         kind: 'substrate' | 'product';
         wellsPresent: number;
         wellsMatched: number;
@@ -2424,6 +2532,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
         if (!agg) {
           agg = {
             label: cs.label,
+            smiles: cs.smiles,
             kind: cs.kind,
             wellsPresent: 0,
             wellsMatched: 0,
@@ -2436,6 +2545,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
           };
           phaseCompAccum.set(cs.compoundKey, agg);
         }
+        if (!agg.smiles && cs.smiles) agg.smiles = cs.smiles;
         if (cs.kind === 'substrate') agg.kind = 'substrate';
         if (cs.matchMethod === 'consensus') agg.hasConsensus = true;
         agg.wellsPresent += cs.wellsPresent;
@@ -2459,6 +2569,7 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       const chArr = Array.from(agg.channels);
       phaseCompoundSummaries.push({
         compoundKey: ck,
+        ...(agg.smiles ? { smiles: agg.smiles } : {}),
         label: agg.label,
         kind: agg.kind,
         wellsPresent: Math.max(agg.wellsPresent, agg.wellsMatched),
@@ -2509,6 +2620,103 @@ export function calibrateTlcModelFromCampaign(params: CalibrateTlcParams): {
       ...(Object.keys(plateLevelFamilies).length > 0 ? { plateLevelFamilies } : {}),
     };
     model.byPhase[phase] = fit;
+  }
+
+  // Pass C: Cross-plate physical consistency validation across all uploaded TLC solvent systems for the same plateIndex.
+  // Because every TLC plate of the same plateIndex is spotted from the exact same reaction vials,
+  // a compound cannot genuinely be present in a well on System A while completely missing (neither found,
+  // nor co-eluting, nor pinned at baseline, nor at the solvent front) on System B if System B empirically
+  // detects that compound in other wells or predicts it cleanly inside its mid-plate window.
+  const platesByPlateIndex = new Map<number, CalibratedPlateSummary[]>();
+  for (const plate of model.plates) {
+    const arr = platesByPlateIndex.get(plate.plateIndex) || [];
+    arr.push(plate);
+    platesByPlateIndex.set(plate.plateIndex, arr);
+  }
+
+  for (const groupPlates of platesByPlateIndex.values()) {
+    if (groupPlates.length < 2) continue;
+
+    // 1. Snapshot well lookups and which compounds each plate empirically resolved cleanly in >= 1 well
+    const empiricalFoundOnPlate = new Map<CalibratedPlateSummary, Set<string>>();
+    const laneMapByPlate = new Map<CalibratedPlateSummary, Map<number, CalibratedLaneComparison>>();
+    const laneMeasured = (plate: CalibratedPlateSummary, wIdx: number): boolean => {
+      const lane = laneMapByPlate.get(plate)?.get(wIdx);
+      if (!lane || lane.isBlank) return false;
+      return (
+        lane.measuredSpots.length > 0 ||
+        Boolean(lane.frontOccupied) ||
+        Boolean(lane.originOccupied)
+      );
+    };
+
+    for (const plate of groupPlates) {
+      const foundKeys = new Set<string>();
+      const lMap = new Map<number, CalibratedLaneComparison>();
+      for (const lane of plate.lanes) {
+        lMap.set(lane.wellIndex, lane);
+        if (lane.isBlank) continue;
+        for (const pSp of lane.predictedSpots) {
+          if (pSp.boundaryStatus === 'found') {
+            foundKeys.add(pSp.compoundKey || `${pSp.kind}:${pSp.label}`);
+          }
+        }
+      }
+      laneMapByPlate.set(plate, lMap);
+      empiricalFoundOnPlate.set(plate, foundKeys);
+    }
+
+    // 2. Evaluate contradictions simultaneously against the snapshot (order-independent)
+    const downgrades: Array<{
+      pSp: CalibratedLaneComparison['predictedSpots'][number];
+      conflictPlates: string[];
+    }> = [];
+
+    for (const plate of groupPlates) {
+      for (const lane of plate.lanes) {
+        if (lane.isBlank) continue;
+        const wIdx = lane.wellIndex;
+        for (const pSp of lane.predictedSpots) {
+          if (pSp.boundaryStatus !== 'found') continue;
+          const ck = pSp.compoundKey || `${pSp.kind}:${pSp.label}`;
+          const conflictSet = new Set<string>();
+
+          for (const other of groupPlates) {
+            if (other === plate) continue;
+            if (!laneMeasured(other, wIdx)) continue;
+            const otherLane = laneMapByPlate.get(other)?.get(wIdx);
+            if (!otherLane) continue;
+            const otherSpot = otherLane.predictedSpots.find(
+              (s) => (s.compoundKey || `${s.kind}:${s.label}`) === ck
+            );
+            if (!otherSpot) continue;
+            // Found, co-eluted, front-saturated, or baseline-pinned on the other plate are all physically consistent
+            if (otherSpot.boundaryStatus !== 'missing') continue;
+
+            const empiricallyVisibleOnOther =
+              empiricalFoundOnPlate.get(other)?.has(ck) ?? false;
+            const stronglyExpectedMidplateOnOther =
+              pSp.matchMethod !== 'consensus' &&
+              otherSpot.rfAfter >= 0.16 &&
+              otherSpot.rfAfter <= 0.84;
+
+            if (empiricallyVisibleOnOther || stronglyExpectedMidplateOnOther) {
+              conflictSet.add(other.matchedSystemName);
+            }
+          }
+
+          if (conflictSet.size > 0) {
+            downgrades.push({ pSp, conflictPlates: Array.from(conflictSet) });
+          }
+        }
+      }
+    }
+
+    for (const { pSp, conflictPlates } of downgrades) {
+      pSp.boundaryStatus = 'inconsistent';
+      pSp.found = false;
+      pSp.conflictPlates = conflictPlates;
+    }
   }
 
   return { model, newlyComputedPredictions };

@@ -1241,5 +1241,196 @@ describe('Step 3: arPLS Baseline, Channel-Calibrated 2D Maps & Watershed Spot Se
     );
     expect(roundTrip).toBeCloseTo(0.28, 2);
   });
+
+  it('Densitogram mode rejects spotter microdroplets and their narrow vertical runs while keeping normal eluted spots', () => {
+    const origin = 50;
+    const front = 370;
+
+    // Lane A: pure spotter microdroplet at origin (FWHM ~ 0.15W) + narrow elongated vertical run (FWHM ~ 0.22W)
+    const microStrip = makeLaneStrip(40, 420, [8, 185, 8]);
+    paintSpot(microStrip, { pos: origin, cxFrac: 0.45, sigmaY: 6.5, sigmaXFrac: 0.065, deltaRgb: [0, -92, 0] });
+    paintSpot(microStrip, { pos: 215, cxFrac: 0.43, sigmaY: 32, sigmaXFrac: 0.095, deltaRgb: [0, -72, 0] });
+
+    const { profile: microProf, metrics: microMetrics } = analyzeLaneStripRgb(
+      microStrip.rgba,
+      microStrip.width,
+      microStrip.length,
+      'UV254',
+      0.35
+    );
+
+    // Default Min W (28%) rejects the narrow microdroplet run and records it for UI transparency
+    const densFiltered = extractDensitogram(microProf, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: microMetrics,
+      detectorMode: 'densitogram',
+    });
+    expect(densFiltered.spots).toEqual([]);
+    expect(densFiltered.rejectedNarrowPeaks?.length).toBeGreaterThanOrEqual(1);
+    expect(densFiltered.rejectedNarrowPeaks![0].reason).toBe('microdroplet-run');
+    expect(densFiltered.rejectedNarrowPeaks![0].widthFrac).toBeLessThan(0.28);
+
+    // Disabling Min W (0 = Off) restores the peak if the user explicitly wants to see microdroplet streaks
+    const densOff = extractDensitogram(microProf, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: microMetrics,
+      detectorMode: 'densitogram',
+      minSpotWidthFrac: 0,
+    });
+    expect(densOff.spots.length).toBe(1);
+    expect(Math.abs(densOff.spots[0].pos - 215)).toBeLessThanOrEqual(8);
+
+    // Lane B: normal eluted spot (FWHM ~ 0.52W) + a narrow mid-lane microdroplet streak (FWHM ~ 0.19W)
+    const mixedStrip = makeLaneStrip(40, 420, [8, 185, 8]);
+    paintSpot(mixedStrip, { pos: origin, cxFrac: 0.5, sigmaY: 8, sigmaXFrac: 0.22, deltaRgb: [0, -110, 0] });
+    paintSpot(mixedStrip, { pos: 155, cxFrac: 0.46, sigmaY: 22, sigmaXFrac: 0.08, deltaRgb: [0, -68, 0] });
+    paintSpot(mixedStrip, { pos: 275, cxFrac: 0.5, sigmaY: 11, sigmaXFrac: 0.22, deltaRgb: [0, -62, 0] });
+
+    const { profile: mixedProf, metrics: mixedMetrics } = analyzeLaneStripRgb(
+      mixedStrip.rgba,
+      mixedStrip.width,
+      mixedStrip.length,
+      'UV254',
+      0.35
+    );
+    const densMixed = extractDensitogram(mixedProf, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: mixedMetrics,
+      detectorMode: 'densitogram',
+    });
+    expect(densMixed.spots.length).toBe(1);
+    expect(Math.abs(densMixed.spots[0].pos - 275)).toBeLessThanOrEqual(5);
+    expect(densMixed.spots[0].widthFrac).toBeGreaterThan(0.40);
+    expect(densMixed.rejectedNarrowPeaks?.length).toBe(1);
+    expect(Math.abs(densMixed.rejectedNarrowPeaks![0].pos - 155)).toBeLessThanOrEqual(8);
+  });
+
+  it('2D Seg mode rejects tall narrow microdroplet runs while keeping normal eluted spots', () => {
+    const origin = 50;
+    const front = 370;
+
+    const strip = makeLaneStrip(40, 420, [8, 185, 8]);
+    // Tiny microdroplet at origin + tall narrow vertical run
+    paintSpot(strip, { pos: origin, cxFrac: 0.45, sigmaY: 6.5, sigmaXFrac: 0.065, deltaRgb: [0, -92, 0] });
+    paintSpot(strip, { pos: 215, cxFrac: 0.43, sigmaY: 32, sigmaXFrac: 0.095, deltaRgb: [0, -72, 0] });
+    const { profile, metrics } = analyzeLaneStripRgb(strip.rgba, strip.width, strip.length, 'UV254', 0.35);
+
+    const spots2d = findSpots(profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: metrics,
+      detectorMode: '2d',
+    });
+    expect(spots2d).toEqual([]);
+
+    // With minSpotWidthFrac disabled (0), 2D Seg detects the elongated run
+    const spots2dOff = findSpots(profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: metrics,
+      detectorMode: '2d',
+      minSpotWidthFrac: 0,
+    });
+    expect(spots2dOff.length).toBe(1);
+  });
+
+  it('Densitogram mode never rejects wide full-lane UV254 or tilted UV366 bands as narrow microdroplets or edge spillover', () => {
+    const origin = 45;
+    const front = 375;
+    const span = front - origin;
+    const posHigh = origin + Math.round(0.72 * span);
+    const posLow = origin + Math.round(0.55 * span);
+
+    // 1. Wide full-lane UV254 band spanning 100% of lane width with a small central dome (previously collapsed to ~26% width when same-row flanks were subtracted)
+    const uv254Strip = makeLaneStrip(38, 420, [8, 192, 10]);
+    paintSpot(uv254Strip, { pos: posHigh, cxFrac: 0.5, sigmaY: 16, sigmaXFrac: 1.4, deltaRgb: [0, -42, 0] });
+    paintSpot(uv254Strip, { pos: posHigh, cxFrac: 0.5, sigmaY: 14, sigmaXFrac: 0.11, deltaRgb: [0, -8, 0] });
+    const uv254 = analyzeLaneStripRgb(uv254Strip.rgba, uv254Strip.width, uv254Strip.length, 'UV254', 0.35);
+    const dens254 = extractDensitogram(uv254.profile, {
+      sign: -1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: uv254.metrics,
+      detectorMode: 'densitogram',
+    });
+    expect(dens254.spots.length).toBe(1);
+    expect(Math.abs(dens254.spots[0].pos - posHigh)).toBeLessThanOrEqual(5);
+    expect(dens254.spots[0].widthFrac).toBeGreaterThanOrEqual(0.85);
+    expect(dens254.rejectedNarrowPeaks ?? []).toEqual([]);
+
+    // 2. Wide full-lane slightly right-tilted UV366 fluorescent band above a lower spot at Rf 0.55
+    const uv366Strip = makeLaneStrip(38, 420, [10, 14, 24]);
+    paintSpot(uv366Strip, { pos: posLow, cxFrac: 0.5, sigmaY: 9, sigmaXFrac: 0.45, deltaRgb: [10, 35, 65] });
+    paintSpot(uv366Strip, { pos: posHigh, cxFrac: 0.62, sigmaY: 22, sigmaXFrac: 1.3, deltaRgb: [25, 85, 165] });
+    const uv366 = analyzeLaneStripRgb(uv366Strip.rgba, uv366Strip.width, uv366Strip.length, 'UV366', 0.35);
+    const dens366 = extractDensitogram(uv366.profile, {
+      sign: 1,
+      origin,
+      front,
+      minProminence: 0.28,
+      lane2d: uv366.metrics,
+      detectorMode: 'densitogram',
+    });
+    expect(dens366.spots.some((s) => Math.abs(s.pos - posHigh) <= 6)).toBe(true);
+    const highSpot = dens366.spots.find((s) => Math.abs(s.pos - posHigh) <= 6)!;
+    expect(highSpot.widthFrac).toBeGreaterThanOrEqual(0.85);
+    expect(dens366.rejectedNarrowPeaks ?? []).toEqual([]);
+  });
+
+  it('mergeMultiChannelSpots keeps closely-spaced UV254 and UV366 peaks distinct when one sits in the other channel valley', () => {
+    // Exact scenario: UV254 peaks at Rf 0.02 (pos 52) & Rf 0.093 (pos 76, valley at pos 65 / Rf 0.06),
+    // while UV366 peaks right in that UV254 valley at Rf 0.06 (pos 65).
+    const interleaved = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 52, rf: 0.02, strength: 1.0, confidence: 0.96, extentStart: 45, extentEnd: 65, source: 'auto' },
+        { pos: 76, rf: 0.093, strength: 0.92, confidence: 0.94, extentStart: 65, extentEnd: 92, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 65, rf: 0.06, strength: 1.0, confidence: 0.96, extentStart: 56, extentEnd: 74, source: 'auto' },
+      ],
+    });
+    expect(interleaved.length).toBe(3);
+    expect(interleaved.map((s) => +s.rf.toFixed(3))).toEqual([0.02, 0.06, 0.093]);
+
+    // Even when ΔRf = 0.020 (< 0.024), a peak sitting right on the other peak's valley boundary must NOT merge
+    const valleyEdge = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 72, rf: 0.08, strength: 0.9, confidence: 0.92, extentStart: 65, extentEnd: 84, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 65, rf: 0.06, strength: 1.0, confidence: 0.95, extentStart: 56, extentEnd: 71, source: 'auto' },
+      ],
+    });
+    expect(valleyEdge.length).toBe(2);
+
+    // Genuinely co-eluting UV254 + UV366 peaks whose apexes sit inside each other's bodies still merge
+    const coEluting = mergeMultiChannelSpots({
+      UV254: [
+        { pos: 66, rf: 0.062, strength: 0.9, confidence: 0.90, extentStart: 56, extentEnd: 76, source: 'auto' },
+      ],
+      UV366: [
+        { pos: 65, rf: 0.06, strength: 1.0, confidence: 0.95, extentStart: 55, extentEnd: 75, source: 'auto' },
+      ],
+    });
+    expect(coEluting.length).toBe(1);
+    expect(coEluting[0].channels).toEqual(['UV254', 'UV366']);
+  });
 });
+
+
+
 

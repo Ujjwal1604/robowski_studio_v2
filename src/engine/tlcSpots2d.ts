@@ -468,7 +468,7 @@ function smooth2dLight(src: Float32Array, w: number, h: number, rLo: number, rHi
  * accidental spotter microdroplets and their narrow vertical streaks span ~14–26% of lane width.
  * Set `minSpotWidthFrac: 0` to disable width-based microdroplet filtering.
  */
-export const DEFAULT_MIN_SPOT_WIDTH_FRAC = 0.28;
+export const DEFAULT_MIN_SPOT_WIDTH_FRAC = 0.26;
 
 export interface SpotLateralWidth2d {
   /** Sub-pixel horizontal Full-Width at Half-Maximum as a fraction of full lane width (0..1) */
@@ -531,7 +531,13 @@ export function computeCleanFlankBaseline2d(
 export function measureSpotLateralWidth2d(
   spotMap: LaneSpotMap2d,
   posOrig: number,
-  opts: { origin?: number; front?: number; halfRowWin?: number; cleanFlankBase?: Float64Array } = {}
+  opts: {
+    origin?: number;
+    front?: number;
+    halfRowWin?: number;
+    cleanFlankBase?: Float64Array;
+    centerXFrac?: number;
+  } = {}
 ): SpotLateralWidth2d | null {
   const { w, h, origLen, map, bgSigma } = spotMap;
   if (w < 10 || h < 10 || origLen < 10) return null;
@@ -589,17 +595,51 @@ export function measureSpotLateralWidth2d(
 
   const xLo = Math.max(1, Math.floor(w * 0.14));
   const xHi = Math.min(w - 2, Math.ceil(w * 0.86) - 1);
+  const cLo = Math.max(xLo, Math.floor(w * 0.25));
+  const cHi = Math.min(xHi, Math.ceil(w * 0.75) - 1);
+  const minMeasurable = Math.max(1.5, bgSigma * 0.8);
+
+  // Prefer a true interior local maximum over a monotonic neighbor-spillover slope climbing
+  // out of [xLo..xHi]. When a segmented region supplies centerXFrac, anchor search near it first.
+  const findBestLocalMax = (lo: number, hi: number): { x: number; val: number } | null => {
+    let bestX = -1;
+    let bestV = -1;
+    for (let x = Math.max(1, lo); x <= Math.min(w - 2, hi); x++) {
+      if (s[x] >= s[x - 1] && s[x] >= s[x + 1] && (s[x] > s[x - 1] || s[x] > s[x + 1] || (x > lo && x < hi))) {
+        if (s[x] > bestV) {
+          bestV = s[x];
+          bestX = x;
+        }
+      }
+    }
+    return bestX >= 0 && bestV > minMeasurable ? { x: bestX, val: bestV } : null;
+  };
+
+  let chosenLocal: { x: number; val: number } | null = null;
+  if (opts.centerXFrac !== undefined && Number.isFinite(opts.centerXFrac)) {
+    const hintX = Math.max(xLo, Math.min(xHi, Math.round(opts.centerXFrac * w - 0.5)));
+    const rad = Math.max(2, Math.round(w * 0.22));
+    chosenLocal = findBestLocalMax(Math.max(xLo, hintX - rad), Math.min(xHi, hintX + rad));
+  }
+  if (!chosenLocal) {
+    chosenLocal = findBestLocalMax(cLo, cHi) ?? findBestLocalMax(xLo, xHi);
+  }
+
   let peakX = Math.floor(w * 0.5);
   let peakVal = -1;
-  for (let x = xLo; x <= xHi; x++) {
-    if (s[x] > peakVal) {
-      peakVal = s[x];
-      peakX = x;
+  const hasInteriorLocalPeak = chosenLocal !== null;
+  if (chosenLocal) {
+    peakX = chosenLocal.x;
+    peakVal = chosenLocal.val;
+  } else {
+    for (let x = xLo; x <= xHi; x++) {
+      if (s[x] > peakVal) {
+        peakVal = s[x];
+        peakX = x;
+      }
     }
   }
 
-  const cLo = Math.max(xLo, Math.floor(w * 0.25));
-  const cHi = Math.min(xHi, Math.ceil(w * 0.75) - 1);
   let centerPeak = 0;
   for (let x = cLo; x <= cHi; x++) {
     if (s[x] > centerPeak) centerPeak = s[x];
@@ -609,7 +649,6 @@ export function measureSpotLateralWidth2d(
   for (let x = 0; x < xLo; x++) if (s[x] > edgePeak) edgePeak = s[x];
   for (let x = xHi + 1; x < w; x++) if (s[x] > edgePeak) edgePeak = s[x];
 
-  const minMeasurable = Math.max(1.5, bgSigma * 0.8);
   if (peakVal <= minMeasurable) {
     return {
       fwhmXFrac: 0,
@@ -623,20 +662,48 @@ export function measureSpotLateralWidth2d(
   const widthAtFrac = (frac: number): [number, number] => {
     const thr = peakVal * frac;
     let leftPos = 0;
+    let leftHitSaddle = false;
+    let leftMin = peakVal;
+    let leftMinX = peakX;
     for (let x = peakX - 1; x >= 0; x--) {
       if (s[x] < thr) {
         const denom = Math.max(1e-6, s[x + 1] - s[x]);
         leftPos = x + (thr - s[x]) / denom;
         break;
       }
+      if (s[x] < leftMin) {
+        leftMin = s[x];
+        leftMinX = x;
+      } else if (hasInteriorLocalPeak && s[x] > leftMin + Math.max(2.0, peakVal * 0.08)) {
+        leftPos = leftMinX;
+        leftHitSaddle = true;
+        break;
+      }
     }
     let rightPos = w - 1;
+    let rightHitSaddle = false;
+    let rightMin = peakVal;
+    let rightMinX = peakX;
     for (let x = peakX + 1; x < w; x++) {
       if (s[x] < thr) {
         const denom = Math.max(1e-6, s[x - 1] - s[x]);
         rightPos = x - (thr - s[x]) / denom;
         break;
       }
+      if (s[x] < rightMin) {
+        rightMin = s[x];
+        rightMinX = x;
+      } else if (hasInteriorLocalPeak && s[x] > rightMin + Math.max(2.0, peakVal * 0.08)) {
+        rightPos = rightMinX;
+        rightHitSaddle = true;
+        break;
+      }
+    }
+    // If one flank rose into a huge adjacent-lane neighbor before dropping below thr, mirror the clean flank's half-width
+    if (leftHitSaddle && !rightHitSaddle) {
+      leftPos = Math.max(0, peakX - (rightPos - peakX));
+    } else if (rightHitSaddle && !leftHitSaddle) {
+      rightPos = Math.min(w - 1, peakX + (peakX - leftPos));
     }
     return [leftPos, rightPos];
   };
@@ -655,10 +722,11 @@ export function measureSpotLateralWidth2d(
   }
   const centroidXFrac = sumW > 1e-6 ? sumX / (sumW * w) : (peakX + 0.5) / w;
 
-  // Genuine neighbor-lane spillover hugs an outer border (<20% or >80% centroid) and rises steeply
-  // at the edge compared to the lane center — a wide full-lane band with slight tilt has centroid ~0.40..0.60
-  // and is NEVER rejected as spillover.
+  // Genuine neighbor-lane spillover has no interior peak, hugs an outer border (<20% or >80% centroid),
+  // and rises steeply at the edge compared to the lane center — a real centered spot beside a huge neighbor
+  // or a wide full-lane band with slight tilt is NEVER rejected as spillover.
   const edgeSpillover =
+    !hasInteriorLocalPeak &&
     (centroidXFrac < 0.20 || centroidXFrac > 0.80) &&
     edgePeak > Math.max(centerPeak * 1.45, minMeasurable * 2.0);
 
@@ -1619,10 +1687,12 @@ export function segmentLaneSpots2d(
       }
       // Reject narrow spotter microdroplets & their elongated skinny vertical runs at any resolution
       if (effMinWidthFrac > 0 && fwhmXFrac < Math.max(0.42, effMinWidthFrac * 1.35)) {
+        const regCxCol = reg.mass > 0 ? reg.sumX / reg.mass : (reg.minX + reg.maxX) * 0.5;
         const latAtPeak = measureSpotLateralWidth2d(spotMap, Math.round(reg.peakRow * scaleY), {
           origin: opts.origin,
           front: opts.front,
           cleanFlankBase,
+          centerXFrac: (regCxCol + 0.5) / w,
         });
         if (latAtPeak && latAtPeak.corePeak > 0 && latAtPeak.fwhmXFrac < effMinWidthFrac) {
           continue;

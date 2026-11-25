@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp, buildDataPayload } from '../../context/AppContext';
 import * as Core from '../../engine';
+import { exportFilenameForKind } from '../../utils/exportFilename';
 
 export const PreviewModal: React.FC = () => {
   const { previewModal, closePreview, run, state, rowsCache, triBlank, triMeta, downloadExport, toast } =
@@ -78,22 +79,7 @@ export const PreviewModal: React.FC = () => {
               </>
             ) : (
               <>
-                Preview{' '}
-                <b>
-                  {kind === 'xlsx'
-                    ? 'robowski_run.xlsx'
-                    : kind === 'bench'
-                    ? 'bench_sheet.html'
-                    : kind === 'stock'
-                    ? 'stock_preparation.csv'
-                    : kind === 'load'
-                    ? 'deck_load_checklist.csv'
-                    : kind === 'tlc'
-                    ? 'tlc_lane_map.csv'
-                    : kind === 'png'
-                    ? 'run_card.png'
-                    : 'robowski_package.zip'}
-                </b>
+                Preview <b>{exportFilenameForKind(kind || 'zip', activeName, activeDate)}</b>
               </>
             )}
           </div>
@@ -394,7 +380,7 @@ export const PreviewModal: React.FC = () => {
                     const url = URL.createObjectURL(blob);
                     const el = document.createElement('a');
                     el.href = url;
-                    el.download = `notebook_card_${activeName.replace(/[^A-Za-z0-9_-]+/g, '_')}.png`;
+                    el.download = exportFilenameForKind('nb', activeName, activeDate);
                     document.body.appendChild(el);
                     el.click();
                     el.remove();

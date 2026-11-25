@@ -2,6 +2,7 @@
 import { PredictedSpecies, WellConditionConfig, WellPredictionResult } from './types';
 import { predictWellReactions } from './engine';
 import { extractWellForPrediction } from './plateBridge';
+import { analyzeTlcVisibility, TlcVisibilityInfo } from './tlcVisibility';
 import { wellLabel } from '../tlcLanes';
 import { RunResult, RunState } from '../../types';
 import {
@@ -187,6 +188,8 @@ export interface TlcMolProfile {
   meohReactiveLabel?: string | null;
   /** has a chromophore that shows under UV254/366 (aromatic ring or conjugated C=C/C=O/C=N) */
   uvActive: boolean;
+  /** Detailed UV 254/366 nm + recommended TLC chemical stain info */
+  tlcVisibility?: TlcVisibilityInfo;
   /** Solute LSER (E, S, A, B) & Snyder-Soczewinski displacement slope n_i */
   lser?: TlcMolLser;
 }
@@ -227,6 +230,8 @@ export interface SimulatedSpot {
   tailingReason?: string;
   /** false: no chromophore, only visible with a stain */
   uvActive?: boolean;
+  /** Specific UV 254/366 nm and TLC stain cues (Ninhydrin, KMnO4, 2,4-DNP, etc.) */
+  tlcVisibility?: TlcVisibilityInfo;
   /** reversible species expected to fall apart on acidic silica or react with eluent */
   mayDecompose?: boolean;
   /** basic amine in an Et₃N eluent where NH₃/MeOH is available: slight residual streaking expected */
@@ -1026,6 +1031,7 @@ export function profileMoleculeForTlc(
       acetoneReactiveLabel,
       meohReactiveLabel,
       uvActive: aromaticRings > 0 || conjugated,
+      tlcVisibility: analyzeTlcVisibility(rdkit, clean),
       lser: {
         E: lserE,
         S: lserS,
@@ -2096,6 +2102,7 @@ function evaluateWellInSolvent(
       tailing: pred.tailing,
       tailingReason: pred.tailingReason || rx.reason,
       uvActive: s.profile.uvActive,
+      tlcVisibility: s.profile.tlcVisibility,
       mayDecompose: rx.factor < 1,
       mildStreak: pred.mildStreak,
     };
@@ -2129,6 +2136,7 @@ function evaluateWellInSolvent(
       tailing: pred.tailing,
       tailingReason: pred.tailingReason || rx.reason,
       uvActive: p.profile.uvActive,
+      tlcVisibility: p.profile.tlcVisibility,
       mayDecompose: (system.stationaryPhase === 'SiO2' && p.reversibleEnd && p.persistence < 0.6) || rx.factor < 1,
       mildStreak: pred.mildStreak,
     };

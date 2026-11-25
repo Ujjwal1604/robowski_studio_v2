@@ -309,20 +309,42 @@ export function robotSheetsToRun(
     }
   }
 
-  // Names and structures from the description sheet (substrate_code / substrate_IUPAC_names / substrate_smiles).
+  // Names, structures, temperature, and date from the description sheet.
   const infoByCode: Record<string, { name?: string; smiles?: string }> = {};
+  const parseTempCell = (v: unknown): number | undefined => {
+    if (v === '' || v === null || v === undefined) return undefined;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    const m = /^\s*(-?\d+(?:\.\d+)?)\s*(?:°?\s*C)?\s*$/i.exec(String(v));
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) return n;
+    }
+    return undefined;
+  };
+  let temperatureC: number | undefined = parseTempCell(metaObj['temperature_c'] ?? metaObj['temperature']);
+  let exportDate: string | undefined = metaObj['export_date'] || metaObj['date'] || undefined;
+
   if (desc && desc.length > 1) {
     const dh = (desc[0] || []).map((x: any) => normKey(String(x || '')));
     const cCode = dh.indexOf('substratecode');
     const cName = dh.indexOf('substrateiupacnames');
     const cSmi = dh.indexOf('substratesmiles');
+    const cTemp = dh.findIndex((h) => h === 'temperaturec' || h === 'temperature' || h === 'tempc' || h === 'temp');
+    const cDate = dh.findIndex((h) => h === 'date' || h === 'exportdate');
     const split = (v: any) =>
       String(v ?? '')
         .split(';')
         .map((x) => x.trim());
-    if (cCode >= 0) {
-      for (const r of desc.slice(1)) {
-        if (!r) continue;
+    for (const r of desc.slice(1)) {
+      if (!r) continue;
+      if (temperatureC === undefined && cTemp >= 0) {
+        const t = parseTempCell(r[cTemp]);
+        if (t !== undefined) temperatureC = t;
+      }
+      if (!exportDate && cDate >= 0 && r[cDate] != null && String(r[cDate]).trim()) {
+        exportDate = String(r[cDate]).trim();
+      }
+      if (cCode >= 0) {
         const cs = split(r[cCode]);
         const ns = cName >= 0 ? split(r[cName]) : [];
         const ms = cSmi >= 0 ? split(r[cSmi]) : [];
@@ -537,6 +559,8 @@ export function robotSheetsToRun(
     tri: triSetup,
     blankRows,
     savedState,
+    ...(temperatureC !== undefined ? { temperatureC } : {}),
+    ...(exportDate ? { exportDate } : {}),
   };
 }
 

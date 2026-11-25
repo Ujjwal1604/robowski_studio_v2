@@ -146,4 +146,18 @@ describe('robot workbook import hardening', () => {
       for (const k of keys) expect(Math.abs((r[k] || 0) - ((run2.rows[i] as any)[k] || 0))).toBeLessThan(0.01);
     });
   });
+
+  it('restores temperatureC and exportDate from the description sheet even without robowski_meta', () => {
+    const c: any = exampleState();
+    c.mode = 'concentration';
+    c.temperatureC = 80;
+    c.eln = { ...c.eln, temperatureC: 80 };
+    c.randomize = false;
+    c.reagents = reagents(2, false);
+    c.sets = [{ name: 'Set 1', items: c.reagents.map(() => ({ on: true, min: 10, step: 10, max: 20 })) }];
+    const sheets = without(exportSheets(c), 'robowski_meta', 'version');
+    const d: any = robotSheetsToRun(sheets, 'heated.xlsx');
+    expect(d.temperatureC).toBe(80);
+    expect(d.exportDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
 });

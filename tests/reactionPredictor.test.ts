@@ -293,9 +293,17 @@ describe('Reaction Predictor Engine (RDKit WASM)', () => {
     expect(resConj.species.some((s) => s.formula === 'C12H11ClN2O' && s.tier === 'Medium')).toBe(true);
     expect(resConj.species.some((s) => s.formula === 'C9H8N2O' && s.bestChain.some((st) => st.stepLabel === 'DH'))).toBe(true);
 
-    // At 80 °C, azole SNAr product (C11H8N4O) should also appear cleanly
-    const res80 = predictWellReactions(rdkit, subsB6Conj, { ...cond25Base, temperatureC: 80 });
-    expect(res80.species.some((s) => s.bestChain.some((st) => st.stepLabel === 'AR'))).toBe(true);
+    // At 80 °C, unactivated 5-chlorobenzimidazole azole SNAr product (C11H8N4O) appears as Speculative via AR_azole_het_broad
+    const res80 = predictWellReactions(
+      rdkit,
+      subsB6Conj,
+      { ...cond25Base, temperatureC: 80 },
+      { includeSpeculative: true }
+    );
+    const b6Ar = res80.species.find((s) => s.bestChain.some((st) => st.stepLabel === 'AR'));
+    expect(b6Ar).toBeDefined();
+    expect(b6Ar!.bestChain.some((st) => st.ruleId === 'AR_azole_het_broad')).toBe(true);
+    expect(b6Ar!.tier).toBe('Speculative');
   }, 15000);
 });
 

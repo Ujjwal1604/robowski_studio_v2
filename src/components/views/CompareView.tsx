@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { getImagesForSets } from '../../context/tlcStorage';
+import { buildMultiRunExportFilename } from '../../utils/exportFilename';
 import {
   CURRENT_RUN_ID,
   ComparableRun,
@@ -506,7 +507,14 @@ export const CompareView: React.FC = () => {
         ]),
       ];
       const csv = '\ufeff' + rows.map((r) => r.map(csvEsc).join(',')).join('\r\n');
-      downloadCsvFile('run_comparison.csv', csv);
+      downloadCsvFile(
+        buildMultiRunExportFilename(
+          runsComparison.runs.map((r) => r.name),
+          'run_comparison',
+          'csv'
+        ),
+        csv
+      );
       toast('Exported multi-run comparison CSV.');
       return;
     }
@@ -546,7 +554,14 @@ export const CompareView: React.FC = () => {
         ])
       );
       const csv = '\ufeff' + rows.map((r) => r.map(csvEsc).join(',')).join('\r\n');
-      downloadCsvFile('well_comparison.csv', csv);
+      downloadCsvFile(
+        buildMultiRunExportFilename(
+          wellSnapshots.map((s) => s.runName),
+          'well_comparison',
+          'csv'
+        ),
+        csv
+      );
       toast('Exported multi-well comparison CSV.');
     }
   };

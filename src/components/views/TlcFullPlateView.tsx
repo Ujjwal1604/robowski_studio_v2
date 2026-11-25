@@ -293,6 +293,90 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
   // Selected lane object
   const selectedLane = selectedLaneId !== null ? lanes.find((l) => l.id === selectedLaneId) || null : null;
 
+  // Solvent front base values per half + smooth 60 FPS live-preview state for Front Side 1/2 sliders.
+  // While pointer-dragging, only updates the overlay canvas front line (~1.5 ms) with zero 54-lane
+  // spot/coherence recomputation, then commits once on release at the exact same pixel position.
+  const sampleLaneSide0 = lanes.find((l) => l.id < 27) || lanes[0];
+  const sampleLaneSide1 = lanes.find((l) => l.id >= 27) || lanes[Math.min(27, lanes.length - 1)];
+  const frontSide0Val = tlcHalfFrontBase(currentSet, 0, sampleLaneSide0, getProfile);
+  const frontSide1Val = tlcHalfFrontBase(currentSet, 1, sampleLaneSide1, getProfile);
+
+  const [draftFront0, setDraftFront0] = useState<number>(frontSide0Val);
+  const [draftFront1, setDraftFront1] = useState<number>(frontSide1Val);
+  const draftFrontRef = useRef<{ 0: number; 1: number }>({ 0: frontSide0Val, 1: frontSide1Val });
+  const draggingFrontRef = useRef<{ 0: boolean; 1: boolean }>({ 0: false, 1: false });
+  const front0TimerRef = useRef<number | null>(null);
+  const front1TimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!draggingFrontRef.current[0]) {
+      draftFrontRef.current[0] = frontSide0Val;
+      setDraftFront0(frontSide0Val);
+    }
+  }, [frontSide0Val]);
+
+  useEffect(() => {
+    if (!draggingFrontRef.current[1]) {
+      draftFrontRef.current[1] = frontSide1Val;
+      setDraftFront1(frontSide1Val);
+    }
+  }, [frontSide1Val]);
+
+  useEffect(() => {
+    return () => {
+      if (front0TimerRef.current !== null) window.clearTimeout(front0TimerRef.current);
+      if (front1TimerRef.current !== null) window.clearTimeout(front1TimerRef.current);
+    };
+  }, []);
+
+  const commitFrontSide = useCallback(
+    (side: 0 | 1, val?: number) => {
+      const ref = side === 0 ? front0TimerRef : front1TimerRef;
+      if (ref.current !== null) {
+        window.clearTimeout(ref.current);
+        ref.current = null;
+      }
+      const nextVal = val !== undefined ? val : draftFrontRef.current[side];
+      draftFrontRef.current[side] = nextVal;
+      draggingFrontRef.current[side] = false;
+      if (onUpdateSetFront) onUpdateSetFront(nextVal, side);
+    },
+    [onUpdateSetFront]
+  );
+
+  const handleFrontPointerDown = useCallback(
+    (side: 0 | 1) => {
+      if (!draggingFrontRef.current[side]) {
+        draggingFrontRef.current[side] = true;
+        if (onSnapshotHistory) onSnapshotHistory();
+        const onWinUp = () => {
+          window.removeEventListener('pointerup', onWinUp);
+          window.removeEventListener('pointercancel', onWinUp);
+          if (draggingFrontRef.current[side]) {
+            commitFrontSide(side, draftFrontRef.current[side]);
+          }
+        };
+        window.addEventListener('pointerup', onWinUp);
+        window.addEventListener('pointercancel', onWinUp);
+      }
+    },
+    [onSnapshotHistory, commitFrontSide]
+  );
+
+  const handleFrontChange = useCallback(
+    (side: 0 | 1, val: number) => {
+      draftFrontRef.current[side] = val;
+      if (side === 0) setDraftFront0(val);
+      else setDraftFront1(val);
+      // During active pointer drag, only update the overlay preview line at 60 FPS; commit once on release.
+      if (draggingFrontRef.current[side]) return;
+      const ref = side === 0 ? front0TimerRef : front1TimerRef;
+      if (ref.current !== null) window.clearTimeout(ref.current);
+      ref.current = window.setTimeout(() => commitFrontSide(side, val), 140);
+    },
+    [commitFrontSide]
+  );
+
   // Stable anchor coordinates for Shift X and Shift Y sliders (prevents range shifting under thumb during drag)
   const laneAnchorRef = useRef<{ id: number; x0: number; y0: number } | null>(null);
   if (selectedLane && (!laneAnchorRef.current || laneAnchorRef.current.id !== selectedLane.id)) {
@@ -823,8 +907,23 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
 
       // Spot Origin marker (baseline Rf = 0)
       const originDist = tlcOrigin(currentSet, l, getProfile as any) * imgScale;
-      // Solvent front marker (Rf = 1.0)
-      const frontDist = tlcFront(currentSet, l, getProfile) * imgScale;
+      // Solvent front marker (Rf = 1.0) — live-tracks draftFront0/1 at 60 FPS during slider drag
+      const halfIdx = l.id < 27 ? 0 : 1;
+      const previewFrontBase = halfIdx === 0 ? draftFront0 : draftFront1;
+      const committedFrontBase = halfIdx === 0 ? frontSide0Val : frontSide1Val;
+      let frontPxForLane = tlcFront(currentSet, l, getProfile);
+      if (previewFrontBase !== committedFrontBase) {
+        const autoMed = currentSet.frontAuto?.[halfIdx];
+        const autoLane = currentSet.frontAutoByLane?.[l.id];
+        const curveDelta =
+          autoMed != null && autoMed > 0 && autoLane != null && autoLane > 0
+            ? autoLane - autoMed
+            : 0;
+        frontPxForLane = Math.round(
+          Math.max(20, Math.min(l.length - 2, previewFrontBase + curveDelta))
+        );
+      }
+      const frontDist = frontPxForLane * imgScale;
 
       if (isSelected) {
         // Prominent glowing bounding box for active editing
@@ -1241,6 +1340,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
     hoveredSpotInfo,
     automiddleEnabled,
     hoveredConfidenceTier,
+    draftFront0,
+    draftFront1,
+    frontSide0Val,
+    frontSide1Val,
   ]);
 
   // Find spot collision at mouse coordinates (for dragging, Alt+Click deletion, or tooltip)
@@ -1864,56 +1967,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
   const selectedRow = selectedWell !== null && run?.rows
     ? run.rows.find((r: any) => r.plate_number === plate && r.container_id === selectedWell)
     : null;
-
-  const sampleLaneSide0 = lanes.find((l) => l.id < 27) || lanes[0];
-  const sampleLaneSide1 = lanes.find((l) => l.id >= 27) || lanes[Math.min(27, lanes.length - 1)];
-
-  const frontSide0Val = tlcHalfFrontBase(currentSet, 0, sampleLaneSide0, getProfile);
-  const frontSide1Val = tlcHalfFrontBase(currentSet, 1, sampleLaneSide1, getProfile);
-
-  // Smooth trailing-debounced local values for Front Side 1/2 sliders (avoids stacking full-half spot recomputes while dragging)
-  const [draftFront0, setDraftFront0] = useState<number>(frontSide0Val);
-  const [draftFront1, setDraftFront1] = useState<number>(frontSide1Val);
-  const front0TimerRef = useRef<number | null>(null);
-  const front1TimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    setDraftFront0(frontSide0Val);
-  }, [frontSide0Val]);
-
-  useEffect(() => {
-    setDraftFront1(frontSide1Val);
-  }, [frontSide1Val]);
-
-  useEffect(() => {
-    return () => {
-      if (front0TimerRef.current !== null) window.clearTimeout(front0TimerRef.current);
-      if (front1TimerRef.current !== null) window.clearTimeout(front1TimerRef.current);
-    };
-  }, []);
-
-  const commitFrontSide = useCallback(
-    (side: 0 | 1, val: number) => {
-      const ref = side === 0 ? front0TimerRef : front1TimerRef;
-      if (ref.current !== null) {
-        window.clearTimeout(ref.current);
-        ref.current = null;
-      }
-      if (onUpdateSetFront) onUpdateSetFront(val, side);
-    },
-    [onUpdateSetFront]
-  );
-
-  const scheduleFrontSide = useCallback(
-    (side: 0 | 1, val: number) => {
-      if (side === 0) setDraftFront0(val);
-      else setDraftFront1(val);
-      const ref = side === 0 ? front0TimerRef : front1TimerRef;
-      if (ref.current !== null) window.clearTimeout(ref.current);
-      ref.current = window.setTimeout(() => commitFrontSide(side, val), 45);
-    },
-    [commitFrontSide]
-  );
 
   const selectedSide = selectedLane ? (selectedLane.id < 27 ? 0 : 1) : null;
 
@@ -2670,10 +2723,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                     max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
                     step={1}
                     value={draftFront0}
-                    onPointerDown={onSnapshotHistory}
-                    onMouseDown={onSnapshotHistory}
-                    onChange={(e) => scheduleFrontSide(0, +e.target.value)}
+                    onPointerDown={() => handleFrontPointerDown(0)}
+                    onChange={(e) => handleFrontChange(0, +e.target.value)}
                     onPointerUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
+                    onPointerCancel={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                     onKeyUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                     style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
                   />
@@ -2683,6 +2736,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
                       const nextVal = draftFront0 + 1;
+                      draftFrontRef.current[0] = nextVal;
                       setDraftFront0(nextVal);
                       commitFrontSide(0, nextVal);
                     }}
@@ -2715,6 +2769,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
                       const nextVal = Math.max(50, draftFront1 - 1);
+                      draftFrontRef.current[1] = nextVal;
                       setDraftFront1(nextVal);
                       commitFrontSide(1, nextVal);
                     }}
@@ -2728,10 +2783,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                     max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
                     step={1}
                     value={draftFront1}
-                    onPointerDown={onSnapshotHistory}
-                    onMouseDown={onSnapshotHistory}
-                    onChange={(e) => scheduleFrontSide(1, +e.target.value)}
+                    onPointerDown={() => handleFrontPointerDown(1)}
+                    onChange={(e) => handleFrontChange(1, +e.target.value)}
                     onPointerUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
+                    onPointerCancel={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                     onKeyUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                     style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
                   />
@@ -2741,6 +2796,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
                       const nextVal = draftFront1 + 1;
+                      draftFrontRef.current[1] = nextVal;
                       setDraftFront1(nextVal);
                       commitFrontSide(1, nextVal);
                     }}
@@ -3475,8 +3531,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                   max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
                   step={1}
                   value={draftFront0}
-                  onChange={(e) => scheduleFrontSide(0, +e.target.value)}
+                  onPointerDown={() => handleFrontPointerDown(0)}
+                  onChange={(e) => handleFrontChange(0, +e.target.value)}
                   onPointerUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
+                  onPointerCancel={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                   onKeyUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                   style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
                 />
@@ -3492,8 +3550,10 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
                   max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
                   step={1}
                   value={draftFront1}
-                  onChange={(e) => scheduleFrontSide(1, +e.target.value)}
+                  onPointerDown={() => handleFrontPointerDown(1)}
+                  onChange={(e) => handleFrontChange(1, +e.target.value)}
                   onPointerUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
+                  onPointerCancel={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                   onKeyUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                   style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
                 />

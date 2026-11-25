@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { SavedRun } from '../../types';
-import { buildRun, localDate } from '../../engine';
+import { buildRun, inspectReagentWithBackend, localDate } from '../../engine';
 import { dataFor } from '../../context/AppContext';
 import { ChemicalStructure, resolveChemicalNameToSmiles } from '../ui/ChemicalStructure';
 
@@ -30,6 +30,9 @@ export const RunsView: React.FC = () => {
     restoreBackupFile,
     importRobowskiArchiveFile,
     exportRobowskiArchive,
+    backendStatus,
+    backendSyncing,
+    syncWithBackend,
     toast,
   } = useApp();
 
@@ -79,6 +82,16 @@ export const RunsView: React.FC = () => {
           smiles = resolved.smiles;
           if (!mm && resolved.mw) mm = resolved.mw;
           if (!iupac && resolved.iupac) iupac = resolved.iupac;
+        }
+      } catch {}
+    }
+
+    // If connected to Lab PC Python RDKit and SMILES is present, standardize & auto-fill exact molar mass
+    if (smiles && backendStatus?.connected) {
+      try {
+        const info = await inspectReagentWithBackend(smiles);
+        if (info?.valid) {
+          if (!mm && info.molarMass) mm = info.molarMass;
         }
       } catch {}
     }
@@ -133,7 +146,7 @@ export const RunsView: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const el = document.createElement('a');
     el.href = url;
-    el.download = 'reagent_library_template.csv';
+    el.download = `reagent_library_template_${localDate()}.csv`;
     document.body.appendChild(el);
     el.click();
     el.remove();
@@ -161,7 +174,7 @@ export const RunsView: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const el = document.createElement('a');
     el.href = url;
-    el.download = 'reagent_library.csv';
+    el.download = `reagent_library_${localDate()}.csv`;
     document.body.appendChild(el);
     el.click();
     el.remove();
@@ -249,11 +262,22 @@ export const RunsView: React.FC = () => {
             <div>
               <div className="ptl">Runs</div>
               <div className="psub">
-                Every run is saved with its deck, plates and tips (in this browser). Open one to
-                edit it, or duplicate it as a starting point.
+                {backendStatus?.connected
+                  ? 'Synced with your personal Lab PC — runs, ELN notes, and TLC photos stay available across computers.'
+                  : 'Every run is saved with its deck, plates and tips (in this browser). Open one to edit it, or duplicate it as a starting point.'}
               </div>
             </div>
             <div className="pr">
+              {backendStatus?.connected && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={backendSyncing}
+                  onClick={() => syncWithBackend()}
+                >
+                  {backendSyncing ? 'Syncing…' : 'Sync Lab PC'}
+                </button>
+              )}
               <div className="seg" role="group" aria-label="Filter runs">
                 {(['all', 'draft', 'exported'] as const).map((f) => (
                   <button

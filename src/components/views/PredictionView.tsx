@@ -13,11 +13,13 @@ import {
   Play,
   Plus,
   Search,
+  Server,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { buildExportFilename } from '../../utils/exportFilename';
 import {
   MediumMode,
   PathwayFamily,
@@ -35,6 +37,9 @@ import {
   getSuggestedWellDisplay,
   groupSpeciesByPathway,
   predictWellReactions,
+  refinePlateWithPythonBackend,
+  refineWellWithPythonBackend,
+  submitTlcFeedback,
   wellLabel,
 } from '../../engine';
 import { getRDKitInstance } from '../../utils/rdkit';
@@ -190,6 +195,10 @@ export const PredictionView: React.FC = () => {
     setTargetWell,
     addWellToCompare,
     toast,
+    backendUrl: pythonUrl,
+    backendStatus: pythonStatus,
+    backendRevision: pythonRevision,
+    setBackendPanelOpen,
   } = useApp();
 
   const [rdkit, setRdkit] = useState<any>(null);
@@ -224,6 +233,8 @@ export const PredictionView: React.FC = () => {
   );
   const [sandboxResult, setSandboxResult] = useState<WellPredictionResult | null>(null);
   const [resolvingCode, setResolvingCode] = useState<string | null>(null);
+  const [refinedActiveWell, setRefinedActiveWell] = useState<{ sig: string; result: WellPredictionResult } | null>(null);
+  const sandboxRunIdRef = useRef<number>(0);
 
   // Initialize RDKit WebAssembly once
   useEffect(() => {
@@ -352,7 +363,7 @@ export const PredictionView: React.FC = () => {
 
   const activeWellInputSig = currentRow ? `${plateChemSig}::${currentRowSig}` : '';
 
-  const activeWellResult = useMemo<WellPredictionResult | null>(() => {
+  const baseActiveWellResult = useMemo<WellPredictionResult | null>(() => {
     if (!rdkit || !currentExtraction || mode !== 'plate' || !activeWellInputSig) return null;
     const validSubs = currentExtraction.substrates.filter((s) => s.smiles.trim().length > 0);
     if (validSubs.length === 0) return null;
@@ -373,7 +384,29 @@ export const PredictionView: React.FC = () => {
     } catch {
       return null;
     }
-  }, [rdkit, currentExtraction, mode, activeWellInputSig, includeSpeculative]);
+    // pythonRevision forces re-read after connecting/disconnecting personal-PC backend
+  }, [rdkit, currentExtraction, mode, activeWellInputSig, includeSpeculative, pythonRevision]);
+
+  const activeWellResult =
+    refinedActiveWell && refinedActiveWell.sig === activeWellInputSig
+      ? refinedActiveWell.result
+      : baseActiveWellResult;
+
+  // Upgrade the active well with personal-PC Python RDKit (3D MMFF94s strain + tautomer cleanup + SQLite TLC history) when connected
+  useEffect(() => {
+    if (!pythonStatus?.connected || !pythonUrl || !baseActiveWellResult || !activeWellInputSig) return;
+    if (baseActiveWellResult.stats.pythonRefined || baseActiveWellResult.species.length === 0) return;
+
+    let cancelled = false;
+    refineWellWithPythonBackend(baseActiveWellResult, pythonUrl).then((refined) => {
+      if (cancelled || !refined?.stats?.pythonRefined) return;
+      wellPredCacheRef.current.set(activeWellInputSig, refined);
+      setRefinedActiveWell({ sig: activeWellInputSig, result: refined });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pythonStatus?.connected, pythonUrl, baseActiveWellResult, activeWellInputSig]);
 
   // Synchronize plateResults matrix badges when chemistry/conditions/recipes change, hydrating immediately from cache when available
   const prevChemSigRef = useRef<string>(plateChemSig);
@@ -438,21 +471,36 @@ export const PredictionView: React.FC = () => {
       setSandboxResult(null);
       return;
     }
+    const runId = ++sandboxRunIdRef.current;
     try {
       const res = predictWellReactions(rdkit, valid, sandboxCond, { includeSpeculative });
       setSandboxResult(res);
+      if (pythonStatus?.connected && pythonUrl && res.species.length > 0) {
+        refineWellWithPythonBackend(res, pythonUrl).then((refined) => {
+          if (sandboxRunIdRef.current !== runId || !refined?.stats?.pythonRefined) return;
+          setSandboxResult(refined);
+        });
+      }
     } catch (e: any) {
       toast('Prediction error: ' + (e?.message || e));
     }
-  }, [rdkit, sandboxSubs, sandboxCond, includeSpeculative, toast]);
+  }, [rdkit, sandboxSubs, sandboxCond, includeSpeculative, pythonStatus?.connected, pythonUrl, toast]);
 
   useEffect(() => {
     if (mode === 'sandbox' && rdkit) {
       runSandboxNow();
     }
-  }, [mode, rdkit, runSandboxNow]);
+  }, [mode, rdkit, runSandboxNow, pythonRevision]);
 
-  // Batch analyze active plate cleanly without freezing UI (reusing cached & identical replicate wells)
+  // Reset cached well predictions whenever the global Lab PC backend connects or disconnects
+  useEffect(() => {
+    if (pythonRevision === 0) return;
+    wellPredCacheRef.current.clear();
+    setRefinedActiveWell(null);
+    setPlateResults({});
+  }, [pythonRevision]);
+
+  // Batch analyze active plate cleanly without freezing UI (offloaded to backend RDKit API with local fallback)
   const runPlateBatch = async () => {
     if (!rdkit || !run) return;
     batchCancelRef.current = false;
@@ -469,42 +517,130 @@ export const PredictionView: React.FC = () => {
     setBatchProgress({ running: true, done: 0, total: wellsToRun.length });
     const accumulated: Record<string, WellPredictionResult> = { ...plateResults };
 
-    for (let i = 0; i < wellsToRun.length; i++) {
-      if (batchCancelRef.current) break;
-      const { key, row } = wellsToRun[i];
+    // Partition cached vs uncached wells
+    const uncached: Array<{
+      key: string;
+      sig: string;
+      substrates: ReturnType<typeof extractWellForPrediction>['substrates'];
+      condition: ReturnType<typeof extractWellForPrediction>['condition'];
+    }> = [];
+    let completed = 0;
+
+    for (const { key, row } of wellsToRun) {
       const sig = `${plateChemSig}::${rowRecipeSig(row)}`;
       const cached = wellPredCacheRef.current.get(sig);
       if (cached) {
         accumulated[key] = cached;
         plateResultSigRef.current[key] = sig;
+        completed++;
       } else {
         const ext = extractWellForPrediction(state, row, conditionOverrides);
         const validSubs = ext.substrates.filter((s) => s.smiles.trim().length > 0);
         if (validSubs.length > 0) {
-          try {
-            const res = predictWellReactions(rdkit, validSubs, ext.condition, {
-              includeSpeculative,
-            });
-            if (wellPredCacheRef.current.size > 600) {
-              const firstKey = wellPredCacheRef.current.keys().next().value;
-              if (firstKey !== undefined) wellPredCacheRef.current.delete(firstKey);
-            }
-            wellPredCacheRef.current.set(sig, res);
-            accumulated[key] = res;
-            plateResultSigRef.current[key] = sig;
-          } catch {}
-        }
-      }
-      setBatchProgress({ running: true, done: i + 1, total: wellsToRun.length });
-      if ((i + 1) % 3 === 0 || i === wellsToRun.length - 1) {
-        setPlateResults({ ...accumulated });
-        if (!cached) {
-          await new Promise((res) => setTimeout(res, 0));
+          uncached.push({ key, sig, substrates: validSubs, condition: ext.condition });
+        } else {
+          completed++;
         }
       }
     }
+
+    if (completed > 0) {
+      setPlateResults({ ...accumulated });
+      setBatchProgress({ running: true, done: completed, total: wellsToRun.length });
+    }
+
+    // Send uncached wells to backend RDKit endpoint in smooth chunks of 9 (one row per call)
+    let useBackend = true;
+    const CHUNK = 9;
+    for (let start = 0; start < uncached.length; start += CHUNK) {
+      if (batchCancelRef.current) break;
+      const chunk = uncached.slice(start, start + CHUNK);
+
+      if (useBackend) {
+        try {
+          const resp = await fetch('/api/predictor/plate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              wells: chunk.map((c) => ({
+                key: c.key,
+                substrates: c.substrates,
+                condition: c.condition,
+              })),
+              options: { includeSpeculative },
+            }),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = await resp.json();
+          if (!data?.success || !data?.results) throw new Error('Invalid backend payload');
+
+          const rawChunkMap = data.results as Record<string, WellPredictionResult>;
+          const finalChunkMap =
+            pythonStatus?.connected && pythonUrl
+              ? await refinePlateWithPythonBackend(rawChunkMap, pythonUrl)
+              : rawChunkMap;
+
+          for (const item of chunk) {
+            const res = finalChunkMap[item.key] as WellPredictionResult | undefined;
+            if (res) {
+              if (wellPredCacheRef.current.size > 600) {
+                const firstKey = wellPredCacheRef.current.keys().next().value;
+                if (firstKey !== undefined) wellPredCacheRef.current.delete(firstKey);
+              }
+              wellPredCacheRef.current.set(item.sig, res);
+              accumulated[item.key] = res;
+              plateResultSigRef.current[item.key] = item.sig;
+            }
+            completed++;
+          }
+          setPlateResults({ ...accumulated });
+          setBatchProgress({ running: true, done: completed, total: wellsToRun.length });
+          continue;
+        } catch {
+          useBackend = false;
+        }
+      }
+
+      // Automatic local browser RDKit fallback (optionally refined by personal-PC Python RDKit)
+      const localChunkMap: Record<string, WellPredictionResult> = {};
+      for (const item of chunk) {
+        if (batchCancelRef.current) break;
+        try {
+          const res = predictWellReactions(rdkit, item.substrates, item.condition, {
+            includeSpeculative,
+          });
+          localChunkMap[item.key] = res;
+        } catch {}
+        completed++;
+        setBatchProgress({ running: true, done: completed, total: wellsToRun.length });
+        if (completed % 3 === 0 || completed === wellsToRun.length) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      const refinedLocalMap =
+        pythonStatus?.connected && pythonUrl && Object.keys(localChunkMap).length > 0
+          ? await refinePlateWithPythonBackend(localChunkMap, pythonUrl)
+          : localChunkMap;
+      for (const item of chunk) {
+        const res = refinedLocalMap[item.key];
+        if (!res) continue;
+        if (wellPredCacheRef.current.size > 600) {
+          const firstKey = wellPredCacheRef.current.keys().next().value;
+          if (firstKey !== undefined) wellPredCacheRef.current.delete(firstKey);
+        }
+        wellPredCacheRef.current.set(item.sig, res);
+        accumulated[item.key] = res;
+        plateResultSigRef.current[item.key] = item.sig;
+      }
+      setPlateResults({ ...accumulated });
+    }
+
     setBatchProgress({ running: false, done: wellsToRun.length, total: wellsToRun.length });
-    toast(`Analyzed ${wellsToRun.length} wells on Plate ${activePlate + 1}.`);
+    toast(
+      pythonStatus?.connected
+        ? `Analyzed ${wellsToRun.length} wells on Plate ${activePlate + 1} with Python 3D RDKit.`
+        : `Analyzed ${wellsToRun.length} wells on Plate ${activePlate + 1}.`
+    );
   };
 
   // Resolve reagent SMILES from PubChem directly inside Plate Predictor and save to Setup state
@@ -542,7 +678,7 @@ export const PredictionView: React.FC = () => {
 
   const handleExportCurrentWellCsv = (res: WellPredictionResult, label: string, group: string) => {
     const csv = exportLcmsTargetListCsv([{ wellLabel: label, groupLabel: group, result: res }]);
-    downloadCsv(`${(state.name || 'robowski').replace(/[^A-Za-z0-9_-]+/g, '_')}_${label}_lcms_targets.csv`, csv);
+    downloadCsv(buildExportFilename(state.name || run?.runName, `${label}_lcms_targets`, 'csv'), csv);
     toast(`Exported ${res.species.length} predicted LC-MS targets for ${label}.`);
   };
 
@@ -565,7 +701,7 @@ export const PredictionView: React.FC = () => {
       return;
     }
     const csv = exportLcmsTargetListCsv(entries);
-    downloadCsv(`${(state.name || 'robowski').replace(/[^A-Za-z0-9_-]+/g, '_')}_plate${activePlate + 1}_lcms_targets.csv`, csv);
+    downloadCsv(buildExportFilename(state.name || run?.runName, `plate${activePlate + 1}_lcms_targets`, 'csv'), csv);
     toast(`Exported LC-MS target list for ${entries.length} wells on Plate ${activePlate + 1}.`);
   };
 
@@ -596,6 +732,25 @@ export const PredictionView: React.FC = () => {
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => setBackendPanelOpen((v) => !v)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                borderColor: pythonStatus?.connected
+                  ? 'color-mix(in srgb, var(--ok) 55%, var(--line))'
+                  : undefined,
+                color: pythonStatus?.connected ? 'var(--ok)' : undefined,
+              }}
+              title="Open Lab PC backend settings (3D RDKit strain checks, tautomer cleanup, and permanent TLC memory)"
+            >
+              <Server size={13} />
+              <span>{pythonStatus?.connected ? 'Lab PC 3D RDKit · On' : 'Connect Lab PC'}</span>
+            </button>
+
             <div className="seg" role="group" aria-label="Predictor workspace mode">
               <button
                 type="button"
@@ -1684,19 +1839,81 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
             <span>
               Free H⁺ {acidBase.freeAcidEq.toFixed(2)} eq · Free Base {acidBase.freeBaseEq.toFixed(2)} eq
             </span>
+            {result.stats.pythonRefined && (
+              <span style={{ color: 'var(--ok)', fontWeight: 600 }}>3D RDKit ✓</span>
+            )}
           </div>
 
-          {(acidBase.notes.length > 0 || substrates.some((s) => s.sites.length > 0)) && (
-            <button
-              type="button"
-              className="btn sm"
-              style={{ height: '24px', fontSize: '11px', padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-              onClick={() => setShowEquilibriumDetails((v) => !v)}
-            >
-              {showEquilibriumDetails ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-              <span>Ionization sites</span>
-            </button>
-          )}
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+            {species.length > 0 && (
+              <>
+                <span style={{ fontSize: '11px', color: 'var(--mut)' }}>TLC check:</span>
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                  title="Record that you saw a new product spot on TLC for this well"
+                  onClick={async () => {
+                    const topRules = Array.from(
+                      new Set(species.slice(0, 3).flatMap((s) => s.bestChain.map((st) => st.ruleId)))
+                    );
+                    const saved = await submitTlcFeedback({
+                      wellKey: result.wellLabel || 'well',
+                      ruleIds: topRules,
+                      observedNewSpot: true,
+                      substrates: substrates.map((s) => s.neutralSmiles),
+                    });
+                    if (saved.savedTo === 'python') {
+                      toast(`Saved to your PC's TLC database (${saved.totalObservations ?? 1} total checks).`);
+                    } else if (saved.savedTo === 'builtin') {
+                      toast('Saved TLC feedback: new spot observed.');
+                    } else {
+                      toast('Could not save TLC feedback to server.');
+                    }
+                  }}
+                >
+                  New spot
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
+                  title="Record that no new product spot appeared on TLC for this well"
+                  onClick={async () => {
+                    const topRules = Array.from(
+                      new Set(species.slice(0, 3).flatMap((s) => s.bestChain.map((st) => st.ruleId)))
+                    );
+                    const saved = await submitTlcFeedback({
+                      wellKey: result.wellLabel || 'well',
+                      ruleIds: topRules,
+                      observedNewSpot: false,
+                      substrates: substrates.map((s) => s.neutralSmiles),
+                    });
+                    if (saved.savedTo === 'python') {
+                      toast(`Saved to your PC's TLC database (${saved.totalObservations ?? 1} total checks).`);
+                    } else if (saved.savedTo === 'builtin') {
+                      toast('Saved TLC feedback: no new spot.');
+                    } else {
+                      toast('Could not save TLC feedback to server.');
+                    }
+                  }}
+                >
+                  No new spot
+                </button>
+              </>
+            )}
+            {(acidBase.notes.length > 0 || substrates.some((s) => s.sites.length > 0)) && (
+              <button
+                type="button"
+                className="btn sm"
+                style={{ height: '24px', fontSize: '11px', padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                onClick={() => setShowEquilibriumDetails((v) => !v)}
+              >
+                {showEquilibriumDetails ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                <span>Ionization sites</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {showEquilibriumDetails && (
@@ -2144,6 +2361,20 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                       </div>
                     </div>
 
+                    {sp.tlcVisibility && (
+                      <div
+                        style={{
+                          fontSize: '11.5px',
+                          color: sp.tlcVisibility.uv254 === 'none' || sp.tlcVisibility.uv254 === 'weak' ? 'var(--warn)' : 'var(--fg2)',
+                          fontWeight: sp.tlcVisibility.uv254 === 'none' ? 600 : 400,
+                        }}
+                        title={sp.tlcVisibility.stainTip || sp.tlcVisibility.stains.map((s) => `${s.stain}: ${s.colorCue} (${s.reason})`).join(' | ')}
+                      >
+                        TLC visibility: {sp.tlcVisibility.shortCue}
+                        {sp.tlcVisibility.stainTip ? ` — ${sp.tlcVisibility.stainTip}` : ''}
+                      </div>
+                    )}
+
                     {sp.lossIons && sp.lossIons.length > 0 && (
                       <div className="mono" style={{ fontSize: '11.5px', color: 'var(--fg2)' }}>
                         In-source LC-MS:{' '}
@@ -2560,6 +2791,19 @@ const WellResultsDisplay: React.FC<WellResultsDisplayProps> = ({
                     {node && node.alsoViaLabels.length > 0 && (
                       <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
                         Convergent: also reached via {node.alsoViaLabels.join(', ')}
+                      </div>
+                    )}
+
+                    {sp.tlcVisibility && (
+                      <div
+                        style={{
+                          fontSize: '11px',
+                          color: sp.tlcVisibility.uv254 === 'none' || sp.tlcVisibility.uv254 === 'weak' ? 'var(--warn)' : 'var(--fg2)',
+                          fontWeight: sp.tlcVisibility.uv254 === 'none' ? 600 : 400,
+                        }}
+                        title={sp.tlcVisibility.stainTip || sp.tlcVisibility.stains.map((s) => `${s.stain}: ${s.colorCue}`).join(' | ')}
+                      >
+                        TLC: {sp.tlcVisibility.shortCue}
                       </div>
                     )}
 

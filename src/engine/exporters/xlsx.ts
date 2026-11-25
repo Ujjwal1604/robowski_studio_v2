@@ -1,6 +1,6 @@
 // Robowski Studio - OpenXML Spreadsheet (.xlsx) Generator
 import { RunResult, RunRow } from '../../types';
-import { num, round, SOLVENT_DENSITIES } from '../constants';
+import { localDate, num, round, SOLVENT_DENSITIES } from '../constants';
 import { surfaceHeight } from '../deckTiming';
 import { zipStore } from './zipStore';
 
@@ -159,6 +159,21 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
     ]),
   ];
 
+  const parseTemp = (v: unknown): number | null => {
+    if (v === '' || v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const temperatureC =
+    parseTemp(run.temperatureC) ??
+    parseTemp(data?.temperatureC) ??
+    parseTemp(data?.state?.temperatureC) ??
+    parseTemp(data?.state?.eln?.temperatureC);
+  const exportDate =
+    typeof data?.exportDate === 'string' && data.exportDate.trim()
+      ? data.exportDate.trim()
+      : localDate();
+
   const descRows = [
     [
       'reaction_code',
@@ -171,6 +186,8 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
       'product_code',
       'products_smiles',
       'generator_combination_index',
+      'temperature_C',
+      'date',
     ],
     ...run.rows.map((row) => [
       row.global_index,
@@ -186,6 +203,8 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
             .join('; '),
       ...descChem(run, row),
       row.combo_index,
+      temperatureC,
+      exportDate,
     ]),
   ];
   const detectedMode =
@@ -214,6 +233,8 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
     ['vial_volume_uL', run.vialVolume],
     ['dilution_factor', run.dilutionFactor],
     ['reaction_solvent', run.reactionSolvent],
+    ['temperature_C', temperatureC ?? ''],
+    ['export_date', exportDate],
     ['run_state_json', rawState ? JSON.stringify(rawState) : ''],
     ['tri_setup_json', triData ? JSON.stringify(triData) : ''],
   ];

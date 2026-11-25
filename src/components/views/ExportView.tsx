@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { chooseSaveFolder, clearSaveFolder, folderSaveSupported, getSaveFolderName } from '../../utils/folderSave';
+import { exportFilenameForKind } from '../../utils/exportFilename';
 import { useApp } from '../../context/AppContext';
+import { getImagesForSets } from '../../context/tlcStorage';
 import { notebookCardSvg, localDate } from '../../engine';
 import * as Core from '../../engine';
 
@@ -16,11 +18,16 @@ export const ExportView: React.FC = () => {
     setView,
     setVisited,
     toast,
+    tlcSets,
     activeTlcStatus,
     exportRobowskiArchive,
+    backendStatus,
+    backendUrl,
+    setBackendPanelOpen,
   } = useApp();
 
   const [descOpen, setDescOpen] = useState(false);
+  const [labPcBusy, setLabPcBusy] = useState<'archive' | 'eln' | null>(null);
   const [saveFolder, setSaveFolder] = useState<string | null>(null);
   useEffect(() => {
     getSaveFolderName().then(setSaveFolder).catch(() => {});
@@ -28,45 +35,131 @@ export const ExportView: React.FC = () => {
 
   const blocked = !run || run.blockingIssues > 0;
 
+  const runTitle = state.name || run?.runName;
+  const exportDate = localDate();
+
+  const handleSaveArchiveToLabPc = async () => {
+    if (!run || run.blockingIssues > 0) return;
+    setLabPcBusy('archive');
+    try {
+      const imageBlobs = await getImagesForSets(tlcSets);
+      const archiveBytes = await Core.buildRobowskiArchive(state, run, tlcSets, imageBlobs);
+      const filename = exportFilenameForKind('robowski', runTitle, exportDate);
+      const res = await Core.saveArchiveToBackend(runTitle || 'run', filename, archiveBytes, backendUrl);
+      if (res.success) {
+        toast(`Saved archive directly to your Lab PC (${res.relativePath || filename}).`);
+      } else {
+        toast(res.error || 'Could not save archive to Lab PC.');
+      }
+    } catch (e: any) {
+      toast('Archive save error: ' + (e?.message || e));
+    } finally {
+      setLabPcBusy(null);
+    }
+  };
+
+  const handleExportIllustratedEln = async () => {
+    if (!run) return;
+    setLabPcBusy('eln');
+    try {
+      const cond = Core.getCanonicalRunConditions(state);
+      const obsMap = state.eln?.wells || {};
+      const observations = Object.entries(obsMap).map(([key, ob]: [string, any]) => {
+        const [pStr, wStr] = key.split('-');
+        const pIdx = Number(pStr) || 0;
+        const wIdx = Number(wStr) || 0;
+        return {
+          plate: pIdx + 1,
+          well: Core.wellLabel(wIdx),
+          outcome: ob?.outcome || '',
+          tags: Array.isArray(ob?.tags) ? ob.tags : [],
+          notes: ob?.notes || '',
+          components: '',
+        };
+      });
+      const res = await Core.downloadIllustratedElnXlsx(
+        {
+          runName: runTitle || 'Robowski_Run',
+          hood: state.hood,
+          mode: state.mode,
+          date: exportDate,
+          conditions: {
+            Solvent: cond.solvent,
+            'Temperature (°C)': cond.temperatureC,
+            'Base Water (%)': cond.baseWaterPct,
+            'Reaction Time (h)': cond.reactionTimeHours,
+            Atmosphere: cond.atmosphere,
+            Agitation: cond.agitation,
+          },
+          reagents: state.reagents.map((r) => ({
+            code: r.code,
+            name: r.name,
+            smiles: r.smiles,
+            molarMass: r.molarMass,
+            stock: r.stock,
+            solvent: r.solvent,
+          })),
+          observations,
+        },
+        backendUrl
+      );
+      if (res.ok && res.blob) {
+        const url = URL.createObjectURL(res.blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = res.filename || `${runTitle || 'run'}_ELN_Illustrated.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        toast(`Downloaded ${res.filename} with embedded 2D structures.`);
+      } else {
+        toast(res.error || 'Could not generate illustrated Excel ELN.');
+      }
+    } finally {
+      setLabPcBusy(null);
+    }
+  };
+
   const files = [
     [
       'robowski',
-      `${state.name || 'run'}.robowski`,
+      exportFilenameForKind('robowski', runTitle, exportDate),
       'Complete self-contained experiment archive: reaction recipe, robot XLSX, hood bench sheet, and high-res TLC plate images + densitograms.',
     ],
     [
       'xlsx',
-      'robowski_run.xlsx',
+      exportFilenameForKind('xlsx', runTitle, exportDate),
       'The input workbook for the robot: reactions_with_run_info and stock_solutions sheets, plus reference sheets.',
     ],
     [
       'bench',
-      'bench_sheet.html',
+      exportFilenameForKind('bench', runTitle, exportDate),
       'One printable page for the hood: how to prepare each stock, where everything goes on the deck, tips to load, with tick boxes and room for notes.',
     ],
     [
       'stock',
-      'stock_preparation.csv',
+      exportFilenameForKind('stock', runTitle, exportDate),
       'Stock preparation list with plain instructions (weigh X g, or take X mL and add Y mL), volumes and tick boxes. Opens in Excel.',
     ],
     [
       'load',
-      'deck_load_checklist.csv',
+      exportFilenameForKind('load', runTitle, exportDate),
       'Deck loading checklist in the order you walk the deck: bottles, solvent, vial plates, tip racks.',
     ],
     [
       'tlc',
-      'tlc_lane_map.csv',
+      exportFilenameForKind('tlc', runTitle, exportDate),
       'TLC lane mapping in column-by-column spotting order for the 6×9 plate with well coordinates, vial IDs, and reagent concentrations.',
     ],
     [
       'nb',
-      'notebook_card.png',
+      exportFilenameForKind('nb', runTitle, exportDate),
       'The notebook card: conditions, reagents and stock volumes on one image, for the notebook or a slide.',
     ],
     [
       'zip',
-      'robowski_package.zip',
+      exportFilenameForKind('zip', runTitle, exportDate),
       'Everything above in one zip, plus the plate-layout picture and a manifest.',
     ],
   ];
@@ -159,21 +252,77 @@ export const ExportView: React.FC = () => {
                   : 'Reaction conditions and robot workbooks are ready. TLC plate photos are not uploaded yet; you can export now for hood execution, and attach plate photos later in the TLC Map tab.'}
               </div>
             </div>
-            <button
-              type="button"
-              className="btn pri"
-              disabled={blocked}
-              onClick={exportRobowskiArchive}
-              title="Download complete .robowski experiment archive"
-            >
-              Export .robowski
-            </button>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={blocked}
+                onClick={exportRobowskiArchive}
+                title="Download complete .robowski experiment archive"
+              >
+                Export .robowski
+              </button>
+              {backendStatus?.connected && (
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={blocked || labPcBusy !== null}
+                  onClick={handleSaveArchiveToLabPc}
+                  title="Save a permanent copy directly into python_backend/data/archives/ on your personal lab PC"
+                >
+                  {labPcBusy === 'archive' ? 'Saving…' : 'Save Copy to Lab PC'}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Illustrated Excel ELN with RDKit 2D Structures (Lab PC Backend) */}
+          <div
+            style={{
+              marginBottom: '16px',
+              padding: '12px 16px',
+              background: 'var(--subtle, rgba(0,0,0,0.02))',
+              border: '1px solid var(--border)',
+              borderRadius: '8px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: '12px',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ flex: '1 1 260px' }}>
+              <b style={{ fontSize: '13.5px' }}>Illustrated Lab Notebook (.xlsx with 2D Structures)</b>
+              <div style={{ fontSize: '12px', color: 'var(--mut)', marginTop: '2px' }}>
+                {backendStatus?.connected
+                  ? 'Uses your Lab PC Python RDKit to draw crisp 2D chemical structures directly inside Excel cells alongside reagent stocks and ELN observations.'
+                  : 'Connect your personal Lab PC backend in the top bar to generate Excel notebooks with embedded 2D chemical structure drawings.'}
+              </div>
+            </div>
+            {backendStatus?.connected ? (
+              <button
+                type="button"
+                className="btn sm pri"
+                disabled={blocked || labPcBusy !== null}
+                onClick={handleExportIllustratedEln}
+              >
+                {labPcBusy === 'eln' ? 'Building .xlsx…' : 'Download Illustrated ELN'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => setBackendPanelOpen(true)}
+              >
+                Connect Lab PC
+              </button>
+            )}
           </div>
 
           <div className="list">
             {files.map(([kind, filename, desc]) => (
               <div key={kind}>
-                <b className="mono" style={{ minWidth: '190px' }}>
+                <b className="mono" style={{ minWidth: '190px', maxWidth: '280px', overflowWrap: 'anywhere', fontSize: '12px' }}>
                   {filename}
                 </b>
                 <span style={{ flex: '1 1 240px', color: 'var(--fg2)' }}>{desc}</span>

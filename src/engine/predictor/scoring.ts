@@ -2,6 +2,7 @@
 import { AcidBaseSummary, ConfidenceClass, PredictionTier, StepEvent, WellConditionConfig } from './types';
 import { ReactionRuleDef } from './rules';
 import { countSubstruct } from './molQueries';
+import { inspectMatchedSite } from './rdkitGraph';
 
 export function computeRingSizesFromMol(mol: any): number[] {
   try {
@@ -127,6 +128,18 @@ export function estimateStericFactor(
         countSubstruct(rdkit, smi, AMINE_N) === countSubstruct(rdkit, smi, ARYL_AMINE_N)
       ) {
         factor *= 0.86;
+        // Local ortho steric crowding on the specific aniline ring (e.g. 2,6-dimethylaniline)
+        const site = inspectMatchedSite(rdkit, smi, ARYL_AMINE_N);
+        if (site.ring && site.ring.orthoBlockers >= 1.2) {
+          factor *= Math.max(0.55, 1 - 0.16 * site.ring.orthoBlockers);
+        }
+      }
+      // Local ortho steric crowding on hindered aryl aldehydes (e.g. mesitaldehyde)
+      if (countSubstruct(rdkit, smi, '[CX3;H1](=O)c') > 0) {
+        const aldSite = inspectMatchedSite(rdkit, smi, '[CX3;H1](=O)c');
+        if (aldSite.ring && aldSite.ring.orthoBlockers >= 1.4) {
+          factor *= Math.max(0.62, 1 - 0.14 * aldSite.ring.orthoBlockers);
+        }
       }
     }
   }
@@ -134,34 +147,122 @@ export function estimateStericFactor(
   return Math.max(0.25, Math.min(1.0, factor));
 }
 
+const SN2_I = '[CX4;H3,H2,H1]I';
+const SN2_BR = '[CX4;H3,H2,H1]Br';
+const SN2_CL = '[CX4;H3,H2,H1]Cl';
+const SN2_SULFONATE = '[CX4;H3,H2,H1][OX2][SX4](=[OX1])(=[OX1])[#6]';
+
+const SNAR_ACT_BASE =
+  '$(c:n),$(c1:[c,n]:[c,n]:n:[c,n]:[c,n]:1),$(c:c-[NX3+](=O)[O-]),$(c1:[c,n]:[c,n]:c(-[NX3+](=O)[O-]):[c,n]:[c,n]:1),$(c:c-C#N),$(c1:[c,n]:[c,n]:c(-C#N):[c,n]:[c,n]:1),$(c:c-[CX3](=O)[#6,O]),$(c1:[c,n]:[c,n]:c(-[CX3](=O)[#6,O]):[c,n]:[c,n]:1),$(c:c-[SX4](=O)=O),$(c1:[c,n]:[c,n]:c(-[SX4](=O)=O):[c,n]:[c,n]:1)';
+const SNAR_ACT_F = `[c;${SNAR_ACT_BASE}]F`;
+const SNAR_ACT_CL = `[c;${SNAR_ACT_BASE}]Cl`;
+const SNAR_ACT_BR = `[c;${SNAR_ACT_BASE}]Br`;
+const SNAR_ACT_I = `[c;${SNAR_ACT_BASE}]I`;
+const SNAR_ACT_OTF = `[c;${SNAR_ACT_BASE}][OX2][SX4](=[OX1])(=[OX1])C(F)(F)F`;
+
+const ELEC_ALDEHYDE = '[CX3;$([CH1](=O)[#6]),$([CH2]=O)]=O';
+const ELEC_ARYL_KETONE = '[CX3;H0](=O)(c)[#6]';
+const ELEC_ALIPH_KETONE = '[CX3;H0](=O)([CX4])[CX4]';
+const ELEC_MALONONITRILE = '[CX4;H2](C#N)C#N';
+
 /**
- * Leaving group & electrophile electronics modifier (I > Br > Cl > F for SN2; aldehyde > ketone)
+ * Leaving group & electrophile electronics modifier (I > Br > Cl for SN2; F > Cl > Br > I for SNAr;
+ * aldehyde > aliphatic ketone > aryl ketone for carbonyl additions).
+ * Uses RDKit substructure queries on the reacting electrophile so spectator halogens / CF3 never misfire.
  */
-export function estimateElectronicFactor(rule: ReactionRuleDef, reactantSmiles: string[]): number {
+export function estimateElectronicFactor(
+  rule: ReactionRuleDef,
+  reactantSmiles: string[],
+  rdkit?: any
+): number {
   let factor = 1.0;
-  const joined = reactantSmiles.join('.');
+  const electrophile = reactantSmiles[0] || '';
 
-  if (rule.stepLabel === 'SN(N)' || rule.stepLabel === 'SN(S)' || rule.stepLabel === 'SN(O)') {
-    if (/I/.test(joined)) factor *= 1.08;
-    else if (/Br/.test(joined)) factor *= 1.0;
-    else if (/Cl/.test(joined)) factor *= 0.86;
+  if (rdkit) {
+    if (rule.stepLabel === 'SN(N)' || rule.stepLabel === 'SN(S)' || rule.stepLabel === 'SN(O)') {
+      if (rule.id.includes('sulfonate')) {
+        if (countSubstruct(rdkit, electrophile, SN2_SULFONATE) > 0) factor *= 1.04;
+      } else if (!rule.id.includes('epoxide') && !rule.id.includes('sulfonyl_halide')) {
+        if (countSubstruct(rdkit, electrophile, SN2_I) > 0) factor *= 1.08;
+        else if (countSubstruct(rdkit, electrophile, SN2_BR) > 0) factor *= 1.02;
+        else if (countSubstruct(rdkit, electrophile, SN2_CL) > 0) factor *= 0.86;
+      }
+    }
+
+    if (rule.stepLabel === 'AR') {
+      if (countSubstruct(rdkit, electrophile, SNAR_ACT_F) > 0) factor *= 1.08; // F is fastest in SNAr
+      else if (countSubstruct(rdkit, electrophile, SNAR_ACT_OTF) > 0) factor *= 1.02;
+      else if (countSubstruct(rdkit, electrophile, SNAR_ACT_CL) > 0) factor *= 0.96;
+      else if (countSubstruct(rdkit, electrophile, SNAR_ACT_BR) > 0) factor *= 0.88;
+      else if (countSubstruct(rdkit, electrophile, SNAR_ACT_I) > 0) factor *= 0.84;
+    }
+
+    if (
+      (rule.stepLabel === 'NA(N)' || rule.stepLabel === 'NA(C)') &&
+      !rule.id.includes('isocyanate') &&
+      !rule.id.includes('nitrile') &&
+      !rule.id.includes('imine')
+    ) {
+      // Malononitrile has higher intrinsic carbon-acid reactivity than malonate esters
+      if (reactantSmiles.some((s) => countSubstruct(rdkit, s, ELEC_MALONONITRILE) > 0)) {
+        factor *= 1.08;
+      }
+      // Distinguish aldehydes vs aliphatic ketones vs aryl ketones (ketimines from aryl ketones are much less favorable)
+      const hasAld = countSubstruct(rdkit, electrophile, ELEC_ALDEHYDE) > 0;
+      if (!hasAld) {
+        if (countSubstruct(rdkit, electrophile, ELEC_ARYL_KETONE) > 0) {
+          factor *= 0.52;
+        } else if (countSubstruct(rdkit, electrophile, ELEC_ALIPH_KETONE) > 0) {
+          factor *= 0.8;
+        }
+      } else {
+        // Local Hammett electronics on the specific aromatic ring attached to an aryl aldehyde
+        const aldSite = inspectMatchedSite(rdkit, electrophile, '[CX3;H1](=O)c');
+        if (aldSite.ring) {
+          if (aldSite.ring.ewgStrength > 0.4) {
+            factor *= Math.min(1.12, 1 + 0.06 * aldSite.ring.ewgStrength);
+          } else if (aldSite.ring.edgStrength > 0.5) {
+            factor *= Math.max(0.84, 1 - 0.09 * aldSite.ring.edgStrength);
+          }
+        }
+      }
+    }
+
+    // Site-localized Hammett electronics on aniline/arylamine nucleophiles (e.g. 4-nitroaniline vs 4-methoxyaniline)
+    if (
+      reactantSmiles.length >= 2 &&
+      (rule.stepLabel === 'NA(N)' ||
+        rule.stepLabel === 'MI(N)' ||
+        rule.stepLabel === 'SN(N)' ||
+        rule.stepLabel === 'AR' ||
+        rule.stepLabel === 'AS(N)')
+    ) {
+      const nuc = reactantSmiles[1];
+      const anilSite = inspectMatchedSite(rdkit, nuc, '[NX3;H2,H1;$(N-c);!$(N-C=[O,S,N]);!$(N-S=O)]');
+      const hasAliphAmine = countSubstruct(rdkit, nuc, '[NX3;H2,H1;$(N-[#6;X4]);!$(N-C=[O,S,N]);!$(N-S=O);!$(N-c)]') > 0;
+      if (anilSite.matched && anilSite.ring && !hasAliphAmine) {
+        if (anilSite.ring.ewgStrength > 0.5) {
+          factor *= Math.max(0.55, 1 - 0.22 * anilSite.ring.ewgStrength);
+        } else if (anilSite.ring.edgStrength > 0.4) {
+          factor *= Math.min(1.12, 1 + 0.07 * anilSite.ring.edgStrength);
+        }
+      }
+    }
+
+    // Ketimines from aryl ketones are thermodynamically & kinetically disfavored vs aldimines
+    if (rule.id === 'DH_imine') {
+      if (countSubstruct(rdkit, electrophile, '[CX4;H0]([OX2H1])([NX3;H2,H1])(c)[#6]') > 0) {
+        factor *= 0.65;
+      }
+    }
+  } else {
+    const joined = reactantSmiles.join('.');
+    if (rule.stepLabel === 'NA(N)' || rule.stepLabel === 'NA(C)') {
+      if (/N#CCC#N/.test(joined)) factor *= 1.08;
+    }
   }
 
-  if (rule.stepLabel === 'AR') {
-    if (/F/.test(joined)) factor *= 1.08; // F is fastest in SNAr!
-    else if (/Cl/.test(joined)) factor *= 0.96;
-    else if (/Br/.test(joined)) factor *= 0.88;
-  }
-
-  if (rule.stepLabel === 'NA(N)' || rule.stepLabel === 'NA(C)') {
-    // Malononitrile / 1,3-diketone higher intrinsic reactivity than malonate ester
-    if (/N#CCC#N/.test(joined)) factor *= 1.08;
-    // Aldehydes (excluding ketones/esters) faster than ketones
-    const hasAld = reactantSmiles.some((s) => /(^|=O\))C=O|^O=C/.test(s) || /C=O/.test(s));
-    if (hasAld) factor *= 1.0;
-  }
-
-  return Math.max(0.4, Math.min(1.15, factor));
+  return Math.max(0.35, Math.min(1.15, factor));
 }
 
 // Equilibrium constants of reversible step types:
@@ -179,6 +280,9 @@ const K_EQ: Record<string, number> = {
   DH: 50, // dehydration equilibrium relative to hemiaminal so imines stay viable in 15-50 mM wells
   IS: 10,
   Tautomer: 0.6,
+};
+const K_EQ_BY_RULE: Record<string, number> = {
+  DH_enamine: 5, // unconjugated 2° amine enamines hydrolyze readily in wet DMSO
 };
 const DEFAULT_K_EQ = 5;
 const EFFECTIVE_MOLARITY = 5;
@@ -201,7 +305,7 @@ export function equilibriumPersistence(chain: StepEvent[], ctx: ScoreContext = {
   for (let i = chain.length - 1; i >= 0; i--) {
     const st = chain[i];
     if (!st.reversible) break;
-    const k = K_EQ[st.stepLabel] ?? DEFAULT_K_EQ;
+    const k = K_EQ_BY_RULE[st.ruleId] ?? K_EQ[st.stepLabel] ?? DEFAULT_K_EQ;
     let xi: number;
     if (st.stepLabel === 'DH') xi = k / (1 + 0.35 * water);
     else if (st.stepLabel === 'Tautomer') xi = k;

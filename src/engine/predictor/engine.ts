@@ -27,6 +27,8 @@ import {
   temperatureGate,
 } from './scoring';
 import { stepIsAtomBalanced, countSubstruct } from './molQueries';
+import { hasAntiBredtDoubleBond } from './rdkitGraph';
+import { analyzeTlcVisibility } from './tlcVisibility';
 
 const PROTON_MASS = 1.00727647;
 const NA_MASS = 22.989218;
@@ -81,6 +83,7 @@ interface CompiledRuleEntry {
 let compiledRuleCache: WeakMap<object, Map<string, CompiledRuleEntry | null>> = new WeakMap();
 let chelatorQueriesCache: WeakMap<object, Array<{ label: string; qmol: any }>> = new WeakMap();
 let michaelQueryCache: WeakMap<object, any> = new WeakMap();
+let unmodeledQueriesCache: WeakMap<object, Array<{ label: string; qmol: any }>> = new WeakMap();
 
 function splitTopLevelDot(s: string): string[] {
   const out: string[] = [];
@@ -161,13 +164,60 @@ function getChelatorQueries(rdkit: any): Array<{ label: string; qmol: any }> {
 function getMichaelQuery(rdkit: any): any | null {
   if (michaelQueryCache.has(rdkit)) return michaelQueryCache.get(rdkit);
   try {
-    const q = rdkit.get_qmol('[CX3]=[CX3]-[CX3]=[OX1],[CX3]=[CX3]-[CX2]#[NX1],[CX3]=[CX3]-[NX3+](=O)[O-]');
+    const q = rdkit.get_qmol(
+      '[CX3;!$([CX3]([NX3,OX2,SX2]))]=[CX3;$(C([CX3H1]=O)),$(C([CX3](=O)[#6])),$(C([CX3](=O)[OX2H0][#6])),$(C([CX3](=O)[NX3][CX3]=O)),$(C(C#N)),$(C([NX3+](=O)[O-])),$(C(S(=O)=O))]'
+    );
     michaelQueryCache.set(rdkit, q || null);
     return q || null;
   } catch {
     michaelQueryCache.set(rdkit, null);
     return null;
   }
+}
+
+function getUnmodeledReactiveQueries(rdkit: any): Array<{ label: string; qmol: any }> {
+  let cached = unmodeledQueriesCache.get(rdkit);
+  if (cached) return cached;
+  const defs: Array<[string, string]> = [
+    ['carbodiimide (N=C=N)', '[NX2]=[CX2]=[NX2]'],
+    ['ketene (C=C=O)', '[CX3]=[CX2]=[OX1]'],
+    ['aziridine (3-membered N-ring)', '[CX4]1[NX3][CX4]1'],
+    ['diazonium salt ([N+]#N)', '[#6][NX2+]#[NX1]'],
+    ['chloroformate (RO-CO-Cl)', '[OX2][CX3](=[OX1])Cl'],
+    ['boronic acid/ester (requires Pd/Cu catalyst)', '[#6][BX3]([OX2])[OX2]'],
+    ['phosphorochloridate / P–Cl reagent', '[PX4,PX3]Cl'],
+    ['organic peroxide (O–O)', '[OX2][OX2]'],
+  ];
+  cached = [];
+  for (const [label, sma] of defs) {
+    try {
+      const q = rdkit.get_qmol(sma);
+      if (q) cached.push({ label, qmol: q });
+    } catch {}
+  }
+  unmodeledQueriesCache.set(rdkit, cached);
+  return cached;
+}
+
+function detectUnmodeledSubstrateGroups(rdkit: any, smi: string): string[] {
+  const hits: string[] = [];
+  let mol: any = null;
+  try {
+    mol = rdkit.get_mol(smi);
+    if (!mol || !mol.is_valid()) return hits;
+    for (const { label, qmol } of getUnmodeledReactiveQueries(rdkit)) {
+      try {
+        const m = mol.get_substruct_match(qmol);
+        if (m && m !== '{}') hits.push(label);
+      } catch {}
+    }
+  } catch {
+  } finally {
+    try {
+      mol?.delete?.();
+    } catch {}
+  }
+  return hits;
 }
 
 interface MolMeta {
@@ -417,6 +467,7 @@ const LEAVING_GROUP_STEPS = new Set([
   'AR',
   'AS(N)',
   'AS(O)',
+  'AS(S)',
   'EL',
   'DC',
   'OX',
@@ -748,7 +799,7 @@ export function predictWellReactions(
         if (prodSets.length === 0) continue;
 
         const stericFactor = estimateStericFactor(rule, reactantSmis, rdkit);
-        const elecFactor = estimateElectronicFactor(rule, reactantSmis);
+        const elecFactor = estimateElectronicFactor(rule, reactantSmis, rdkit);
 
         // Substrate free-fraction factor (when an original substrate is participating directly)
         let fFree = 1.0;
@@ -791,6 +842,17 @@ export function predictWellReactions(
 
           // Intramolecular cyclizations must form at least one new ring
           if (rule.intramolecular && mainMeta.numRings <= pair[0].meta.numRings) continue;
+
+          // Guard against physically impossible anti-Bredt bridgehead double bonds and unintentional dearomatization
+          if (mainMeta.numRings >= 2 && hasAntiBredtDoubleBond(rdkit, mainMeta.smiles)) continue;
+          const parentAromSum = pair.reduce((acc, p) => acc + p.meta.numAromaticRings, 0);
+          if (
+            !LEAVING_GROUP_STEPS.has(rule.stepLabel) &&
+            mainMeta.numAromaticRings < parentAromSum &&
+            rule.stepLabel !== 'Tautomer'
+          ) {
+            continue;
+          }
 
           // Ring-size / strain / effective-molarity check
           const ringEval = evaluateNewRingFactor(parentRings, mainMeta.ringSizes);
@@ -930,6 +992,22 @@ export function predictWellReactions(
     }
   }
 
+  let hasRemainingFrontier = false;
+  for (const sp of speciesMap.values()) {
+    if (!sp.expanded && sp.chain.length < maxDepth && sp.priorityScore >= minFrontierScore) {
+      hasRemainingFrontier = true;
+      break;
+    }
+  }
+  const hitSpeciesCap = speciesMap.size >= maxSpecies;
+  const hitExpansionCap = expansions >= maxExpansions && hasRemainingFrontier;
+  const truncated = hitSpeciesCap || hitExpansionCap;
+  const truncationReason: 'max_expansions' | 'max_species' | null = hitSpeciesCap
+    ? 'max_species'
+    : hitExpansionCap
+    ? 'max_expansions'
+    : null;
+
   // 4. Final Classification (Sink vs Transient vs Byproduct) & Competition Adjustment
   const nonSubSpecies = Array.from(speciesMap.values()).filter((s) => !s.isSubstrate);
 
@@ -946,11 +1024,13 @@ export function predictWellReactions(
     const hasRingOrAromaticLock = sp.chain.some(
       (st) => st.ringFactor > 1.15 || st.stepLabel === 'AO' || st.stepLabel === 'PC' || st.stepLabel === 'DC'
     );
-    // If the terminal step is reversible AND hasn't reached an irreversible lock (e.g. hemiaminal, uncyclized imine, open aza-Michael), treat as transient
+    // If the terminal step is reversible AND hasn't reached an irreversible lock (e.g. hemiaminal, uncyclized imine, simple enamine, open aza-Michael), treat as transient
     const isTransient = Boolean(last && last.reversible && !hasRingOrAromaticLock && last.stepLabel !== 'DH');
-    // Note: Imine (DH_imine) in dry/acid conditions without cyclization is also reversible equilibrium intermediate!
-    const isUncyclizedImine = Boolean(last && last.ruleId === 'DH_imine');
-    const finalTransient = isTransient || isUncyclizedImine;
+    // Uncyclized imine (DH_imine) and simple unconjugated 2° amine enamine (DH_enamine) remain reversible equilibrium intermediates
+    const isUncyclizedImineOrEnamine = Boolean(
+      last && (last.ruleId === 'DH_imine' || last.ruleId === 'DH_enamine')
+    );
+    const finalTransient = isTransient || isUncyclizedImineOrEnamine;
 
     preliminaryStatus.set(sp.key, finalTransient ? 'transient' : 'sink');
     if (!finalTransient && sp.priorityScore >= 0.45) {
@@ -1040,6 +1120,7 @@ export function predictWellReactions(
       bestChain: sp.chain,
       alternativeChains: sp.altChains,
       mechanismSummary,
+      tlcVisibility: sp.isSmallFragment ? undefined : analyzeTlcVisibility(rdkit, sp.meta.smiles),
       alerts: [...stepAlerts, ...molAlerts],
     };
 
@@ -1094,6 +1175,42 @@ export function predictWellReactions(
       message: `Gas evolution predicted: ${Array.from(releasedGases).join(', ')}`,
     });
   }
+  for (const sub of activeSubs) {
+    const unmodeled = detectUnmodeledSubstrateGroups(rdkit, sub.neutralSmiles);
+    if (unmodeled.length > 0) {
+      wellAlerts.push({
+        kind: 'unmodeled_reactive_group',
+        severity: 'warn',
+        message: `${sub.code} contains reactive group(s) not modeled by rules: ${unmodeled.join(', ')}`,
+      });
+    }
+  }
+  if (truncated) {
+    wellAlerts.push({
+      kind: 'search_truncated',
+      severity: 'info',
+      message:
+        truncationReason === 'max_species'
+          ? `Search reached the ${maxSpecies}-species cap; lower-ranked pathways may be omitted.`
+          : `Search reached the ${maxExpansions}-expansion cap; lower-ranked pathways may be omitted.`,
+    });
+  }
+  const uvInvisibleMajor = finalSpecies.filter(
+    (s) => (s.tier === 'High' || s.tier === 'Medium') && s.tlcVisibility?.uv254 === 'none'
+  );
+  if (uvInvisibleMajor.length > 0) {
+    const stains = Array.from(
+      new Set(
+        uvInvisibleMajor
+          .flatMap((s) => s.tlcVisibility?.stains.slice(0, 2).map((st) => st.stain) || [])
+      )
+    ).slice(0, 3);
+    wellAlerts.push({
+      kind: 'uv_invisible_product',
+      severity: 'warn',
+      message: `${uvInvisibleMajor.length} expected product${uvInvisibleMajor.length > 1 ? 's are' : ' is'} not UV-254 active — stain TLC with ${stains.join(' or ') || 'KMnO₄ / I₂'} to see ${uvInvisibleMajor.length > 1 ? 'them' : 'it'}.`,
+    });
+  }
   const hasHighOrMed = finalSpecies.some((s) => s.score >= 0.28);
   if (activeSubs.length > 0 && !hasHighOrMed) {
     wellAlerts.push({
@@ -1131,6 +1248,8 @@ export function predictWellReactions(
       transientCount,
       expansionsRun: expansions,
       totalSpeciesExplored: speciesMap.size,
+      truncated,
+      truncationReason,
       elapsedMs: Math.round(t1 - t0),
     },
   };

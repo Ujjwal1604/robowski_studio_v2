@@ -10,6 +10,7 @@ import {
 } from '../types';
 import * as Core from '../engine';
 import { writeToSaveFolder } from '../utils/folderSave';
+import { exportFilenameForKind } from '../utils/exportFilename';
 import { putTlcImage, getAllSetImages, getImagesForSets } from './tlcStorage';
 import {
   exampleState,
@@ -144,6 +145,16 @@ export interface AppContextType {
   importRobowskiArchiveFile: (f: File) => Promise<boolean>;
   targetWell: { wellIndex: number; plateIndex?: number; setUid?: string; source?: 'palette' | 'heatmap' | 'combinations' | 'advisor' } | null;
   setTargetWell: (w: { wellIndex: number; plateIndex?: number; setUid?: string; source?: 'palette' | 'heatmap' | 'combinations' | 'advisor' } | null) => void;
+  // Whole-app Personal Lab PC Python Backend
+  backendUrl: string;
+  backendStatus: Core.PythonBackendStatus | null;
+  backendPanelOpen: boolean;
+  setBackendPanelOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  backendSyncing: boolean;
+  backendRevision: number;
+  connectBackend: (rawUrl: string) => Promise<Core.PythonBackendStatus>;
+  disconnectBackend: () => void;
+  syncWithBackend: (overrideUrl?: string, opts?: { silent?: boolean }) => Promise<void>;
 }
 
 const AppContext: React.Context<AppContextType | null> =
@@ -204,6 +215,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [runsList, setRunsList] = useState<SavedRun[]>(loadSavedRuns);
   const [lib, setLib] = useState<LibraryReagent[]>(loadSavedLib);
   const [tlcSets, setTlcSets] = useState<TlcSet[]>([defaultTlcSet()]);
+
+  // Global Personal Lab PC Python Backend state
+  const [backendUrl, setBackendUrl] = useState<string>(() => Core.getPythonBackendUrl());
+  const [backendStatus, setBackendStatus] = useState<Core.PythonBackendStatus | null>(null);
+  const [backendPanelOpen, setBackendPanelOpen] = useState<boolean>(false);
+  const [backendSyncing, setBackendSyncing] = useState<boolean>(false);
+  const [backendRevision, setBackendRevision] = useState<number>(0);
+
+  const runsListRef = useRef<SavedRun[]>(runsList);
+  const libRef = useRef<LibraryReagent[]>(lib);
+  useEffect(() => {
+    runsListRef.current = runsList;
+  }, [runsList]);
+  useEffect(() => {
+    libRef.current = lib;
+  }, [lib]);
 
   const activeTlcStatus: 'ready' | 'pending' = useMemo(() => {
     const hasImgs = tlcSets.some((s) => Core.tlcSetHasAnyImages(s));
@@ -583,6 +610,121 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }, 40);
   }, [run, state, rowsCache, triBlank, triMeta]);
 
+  // Whole-app bidirectional sync with Personal Lab PC Python Backend
+  const syncWithBackend = useCallback(
+    async (overrideUrl?: string, opts?: { silent?: boolean }) => {
+      const targetUrl = (overrideUrl ?? Core.getPythonBackendUrl()).trim().replace(/\/+$/, '');
+      if (!targetUrl) return;
+      setBackendSyncing(true);
+      try {
+        const [remoteRuns, remoteLib] = await Promise.all([
+          Core.fetchBackendRuns<SavedRun>(targetUrl),
+          Core.fetchBackendLibrary<LibraryReagent>(targetUrl),
+        ]);
+
+        let mergedRunsCount = 0;
+        let mergedLibCount = 0;
+
+        if (remoteRuns) {
+          const byId = new Map<string, SavedRun>();
+          for (const r of remoteRuns) {
+            if (r?.id) byId.set(r.id, r);
+          }
+          const toPush: SavedRun[] = [];
+          for (const local of runsListRef.current) {
+            if (!local?.id) continue;
+            const existing = byId.get(local.id);
+            if (!existing || (local.updated || 0) > (existing.updated || 0)) {
+              byId.set(local.id, local);
+              toPush.push(local);
+            }
+          }
+          const mergedRuns = Array.from(byId.values()).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+          mergedRunsCount = mergedRuns.length;
+          setRunsList(mergedRuns);
+          saveSavedRuns(mergedRuns);
+          if (toPush.length > 0) {
+            await Core.bulkSaveBackendRuns(toPush, targetUrl);
+          }
+        }
+
+        if (remoteLib) {
+          const byId = new Map<string, LibraryReagent>();
+          for (const item of remoteLib) {
+            if (item?.id) byId.set(item.id, item);
+          }
+          const toPushLib: LibraryReagent[] = [];
+          for (const local of libRef.current) {
+            if (!local?.id) continue;
+            if (!byId.has(local.id)) {
+              byId.set(local.id, local);
+              toPushLib.push(local);
+            }
+          }
+          const mergedLib = Array.from(byId.values());
+          mergedLibCount = mergedLib.length;
+          setLib(mergedLib);
+          saveSavedLib(mergedLib);
+          if (toPushLib.length > 0) {
+            await Core.bulkSaveBackendLibrary(toPushLib, targetUrl);
+          }
+        }
+
+        const freshStatus = await Core.testPythonBackend(targetUrl);
+        setBackendStatus(freshStatus);
+        if (!opts?.silent) {
+          toast(`Synced with Lab PC (${mergedRunsCount} runs, ${mergedLibCount} library reagents).`);
+        }
+      } finally {
+        setBackendSyncing(false);
+      }
+    },
+    [toast]
+  );
+
+  const connectBackend = useCallback(
+    async (rawUrl: string): Promise<Core.PythonBackendStatus> => {
+      const status = await Core.testPythonBackend(rawUrl);
+      setBackendStatus(status);
+      if (status.connected) {
+        const saved = Core.setPythonBackendUrl(status.url);
+        setBackendUrl(saved);
+        setBackendRevision((v) => v + 1);
+        await syncWithBackend(saved, { silent: true });
+        toast(`Connected to Lab PC (RDKit ${status.rdkitVersion || ''}) — runs & library synced.`);
+      } else {
+        toast(status.error || 'Could not reach Lab PC server.');
+      }
+      return status;
+    },
+    [syncWithBackend, toast]
+  );
+
+  const disconnectBackend = useCallback(() => {
+    Core.setPythonBackendUrl('');
+    setBackendUrl('');
+    setBackendStatus(null);
+    setBackendRevision((v) => v + 1);
+    toast('Disconnected Lab PC — using local browser storage and built-in predictor.');
+  }, [toast]);
+
+  // Silently check saved Lab PC backend and sync once on startup
+  useEffect(() => {
+    const saved = Core.getPythonBackendUrl();
+    if (!saved) return;
+    let active = true;
+    Core.testPythonBackend(saved).then((st) => {
+      if (!active) return;
+      setBackendStatus(st);
+      if (st.connected) {
+        void syncWithBackend(saved, { silent: true });
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [syncWithBackend]);
+
   // Run library & Reagent Library Storage Helpers
   const putRun = useCallback(
     async (r: SavedRun) => {
@@ -595,6 +737,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         saveSavedRuns(next);
         return next;
       });
+      if (Core.getPythonBackendUrl()) {
+        void Core.saveBackendRun(r);
+      }
     },
     []
   );
@@ -606,20 +751,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         saveSavedRuns(next);
         return next;
       });
+      if (Core.getPythonBackendUrl()) {
+        void Core.deleteBackendRun(id);
+      }
     },
     []
   );
 
   const putLib = useCallback(
     async (item: Partial<LibraryReagent> & { id: string; name: string }) => {
+      let savedItem: LibraryReagent | null = null;
       setLib((prev) => {
         const next = [...prev];
         const idx = next.findIndex((x) => x.id === item.id);
-        if (idx < 0) next.push(item as LibraryReagent);
-        else next[idx] = { ...next[idx], ...item } as LibraryReagent;
+        if (idx < 0) {
+          savedItem = item as LibraryReagent;
+          next.push(savedItem);
+        } else {
+          savedItem = { ...next[idx], ...item } as LibraryReagent;
+          next[idx] = savedItem;
+        }
         saveSavedLib(next);
         return next;
       });
+      if (Core.getPythonBackendUrl() && savedItem) {
+        void Core.saveBackendLibraryItem(savedItem);
+      }
     },
     []
   );
@@ -630,6 +787,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       saveSavedLib(next);
       return next;
     });
+    if (Core.getPythonBackendUrl()) {
+      void Core.deleteBackendLibraryItem(id);
+    }
   }, []);
 
   const saveRun = useCallback(
@@ -822,11 +982,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setPreviewModal(null);
   }, []);
 
-  const safeName = (s: string) =>
-    String(s || 'run')
-      .replace(/[^A-Za-z0-9_-]+/g, '_')
-      .slice(0, 40);
-
   const saveFileToDisk = async (name: string, data: any) => {
     try {
       const blob = data instanceof Blob ? data : new Blob([data]);
@@ -851,38 +1006,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!run || run.blockingIssues > 0) return;
       try {
         let ok = false;
+        const runTitle = state.name || run.runName;
+        const exportDate = Core.localDate();
+        const outName = exportFilenameForKind(kind, runTitle, exportDate);
         if (kind === 'xlsx') {
           ok = await saveFileToDisk(
-            'robowski_run.xlsx',
-            Core.workbookBytes({ ...buildDataPayload(state, rowsCache, triBlank, triMeta), state }, run)
+            outName,
+            Core.workbookBytes({ ...buildDataPayload(state, rowsCache, triBlank, triMeta), state, exportDate }, run)
           );
         } else if (kind === 'bench') {
           ok = await saveFileToDisk(
-            'bench_sheet_' + safeName(state.name) + '.html',
-            Core.benchSheetHtml(run, Core.localDate())
+            outName,
+            Core.benchSheetHtml(run, exportDate)
           );
         } else if (kind === 'nb') {
-          const pngBytes = await Core.notebookCardPngBytes(run, Core.localDate());
-          ok = await saveFileToDisk('notebook_card_' + safeName(state.name) + '.png', pngBytes);
+          const pngBytes = await Core.notebookCardPngBytes(run, exportDate);
+          ok = await saveFileToDisk(outName, pngBytes);
         } else if (kind === 'stock') {
-          ok = await saveFileToDisk('stock_preparation.csv', Core.stockCsv(run, Core.stockSteps(run)));
+          ok = await saveFileToDisk(outName, Core.stockCsv(run, Core.stockSteps(run)));
         } else if (kind === 'load') {
-          ok = await saveFileToDisk('deck_load_checklist.csv', Core.loadCsv(Core.deckSteps(run)));
+          ok = await saveFileToDisk(outName, Core.loadCsv(Core.deckSteps(run)));
         } else if (kind === 'tlc') {
-          ok = await saveFileToDisk('tlc_lane_map.csv', Core.tlcLaneCsv(run));
+          ok = await saveFileToDisk(outName, Core.tlcLaneCsv(run));
         } else if (kind === 'png') {
           const png = await Core.runCardPngBytes(run);
-          ok = await saveFileToDisk('run_card.png', png);
+          ok = await saveFileToDisk(outName, png);
         } else if (kind === 'zip') {
           let png: Uint8Array | null = null;
           try {
             png = await Core.runCardPngBytes(run);
           } catch (e) {}
-          ok = await saveFileToDisk('robowski_package.zip', Core.packageBytes(run, png));
+          ok = await saveFileToDisk(outName, Core.packageBytes(run, png));
         } else if (kind === 'robowski') {
           const imageBlobs = await getImagesForSets(tlcSets);
           const archiveBytes = await Core.buildRobowskiArchive(state, run, tlcSets, imageBlobs);
-          ok = await saveFileToDisk(safeName(state.name) + '_' + Core.localDate() + '.robowski', archiveBytes);
+          ok = await saveFileToDisk(outName, archiveBytes);
         }
         if (ok) {
           setStatus('exported');
@@ -914,7 +1072,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       toast('Packaging .robowski experiment archive…');
       const imageBlobs = await getImagesForSets(tlcSets);
       const archiveBytes = await Core.buildRobowskiArchive(state, run, tlcSets, imageBlobs);
-      const filename = `${safeName(state.name || 'run')}_${Core.localDate()}.robowski`;
+      const filename = exportFilenameForKind('robowski', state.name || run.runName);
       const ok = await saveFileToDisk(filename, archiveBytes);
       if (ok) {
         setStatus('exported');
@@ -1038,6 +1196,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         setLib(res.nextLib);
         saveSavedLib(res.nextLib);
+        if (Core.getPythonBackendUrl()) {
+          void Core.bulkSaveBackendLibrary(res.nextLib);
+        }
         toast(`Library: ${res.added} added, ${res.updated} updated.`);
       } catch (e: any) {
         toast('Could not read that file: ' + e.message);
@@ -1189,6 +1350,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
         delete st.sets;
         if (d.deckPlates) st.deckPlates = d.deckPlates;
+        if (d.temperatureC != null && Number.isFinite(Number(d.temperatureC))) {
+          st.temperatureC = Number(d.temperatureC);
+          if (st.eln) st.eln.temperatureC = Number(d.temperatureC);
+        }
         if (mode === 'triplet' && d.tri) {
           st.tri = d.tri;
         }
@@ -1361,6 +1526,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         importRobowskiArchiveFile,
         targetWell,
         setTargetWell,
+        backendUrl,
+        backendStatus,
+        backendPanelOpen,
+        setBackendPanelOpen,
+        backendSyncing,
+        backendRevision,
+        connectBackend,
+        disconnectBackend,
+        syncWithBackend,
       }}
     >
       {children}

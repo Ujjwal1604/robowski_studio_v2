@@ -1,9 +1,82 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import fs from 'node:fs';
+import { predictWellReactions } from './src/engine/predictor/engine';
+import type {
+  PredictionOptions,
+  PredictorSubstrateInput,
+  WellConditionConfig,
+  WellPredictionResult,
+} from './src/engine/predictor/types';
 
 const app = express();
 const port = 3000;
+
+// Lazily initialized server-side RDKit instance + LRU well prediction cache
+let serverRdkitPromise: Promise<any> | null = null;
+function getServerRdkit(): Promise<any> {
+  if (!serverRdkitPromise) {
+    serverRdkitPromise = import('@rdkit/rdkit').then((mod: any) => (mod.default || mod)());
+  }
+  return serverRdkitPromise;
+}
+
+const serverPredCache = new Map<string, WellPredictionResult>();
+const MAX_SERVER_PRED_CACHE = 600;
+
+function makeWellCacheKey(
+  substrates: PredictorSubstrateInput[],
+  condition: WellConditionConfig,
+  options?: PredictionOptions
+): string {
+  const normSubs = [...substrates]
+    .map((s) => `${s.code}|${s.smiles.trim()}|${Number(s.equivalents).toFixed(3)}|${Number(s.concentrationMm ?? 0).toFixed(1)}`)
+    .sort()
+    .join(';');
+  const normCond = `${condition.medium}|${condition.additiveName}|${Number(condition.additiveEquiv).toFixed(3)}|${Number(condition.additivePka).toFixed(2)}|${Number(condition.temperatureC).toFixed(1)}|${Number(condition.waterPct).toFixed(2)}|${condition.solvent}|${condition.equivBasis}`;
+  const normOpt = `${Boolean(options?.includeSpeculative)}|${options?.maxExpansions ?? 160}|${options?.maxSpecies ?? 260}`;
+  return `${normSubs}::${normCond}::${normOpt}`;
+}
+
+interface TlcFeedbackEntry {
+  timestamp: string;
+  wellKey: string;
+  ruleIds: string[];
+  observedNewSpot: boolean;
+  solventSystem?: string;
+  measuredRf?: number;
+}
+
+const TLC_FEEDBACK_FILE = '/tmp/robowski-tlc-feedback.json';
+let tlcFeedbackStore: TlcFeedbackEntry[] = [];
+try {
+  if (fs.existsSync(TLC_FEEDBACK_FILE)) {
+    const raw = JSON.parse(fs.readFileSync(TLC_FEEDBACK_FILE, 'utf8'));
+    if (Array.isArray(raw)) tlcFeedbackStore = raw;
+  }
+} catch {}
+
+function saveTlcFeedback(): void {
+  try {
+    fs.writeFileSync(TLC_FEEDBACK_FILE, JSON.stringify(tlcFeedbackStore.slice(-1000)), 'utf8');
+  } catch {}
+}
+
+function summarizeRuleFeedback(): Record<string, { hits: number; total: number; hitRate: number }> {
+  const stats: Record<string, { hits: number; total: number; hitRate: number }> = {};
+  for (const item of tlcFeedbackStore) {
+    for (const rid of item.ruleIds) {
+      if (!stats[rid]) stats[rid] = { hits: 0, total: 0, hitRate: 0 };
+      stats[rid].total += 1;
+      if (item.observedNewSpot) stats[rid].hits += 1;
+    }
+  }
+  for (const k of Object.keys(stats)) {
+    stats[k].hitRate = Math.round((stats[k].hits / Math.max(1, stats[k].total)) * 1000) / 1000;
+  }
+  return stats;
+}
 
 app.use(express.json({ limit: '15mb' }));
 
@@ -102,6 +175,107 @@ app.get('/api/ai/status', (_req, res) => {
     hasKey: Boolean(process.env.GEMINI_API_KEY),
     model: 'gemini-3.1-flash-lite',
   });
+});
+
+// Server-side RDKit Reaction Prediction (runs off the browser main thread with LRU caching)
+app.post('/api/predictor/well', async (req, res) => {
+  try {
+    const { substrates, condition, options } = req.body || {};
+    if (!Array.isArray(substrates) || !condition) {
+      res.status(400).json({ error: 'Missing substrates or condition.' });
+      return;
+    }
+    const cacheKey = makeWellCacheKey(substrates, condition, options);
+    const cached = serverPredCache.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, cached: true, result: cached });
+      return;
+    }
+    const rdkit = await getServerRdkit();
+    const result = predictWellReactions(rdkit, substrates, condition, options || {});
+    if (serverPredCache.size >= MAX_SERVER_PRED_CACHE) {
+      const oldest = serverPredCache.keys().next().value;
+      if (oldest !== undefined) serverPredCache.delete(oldest);
+    }
+    serverPredCache.set(cacheKey, result);
+    res.json({ success: true, cached: false, result });
+  } catch (err: any) {
+    console.error('Server predictor /well error:', err);
+    res.status(500).json({ error: cleanErrorMessage(err) });
+  }
+});
+
+app.post('/api/predictor/plate', async (req, res) => {
+  try {
+    const { wells, options } = req.body || {};
+    if (!Array.isArray(wells) || wells.length === 0 || wells.length > 60) {
+      res.status(400).json({ error: 'Provide between 1 and 60 wells.' });
+      return;
+    }
+    const rdkit = await getServerRdkit();
+    const results: Record<string, WellPredictionResult> = {};
+    let cacheHits = 0;
+
+    for (const w of wells) {
+      if (!w || typeof w.key !== 'string' || !Array.isArray(w.substrates) || !w.condition) continue;
+      const validSubs = w.substrates.filter((s: any) => typeof s?.smiles === 'string' && s.smiles.trim().length > 0);
+      if (validSubs.length === 0) continue;
+      const cacheKey = makeWellCacheKey(validSubs, w.condition, options);
+      const hit = serverPredCache.get(cacheKey);
+      if (hit) {
+        results[w.key] = hit;
+        cacheHits++;
+      } else {
+        const pred = predictWellReactions(rdkit, validSubs, w.condition, options || {});
+        if (serverPredCache.size >= MAX_SERVER_PRED_CACHE) {
+          const oldest = serverPredCache.keys().next().value;
+          if (oldest !== undefined) serverPredCache.delete(oldest);
+        }
+        serverPredCache.set(cacheKey, pred);
+        results[w.key] = pred;
+      }
+    }
+
+    res.json({ success: true, count: Object.keys(results).length, cacheHits, results });
+  } catch (err: any) {
+    console.error('Server predictor /plate error:', err);
+    res.status(500).json({ error: cleanErrorMessage(err) });
+  }
+});
+
+app.get('/api/predictor/tlc-feedback', (_req, res) => {
+  res.json({
+    success: true,
+    totalObservations: tlcFeedbackStore.length,
+    ruleStats: summarizeRuleFeedback(),
+  });
+});
+
+app.post('/api/predictor/tlc-feedback', (req, res) => {
+  try {
+    const { wellKey, ruleIds, observedNewSpot, solventSystem, measuredRf } = req.body || {};
+    if (typeof wellKey !== 'string' || !Array.isArray(ruleIds)) {
+      res.status(400).json({ error: 'Missing wellKey or ruleIds.' });
+      return;
+    }
+    const entry: TlcFeedbackEntry = {
+      timestamp: new Date().toISOString(),
+      wellKey,
+      ruleIds: ruleIds.filter((r: any) => typeof r === 'string').slice(0, 12),
+      observedNewSpot: Boolean(observedNewSpot),
+      ...(typeof solventSystem === 'string' && solventSystem.trim() ? { solventSystem: solventSystem.trim() } : {}),
+      ...(Number.isFinite(Number(measuredRf)) ? { measuredRf: Number(measuredRf) } : {}),
+    };
+    tlcFeedbackStore.push(entry);
+    saveTlcFeedback();
+    res.json({
+      success: true,
+      totalObservations: tlcFeedbackStore.length,
+      ruleStats: summarizeRuleFeedback(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: cleanErrorMessage(err) });
+  }
 });
 
 // 1. AI HTE Campaign Synthesis Report Generator (Option 5)

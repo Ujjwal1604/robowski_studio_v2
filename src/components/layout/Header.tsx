@@ -1,8 +1,49 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { RefreshCw, Server } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 
 export const Header: React.FC = () => {
-  const { state, setPath, view, setView, toggleTheme, theme, draftSavedAt } = useApp();
+  const {
+    state,
+    setPath,
+    view,
+    setView,
+    toggleTheme,
+    theme,
+    draftSavedAt,
+    backendUrl,
+    backendStatus,
+    backendPanelOpen,
+    setBackendPanelOpen,
+    backendSyncing,
+    connectBackend,
+    disconnectBackend,
+    syncWithBackend,
+    toast,
+  } = useApp();
+
+  const [urlDraft, setUrlDraft] = useState<string>(() => backendUrl || 'http://localhost:8000');
+  const [testing, setTesting] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (backendUrl) setUrlDraft(backendUrl);
+  }, [backendUrl]);
+
+  const handleTestAndSave = async () => {
+    const trimmed = urlDraft.trim();
+    if (!trimmed) {
+      toast('Enter your Lab PC server address first (e.g. http://localhost:8000).');
+      return;
+    }
+    setTesting(true);
+    const st = await connectBackend(trimmed);
+    setTesting(false);
+    if (st.connected) {
+      setUrlDraft(st.url);
+    }
+  };
+
+  const isConnected = Boolean(backendStatus?.connected && backendUrl);
 
   return (
     <div className="top">
@@ -96,6 +137,35 @@ export const Header: React.FC = () => {
             </kbd>
           </button>
 
+          {/* Whole-App Personal Lab PC Backend Button */}
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => setBackendPanelOpen((v) => !v)}
+            title="Connect your personal lab PC backend (syncs runs, reagent library, TLC photos, Excel ELN structures, and 3D RDKit predictor)"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '4px 10px',
+              fontSize: '11.5px',
+              borderColor: isConnected
+                ? 'color-mix(in srgb, var(--ok) 55%, var(--line))'
+                : undefined,
+              color: isConnected ? 'var(--ok)' : undefined,
+            }}
+          >
+            <span
+              className="hdot"
+              style={{
+                background: isConnected ? '#1F9D6B' : '#AEB5AC',
+                marginRight: 0,
+              }}
+            />
+            <Server size={12} />
+            <span>{isConnected ? 'Lab PC' : 'Lab PC'}</span>
+          </button>
+
           <button
             type="button"
             className={`runsl ${view === 'compare' ? 'on' : ''}`}
@@ -116,7 +186,7 @@ export const Header: React.FC = () => {
           <div className="rname">
             <div>{state.name}</div>
             <div className="hint" style={{ margin: 0 }}>
-              {state.id ? 'Saved run' : 'Draft'} · this browser
+              {state.id ? 'Saved run' : 'Draft'} · {isConnected ? 'Lab PC synced' : 'this browser'}
               {draftSavedAt ? <span className="dsave"> · saved</span> : ''}
             </div>
           </div>
@@ -142,6 +212,128 @@ export const Header: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {backendPanelOpen && (
+        <div
+          style={{
+            borderTop: '1px solid var(--line2)',
+            background: 'var(--panel)',
+            padding: '12px 20px',
+          }}
+        >
+          <div
+            style={{
+              maxWidth: '1320px',
+              margin: '0 auto',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '8px',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+              <div style={{ fontSize: '12.5px', color: 'var(--fg2)' }}>
+                <strong>Personal Lab PC Backend:</strong> Syncs all your runs, ELN notes, reagent library, and TLC plate photos across PCs, exports Excel ELNs with 2D structures, and upgrades the predictor with 3D RDKit. Automatically falls back when your PC is off.
+              </div>
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => setBackendPanelOpen(false)}
+                style={{ padding: '2px 8px', fontSize: '11px' }}
+              >
+                Close
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <input
+                type="url"
+                value={urlDraft}
+                onChange={(e) => setUrlDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleTestAndSave();
+                }}
+                placeholder="http://localhost:8000 or https://....trycloudflare.com"
+                className="mono"
+                style={{
+                  flex: '1 1 280px',
+                  minWidth: '220px',
+                  height: '32px',
+                  padding: '0 10px',
+                  borderRadius: '6px',
+                  border: '1px solid var(--line)',
+                  background: 'var(--bg)',
+                  color: 'var(--fg)',
+                  fontSize: '12px',
+                }}
+              />
+              <button
+                type="button"
+                className="btn sm pri"
+                disabled={testing}
+                onClick={handleTestAndSave}
+              >
+                {testing ? 'Connecting…' : 'Test & Save'}
+              </button>
+              {isConnected && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={backendSyncing}
+                  onClick={() => syncWithBackend()}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                >
+                  <RefreshCw size={12} />
+                  <span>{backendSyncing ? 'Syncing…' : 'Sync Now'}</span>
+                </button>
+              )}
+              {backendUrl && (
+                <button type="button" className="btn sm" onClick={disconnectBackend}>
+                  Disconnect
+                </button>
+              )}
+            </div>
+
+            {backendStatus && (
+              <div
+                style={{
+                  fontSize: '12px',
+                  color: backendStatus.connected ? 'var(--ok)' : 'var(--warn)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px',
+                  flexWrap: 'wrap',
+                }}
+              >
+                {backendStatus.connected ? (
+                  <>
+                    <span>
+                      Connected · RDKit {backendStatus.rdkitVersion} · {backendStatus.runsCount ?? 0} runs ·{' '}
+                      {backendStatus.libraryCount ?? 0} reagents · {backendStatus.tlcImagesCount ?? 0} TLC photos ·{' '}
+                      {backendStatus.tlcObservations ?? 0} TLC checks
+                    </span>
+                    <a
+                      href={`${backendStatus.url}/api/tlc/export.csv`}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: 'var(--acc)', textDecoration: 'underline' }}
+                    >
+                      Download TLC History CSV
+                    </a>
+                  </>
+                ) : (
+                  <span>{backendStatus.error || 'Lab PC server not reachable — using local browser storage.'}</span>
+                )}
+              </div>
+            )}
+
+            <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
+              On your personal lab PC inside <span className="mono">python_backend/</span>, run:{' '}
+              <span className="mono">uv run app.py</span> · To access from the public robot PC (or HTTPS), also run:{' '}
+              <span className="mono">cloudflared tunnel --url http://127.0.0.1:8000</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -41,6 +41,7 @@ import {
 } from '../../engine';
 import { AiSynthesisReport } from '../ui/AiSynthesisReport';
 import { WellTlcPreview } from '../ui/WellTlcPreview';
+import { buildExportFilename } from '../../utils/exportFilename';
 
 const PLATE_SIZE = 54;
 const ROWS = 6;
@@ -96,10 +97,6 @@ function downloadBlob(filename: string, data: BlobPart, type: string) {
   el.click();
   el.remove();
   setTimeout(() => URL.revokeObjectURL(url), 4000);
-}
-
-function safeSlug(name: string): string {
-  return (name || 'robowski_run').replace(/[^A-Za-z0-9_-]+/g, '_');
 }
 
 export const ElnView: React.FC = () => {
@@ -474,7 +471,11 @@ export const ElnView: React.FC = () => {
   const handleExportCsv = () => {
     try {
       const csv = elnObservationsCsv(state, run, tlcSets, triMeta);
-      downloadBlob(`${safeSlug(state.name)}_eln_observations.csv`, csv, 'text/csv;charset=utf-8');
+      downloadBlob(
+        buildExportFilename(state.name || run?.runName, 'eln_observations', 'csv'),
+        csv,
+        'text/csv;charset=utf-8'
+      );
       toast('Exported ELN observations spreadsheet (.csv).');
     } catch (e: any) {
       toast('Could not export CSV: ' + e.message);
@@ -485,7 +486,7 @@ export const ElnView: React.FC = () => {
     try {
       const bytes = elnObservationsXlsxBytes(state, run, tlcSets, triMeta);
       downloadBlob(
-        `${safeSlug(state.name)}_eln_observations.xlsx`,
+        buildExportFilename(state.name || run?.runName, 'eln_observations', 'xlsx'),
         bytes as BlobPart,
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       );
@@ -493,6 +494,22 @@ export const ElnView: React.FC = () => {
     } catch (e: any) {
       toast('Could not export XLSX: ' + e.message);
     }
+  };
+
+  const handlePrintEln = () => {
+    const prevTitle = document.title;
+    const printTitle = buildExportFilename(state.name || run?.runName, 'eln_report', 'pdf').replace(/\.pdf$/i, '');
+    document.title = printTitle;
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      document.title = prevTitle;
+      window.removeEventListener('afterprint', restore);
+    };
+    window.addEventListener('afterprint', restore, { once: true });
+    window.print();
+    setTimeout(restore, 1000);
   };
 
   // Import Spreadsheet handler
@@ -2581,7 +2598,7 @@ export const ElnView: React.FC = () => {
               <button
                 type="button"
                 className="btn sm"
-                onClick={() => window.print()}
+                onClick={handlePrintEln}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                 title="Print current ELN view via browser print dialog"
               >

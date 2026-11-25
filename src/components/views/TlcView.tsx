@@ -6,6 +6,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { getSpotConfidenceStyle } from '../../utils/spotConfidence';
+import { buildExportFilename } from '../../utils/exportFilename';
 import {
   LANE_FRAME_WIDTH,
   tlcLane,
@@ -2508,11 +2509,9 @@ export const TlcView: React.FC = () => {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      const baseName = (run?.runName || currentSet.name || 'tlc_plate')
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]/g, '_');
+      const runTitle = state.name || run?.runName || currentSet.name || 'tlc_plate';
       const scopeSuffix = scope === 'all' ? `plate_${plate + 1}_all_sets` : `plate_${plate + 1}`;
-      a.download = `tlc_analysis_${baseName}_${scopeSuffix}.${ext}`;
+      a.download = buildExportFilename(runTitle, `tlc_analysis_${scopeSuffix}`, ext);
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -2831,7 +2830,12 @@ export const TlcView: React.FC = () => {
       const a = document.createElement('a');
       a.href = url;
       const plateTag = selectablePlatesCount > 1 ? `_plate_${plate + 1}` : '';
-      a.download = `lane_config_${currentSet.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}${plateTag}_corrected.csv`;
+      const runTitle = state.name || run?.runName || currentSet.name;
+      a.download = buildExportFilename(
+        runTitle,
+        `lane_config_${currentSet.name}${plateTag}_corrected`,
+        'csv'
+      );
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -2840,7 +2844,7 @@ export const TlcView: React.FC = () => {
     } catch (err: any) {
       toast('Error exporting lane CSV: ' + err.message);
     }
-  }, [activePlateSet.cfg, selectablePlatesCount, plate, currentSet.name, toast]);
+  }, [activePlateSet.cfg, selectablePlatesCount, plate, state.name, run?.runName, currentSet.name, toast]);
 
   // Stable memoized props for TlcFullPlateView (prevents redundant 54-lane recomputes on CSS filter / UI renders)
   const fullPlateGetProfile = useCallback(

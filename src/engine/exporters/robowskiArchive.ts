@@ -93,8 +93,9 @@ export async function buildRobowskiArchive(
   // Strip non-serializable ImageBitmap instances from TLC sets (preserving all per-plate plateData)
   const serializableSets = tlcSets.map((s) => serializeTlcSet(s));
 
-  const wbBytes = workbookBytes({}, run);
-  const benchHtml = benchSheetHtml(run, localDate());
+  const exportDate = localDate();
+  const wbBytes = workbookBytes({ state, exportDate }, run);
+  const benchHtml = benchSheetHtml(run, exportDate);
   const stCsv = stockCsv(run, stockSteps(run));
   const dkCsv = loadCsv(deckSteps(run));
   const tlcMap = tlcLaneCsv(run);

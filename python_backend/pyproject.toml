@@ -1,0 +1,15 @@
+[project]
+name = "robowski-studio-backend"
+version = "2.0.0"
+description = "Whole-app personal lab PC Python backend for Robowski Studio (Runs, Library, TLC Photos, Illustrated Excel ELN, and Full 3D RDKit)"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn[standard]>=0.30.0,<1.0.0",
+    "pydantic>=2.7.0,<3.0.0",
+    "python-multipart>=0.0.9,<1.0.0",
+    "rdkit>=2024.3.1",
+    "openpyxl>=3.1.2,<4.0.0",
+    "pillow>=10.0.0,<12.0.0",
+    "numpy>=1.26.0,<3.0.0",
+]

@@ -3644,8 +3644,18 @@ export const AiSolventAdvisorModal: React.FC<AiSolventAdvisorModalProps> = ({
                                   </div>
                                 )}
                                 {spot.uvActive === false && (
+                                  <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center', fontWeight: 600 }}>
+                                    {spot.tlcVisibility?.stainTip || 'No UV 254 nm — dip in KMnO₄ or I₂ stain'}
+                                  </div>
+                                )}
+                                {spot.uvActive !== false && spot.tlcVisibility?.uv366Likely && (
+                                  <div style={{ fontSize: '10px', color: 'var(--accent)', textAlign: 'center' }}>
+                                    UV 254 + likely fluorescent at 366 nm
+                                  </div>
+                                )}
+                                {spot.uvActive !== false && spot.tlcVisibility?.uv254 === 'weak' && spot.tlcVisibility?.stainTip && (
                                   <div style={{ fontSize: '10px', color: 'var(--warn)', textAlign: 'center' }}>
-                                    No chromophore: not visible under UV, use a stain
+                                    {spot.tlcVisibility.stainTip}
                                   </div>
                                 )}
                                 {spot.mayDecompose && (

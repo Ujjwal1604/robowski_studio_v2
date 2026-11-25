@@ -55,6 +55,30 @@ describe('Exporters & Safety', () => {
     ]);
   });
 
+  it('writes temperature_C (including 0°C) and export date to description and robowski_meta sheets', () => {
+    const run = buildRun({
+      vialVolume: 500,
+      threshold: 50,
+      dilutionFactor: 5,
+      reactionSolvent: 'ethanol',
+      temperatureC: 0,
+      leftoverMl: 2,
+      reagents: [
+        { code: 'R1', stock: 100, min: 20, step: 1, max: 20 },
+        { code: 'R2', stock: 100, min: 20, step: 1, max: 20 },
+      ],
+    });
+
+    const sheets = workbookSheets(run, { exportDate: '2026-11-25' });
+    const desc = sheets.find((s) => s.name === 'description')!;
+    const meta = sheets.find((s) => s.name === 'robowski_meta')!;
+
+    expect(desc.rows[0].slice(-2)).toEqual(['temperature_C', 'date']);
+    expect(desc.rows[1].slice(-2)).toEqual([0, '2026-11-25']);
+    expect(meta.rows).toContainEqual(['temperature_C', 0]);
+    expect(meta.rows).toContainEqual(['export_date', '2026-11-25']);
+  });
+
   it('generates non-empty ZIP bytes for Excel workbook package', () => {
     const run = buildRun({
       vialVolume: 500,

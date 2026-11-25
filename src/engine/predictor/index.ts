@@ -10,5 +10,9 @@ export * from './solventSystemModel';
 export * from './tlcCalibration';
 export * from './pathwayGrouping';
 export * from './molQueries';
+export * from './rdkitGraph';
+export * from './tlcVisibility';
 export * from './lcmsTargets';
 export * from './bondHighlight';
+export * from './backendClient';
+

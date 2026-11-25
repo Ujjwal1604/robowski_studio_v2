@@ -1,6 +1,12 @@
 // Robowski Studio - TLC IndexedDB Image Store
 // Stores high-resolution plate images keyed by Set UID and Channel (UV254, UV366, White)
 // Fails soft if IndexedDB is unavailable or blocked (e.g., private browsing mode).
+import {
+  deleteBackendTlcImage,
+  downloadBackendTlcImage,
+  getPythonBackendUrl,
+  uploadBackendTlcImage,
+} from '../engine/predictor/backendClient';
 
 let tlcDbPromise: Promise<IDBDatabase | null> | null = null;
 
@@ -69,6 +75,9 @@ export async function putTlcImage(
   const res = await runTlcDbTx('readwrite', (store) =>
     store.put({ name, blob }, `${uid}/${key}`)
   );
+  if (getPythonBackendUrl()) {
+    void uploadBackendTlcImage(uid, key, name, blob);
+  }
   return res !== null;
 }
 
@@ -79,13 +88,26 @@ export async function getTlcImage(
   const res = await runTlcDbTx<{ name: string; blob: Blob }>('readonly', (store) =>
     store.get(`${uid}/${key}`)
   );
-  return res || null;
+  if (res) return res;
+  if (getPythonBackendUrl()) {
+    const remote = await downloadBackendTlcImage(uid, key);
+    if (remote) {
+      await runTlcDbTx('readwrite', (store) => store.put(remote, `${uid}/${key}`));
+      return remote;
+    }
+  }
+  return null;
 }
 
 export async function deleteTlcSetImages(uid: string, keys: string[]): Promise<void> {
   await runTlcDbTx('readwrite', (store) => {
     keys.forEach((k) => store.delete(`${uid}/${k}`));
   });
+  if (getPythonBackendUrl()) {
+    keys.forEach((k) => {
+      void deleteBackendTlcImage(uid, k);
+    });
+  }
 }
 
 export async function deleteAllSetImages(uid: string): Promise<void> {

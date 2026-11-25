@@ -7,6 +7,8 @@ import {
   WellConditionConfig,
 } from './types';
 import { detectHydrateStoichiometry } from '../conditions';
+import { computeLocalPkaShift } from './rdkitGraph';
+import { analyzeTlcVisibility } from './tlcVisibility';
 
 interface CounterionDef {
   smilesSet: string[];
@@ -524,17 +526,20 @@ export function parseSubstrateAndSalts(
       if (seenAnchors.has(anchorKey)) continue;
       seenAnchors.add(anchorKey);
 
-      const prev = siteByRule.get(m.rule.id);
+      const pkaShift = computeLocalPkaShift(rdkit, cleanSmiles, anchor, m.rule.id);
+      const adjustedPka = Math.round((m.rule.pka + pkaShift) * 10) / 10;
+      const groupKey = `${m.rule.id}:${adjustedPka}`;
+      const prev = siteByRule.get(groupKey);
       if (prev) {
         prev.count += 1;
         prev.atomIndices.push(...m.atoms);
       } else {
-        siteByRule.set(m.rule.id, {
+        siteByRule.set(groupKey, {
           id: m.rule.id,
           substrateCode: input.code,
           label: m.rule.label,
           kind: m.rule.kind,
-          pka: m.rule.pka,
+          pka: adjustedPka,
           atomIndices: [...m.atoms],
           count: 1,
           freeFraction: 1,
@@ -583,6 +588,7 @@ export function parseSubstrateAndSalts(
       sites: Array.from(siteByRule.values()),
       exactMass,
       formula,
+      tlcVisibility: analyzeTlcVisibility(rdkit, cleanSmiles),
       valid: true,
     };
   } catch (e: any) {

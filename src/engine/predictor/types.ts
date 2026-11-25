@@ -1,4 +1,5 @@
 // Robowski Studio - General N-Component Mechanistic Reaction Prediction Types
+import type { TlcVisibilityInfo } from './tlcVisibility';
 
 export type MediumMode = 'acid' | 'base' | 'neutral' | 'auto';
 export type EquivBasis = 'limiting' | 'total';
@@ -65,6 +66,7 @@ export interface ParsedSubstrate {
   sites: IonizableSite[];
   exactMass: number;
   formula: string;
+  tlcVisibility?: TlcVisibilityInfo;
   valid: boolean;
   error?: string;
 }
@@ -107,6 +109,11 @@ export type ChemicalAlertKind =
   | 'salt_effect'
   | 'hydrate_water'
   | 'buffered_well'
+  | 'unmodeled_reactive_group'
+  | 'uv_invisible_product'
+  | 'python_3d_strain'
+  | 'tlc_history'
+  | 'search_truncated'
   | 'blank_likely';
 
 export interface ChemicalAlert {
@@ -153,6 +160,7 @@ export interface PredictedSpecies {
   bestChain: StepEvent[];
   alternativeChains: StepEvent[][];
   mechanismSummary: string;
+  tlcVisibility?: TlcVisibilityInfo;
   alerts: ChemicalAlert[];
 }
 
@@ -186,6 +194,9 @@ export interface WellPredictionResult {
     transientCount: number;
     expansionsRun: number;
     totalSpeciesExplored: number;
+    truncated: boolean;
+    truncationReason?: 'max_expansions' | 'max_species' | null;
     elapsedMs: number;
+    pythonRefined?: boolean;
   };
 }

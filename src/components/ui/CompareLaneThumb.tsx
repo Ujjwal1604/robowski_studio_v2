@@ -14,6 +14,8 @@ import {
   tlcHalf,
   laneMatrix,
   renderFalseColorLane,
+  drawAlignedChannelImage,
+  getReferenceDimensions,
   tlcFront,
   tlcOrigin,
 } from '../../engine';
@@ -124,7 +126,10 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
     } else {
       const im = tlcSet.imgs?.[activeMode];
       if (im?.bmp) {
-        const m = laneMatrix(lane, im.bmp.width / (tlcSet.frameW || LANE_FRAME_WIDTH), k);
+        const refDim = getReferenceDimensions(tlcSet, activeMode);
+        const refW = refDim?.width ?? im.bmp.width;
+        const refH = refDim?.height ?? im.bmp.height;
+        const m = laneMatrix(lane, refW / (tlcSet.frameW || LANE_FRAME_WIDTH), k);
         const scaleX = targetW / Math.max(1, lane.width * k);
         ctx.save();
         ctx.setTransform(
@@ -135,7 +140,7 @@ export const CompareLaneThumb: React.FC<CompareLaneThumbProps> = ({
           dpr * m[4] * scaleX,
           dpr * m[5]
         );
-        ctx.drawImage(im.bmp, 0, 0);
+        drawAlignedChannelImage(ctx, tlcSet, activeMode, im.bmp, refW, refH);
         ctx.restore();
       }
     }

@@ -503,6 +503,23 @@ export interface TlcPreRunAlignment {
   mode: 'rigid-merged' | 'direct-box';
 }
 
+export type TlcChannelKey = 'UV254' | 'UV366' | 'White';
+
+export interface TlcChannelAlignment {
+  /** Horizontal scale mapping source normalized coords into reference image space */
+  sx: number;
+  /** Vertical scale mapping source normalized coords into reference image space */
+  sy: number;
+  /** Horizontal translation in reference-image fraction (x_ref = (sx * u_src + dx) * refW) */
+  dx: number;
+  /** Vertical translation in reference-image fraction (y_ref = (sy * v_src + dy) * refH) */
+  dy: number;
+  /** Normalized cross-correlation confidence (0..1) */
+  confidence: number;
+  /** Canonical reference channel this channel was registered against */
+  refChannel: TlcChannelKey;
+}
+
 export interface TlcPlateData {
   cfg: TlcLaneConfig | null;
   cfgName: string;
@@ -519,6 +536,8 @@ export interface TlcPlateData {
   originAutoByLane?: Record<number, number>;
   prof?: Record<string, number[]>;
   imgs: Record<string, TlcImageEntry>;
+  /** Automatic per-channel registration transforms aligning secondary channels (UV366/White) onto the reference channel (UV254) */
+  channelAlign?: Partial<Record<TlcChannelKey, TlcChannelAlignment>>;
   /** Optional spotted-but-undeveloped pre-run photos per channel for exact origin registration */
   preRunImgs?: Record<string, TlcImageEntry>;
   /** Whether uploaded pre-run photos are actively merged into origin detection (default true when present) */

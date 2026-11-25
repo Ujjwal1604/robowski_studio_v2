@@ -19,6 +19,9 @@ import {
   TLC_SIGNAL,
   computeFalseColorComposite,
   enhanceWhiteLightRgba,
+  channelAlignCacheSuffix,
+  drawAlignedChannelImage,
+  getReferenceDimensions,
 } from '../../engine';
 import { EdgeFit, EdgeSetting, EdgePick, edgeActive, edgeGain, edgeOffset, correctSpots, edgeSuggestion } from '../../engine/tlcEdge';
 import { TlcEdgePanel } from './TlcEdgePanel';
@@ -108,7 +111,7 @@ const hudSliderTrack: React.CSSProperties = {
   background: '#334155',
 };
 
-export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
+export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = React.memo(({
   currentSet,
   activeChannel,
   onSelectChannel,
@@ -143,12 +146,18 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   onToggleBoostWhiteSpots,
   automiddleEnabled = false,
 }) => {
+  const baseCanvasRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const mousePosRef = useRef<{ x: number; y: number } | null>(null);
+  const hoveredLaneIdRef = useRef<number | null>(null);
+  const hoveredSpotRef = useRef<{ laneId: number; spotIndex: number } | null>(null);
+  const dragRafRef = useRef<number | null>(null);
+  const pendingLanePatchRef = useRef<{ laneId: number; patch: Partial<TlcLane> } | null>(null);
 
   const [hoveredLaneId, setHoveredLaneId] = useState<number | null>(null);
   const [selectedLaneId, setSelectedLaneId] = useState<number | null>(0);
-  const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
   // Preview of the edge-effect correction: re-stretch the photo so same-compound spots line up
   const [straighten, setStraighten] = useState(false);
   // Hovering a confidence category button highlights all matching auto spots across the plate
@@ -204,6 +213,14 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   // Offscreen canvas cache for false-color composite & boosted White-light view
   const compositeCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositeCacheKeyRef = useRef<string>('');
+  const compositeRawRef = useRef<{
+    key: string;
+    w: number;
+    h: number;
+    d254: Uint8ClampedArray | null;
+    d366: Uint8ClampedArray | null;
+    dWhite: Uint8ClampedArray | null;
+  } | null>(null);
   const whiteBoostCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const whiteBoostCacheKeyRef = useRef<string>('');
 
@@ -214,16 +231,63 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   const lanes = currentSet.cfg?.lanes || [];
   const frameW = currentSet.frameW || 3280;
 
-  // Global Plate Skew / Tilt: apply delta angle uniformly across all 54 lanes
+  // Coalesce high-frequency drag updates to one React state commit per animation frame
+  const onUpdateLaneRef = useRef(onUpdateLane);
+  onUpdateLaneRef.current = onUpdateLane;
+
+  const scheduleLanePatch = useCallback((laneId: number, patch: Partial<TlcLane>) => {
+    pendingLanePatchRef.current = { laneId, patch };
+    if (dragRafRef.current === null) {
+      dragRafRef.current = window.requestAnimationFrame(() => {
+        dragRafRef.current = null;
+        const pending = pendingLanePatchRef.current;
+        pendingLanePatchRef.current = null;
+        if (pending && onUpdateLaneRef.current) {
+          onUpdateLaneRef.current(pending.laneId, pending.patch);
+        }
+      });
+    }
+  }, []);
+
+  const flushPendingLanePatch = useCallback(() => {
+    if (dragRafRef.current !== null) {
+      window.cancelAnimationFrame(dragRafRef.current);
+      dragRafRef.current = null;
+    }
+    const pending = pendingLanePatchRef.current;
+    pendingLanePatchRef.current = null;
+    if (pending && onUpdateLaneRef.current) {
+      onUpdateLaneRef.current(pending.laneId, pending.patch);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (dragRafRef.current !== null) {
+        window.cancelAnimationFrame(dragRafRef.current);
+        dragRafRef.current = null;
+      }
+    };
+  }, []);
+
+  // Global Plate Skew / Tilt: apply delta angle uniformly across all 54 lanes in one atomic batch
   const handleApplyGlobalSkew = useCallback(
     (deltaDeg: number) => {
+      if (onUpdateLanesBatch) {
+        const patches: Record<number, Partial<TlcLane>> = {};
+        for (const l of lanes) {
+          patches[l.id] = { angle: +(l.angle + deltaDeg).toFixed(2) };
+        }
+        onUpdateLanesBatch(patches);
+        return;
+      }
       if (!onUpdateLane) return;
       if (onSnapshotHistory) onSnapshotHistory();
       lanes.forEach((l) => {
         onUpdateLane(l.id, { angle: +(l.angle + deltaDeg).toFixed(2) });
       });
     },
-    [lanes, onUpdateLane, onSnapshotHistory]
+    [lanes, onUpdateLanesBatch, onUpdateLane, onSnapshotHistory]
   );
 
   // Selected lane object
@@ -463,88 +527,123 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     [currentSet, getProfile, getCanonicalSpots, spotProminence, edgeFits, edgeSettings]
   );
 
-  // Render Full Plate Canvas (clears context, resets transform, and ensures leak-free drawing)
+  // Layer 1 (Base Canvas): renders ONLY the static plate photograph / display-resolution False-Color Composite /
+  // Boosted White / Straightened preview. Never re-runs on lane hover, selection, spot edits, or CSS filter sliders.
+  const straightSetDep = straighten ? currentSet : null;
+  const straightLanesDep = straighten ? lanes : null;
+  const straightEdgeFitsDep = straighten ? edgeFits : null;
+  const straightEdgeSettingsDep = straighten ? edgeSettings : null;
+  const straightGetProfileDep = straighten ? getProfile : null;
+
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const baseCanvas = baseCanvasRef.current;
+    if (!baseCanvas) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const bCtx = baseCanvas.getContext('2d');
+    if (!bCtx) return;
 
-    // 1. Always reset any lingering transform to identity and clear the entire backing buffer
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    bCtx.setTransform(1, 0, 0, 1, 0, 0);
+    bCtx.clearRect(0, 0, baseCanvas.width, baseCanvas.height);
 
     if (!imgEntry?.bmp) {
       compositeCacheKeyRef.current = '';
+      compositeRawRef.current = null;
       return;
     }
 
     const bmp = imgEntry.bmp;
+    const refDim = getReferenceDimensions(
+      currentSet,
+      isComposite ? undefined : (activeChannel as TlcChannelKey)
+    );
+    const refW = refDim?.width ?? bmp.width;
+    const refH = refDim?.height ?? bmp.height;
     const maxDisplayW = Math.min(1200, containerRef.current?.clientWidth || 1000);
-    const scale = maxDisplayW / bmp.width;
-    const displayH = Math.round(bmp.height * scale);
+    const scale = maxDisplayW / refW;
+    const displayH = Math.round(refH * scale);
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const targetW = Math.round(maxDisplayW * dpr);
     const targetH = Math.round(displayH * dpr);
 
-    // Only resize canvas backing buffer if display width or DPR actually changes
-    if (canvas.width !== targetW || canvas.height !== targetH) {
-      canvas.width = targetW;
-      canvas.height = targetH;
-      canvas.style.width = `${maxDisplayW}px`;
-      canvas.style.height = `${displayH}px`;
-      // Resizing canvas resets 2D context; ensure transform is clean
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (baseCanvas.width !== targetW || baseCanvas.height !== targetH) {
+      baseCanvas.width = targetW;
+      baseCanvas.height = targetH;
+      baseCanvas.style.width = `${maxDisplayW}px`;
+      baseCanvas.style.height = `${displayH}px`;
+      bCtx.setTransform(1, 0, 0, 1, 0, 0);
+      bCtx.clearRect(0, 0, baseCanvas.width, baseCanvas.height);
     }
 
-    ctx.save();
+    bCtx.save();
     try {
-      ctx.scale(dpr * scale, dpr * scale);
+      bCtx.scale(dpr * scale, dpr * scale);
 
-      // Draw full plate bitmap using unified multi-channel False-Color Composite (matches Lane Details Composite)
+      // Draw full plate bitmap using unified multi-channel False-Color Composite at display resolution
       if (isComposite && hasCompositeChannels(currentSet.imgs, true)) {
         const bmp254 = currentSet.imgs.UV254?.bmp;
         const bmp366 = currentSet.imgs.UV366?.bmp;
         const bmpWhite = currentSet.imgs.White?.bmp;
-        const refBmp = bmp254 || bmp366 || bmpWhite || bmp;
-        const w = refBmp.width;
-        const h = refBmp.height;
-        const cacheKey = `${currentSet.uid}_fc_${w}_${h}_${Boolean(bmp254)}_${Boolean(bmp366)}_${Boolean(bmpWhite)}_${fluoGain.toFixed(2)}`;
+        const compW = Math.min(refW, Math.min(1800, Math.max(1200, targetW)));
+        const compH = Math.max(1, Math.round((refH * compW) / refW));
+        const alignSuffix = channelAlignCacheSuffix(currentSet, ['UV254', 'UV366', 'White']);
+        const rawKey = `${currentSet.uid}_raw_${compW}_${compH}_${currentSet.imgs.UV254?.name || ''}_${currentSet.imgs.UV366?.name || ''}_${currentSet.imgs.White?.name || ''}_${Boolean(bmp254)}_${Boolean(bmp366)}_${Boolean(bmpWhite)}_${alignSuffix}`;
+        const cacheKey = `${rawKey}_g${fluoGain.toFixed(2)}`;
 
         if (compositeCacheKeyRef.current !== cacheKey || !compositeCacheCanvasRef.current) {
           if (!compositeCacheCanvasRef.current) {
             compositeCacheCanvasRef.current = document.createElement('canvas');
           }
           const cCanvas = compositeCacheCanvasRef.current;
-          cCanvas.width = w;
-          cCanvas.height = h;
-          const cCtx = cCanvas.getContext('2d');
+          if (cCanvas.width !== compW || cCanvas.height !== compH) {
+            cCanvas.width = compW;
+            cCanvas.height = compH;
+          }
+          const cCtx = cCanvas.getContext('2d', { willReadFrequently: true });
           if (cCtx) {
-            const readBmpBytes = (b: ImageBitmap | undefined): Uint8ClampedArray | null => {
-              if (!b) return null;
-              cCtx.clearRect(0, 0, w, h);
-              cCtx.drawImage(b, 0, 0, w, h);
-              return cCtx.getImageData(0, 0, w, h).data;
-            };
-            const d254 = readBmpBytes(bmp254);
-            const d366 = readBmpBytes(bmp366);
-            const dWhite = readBmpBytes(bmpWhite);
+            let raw = compositeRawRef.current;
+            if (!raw || raw.key !== rawKey) {
+              const readBmpBytes = (
+                b: ImageBitmap | undefined,
+                chKey: TlcChannelKey
+              ): Uint8ClampedArray | null => {
+                if (!b) return null;
+                cCtx.setTransform(1, 0, 0, 1, 0, 0);
+                cCtx.fillStyle =
+                  chKey === 'White' ? '#ffffff' : chKey === 'UV254' ? '#00ff00' : '#000000';
+                cCtx.fillRect(0, 0, compW, compH);
+                drawAlignedChannelImage(cCtx, currentSet, chKey, b, compW, compH);
+                return cCtx.getImageData(0, 0, compW, compH).data;
+              };
+              raw = {
+                key: rawKey,
+                w: compW,
+                h: compH,
+                d254: readBmpBytes(bmp254, 'UV254'),
+                d366: readBmpBytes(bmp366, 'UV366'),
+                dWhite: readBmpBytes(bmpWhite, 'White'),
+              };
+              compositeRawRef.current = raw;
+            }
 
-            const fcData = computeFalseColorComposite(d254, d366, w, h, fluoGain, dWhite);
-            const outImg = cCtx.createImageData(w, h);
+            const fcData = computeFalseColorComposite(
+              raw.d254,
+              raw.d366,
+              compW,
+              compH,
+              fluoGain,
+              raw.dWhite
+            );
+            const outImg = cCtx.createImageData(compW, compH);
             outImg.data.set(fcData);
             cCtx.putImageData(outImg, 0, 0);
             compositeCacheKeyRef.current = cacheKey;
           }
         }
         if (compositeCacheCanvasRef.current) {
-          ctx.drawImage(compositeCacheCanvasRef.current, 0, 0);
+          bCtx.drawImage(compositeCacheCanvasRef.current, 0, 0, refW, refH);
         }
       } else if (activeChannel === 'White' && boostWhiteSpots) {
-        compositeCacheKeyRef.current = '';
         const wbW = Math.min(bmp.width, 1600);
         const wbH = Math.max(1, Math.round((bmp.height * wbW) / bmp.width));
         const wbKey = `${currentSet.uid}_wb_${imgEntry.name}_${wbW}_${wbH}`;
@@ -567,81 +666,148 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
             whiteBoostCacheKeyRef.current = wbKey;
           }
         }
-        if (whiteBoostCacheCanvasRef.current) {
-          ctx.drawImage(whiteBoostCacheCanvasRef.current, 0, 0, bmp.width, bmp.height);
-        } else {
-          ctx.drawImage(bmp, 0, 0);
-        }
+        bCtx.fillStyle = '#000000';
+        bCtx.fillRect(0, 0, refW, refH);
+        drawAlignedChannelImage(
+          bCtx,
+          currentSet,
+          'White',
+          whiteBoostCacheCanvasRef.current || bmp,
+          refW,
+          refH
+        );
       } else {
-        compositeCacheKeyRef.current = '';
-        ctx.drawImage(bmp, 0, 0);
+        bCtx.fillStyle = '#000000';
+        bCtx.fillRect(0, 0, refW, refH);
+        drawAlignedChannelImage(bCtx, currentSet, activeChannel as TlcChannelKey, bmp, refW, refH);
       }
 
-    const imgScale = bmp.width / frameW;
+      const imgScale = refW / frameW;
 
-    // Straightened preview: each half of the plate is re-stretched strip by strip about its origin
-    // line, dividing the distance run by g(x). A spot at h*g(x) lands at h, so spots of one compound
-    // line up in a row when the correction is right.
-    const straightHalf = [0, 1].map((h) => {
-      const fit = edgeFits ? edgeFits[h] : null;
-      const st = edgeSettings ? edgeSettings[h] : null;
-      return straighten && fit && st && edgeActive(fit, st) ? { fit, strength: st.strength } : null;
-    });
-    if (straightHalf.some(Boolean)) {
-      const k = dpr * scale; // canvas px per image px
-      const src = document.createElement('canvas');
-      src.width = canvas.width;
-      src.height = canvas.height;
-      const sctx = src.getContext('2d');
-      if (sctx) {
-        sctx.drawImage(canvas, 0, 0);
-        [0, 1].forEach((h) => {
-          const sh = straightHalf[h];
-          if (!sh) return;
-          const hl = lanes.filter((l) => (l.id < 27 ? 0 : 1) === h);
-          if (!hl.length) return;
-          const xs = hl.map((l) => l.x0);
-          const xLo = Math.min(...xs);
-          const xHi = Math.max(...xs);
-          // origin line (image px) of the lane nearest to a strip, and the run direction
-          const originOf = (l: TlcLane) => {
-            const th = (l.angle * Math.PI) / 180;
-            const o = tlcOrigin(currentSet, l, getProfile as any);
-            return { y: (l.y0 - o * Math.cos(th)) * imgScale, up: Math.cos(th) > 0, len: l.length * imgScale };
-          };
-          const strip = 4; // image px
-          const x0px = (xLo - 70) * imgScale;
-          const x1px = (xHi + 70) * imgScale;
-          for (let xp = Math.max(0, x0px); xp < Math.min(bmp.width, x1px); xp += strip) {
-            const xf = (xp + strip / 2) / imgScale;
-            const near = hl.reduce((a, b) => (Math.abs(b.x0 - xf) < Math.abs(a.x0 - xf) ? b : a));
-            const { y: oy, up, len } = originOf(near);
-            const xc = Math.min(xHi, Math.max(xLo, xf));
-            const g = edgeGain(sh.fit, xc, sh.strength);
-            const bOff = edgeOffset(sh.fit, xc, sh.strength);
-            if (!(g > 0) || (Math.abs(g - 1) < 1e-4 && Math.abs(bOff) < 1e-4)) continue;
-            const spanPx = Math.max(1, tlcFront(currentSet, near, getProfile) - tlcOrigin(currentSet, near, getProfile as any)) * imgScale;
-            const offPx = bOff * spanPx; // additive part, image px toward the front
-            // A spot at distance t from the origin line in the corrected photo comes from distance
-            // t*g + offset in the original. dir = +1 when the run goes down the image, -1 when up.
-            const dir = up ? -1 : 1;
-            const srcA = up ? oy - offPx - len * g : oy + offPx;
-            const srcB = up ? oy - offPx : oy + offPx + len * g;
-            const a = Math.max(0, srcA);
-            const b = Math.min(bmp.height, srcB);
-            if (b - a < 2) continue;
-            const dest = (ys: number) => oy + dir * ((dir * (ys - oy) - offPx) / g);
-            const dA = dest(a);
-            const dB = dest(b);
-            if (!(dB - dA > 0)) continue;
-            ctx.drawImage(src, xp * k, a * k, strip * k, (b - a) * k, xp, dA, strip, dB - dA);
-          }
-        });
+      // Straightened preview: each half of the plate is re-stretched strip by strip about its origin
+      // line, dividing the distance run by g(x). A spot at h*g(x) lands at h, so spots of one compound
+      // line up in a row when the correction is right.
+      const straightHalf = [0, 1].map((h) => {
+        const fit = straightEdgeFitsDep ? straightEdgeFitsDep[h] : null;
+        const st = straightEdgeSettingsDep ? straightEdgeSettingsDep[h] : null;
+        return straighten && fit && st && edgeActive(fit, st) ? { fit, strength: st.strength } : null;
+      });
+      if (straightHalf.some(Boolean) && straightLanesDep && straightSetDep) {
+        const k = dpr * scale; // canvas px per image px
+        const src = document.createElement('canvas');
+        src.width = baseCanvas.width;
+        src.height = baseCanvas.height;
+        const sctx = src.getContext('2d');
+        if (sctx) {
+          sctx.drawImage(baseCanvas, 0, 0);
+          [0, 1].forEach((h) => {
+            const sh = straightHalf[h];
+            if (!sh) return;
+            const hl = straightLanesDep.filter((l) => (l.id < 27 ? 0 : 1) === h);
+            if (!hl.length) return;
+            const xs = hl.map((l) => l.x0);
+            const xLo = Math.min(...xs);
+            const xHi = Math.max(...xs);
+            // origin line (image px) of the lane nearest to a strip, and the run direction
+            const originOf = (l: TlcLane) => {
+              const th = (l.angle * Math.PI) / 180;
+              const o = tlcOrigin(straightSetDep, l, straightGetProfileDep as any);
+              return { y: (l.y0 - o * Math.cos(th)) * imgScale, up: Math.cos(th) > 0, len: l.length * imgScale };
+            };
+            const strip = 4; // image px
+            const x0px = (xLo - 70) * imgScale;
+            const x1px = (xHi + 70) * imgScale;
+            for (let xp = Math.max(0, x0px); xp < Math.min(refW, x1px); xp += strip) {
+              const xf = (xp + strip / 2) / imgScale;
+              const near = hl.reduce((a, b) => (Math.abs(b.x0 - xf) < Math.abs(a.x0 - xf) ? b : a));
+              const { y: oy, up, len } = originOf(near);
+              const xc = Math.min(xHi, Math.max(xLo, xf));
+              const g = edgeGain(sh.fit, xc, sh.strength);
+              const bOff = edgeOffset(sh.fit, xc, sh.strength);
+              if (!(g > 0) || (Math.abs(g - 1) < 1e-4 && Math.abs(bOff) < 1e-4)) continue;
+              const spanPx = Math.max(1, tlcFront(straightSetDep, near, straightGetProfileDep || undefined) - tlcOrigin(straightSetDep, near, straightGetProfileDep as any)) * imgScale;
+              const offPx = bOff * spanPx; // additive part, image px toward the front
+              const dir = up ? -1 : 1;
+              const srcA = up ? oy - offPx - len * g : oy + offPx;
+              const srcB = up ? oy - offPx : oy + offPx + len * g;
+              const a = Math.max(0, srcA);
+              const b = Math.min(refH, srcB);
+              if (b - a < 2) continue;
+              const dest = (ys: number) => oy + dir * ((dir * (ys - oy) - offPx) / g);
+              const dA = dest(a);
+              const dB = dest(b);
+              if (!(dB - dA > 0)) continue;
+              bCtx.drawImage(src, xp * k, a * k, strip * k, (b - a) * k, xp, dA, strip, dB - dA);
+            }
+          });
+        }
       }
+    } finally {
+      bCtx.restore();
+    }
+  }, [
+    imgEntry,
+    currentSet.uid,
+    currentSet.imgs,
+    currentSet.channelAlign,
+    activeChannel,
+    isComposite,
+    fluoGain,
+    boostWhiteSpots,
+    straighten,
+    frameW,
+    straightSetDep,
+    straightLanesDep,
+    straightEdgeFitsDep,
+    straightEdgeSettingsDep,
+    straightGetProfileDep,
+  ]);
+
+  // Layer 2 (Interactive Overlay Canvas): renders ONLY crisp 2D lane boxes, origin/front lines, spot markers, and Rf badges
+  // onto a transparent canvas stacked above baseCanvasRef — zero photo re-blitting or composite blending.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!imgEntry?.bmp) {
+      return;
     }
 
-    // Draw All Lanes
-    lanes.forEach((l) => {
+    const bmp = imgEntry.bmp;
+    const refDim = getReferenceDimensions(
+      currentSet,
+      isComposite ? undefined : (activeChannel as TlcChannelKey)
+    );
+    const refW = refDim?.width ?? bmp.width;
+    const refH = refDim?.height ?? bmp.height;
+    const maxDisplayW = Math.min(1200, containerRef.current?.clientWidth || 1000);
+    const scale = maxDisplayW / refW;
+    const displayH = Math.round(refH * scale);
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const targetW = Math.round(maxDisplayW * dpr);
+    const targetH = Math.round(displayH * dpr);
+
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    ctx.save();
+    try {
+      ctx.scale(dpr * scale, dpr * scale);
+      const imgScale = refW / frameW;
+
+      // Draw All Lanes
+      lanes.forEach((l) => {
       const isSelected = l.id === selectedLaneId;
       const isHovered = l.id === hoveredLaneId && !isSelected;
 
@@ -1064,7 +1230,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     getProfile,
     showRfBadges,
     isComposite,
-    fluoGain,
     activeChannel,
     picks,
     straighten,
@@ -1074,7 +1239,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
     getLaneEffectiveSpots,
     isDraggingSpot,
     hoveredSpotInfo,
-    boostWhiteSpots,
     automiddleEnabled,
     hoveredConfidenceTier,
   ]);
@@ -1096,8 +1260,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const mouseX = clientX - rect.left;
       const mouseY = clientY - rect.top;
 
-      const scale = rect.width / imgEntry.bmp.width;
-      const imgScale = imgEntry.bmp.width / frameW;
+      const refW =
+        getReferenceDimensions(
+          currentSet,
+          isComposite ? undefined : (activeChannel as TlcChannelKey)
+        )?.width ?? imgEntry.bmp.width;
+      const scale = rect.width / refW;
+      const imgScale = refW / frameW;
 
       // Check selected lane first for responsive priority, then all lanes
       const targetLanes: TlcLane[] = [];
@@ -1146,7 +1315,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       }
       return null;
     },
-    [imgEntry, frameW, lanes, selectedLaneId, getLaneEffectiveSpots, straighten]
+    [currentSet, isComposite, activeChannel, imgEntry, frameW, lanes, selectedLaneId, getLaneEffectiveSpots, straighten]
   );
 
   // Spot management callbacks: Add, Delete, Reset, and Nudge
@@ -1324,8 +1493,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const mouseX = clientX - rect.left;
       const mouseY = clientY - rect.top;
 
-      const scale = rect.width / imgEntry.bmp.width;
-      const imgScale = imgEntry.bmp.width / frameW;
+      const refW =
+        getReferenceDimensions(
+          currentSet,
+          isComposite ? undefined : (activeChannel as TlcChannelKey)
+        )?.width ?? imgEntry.bmp.width;
+      const scale = rect.width / refW;
+      const imgScale = refW / frameW;
 
       for (const l of lanes) {
         const ox = l.x0 * imgScale * scale;
@@ -1353,20 +1527,30 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       }
       return null;
     },
-    [imgEntry, frameW, lanes]
+    [currentSet, isComposite, activeChannel, imgEntry, frameW, lanes]
   );
 
-  // Mouse Move: update hover, handle on-canvas lane drag & spot centroid drag
+  // Mouse Move: update floating tooltip via direct DOM positioning (zero React re-renders per pixel),
+  // coalesce drag updates to 1 rAF per frame, and only set hover React state when hovered lane/spot changes.
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    setMousePos({ x: e.clientX, y: e.clientY });
+    mousePosRef.current = { x: e.clientX, y: e.clientY };
+    if (tooltipRef.current) {
+      tooltipRef.current.style.left = `${e.clientX + 16}px`;
+      tooltipRef.current.style.top = `${e.clientY - 40}px`;
+    }
 
     // Handle dragging a spot along the lane trajectory
     if (isDraggingSpot && dragSpotRef.current && onUpdateLane && imgEntry?.bmp) {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
-      const scale = rect.width / imgEntry.bmp.width;
-      const imgScale = imgEntry.bmp.width / frameW;
+      const refW =
+        getReferenceDimensions(
+          currentSet,
+          isComposite ? undefined : (activeChannel as TlcChannelKey)
+        )?.width ?? imgEntry.bmp.width;
+      const scale = rect.width / refW;
+      const imgScale = refW / frameW;
       const targetLane = lanes.find((l) => l.id === dragSpotRef.current!.laneId);
       if (targetLane) {
         const th = (targetLane.angle * Math.PI) / 180;
@@ -1390,7 +1574,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
           }
           return s;
         });
-        onUpdateLane(laneId, { customSpots: updatedSpots });
+        scheduleLanePatch(laneId, { customSpots: updatedSpots });
       }
       return;
     }
@@ -1400,25 +1584,42 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
-      const scale = rect.width / imgEntry.bmp.width;
-      const imgScale = imgEntry.bmp.width / frameW;
+      const refW =
+        getReferenceDimensions(
+          currentSet,
+          isComposite ? undefined : (activeChannel as TlcChannelKey)
+        )?.width ?? imgEntry.bmp.width;
+      const scale = rect.width / refW;
+      const imgScale = refW / frameW;
 
       const deltaX = (e.clientX - dragStartRef.current.mouseX) / (scale * imgScale);
       const deltaY = (e.clientY - dragStartRef.current.mouseY) / (scale * imgScale);
 
-      onUpdateLane(selectedLane.id, {
+      scheduleLanePatch(selectedLane.id, {
         x0: Math.round(dragStartRef.current.x0 + deltaX),
         y0: Math.round(dragStartRef.current.y0 + deltaY),
       });
       return;
     }
 
-    // Hit testing for spots and lanes
+    // Hit testing for spots and lanes — only commit React state when the hovered item actually changes
     const spotHit = findSpotAtPoint(e.clientX, e.clientY);
-    setHoveredSpotInfo(spotHit);
+    const prevSpot = hoveredSpotRef.current;
+    const spotChanged =
+      (spotHit?.laneId ?? null) !== (prevSpot?.laneId ?? null) ||
+      (spotHit?.spotIndex ?? null) !== (prevSpot?.spotIndex ?? null);
+    if (spotChanged) {
+      hoveredSpotRef.current = spotHit
+        ? { laneId: spotHit.laneId, spotIndex: spotHit.spotIndex }
+        : null;
+      setHoveredSpotInfo(spotHit);
+    }
 
     const hit = findLaneAtPoint(e.clientX, e.clientY);
-    setHoveredLaneId(hit);
+    if (hit !== hoveredLaneIdRef.current) {
+      hoveredLaneIdRef.current = hit;
+      setHoveredLaneId(hit);
+    }
 
     // Update dynamic cursor
     if (canvasRef.current) {
@@ -1444,8 +1645,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const canvas = canvasRef.current;
       if (l && canvas && imgEntry?.bmp && getProfile && onPickSpot) {
         const rect = canvas.getBoundingClientRect();
-        const scale = rect.width / imgEntry.bmp.width;
-        const imgScale = imgEntry.bmp.width / frameW;
+        const refW =
+          getReferenceDimensions(
+            currentSet,
+            isComposite ? undefined : (activeChannel as TlcChannelKey)
+          )?.width ?? imgEntry.bmp.width;
+        const scale = rect.width / refW;
+        const imgScale = refW / frameW;
         const th = (l.angle * Math.PI) / 180;
         const dx = e.clientX - rect.left - l.x0 * imgScale * scale;
         const dy = e.clientY - rect.top - l.y0 * imgScale * scale;
@@ -1495,8 +1701,13 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       const target = lanes.find((l) => l.id === hit);
       if (target) {
         const rect = canvasRef.current.getBoundingClientRect();
-        const scale = rect.width / imgEntry.bmp.width;
-        const imgScale = imgEntry.bmp.width / frameW;
+        const refW =
+          getReferenceDimensions(
+            currentSet,
+            isComposite ? undefined : (activeChannel as TlcChannelKey)
+          )?.width ?? imgEntry.bmp.width;
+        const scale = rect.width / refW;
+        const imgScale = refW / frameW;
         const th = (target.angle * Math.PI) / 180;
         const dx = e.clientX - rect.left - target.x0 * imgScale * scale;
         const dy = e.clientY - rect.top - target.y0 * imgScale * scale;
@@ -1527,6 +1738,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   };
 
   const handleMouseUp = () => {
+    flushPendingLanePatch();
     setIsDragging(false);
     setIsDraggingSpot(false);
     dragStartRef.current = null;
@@ -1534,9 +1746,12 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
   };
 
   const handleMouseLeave = () => {
+    flushPendingLanePatch();
+    hoveredLaneIdRef.current = null;
+    hoveredSpotRef.current = null;
+    mousePosRef.current = null;
     setHoveredLaneId(null);
     setHoveredSpotInfo(null);
-    setMousePos(null);
     setIsDragging(false);
     setIsDraggingSpot(false);
     dragStartRef.current = null;
@@ -1655,6 +1870,50 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
 
   const frontSide0Val = tlcHalfFrontBase(currentSet, 0, sampleLaneSide0, getProfile);
   const frontSide1Val = tlcHalfFrontBase(currentSet, 1, sampleLaneSide1, getProfile);
+
+  // Smooth trailing-debounced local values for Front Side 1/2 sliders (avoids stacking full-half spot recomputes while dragging)
+  const [draftFront0, setDraftFront0] = useState<number>(frontSide0Val);
+  const [draftFront1, setDraftFront1] = useState<number>(frontSide1Val);
+  const front0TimerRef = useRef<number | null>(null);
+  const front1TimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setDraftFront0(frontSide0Val);
+  }, [frontSide0Val]);
+
+  useEffect(() => {
+    setDraftFront1(frontSide1Val);
+  }, [frontSide1Val]);
+
+  useEffect(() => {
+    return () => {
+      if (front0TimerRef.current !== null) window.clearTimeout(front0TimerRef.current);
+      if (front1TimerRef.current !== null) window.clearTimeout(front1TimerRef.current);
+    };
+  }, []);
+
+  const commitFrontSide = useCallback(
+    (side: 0 | 1, val: number) => {
+      const ref = side === 0 ? front0TimerRef : front1TimerRef;
+      if (ref.current !== null) {
+        window.clearTimeout(ref.current);
+        ref.current = null;
+      }
+      if (onUpdateSetFront) onUpdateSetFront(val, side);
+    },
+    [onUpdateSetFront]
+  );
+
+  const scheduleFrontSide = useCallback(
+    (side: 0 | 1, val: number) => {
+      if (side === 0) setDraftFront0(val);
+      else setDraftFront1(val);
+      const ref = side === 0 ? front0TimerRef : front1TimerRef;
+      if (ref.current !== null) window.clearTimeout(ref.current);
+      ref.current = window.setTimeout(() => commitFrontSide(side, val), 45);
+    },
+    [commitFrontSide]
+  );
 
   const selectedSide = selectedLane ? (selectedLane.id < 27 ? 0 : 1) : null;
 
@@ -2388,7 +2647,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     )}
                   </div>
                   <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
-                    {frontSide0Val} px
+                    {draftFront0} px
                   </span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -2397,8 +2656,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
-                      const nextVal = Math.max(50, frontSide0Val - 1);
-                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
+                      const nextVal = Math.max(50, draftFront0 - 1);
+                      setDraftFront0(nextVal);
+                      commitFrontSide(0, nextVal);
                     }}
                     title="Lower Side 1 front 1px"
                   >
@@ -2409,13 +2669,12 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     min={50}
                     max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
                     step={1}
-                    value={frontSide0Val}
+                    value={draftFront0}
                     onPointerDown={onSnapshotHistory}
                     onMouseDown={onSnapshotHistory}
-                    onChange={(e) => {
-                      const val = +e.target.value;
-                      if (onUpdateSetFront) onUpdateSetFront(val, 0);
-                    }}
+                    onChange={(e) => scheduleFrontSide(0, +e.target.value)}
+                    onPointerUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
+                    onKeyUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                     style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
                   />
                   <button
@@ -2423,8 +2682,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
-                      const nextVal = frontSide0Val + 1;
-                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 0);
+                      const nextVal = draftFront0 + 1;
+                      setDraftFront0(nextVal);
+                      commitFrontSide(0, nextVal);
                     }}
                     title="Raise Side 1 front 1px"
                   >
@@ -2445,7 +2705,7 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     )}
                   </div>
                   <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0891b2' }}>
-                    {frontSide1Val} px
+                    {draftFront1} px
                   </span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -2454,8 +2714,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
-                      const nextVal = Math.max(50, frontSide1Val - 1);
-                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
+                      const nextVal = Math.max(50, draftFront1 - 1);
+                      setDraftFront1(nextVal);
+                      commitFrontSide(1, nextVal);
                     }}
                     title="Lower Side 2 front 1px"
                   >
@@ -2466,13 +2727,12 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     min={50}
                     max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
                     step={1}
-                    value={frontSide1Val}
+                    value={draftFront1}
                     onPointerDown={onSnapshotHistory}
                     onMouseDown={onSnapshotHistory}
-                    onChange={(e) => {
-                      const val = +e.target.value;
-                      if (onUpdateSetFront) onUpdateSetFront(val, 1);
-                    }}
+                    onChange={(e) => scheduleFrontSide(1, +e.target.value)}
+                    onPointerUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
+                    onKeyUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                     style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
                   />
                   <button
@@ -2480,8 +2740,9 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     style={{ ...hudBtn, padding: '2px 6px', fontSize: '10px' }}
                     onClick={() => {
                       if (onSnapshotHistory) onSnapshotHistory();
-                      const nextVal = frontSide1Val + 1;
-                      if (onUpdateSetFront) onUpdateSetFront(nextVal, 1);
+                      const nextVal = draftFront1 + 1;
+                      setDraftFront1(nextVal);
+                      commitFrontSide(1, nextVal);
                     }}
                     title="Raise Side 2 front 1px"
                   >
@@ -3206,30 +3467,34 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>Front Side 1 (L0–26):</span>
                 <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0369a1' }}>
-                  {frontSide0Val} px
+                  {draftFront0} px
                 </span>
                 <input
                   type="range"
                   min={50}
                   max={Math.round((sampleLaneSide0?.length || 980) * 1.1)}
                   step={1}
-                  value={frontSide0Val}
-                  onChange={(e) => onUpdateSetFront(+e.target.value, 0)}
+                  value={draftFront0}
+                  onChange={(e) => scheduleFrontSide(0, +e.target.value)}
+                  onPointerUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
+                  onKeyUp={(e) => commitFrontSide(0, +(e.target as HTMLInputElement).value)}
                   style={{ ...hudSliderTrack, flex: 1, accentColor: '#38bdf8' }}
                 />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <span style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4' }}>Front Side 2 (L27–53):</span>
                 <span className="mono" style={{ fontSize: '11px', fontWeight: 700, color: '#06b6d4', background: '#0f172a', padding: '1px 5px', borderRadius: '3px', border: '1px solid #0891b2' }}>
-                  {frontSide1Val} px
+                  {draftFront1} px
                 </span>
                 <input
                   type="range"
                   min={50}
                   max={Math.round((sampleLaneSide1?.length || 980) * 1.1)}
                   step={1}
-                  value={frontSide1Val}
-                  onChange={(e) => onUpdateSetFront(+e.target.value, 1)}
+                  value={draftFront1}
+                  onChange={(e) => scheduleFrontSide(1, +e.target.value)}
+                  onPointerUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
+                  onKeyUp={(e) => commitFrontSide(1, +(e.target as HTMLInputElement).value)}
                   style={{ ...hudSliderTrack, flex: 1, accentColor: '#06b6d4' }}
                 />
               </div>
@@ -3320,14 +3585,14 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                 </button>
               </div>
 
-              {onUpdateLane && (
+              {(onUpdateLanesBatch || onUpdateLane) && (
                 <>
                   <button
                     type="button"
                     style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
                     onClick={() => {
-                      if (onSnapshotHistory) onSnapshotHistory();
-                      lanes.forEach((l) => {
+                      const patches: Record<number, Partial<TlcLane>> = {};
+                      for (const l of lanes) {
                         if (l.id >= 27) {
                           const th = (l.angle * Math.PI) / 180;
                           const endX = Math.round(l.x0 + l.length * Math.sin(th));
@@ -3336,9 +3601,17 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                           const newAngle = isOpp
                             ? +((l.angle - (l.angle > 0 ? 180 : -180))).toFixed(2)
                             : +((l.angle + 180)).toFixed(2);
-                          onUpdateLane(l.id, { x0: endX, y0: endY, angle: newAngle });
+                          patches[l.id] = { x0: endX, y0: endY, angle: newAngle };
                         }
-                      });
+                      }
+                      if (onUpdateLanesBatch) {
+                        onUpdateLanesBatch(patches);
+                      } else if (onUpdateLane) {
+                        if (onSnapshotHistory) onSnapshotHistory();
+                        for (const [idStr, patch] of Object.entries(patches)) {
+                          onUpdateLane(Number(idStr), patch);
+                        }
+                      }
                     }}
                     title="Invert migration direction of all 27 upper tier lanes"
                   >
@@ -3349,8 +3622,8 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                     type="button"
                     style={{ ...hudBtn, padding: '3px 8px', background: '#1e293b', color: '#38bdf8', borderColor: '#0284c7' }}
                     onClick={() => {
-                      if (onSnapshotHistory) onSnapshotHistory();
-                      lanes.forEach((l) => {
+                      const patches: Record<number, Partial<TlcLane>> = {};
+                      for (const l of lanes) {
                         if (l.id < 27) {
                           const th = (l.angle * Math.PI) / 180;
                           const endX = Math.round(l.x0 + l.length * Math.sin(th));
@@ -3359,9 +3632,17 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
                           const newAngle = isOpp
                             ? +((l.angle - (l.angle > 0 ? 180 : -180))).toFixed(2)
                             : +((l.angle + 180)).toFixed(2);
-                          onUpdateLane(l.id, { x0: endX, y0: endY, angle: newAngle });
+                          patches[l.id] = { x0: endX, y0: endY, angle: newAngle };
                         }
-                      });
+                      }
+                      if (onUpdateLanesBatch) {
+                        onUpdateLanesBatch(patches);
+                      } else if (onUpdateLane) {
+                        if (onSnapshotHistory) onSnapshotHistory();
+                        for (const [idStr, patch] of Object.entries(patches)) {
+                          onUpdateLane(Number(idStr), patch);
+                        }
+                      }
                     }}
                     title="Invert migration direction of all 27 lower tier lanes"
                   >
@@ -3431,31 +3712,52 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
               </button>
             </div>
           )}
-          <canvas
-            ref={canvasRef}
-            onMouseMove={handleMouseMove}
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            onDoubleClick={handleDoubleClick}
+          <div
             style={{
-              display: 'block',
+              position: 'relative',
+              display: 'inline-block',
               maxWidth: '100%',
+              lineHeight: 0,
               borderRadius: '8px',
               border: selectedLaneId !== null ? '2px solid #facc15' : '1px solid var(--line)',
               boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-              cursor: pickMode ? 'copy' : isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
-              filter: cssFilter,
+              overflow: 'hidden',
             }}
-          />
+          >
+            <canvas
+              ref={baseCanvasRef}
+              style={{
+                display: 'block',
+                maxWidth: '100%',
+                filter: cssFilter,
+              }}
+            />
+            <canvas
+              ref={canvasRef}
+              onMouseMove={handleMouseMove}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseLeave}
+              onDoubleClick={handleDoubleClick}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                display: 'block',
+                cursor: pickMode ? 'copy' : isDragging ? 'grabbing' : hoveredLaneId !== null ? 'pointer' : 'crosshair',
+              }}
+            />
+          </div>
 
-          {/* Hover Lane Floating Tooltip (shown when not dragging) */}
-          {hoveredLaneId !== null && mousePos && !isDragging && (
+          {/* Hover Lane Floating Tooltip (positioned directly via DOM ref for 0 React re-renders per mouse pixel) */}
+          {hoveredLaneId !== null && !isDragging && (
             <div
+              ref={tooltipRef}
               style={{
                 position: 'fixed',
-                left: mousePos.x + 16,
-                top: mousePos.y - 40,
+                left: (mousePosRef.current?.x ?? 0) + 16,
+                top: (mousePosRef.current?.y ?? 0) - 40,
                 zIndex: 9999,
                 background: 'rgba(15, 23, 42, 0.95)',
                 color: '#fff',
@@ -3719,4 +4021,6 @@ export const TlcFullPlateView: React.FC<TlcFullPlateViewProps> = ({
       )}
     </div>
   );
-};
+});
+
+TlcFullPlateView.displayName = 'TlcFullPlateView';

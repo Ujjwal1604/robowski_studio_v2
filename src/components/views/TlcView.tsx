@@ -58,6 +58,10 @@ import {
   exportLaneConfigCsv,
   getEffectiveLaneSpots,
   renderFalseColorLane,
+  channelAlignCacheSuffix,
+  drawAlignedChannelImage,
+  getReferenceDimensions,
+  pruneLaneProfileCaches,
   getTlcPlateSlice,
   updateTlcPlateSlice,
   tlcStorageKey,
@@ -285,12 +289,17 @@ function drawLanePanels(
 
     if (!renderedFalseColor && im?.bmp) {
       const srcImg = p.key === 'White' && boostWhiteSpots ? getBoostedWhiteCanvas(im.bmp) : im.bmp;
-      const m = laneMatrix(l, srcImg.width / (p.s.frameW || LANE_FRAME_WIDTH), k);
+      const refDim = getReferenceDimensions(p.s, p.key);
+      const refW = refDim?.width ?? im.bmp.width;
+      const refH = refDim?.height ?? im.bmp.height;
+      const m = laneMatrix(l, refW / (p.s.frameW || LANE_FRAME_WIDTH), k);
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.beginPath();
       ctx.rect(x, top, w, h);
       ctx.clip();
+      ctx.fillStyle = '#090d16';
+      ctx.fillRect(x, top, w, h);
 
       ctx.setTransform(
         dpr * m[0],
@@ -301,7 +310,7 @@ function drawLanePanels(
         dpr * (m[5] + top)
       );
 
-      ctx.drawImage(srcImg, 0, 0);
+      drawAlignedChannelImage(ctx, p.s, p.key, srcImg, refW, refH);
       ctx.restore();
     }
 
@@ -694,6 +703,99 @@ export const TlcView: React.FC = () => {
     [currentSet, plate]
   );
 
+  // Smooth trailing-debounced local values for heavy plate-wide detection sliders
+  const activeMinW = activePlateSet.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC;
+  const [draftProminence, setDraftProminence] = useState<number>(spotProminence);
+  const [draftMinW, setDraftMinW] = useState<number>(activeMinW);
+  const [draftCoreFraction, setDraftCoreFraction] = useState<number>(coreFraction);
+  const promTimerRef = useRef<number | null>(null);
+  const minWTimerRef = useRef<number | null>(null);
+  const coreTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setDraftProminence(spotProminence);
+  }, [spotProminence]);
+
+  useEffect(() => {
+    setDraftMinW(activeMinW);
+  }, [activeMinW]);
+
+  useEffect(() => {
+    setDraftCoreFraction(coreFraction);
+  }, [coreFraction]);
+
+  useEffect(() => {
+    return () => {
+      if (promTimerRef.current !== null) window.clearTimeout(promTimerRef.current);
+      if (minWTimerRef.current !== null) window.clearTimeout(minWTimerRef.current);
+      if (coreTimerRef.current !== null) window.clearTimeout(coreTimerRef.current);
+    };
+  }, []);
+
+  const commitProminence = useCallback(
+    (v: number) => {
+      if (promTimerRef.current !== null) {
+        window.clearTimeout(promTimerRef.current);
+        promTimerRef.current = null;
+      }
+      setSpotProminence(v);
+      if (v >= 0.45) setSpotMode('broad');
+      else if (v <= 0.16) setSpotMode('sensitive');
+      else setSpotMode('standard');
+    },
+    [setSpotProminence]
+  );
+
+  const commitMinW = useCallback(
+    (v: number) => {
+      if (minWTimerRef.current !== null) {
+        window.clearTimeout(minWTimerRef.current);
+        minWTimerRef.current = null;
+      }
+      const uid = currentSet.uid;
+      setSets((prev) =>
+        prev.map((s) =>
+          s.uid === uid
+            ? updateTlcPlateSlice(s, plate, { minSpotWidthFrac: v })
+            : s
+        )
+      );
+    },
+    [currentSet.uid, plate, setSets]
+  );
+
+  const commitCoreFraction = useCallback(
+    (cf: number) => {
+      if (coreTimerRef.current !== null) {
+        window.clearTimeout(coreTimerRef.current);
+        coreTimerRef.current = null;
+      }
+      setCoreFraction(cf);
+      setSets((prev) =>
+        prev.map((s) => {
+          const nextPlateData = s.plateData
+            ? Object.fromEntries(
+                Object.entries(s.plateData).map(([pK, pd]) => [
+                  pK,
+                  { ...pd, prof: {}, frontAuto: {}, frontAutoByLane: {}, originAuto: {}, originAutoByLane: {} },
+                ])
+              )
+            : undefined;
+          return {
+            ...s,
+            prof: {},
+            frontAuto: {},
+            frontAutoByLane: {},
+            originAuto: {},
+            originAutoByLane: {},
+            ...(nextPlateData ? { plateData: nextPlateData } : {}),
+          };
+        })
+      );
+    },
+    [setCoreFraction, setSets]
+  );
+
   const plateSets = useMemo(
     () => sets.map((s) => getTlcPlateSlice(s, plate)),
     [sets, plate]
@@ -769,8 +871,21 @@ export const TlcView: React.FC = () => {
             if (next[item.sIdx]) {
               next[item.sIdx] = updateTlcPlateSlice(next[item.sIdx], item.pIdx, (slice) =>
                 item.isPreRun
-                  ? { preRunImgs: { ...(slice.preRunImgs || {}), [item.channel]: item.entry } }
-                  : { imgs: { ...(slice.imgs || {}), [item.channel]: item.entry } }
+                  ? {
+                      preRunImgs: { ...(slice.preRunImgs || {}), [item.channel]: item.entry },
+                      preRunAlignment: {},
+                      originAuto: {},
+                      originAutoByLane: {},
+                    }
+                  : {
+                      imgs: { ...(slice.imgs || {}), [item.channel]: item.entry },
+                      channelAlign: {},
+                      prof: {},
+                      frontAuto: {},
+                      frontAutoByLane: {},
+                      originAuto: {},
+                      originAutoByLane: {},
+                    }
               );
             }
           }
@@ -792,12 +907,21 @@ export const TlcView: React.FC = () => {
           ? Object.fromEntries(
               Object.entries(s.plateData).map(([pK, pd]) => [
                 pK,
-                { ...pd, prof: {}, frontAuto: {}, frontAutoByLane: {}, originAuto: {}, originAutoByLane: {} },
+                {
+                  ...pd,
+                  channelAlign: {},
+                  prof: {},
+                  frontAuto: {},
+                  frontAutoByLane: {},
+                  originAuto: {},
+                  originAutoByLane: {},
+                },
               ])
             )
           : undefined;
         return {
           ...s,
+          channelAlign: {},
           prof: {},
           frontAuto: {},
           frontAutoByLane: {},
@@ -1082,7 +1206,7 @@ export const TlcView: React.FC = () => {
       setSets((prev) => {
         const next = [...prev];
         next[cur] = updateTlcPlateSlice(next[cur], plate, {
-          ...(loadedCount > 0 ? { imgs: newImgs } : {}),
+          ...(loadedCount > 0 ? { imgs: newImgs, channelAlign: {} } : {}),
           ...(loadedCfg ? { cfg: loadedCfg.cfg, cfgName: loadedCfg.name, cfgText: loadedCfg.text } : {}),
           prof: {},
           frontAuto: {},
@@ -1127,6 +1251,12 @@ export const TlcView: React.FC = () => {
       let compW = 0;
       let compH = 0;
 
+      const refDim = getReferenceDimensions(activePlateSet);
+      if (refDim) {
+        compW = Math.min(refDim.width, 1300);
+        compH = Math.max(1, Math.round((refDim.height * compW) / refDim.width));
+      }
+
       for (const k of keys) {
         const bmp = activePlateSet.imgs[k]!.bmp;
         const w = compW || Math.min(bmp.width, 1300);
@@ -1140,7 +1270,9 @@ export const TlcView: React.FC = () => {
         cv.height = h;
         const ctx = cv.getContext('2d', { willReadFrequently: true });
         if (!ctx) continue;
-        ctx.drawImage(bmp, 0, 0, w, h);
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, w, h);
+        drawAlignedChannelImage(ctx, activePlateSet, k, bmp, w, h);
         const imgData = ctx.getImageData(0, 0, w, h);
         renderedImages.push({ key: k, img: imgData });
         const det = detectLaneRows(imgData, w);
@@ -1746,11 +1878,81 @@ export const TlcView: React.FC = () => {
     [detectOptsFor, getCoherenceRescuedMap, edgeSettingFor, getEdgeFits]
   );
 
+  // Per-lane memo cache for unified multi-channel spot detection (prevents redundant 54-lane recomputes on hover/filter/re-renders)
+  const compositeSpotsCacheRef = useRef(
+    new Map<
+      string,
+      {
+        sig: string;
+        customSpotsRef: TlcSpot[] | undefined;
+        edgePicksRef: EdgePick[] | undefined;
+        edgeFitRef: EdgeFit | null;
+        profRef: number[] | undefined;
+        spots: TlcSpot[] | null;
+      }
+    >()
+  );
+
   // Unified 3-channel spot detection across UV254, UV366, and White for Composite mode
   const getCompositeSpotsForLane = useCallback(
     (set: TlcSet, lane: TlcLane): TlcSpot[] | null => {
       const loaded = getLoadedTlcChannels(set.imgs, false);
       if (!loaded.length) return null;
+      const halfIdx = tlcHalf(lane);
+      const setting = edgeSettingFor(set, halfIdx);
+      const edgeFitRef = setting.mode === 'off' ? null : getEdgeFits(set)[halfIdx] || null;
+      const firstProfKey = `${loaded[0]}:${lane.id}:${coreFraction.toFixed(2)}`;
+      const existingProfRef = set.prof?.[firstProfKey];
+      const blankSig = blankEnabled
+        ? `${blankMeta.UV254?.name || ''},${blankMeta.UV366?.name || ''},${blankMeta.White?.name || ''}`
+        : 'off';
+      const loadedSig = loaded.map((c) => `${c}:${set.imgs[c]?.name || ''}`).join(',');
+      const alignSig = channelAlignCacheSuffix(set, loaded);
+      const sig = [
+        set.uid,
+        plate,
+        lane.id,
+        lane.x0,
+        lane.y0,
+        lane.length,
+        lane.width,
+        lane.angle,
+        lane.zeroRf ?? '',
+        lane.spotRadius ?? '',
+        coreFraction,
+        spotProminence,
+        set.spotDetectorMode || '2d',
+        set.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC,
+        automiddle ? 1 : 0,
+        blankSig,
+        set.originPx ?? '',
+        set.frontPx ?? '',
+        set.frontHalfPx?.[halfIdx] ?? '',
+        set.originAuto?.[halfIdx] ?? '',
+        set.originAutoByLane?.[lane.id] ?? '',
+        set.frontAuto?.[halfIdx] ?? '',
+        set.frontAutoByLane?.[lane.id] ?? '',
+        setting.mode,
+        setting.strength,
+        run?.rows?.length ?? 0,
+        loadedSig,
+        alignSig,
+      ].join('|');
+
+      const cacheKey = `${set.uid}:p${plate}:l${lane.id}`;
+      const cached = compositeSpotsCacheRef.current.get(cacheKey);
+      if (
+        cached &&
+        cached.sig === sig &&
+        cached.customSpotsRef === lane.customSpots &&
+        cached.edgePicksRef === set.edgePicks &&
+        cached.edgeFitRef === edgeFitRef &&
+        existingProfRef !== undefined &&
+        cached.profRef === existingProfRef
+      ) {
+        return cached.spots;
+      }
+
       const get = (s: TlcSet, k: TlcChannelKey, l: TlcLane) => extractLaneProfile(s, k, l, coreFraction);
       const origin = tlcOrigin(set, lane, get);
       const front = tlcFront(set, lane, get);
@@ -1758,7 +1960,6 @@ export const TlcView: React.FC = () => {
       const histograms: Partial<Record<TlcChannelKey, ReturnType<typeof getChannelHistogram>>> = {};
       const lane2dByChannel: Partial<Record<TlcChannelKey, ReturnType<typeof getLane2dMetrics>>> = {};
       const frontBandByChannel: Partial<Record<TlcChannelKey, number[]>> = {};
-      const halfIdx = tlcHalf(lane);
       for (const ch of loaded) {
         const p = get(set, ch, lane);
         if (p && p.length >= 10) {
@@ -1805,15 +2006,40 @@ export const TlcView: React.FC = () => {
         autoSpots = combined;
       }
       const spots = getEffectiveLaneSpots(lane, autoSpots);
-      if (!spots.length) return spots;
-      const h = tlcHalf(lane);
-      const setting = edgeSettingFor(set, h);
-      if (setting.mode === 'off') return spots;
-      const fit = getEdgeFits(set)[h];
-      if (!edgeActive(fit, setting)) return spots;
-      return correctSpots(spots, edgeGain(fit, lane.x0, setting.strength), edgeOffset(fit, lane.x0, setting.strength));
+      let result: TlcSpot[] = spots;
+      if (spots.length && setting.mode !== 'off' && edgeActive(edgeFitRef, setting)) {
+        result = correctSpots(
+          spots,
+          edgeGain(edgeFitRef, lane.x0, setting.strength),
+          edgeOffset(edgeFitRef, lane.x0, setting.strength)
+        );
+      }
+
+      if (compositeSpotsCacheRef.current.size > 600) {
+        compositeSpotsCacheRef.current.clear();
+      }
+      compositeSpotsCacheRef.current.set(cacheKey, {
+        sig,
+        customSpotsRef: lane.customSpots,
+        edgePicksRef: set.edgePicks,
+        edgeFitRef,
+        profRef: set.prof?.[firstProfKey],
+        spots: result,
+      });
+      return result;
     },
-    [coreFraction, spotProminence, getCoherenceRescuedMap, edgeSettingFor, getEdgeFits]
+    [
+      plate,
+      coreFraction,
+      spotProminence,
+      automiddle,
+      blankEnabled,
+      blankMeta,
+      run?.rows?.length,
+      getCoherenceRescuedMap,
+      edgeSettingFor,
+      getEdgeFits,
+    ]
   );
 
   // Helper to extract panels for lane t (always using unified multi-channel spots so Grid, Full Plate, and Modal agree 1-to-1)
@@ -2327,83 +2553,99 @@ export const TlcView: React.FC = () => {
   }, [activePlateSet?.cfg, plateCfgKey]);
 
   // Real-time micro-adjustment of lane coordinates with smart debounced Undo history
-  const handleUpdateLane = (laneId: number, patch: Partial<TlcLane>, forceSnapshot: boolean = false) => {
-    if (!activePlateSet?.cfg) return;
-    const now = Date.now();
-    // Snapshot history once at the start of a slide or after 500ms pause, or if forced
-    if (forceSnapshot || now - lastHistorySnapshotRef.current > 500) {
+  // Surgically prunes caches only for the edited lane (preserving all other 53 lanes).
+  const handleUpdateLane = useCallback(
+    (laneId: number, patch: Partial<TlcLane>, forceSnapshot: boolean = false) => {
+      if (!activePlateSet?.cfg) return;
+      const now = Date.now();
+      // Snapshot history once at the start of a slide or after 500ms pause, or if forced
+      if (forceSnapshot || now - lastHistorySnapshotRef.current > 500) {
+        const currentCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
+        setCfgHistoryByPlate((m) => ({
+          ...m,
+          [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), currentCfg],
+        }));
+        lastHistorySnapshotRef.current = now;
+      }
+      const geometryChanged =
+        patch.x0 !== undefined ||
+        patch.y0 !== undefined ||
+        patch.length !== undefined ||
+        patch.width !== undefined ||
+        patch.angle !== undefined;
+
+      setSets((prev) => {
+        const next = [...prev];
+        if (!next[cur]) return next;
+        next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+          if (!slice.cfg) return {};
+          const newLanes = slice.cfg.lanes.map((l) => (l.id === laneId ? { ...l, ...patch } : l));
+          const nextCfg = { ...slice.cfg, lanes: newLanes };
+          const cachePatch = pruneLaneProfileCaches(
+            { ...slice, cfg: nextCfg } as TlcSet,
+            laneId,
+            geometryChanged
+          );
+          return {
+            cfg: nextCfg,
+            ...cachePatch,
+          };
+        });
+        return next;
+      });
+    },
+    [activePlateSet?.cfg, plateCfgKey, cur, plate, setSets]
+  );
+
+  // Atomic batch lane update (e.g. 1-click removal of a confidence category across the plate)
+  // Snapshots Undo history once and keeps profile/front/origin caches intact when only spots change.
+  const handleUpdateLanesBatch = useCallback(
+    (
+      patches: Record<number, Partial<TlcLane>>,
+      options?: { keepCaches?: boolean; toastMessage?: string }
+    ) => {
+      if (!activePlateSet?.cfg) return;
+      const laneIds = Object.keys(patches);
+      if (laneIds.length === 0) return;
+
       const currentCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
       setCfgHistoryByPlate((m) => ({
         ...m,
         [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), currentCfg],
       }));
-      lastHistorySnapshotRef.current = now;
-    }
-    setSets((prev) => {
-      const next = [...prev];
-      if (!next[cur]) return next;
-      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
-        if (!slice.cfg) return {};
-        const newLanes = slice.cfg.lanes.map((l) => (l.id === laneId ? { ...l, ...patch } : l));
-        return {
-          cfg: { ...slice.cfg, lanes: newLanes },
-          prof: {},
-          frontAuto: {},
-          frontAutoByLane: {},
-          originAuto: {},
-          originAutoByLane: {},
-        };
+      lastHistorySnapshotRef.current = Date.now();
+
+      setSets((prev) => {
+        const next = [...prev];
+        if (!next[cur]) return next;
+        next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+          if (!slice.cfg) return {};
+          const newLanes = slice.cfg.lanes.map((l) =>
+            patches[l.id] ? { ...l, ...patches[l.id] } : l
+          );
+          if (options?.keepCaches) {
+            return { cfg: { ...slice.cfg, lanes: newLanes } };
+          }
+          return {
+            cfg: { ...slice.cfg, lanes: newLanes },
+            prof: {},
+            frontAuto: {},
+            frontAutoByLane: {},
+            originAuto: {},
+            originAutoByLane: {},
+          };
+        });
+        return next;
       });
-      return next;
-    });
-  };
-
-  // Atomic batch lane update (e.g. 1-click removal of a confidence category across the plate)
-  // Snapshots Undo history once and keeps profile/front/origin caches intact when only spots change.
-  const handleUpdateLanesBatch = (
-    patches: Record<number, Partial<TlcLane>>,
-    options?: { keepCaches?: boolean; toastMessage?: string }
-  ) => {
-    if (!activePlateSet?.cfg) return;
-    const laneIds = Object.keys(patches);
-    if (laneIds.length === 0) return;
-
-    const currentCfg = JSON.parse(JSON.stringify(activePlateSet.cfg));
-    setCfgHistoryByPlate((m) => ({
-      ...m,
-      [plateCfgKey]: [...(m[plateCfgKey] || []).slice(-39), currentCfg],
-    }));
-    lastHistorySnapshotRef.current = Date.now();
-
-    setSets((prev) => {
-      const next = [...prev];
-      if (!next[cur]) return next;
-      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
-        if (!slice.cfg) return {};
-        const newLanes = slice.cfg.lanes.map((l) =>
-          patches[l.id] ? { ...l, ...patches[l.id] } : l
-        );
-        if (options?.keepCaches) {
-          return { cfg: { ...slice.cfg, lanes: newLanes } };
-        }
-        return {
-          cfg: { ...slice.cfg, lanes: newLanes },
-          prof: {},
-          frontAuto: {},
-          frontAutoByLane: {},
-          originAuto: {},
-          originAutoByLane: {},
-        };
-      });
-      return next;
-    });
-    if (options?.toastMessage) {
-      toast(options.toastMessage);
-    }
-  };
+      if (options?.toastMessage) {
+        toast(options.toastMessage);
+      }
+    },
+    [activePlateSet?.cfg, plateCfgKey, cur, plate, setSets, toast]
+  );
 
   // Revert last adjustment
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (cfgHistory.length === 0) return;
     const prevCfg = cfgHistory[cfgHistory.length - 1];
     setCfgHistoryByPlate((m) => ({
@@ -2424,23 +2666,26 @@ export const TlcView: React.FC = () => {
       return next;
     });
     toast('Reverted last adjustment (Undo).');
-  };
+  }, [cfgHistory, plateCfgKey, cur, plate, setSets, toast]);
 
   // Reset single lane to its original template configuration
-  const handleResetLane = (laneId: number) => {
-    const origSetCfg = originalCfgRef.current[plateCfgKey];
-    if (!origSetCfg) {
-      toast('No original lane template recorded.');
-      return;
-    }
-    const origLane = origSetCfg.lanes.find((l) => l.id === laneId);
-    if (!origLane) return;
-    handleUpdateLane(laneId, { ...origLane });
-    toast(`Reset Lane ${laneId} to original template.`);
-  };
+  const handleResetLane = useCallback(
+    (laneId: number) => {
+      const origSetCfg = originalCfgRef.current[plateCfgKey];
+      if (!origSetCfg) {
+        toast('No original lane template recorded.');
+        return;
+      }
+      const origLane = origSetCfg.lanes.find((l) => l.id === laneId);
+      if (!origLane) return;
+      handleUpdateLane(laneId, { ...origLane });
+      toast(`Reset Lane ${laneId} to original template.`);
+    },
+    [plateCfgKey, handleUpdateLane, toast]
+  );
 
   // Reset all lanes in the current plate to their original template configuration
-  const handleResetAllLanes = () => {
+  const handleResetAllLanes = useCallback(() => {
     const origSetCfg = originalCfgRef.current[plateCfgKey];
     if (!origSetCfg) {
       toast('No original lane template recorded.');
@@ -2467,54 +2712,58 @@ export const TlcView: React.FC = () => {
       return next;
     });
     toast(`Reset all Plate ${plate + 1} lanes to original configuration.`);
-  };
+  }, [plateCfgKey, activePlateSet.cfg, cur, plate, setSets, toast]);
 
   // Solvent front update (shifts meniscus baseline across the plate or for a specific side while preserving any 2D per-lane curve shape)
-  const handleUpdateSetFront = (frontPx: number | null, side?: number) => {
-    setSets((prev) => {
-      const next = [...prev];
-      if (!next[cur]) return next;
-      next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
-        if (side !== undefined) {
-          const nextHalfFront = { ...(slice.frontHalfPx || {}) };
-          if (frontPx != null && frontPx > 0) {
-            nextHalfFront[side] = frontPx;
+  const handleUpdateSetFront = useCallback(
+    (frontPx: number | null, side?: number) => {
+      setSets((prev) => {
+        const next = [...prev];
+        if (!next[cur]) return next;
+        next[cur] = updateTlcPlateSlice(next[cur], plate, (slice) => {
+          if (side !== undefined) {
+            const nextHalfFront = { ...(slice.frontHalfPx || {}) };
+            if (frontPx != null && frontPx > 0) {
+              nextHalfFront[side] = frontPx;
+              return {
+                frontHalfPx: nextHalfFront,
+              };
+            }
+            delete nextHalfFront[side];
+            const nextFrontAuto = { ...(slice.frontAuto || {}) };
+            delete nextFrontAuto[side];
+            const nextFrontAutoByLane = { ...(slice.frontAutoByLane || {}) };
+            for (const k of Object.keys(nextFrontAutoByLane)) {
+              const lid = Number(k);
+              if ((lid < 27 ? 0 : 1) === side) delete nextFrontAutoByLane[lid];
+            }
             return {
               frontHalfPx: nextHalfFront,
+              frontAuto: nextFrontAuto,
+              frontAutoByLane: nextFrontAutoByLane,
             };
           }
-          delete nextHalfFront[side];
-          const nextFrontAuto = { ...(slice.frontAuto || {}) };
-          delete nextFrontAuto[side];
-          const nextFrontAutoByLane = { ...(slice.frontAutoByLane || {}) };
-          for (const k of Object.keys(nextFrontAutoByLane)) {
-            const lid = Number(k);
-            if ((lid < 27 ? 0 : 1) === side) delete nextFrontAutoByLane[lid];
+          if (frontPx != null && frontPx > 0) {
+            return {
+              frontPx,
+            };
           }
           return {
-            frontHalfPx: nextHalfFront,
-            frontAuto: nextFrontAuto,
-            frontAutoByLane: nextFrontAutoByLane,
+            frontPx: null,
+            frontAuto: {},
+            frontAutoByLane: {},
           };
-        }
-        if (frontPx != null && frontPx > 0) {
-          return {
-            frontPx,
-          };
-        }
-        return {
-          frontPx: null,
-          frontAuto: {},
-          frontAutoByLane: {},
-        };
+        });
+        return next;
       });
-      return next;
-    });
-  };
+    },
+    [cur, plate, setSets]
+  );
 
   // Re-detect both origin baseline and solvent front across all lanes from the plate photos
-  const handleAutoDetectBaselines = () => {
-    if (!hasImages) {
+  const handleAutoDetectBaselines = useCallback(() => {
+    const plateHasImgs = TLC_KEYS.some((k) => Boolean(activePlateSet.imgs[k]));
+    if (!plateHasImgs) {
       toast('Load a plate photo first.');
       return;
     }
@@ -2551,7 +2800,7 @@ export const TlcView: React.FC = () => {
       return next;
     });
     toast(`Re-detected Plate ${plate + 1} origin baseline and solvent front from plate photos.`);
-  };
+  }, [activePlateSet.imgs, activePlateSet.cfg, plateCfgKey, cur, plate, setSets, toast]);
 
   // Global Ctrl+Z / Cmd+Z shortcut for Undo
   useEffect(() => {
@@ -2567,10 +2816,10 @@ export const TlcView: React.FC = () => {
     };
     window.addEventListener('keydown', handleGlobalUndoKey);
     return () => window.removeEventListener('keydown', handleGlobalUndoKey);
-  }, [cfgHistory]);
+  }, [cfgHistory, handleUndo]);
 
   // Export current (or corrected) Lane CSV
-  const handleExportLaneCsv = () => {
+  const handleExportLaneCsv = useCallback(() => {
     if (!activePlateSet.cfg) {
       toast('No lane configuration to export.');
       return;
@@ -2591,7 +2840,46 @@ export const TlcView: React.FC = () => {
     } catch (err: any) {
       toast('Error exporting lane CSV: ' + err.message);
     }
-  };
+  }, [activePlateSet.cfg, selectablePlatesCount, plate, currentSet.name, toast]);
+
+  // Stable memoized props for TlcFullPlateView (prevents redundant 54-lane recomputes on CSS filter / UI renders)
+  const fullPlateGetProfile = useCallback(
+    (s: TlcSet, k: TlcChannelKey, ln: TlcLane) => extractLaneProfile(s, k, ln, coreFraction),
+    [coreFraction]
+  );
+  const fullPlateGetCanonicalSpots = useCallback(
+    (ln: TlcLane) => getCompositeSpotsForLane(activePlateSet, ln),
+    [activePlateSet, getCompositeSpotsForLane]
+  );
+  const fullPlateEdgeFits = useMemo(
+    () => getEdgeFits(activePlateSet),
+    [activePlateSet, getEdgeFits]
+  );
+  const fullPlateEdgeSettings = useMemo(
+    () => [edgeSettingFor(activePlateSet, 0), edgeSettingFor(activePlateSet, 1)],
+    [activePlateSet, edgeSettingFor]
+  );
+  const fullPlatePicks = useMemo(
+    () => activePlateSet.edgePicks || [],
+    [activePlateSet.edgePicks]
+  );
+  const handleOpenWellModalFromPlate = useCallback((w: number) => {
+    setInspectWell(w);
+    setPinnedMarkers([]);
+    setHoverRf(null);
+    setHoverY(null);
+    setHoverSpot(null);
+  }, []);
+
+  const baselineDetailsSummary = useMemo(() => {
+    const lanes = activePlateSet.cfg?.lanes;
+    if (!lanes || lanes.length === 0) return null;
+    const plateHasImgs = TLC_KEYS.some((k) => Boolean(activePlateSet.imgs[k]));
+    const notes = plateHasImgs ? tlcDetectionNotes(activePlateSet, fullPlateGetProfile) : [];
+    const origin0 = Math.round(tlcOrigin(activePlateSet, lanes[0], fullPlateGetProfile));
+    const front0 = tlcFront(activePlateSet, lanes[0], fullPlateGetProfile);
+    return { notes, origin0, front0 };
+  }, [activePlateSet, fullPlateGetProfile]);
 
   const hasConfig = Boolean(activePlateSet.cfg);
   const hasImages = TLC_KEYS.some((k) => Boolean(activePlateSet.imgs[k]));
@@ -2879,10 +3167,13 @@ export const TlcView: React.FC = () => {
       if (!im?.bmp || !cfg?.lanes?.length) return null;
 
       const bmp = im.bmp;
+      const refDim = getReferenceDimensions(activePlateSet, targetCh);
+      const refW = refDim?.width ?? bmp.width;
+      const refH = refDim?.height ?? bmp.height;
       const maxW = 1400;
-      const scale = bmp.width > maxW ? maxW / bmp.width : 1;
-      const cw = Math.max(1, Math.round(bmp.width * scale));
-      const ch = Math.max(1, Math.round(bmp.height * scale));
+      const scale = refW > maxW ? maxW / refW : 1;
+      const cw = Math.max(1, Math.round(refW * scale));
+      const ch = Math.max(1, Math.round(refH * scale));
 
       const canvas = document.createElement('canvas');
       canvas.width = cw;
@@ -2890,9 +3181,11 @@ export const TlcView: React.FC = () => {
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
 
-      ctx.drawImage(bmp, 0, 0, cw, ch);
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, cw, ch);
+      drawAlignedChannelImage(ctx, activePlateSet, targetCh, bmp, cw, ch);
 
-      const frameScale = (bmp.width / (activePlateSet.frameW || LANE_FRAME_WIDTH)) * scale;
+      const frameScale = (refW / (activePlateSet.frameW || LANE_FRAME_WIDTH)) * scale;
       const get = (s: TlcSet, k: TlcChannelKey, ln: TlcLane) => extractLaneProfile(s, k, ln, coreFraction);
       const lanesSummary: TlcVisionQcLaneSummary[] = [];
 
@@ -3767,8 +4060,8 @@ export const TlcView: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
-                  setSpotMode('standard');
-                  setSpotProminence(0.28);
+                  setDraftProminence(0.28);
+                  commitProminence(0.28);
                 }}
                 style={{
                   fontSize: '11px',
@@ -3787,8 +4080,8 @@ export const TlcView: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
-                  setSpotMode('broad');
-                  setSpotProminence(0.55);
+                  setDraftProminence(0.55);
+                  commitProminence(0.55);
                 }}
                 style={{
                   fontSize: '11px',
@@ -3808,8 +4101,8 @@ export const TlcView: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
-                  setSpotMode('sensitive');
-                  setSpotProminence(0.12);
+                  setDraftProminence(0.12);
+                  commitProminence(0.12);
                 }}
                 style={{
                   fontSize: '11px',
@@ -3845,80 +4138,79 @@ export const TlcView: React.FC = () => {
                   min={activePlateSet.spotDetectorMode === 'densitogram' ? '0.04' : '0.08'}
                   max={activePlateSet.spotDetectorMode === 'densitogram' ? '0.95' : '0.70'}
                   step="0.01"
-                  value={spotProminence}
+                  value={draftProminence}
                   onChange={(e) => {
                     const v = parseFloat(e.target.value);
-                    setSpotProminence(v);
-                    if (v >= 0.45) setSpotMode('broad');
-                    else if (v <= 0.16) setSpotMode('sensitive');
-                    else setSpotMode('standard');
+                    setDraftProminence(v);
+                    if (promTimerRef.current !== null) window.clearTimeout(promTimerRef.current);
+                    promTimerRef.current = window.setTimeout(() => commitProminence(v), 55);
                   }}
+                  onPointerUp={(e) => commitProminence(parseFloat((e.target as HTMLInputElement).value))}
+                  onKeyUp={(e) => commitProminence(parseFloat((e.target as HTMLInputElement).value))}
                   style={{ width: '60px', height: '14px', cursor: 'pointer' }}
                   title={
                     activePlateSet.spotDetectorMode === 'densitogram'
-                      ? `Densitogram Intensity Cutoff: ${Math.round(spotProminence * 100)}% (higher = only stronger peaks above the dashed cutoff line; lower = catches fainter spots)`
-                      : `Valley Prominence Threshold: ${Math.round(spotProminence * 100)}% (higher = merges broad/tailing bands; lower = detects fine trace spots)`
+                      ? `Densitogram Intensity Cutoff: ${Math.round(draftProminence * 100)}% (higher = only stronger peaks above the dashed cutoff line; lower = catches fainter spots)`
+                      : `Valley Prominence Threshold: ${Math.round(draftProminence * 100)}% (higher = merges broad/tailing bands; lower = detects fine trace spots)`
                   }
                 />
                 <span className="mono" style={{ fontSize: '10px', minWidth: '26px', color: 'var(--fg)', fontWeight: 700 }}>
-                  {Math.round(spotProminence * 100)}%
+                  {Math.round(draftProminence * 100)}%
                 </span>
               </div>
 
-              {(activePlateSet.spotDetectorMode ?? '2d') !== '1d' && (() => {
-                const minW = activePlateSet.minSpotWidthFrac ?? DEFAULT_MIN_SPOT_WIDTH_FRAC;
-                return (
-                  <div
+              {(activePlateSet.spotDetectorMode ?? '2d') !== '1d' && (
+                <div
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    paddingLeft: '6px',
+                    borderLeft: '1px solid var(--line)',
+                    marginLeft: '2px',
+                  }}
+                >
+                  <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>
+                    Min W:
+                  </span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="0.56"
+                    step="0.02"
+                    value={draftMinW}
+                    onChange={(e) => {
+                      const v = Math.round(parseFloat(e.target.value) * 100) / 100;
+                      setDraftMinW(v);
+                      if (minWTimerRef.current !== null) window.clearTimeout(minWTimerRef.current);
+                      minWTimerRef.current = window.setTimeout(() => commitMinW(v), 55);
+                    }}
+                    onPointerUp={(e) =>
+                      commitMinW(Math.round(parseFloat((e.target as HTMLInputElement).value) * 100) / 100)
+                    }
+                    onKeyUp={(e) =>
+                      commitMinW(Math.round(parseFloat((e.target as HTMLInputElement).value) * 100) / 100)
+                    }
+                    style={{ width: '52px', height: '14px', cursor: 'pointer' }}
+                    title={
+                      draftMinW <= 0
+                        ? 'Microdroplet Filter: OFF (accepts all narrow vertical streaks & microdroplets)'
+                        : `Microdroplet Filter (2D Min Spot Width): ${Math.round(draftMinW * 100)}% of lane width — ignores narrow spotter microdroplets & their skinny eluted runs (drag to 0% to disable)`
+                    }
+                  />
+                  <span
+                    className="mono"
                     style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '4px',
-                      paddingLeft: '6px',
-                      borderLeft: '1px solid var(--line)',
-                      marginLeft: '2px',
+                      fontSize: '10px',
+                      minWidth: '26px',
+                      color: draftMinW > 0 ? 'var(--fg)' : 'var(--mut)',
+                      fontWeight: draftMinW > 0 ? 700 : 500,
                     }}
                   >
-                    <span style={{ fontSize: '10px', color: 'var(--mut)', whiteSpace: 'nowrap' }}>
-                      Min W:
-                    </span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="0.56"
-                      step="0.02"
-                      value={minW}
-                      onChange={(e) => {
-                        const v = Math.round(parseFloat(e.target.value) * 100) / 100;
-                        const uid = currentSet.uid;
-                        setSets((prev) =>
-                          prev.map((s) =>
-                            s.uid === uid
-                              ? updateTlcPlateSlice(s, plate, { minSpotWidthFrac: v })
-                              : s
-                          )
-                        );
-                      }}
-                      style={{ width: '52px', height: '14px', cursor: 'pointer' }}
-                      title={
-                        minW <= 0
-                          ? 'Microdroplet Filter: OFF (accepts all narrow vertical streaks & microdroplets)'
-                          : `Microdroplet Filter (2D Min Spot Width): ${Math.round(minW * 100)}% of lane width — ignores narrow spotter microdroplets & their skinny eluted runs (drag to 0% to disable)`
-                      }
-                    />
-                    <span
-                      className="mono"
-                      style={{
-                        fontSize: '10px',
-                        minWidth: '26px',
-                        color: minW > 0 ? 'var(--fg)' : 'var(--mut)',
-                        fontWeight: minW > 0 ? 700 : 500,
-                      }}
-                    >
-                      {minW <= 0 ? 'Off' : `${Math.round(minW * 100)}%`}
-                    </span>
-                  </div>
-                );
-              })()}
+                    {draftMinW <= 0 ? 'Off' : `${Math.round(draftMinW * 100)}%`}
+                  </span>
+                </div>
+              )}
 
               <div
                 style={{
@@ -4230,36 +4522,18 @@ export const TlcView: React.FC = () => {
               min="0.20"
               max="0.60"
               step="0.05"
-              value={coreFraction}
+              value={draftCoreFraction}
               onChange={(e) => {
                 const cf = parseFloat(e.target.value);
-                setCoreFraction(cf);
-                // Clear cached profiles and auto-detected fronts across all plates to recompute with new core corridor
-                setSets((prev) =>
-                  prev.map((s) => {
-                    const nextPlateData = s.plateData
-                      ? Object.fromEntries(
-                          Object.entries(s.plateData).map(([pK, pd]) => [
-                            pK,
-                            { ...pd, prof: {}, frontAuto: {}, frontAutoByLane: {}, originAuto: {}, originAutoByLane: {} },
-                          ])
-                        )
-                      : undefined;
-                    return {
-                      ...s,
-                      prof: {},
-                      frontAuto: {},
-                      frontAutoByLane: {},
-                      originAuto: {},
-                      originAutoByLane: {},
-                      ...(nextPlateData ? { plateData: nextPlateData } : {}),
-                    };
-                  })
-                );
+                setDraftCoreFraction(cf);
+                if (coreTimerRef.current !== null) window.clearTimeout(coreTimerRef.current);
+                coreTimerRef.current = window.setTimeout(() => commitCoreFraction(cf), 65);
               }}
+              onPointerUp={(e) => commitCoreFraction(parseFloat((e.target as HTMLInputElement).value))}
+              onKeyUp={(e) => commitCoreFraction(parseFloat((e.target as HTMLInputElement).value))}
             />
             <span className="mono" style={{ fontSize: '11px', width: '32px' }}>
-              {Math.round(coreFraction * 100)}%
+              {Math.round(draftCoreFraction * 100)}%
             </span>
           </label>
 
@@ -4566,9 +4840,9 @@ export const TlcView: React.FC = () => {
             </div>
             <div style={{ fontSize: '11px', color: 'var(--mut)' }}>
               Spot origin baseline (Rf = 0.00) and solvent front meniscus (Rf = 1.00) are automatically resolved from your lane profiles or microadjusted CSV. You can also specify manual overrides above.
-              {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && hasImages && (
+              {baselineDetailsSummary && baselineDetailsSummary.notes.length > 0 && (
                 <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                  {tlcDetectionNotes(activePlateSet, (s, k, l) => extractLaneProfile(s, k, l, coreFraction)).map((n) => (
+                  {baselineDetailsSummary.notes.map((n) => (
                     <div key={n.label} style={{ color: n.warning ? 'var(--warn)' : 'var(--mut)' }}>
                       {n.label}: {n.source}
                       {n.source === 'detected' ? ` (strength ${n.score.toFixed(1)})` : ''}
@@ -4577,9 +4851,9 @@ export const TlcView: React.FC = () => {
                   ))}
                 </div>
               )}
-              {activePlateSet.cfg && activePlateSet.cfg.lanes.length > 0 && (
+              {baselineDetailsSummary && (
                 <span style={{ color: 'var(--pri)', marginLeft: '6px' }}>
-                  (Current baseline: {Math.round(tlcOrigin(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction)))} px · Solvent front: {tlcFront(activePlateSet, activePlateSet.cfg.lanes[0], (s, k, l) => extractLaneProfile(s, k, l, coreFraction))} px)
+                  (Current baseline: {baselineDetailsSummary.origin0} px · Solvent front: {baselineDetailsSummary.front0} px)
                 </span>
               )}
             </div>
@@ -4904,17 +5178,11 @@ export const TlcView: React.FC = () => {
             activeChannel={fullPlateChannel}
             onSelectChannel={setFullPlateChannel}
             filters={filters}
-            onOpenWellModal={(w) => {
-              setInspectWell(w);
-              setPinnedMarkers([]);
-              setHoverRf(null);
-              setHoverY(null);
-              setHoverSpot(null);
-            }}
+            onOpenWellModal={handleOpenWellModalFromPlate}
             run={run}
             plate={plate}
-            getProfile={(s, k, ln) => extractLaneProfile(s, k, ln, coreFraction)}
-            getCanonicalSpots={(ln) => getCompositeSpotsForLane(activePlateSet, ln)}
+            getProfile={fullPlateGetProfile}
+            getCanonicalSpots={fullPlateGetCanonicalSpots}
             onUpdateLane={handleUpdateLane}
             onUpdateLanesBatch={handleUpdateLanesBatch}
             onUpdateSetFront={handleUpdateSetFront}
@@ -4927,10 +5195,10 @@ export const TlcView: React.FC = () => {
             onExportLaneCsv={handleExportLaneCsv}
             spotProminence={spotProminence}
             pickMode={pickMode}
-            picks={activePlateSet.edgePicks || []}
+            picks={fullPlatePicks}
             onPickSpot={handlePickSpot}
-            edgeFits={getEdgeFits(activePlateSet)}
-            edgeSettings={[edgeSettingFor(activePlateSet, 0), edgeSettingFor(activePlateSet, 1)]}
+            edgeFits={fullPlateEdgeFits}
+            edgeSettings={fullPlateEdgeSettings}
             onEdgeSetting={handleEdgeSetting}
             onPickMode={setPickMode}
             pickGroup={pickGroup}

@@ -21,6 +21,7 @@ export * from './importers/robotParser';
 export * from './presets';
 export * from './dilutionTier';
 export * from './tlcLanes';
+export * from './tlcChannelAlign';
 export * from './tlcVision2d';
 export * from './tlcSpots2d';
 export * from './tlcLabPipeline';

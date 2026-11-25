@@ -5,8 +5,8 @@ import {
   LANE_FRAME_WIDTH,
   TLC_SIGNAL,
   TlcChannelKey,
-  computeLaneRowIntensity,
   extractDensitogram,
+  extractLaneProfile2d,
   findMultiChannelSpots,
   getChannelHistogram,
   getChannelFrontBandProfile,
@@ -15,6 +15,8 @@ import {
   tlcHalf,
   laneMatrix,
   renderFalseColorLane,
+  drawAlignedChannelImage,
+  getReferenceDimensions,
   tlcFront,
   tlcLane,
   tlcOrigin,
@@ -28,53 +30,13 @@ interface WellTlcPreviewProps {
   onOpenTlcMap: () => void;
 }
 
-let previewScratchCanvas: HTMLCanvasElement | null = null;
-
 function extractLaneProfileLocal(
   set: TlcSet,
   key: TlcChannelKey,
   lane: TlcLane,
   coreFraction: number = 0.35
 ): number[] {
-  const ck = `${key}:${lane.id}:${coreFraction.toFixed(2)}`;
-  if (set.prof && set.prof[ck]) return set.prof[ck];
-
-  const im = set.imgs?.[key];
-  if (!im || !im.bmp || typeof document === 'undefined') return [];
-
-  const W = Math.max(1, Math.round(lane.width));
-  const L = Math.max(1, Math.round(lane.length));
-
-  if (!previewScratchCanvas) {
-    previewScratchCanvas = document.createElement('canvas');
-  }
-  previewScratchCanvas.width = W;
-  previewScratchCanvas.height = L;
-
-  const ctx = previewScratchCanvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return [];
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, L);
-
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
-  ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, W, L);
-  const data = imgData.data;
-  const ch = TLC_SIGNAL[key].ch;
-  const out = new Array(L);
-
-  for (let y = 0; y < L; y++) {
-    const rowOffset = y * W * 4;
-    const rowSlice = data.subarray(rowOffset, rowOffset + W * 4);
-    out[L - 1 - y] = computeLaneRowIntensity(rowSlice, W, ch, coreFraction);
-  }
-
-  set.prof = set.prof || {};
-  set.prof[ck] = out;
-  return out;
+  return extractLaneProfile2d(set, key, lane, coreFraction);
 }
 
 export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
@@ -237,7 +199,10 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
     } else {
       const im = tlcSet.imgs?.[activeMode];
       if (im?.bmp) {
-        const m = laneMatrix(lane, im.bmp.width / (tlcSet.frameW || LANE_FRAME_WIDTH), k);
+        const refDim = getReferenceDimensions(tlcSet, activeMode);
+        const refW = refDim?.width ?? im.bmp.width;
+        const refH = refDim?.height ?? im.bmp.height;
+        const m = laneMatrix(lane, refW / (tlcSet.frameW || LANE_FRAME_WIDTH), k);
         const scaleX = targetW / Math.max(1, lane.width * k);
         ctx.save();
         ctx.setTransform(
@@ -248,7 +213,7 @@ export const WellTlcPreview: React.FC<WellTlcPreviewProps> = ({
           dpr * m[4] * scaleX,
           dpr * m[5]
         );
-        ctx.drawImage(im.bmp, 0, 0);
+        drawAlignedChannelImage(ctx, tlcSet, activeMode, im.bmp, refW, refH);
         ctx.restore();
       }
     }

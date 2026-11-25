@@ -406,7 +406,8 @@ export function sampleFloatRgbLaneStrip(
   lane: TlcLane,
   imgScale: number,
   stripW: number,
-  stripL: number
+  stripL: number,
+  align?: { sx: number; sy: number; dx: number; dy: number; refW: number; refH: number }
 ): Float32Array {
   const W = Math.max(1, Math.round(stripW));
   const L = Math.max(1, Math.round(stripL));
@@ -423,6 +424,18 @@ export function sampleFloatRgbLaneStrip(
 
   const maxX = imgW - 1;
   const maxY = imgH - 1;
+  const useAlign =
+    align != null &&
+    align.refW > 0 &&
+    align.refH > 0 &&
+    align.sx > 1e-4 &&
+    align.sy > 1e-4;
+  const invSxW = useAlign ? imgW / align!.sx : 1;
+  const invSyH = useAlign ? imgH / align!.sy : 1;
+  const invRefW = useAlign ? 1 / align!.refW : 1;
+  const invRefH = useAlign ? 1 / align!.refH : 1;
+  const alignDx = useAlign ? align!.dx : 0;
+  const alignDy = useAlign ? align!.dy : 0;
 
   for (let sy = 0; sy < L; sy++) {
     const v = (L - (sy + 0.5)) * imgScale;
@@ -432,8 +445,10 @@ export function sampleFloatRgbLaneStrip(
 
     for (let sx = 0; sx < W; sx++) {
       const u = (sx + 0.5 - halfW) * imgScale;
-      const ix = baseX + u * nx - 0.5;
-      const iy = baseY + u * ny - 0.5;
+      const refX = baseX + u * nx;
+      const refY = baseY + u * ny;
+      const ix = (useAlign ? (refX * invRefW - alignDx) * invSxW : refX) - 0.5;
+      const iy = (useAlign ? (refY * invRefH - alignDy) * invSyH : refY) - 0.5;
 
       const x0 = ix < 0 ? 0 : ix > maxX ? maxX : Math.floor(ix);
       const y0 = iy < 0 ? 0 : iy > maxY ? maxY : Math.floor(iy);

@@ -41,6 +41,13 @@ import {
   measureSpotLateralWidth2d,
   segmentLaneSpots2d,
 } from './tlcSpots2d';
+import {
+  channelAlignCacheSuffix,
+  drawAlignedChannelImage,
+  getChannelAlignment,
+  getReferenceDimensions,
+  isIdentityAlignment,
+} from './tlcChannelAlign';
 export { DEFAULT_MIN_SPOT_WIDTH_FRAC };
 
 export const LANE_FRAME_WIDTH = 3280;
@@ -437,10 +444,25 @@ function extractRawChannelStrip(
   const im = set.imgs?.[key];
   if (!im) return null;
 
+  const refDim = getReferenceDimensions(set, key);
+
   // Prefer unclipped float32 radiance array directly from .npy when available
   if (im.floatRgb && im.floatWidth && im.floatHeight) {
-    const imgScale = im.floatWidth / (set.frameW || LANE_FRAME_WIDTH);
-    return sampleFloatRgbLaneStrip(im.floatRgb, im.floatWidth, im.floatHeight, lane, imgScale, W, L);
+    const refW = refDim?.width ?? im.floatWidth;
+    const refH = refDim?.height ?? im.floatHeight;
+    const imgScale = refW / (set.frameW || LANE_FRAME_WIDTH);
+    const align = getChannelAlignment(set, key);
+    const needsAlign = !isIdentityAlignment(align) || refW !== im.floatWidth || refH !== im.floatHeight;
+    return sampleFloatRgbLaneStrip(
+      im.floatRgb,
+      im.floatWidth,
+      im.floatHeight,
+      lane,
+      imgScale,
+      W,
+      L,
+      needsAlign ? { sx: align.sx, sy: align.sy, dx: align.dx, dy: align.dy, refW, refH } : undefined
+    );
   }
 
   if (!im.bmp || typeof document === 'undefined') return null;
@@ -452,11 +474,14 @@ function extractRawChannelStrip(
   const ctx = sharedLaneScratchCanvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
 
+  const refW = refDim?.width ?? im.bmp.width;
+  const refH = refDim?.height ?? im.bmp.height;
+
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, W, L);
-  const m = laneMatrix(lane, im.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+  const m = laneMatrix(lane, refW / (set.frameW || LANE_FRAME_WIDTH), 1);
   ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-  ctx.drawImage(im.bmp, 0, 0);
+  drawAlignedChannelImage(ctx, set, key, im.bmp, refW, refH);
   return ctx.getImageData(0, 0, W, L).data;
 }
 
@@ -467,13 +492,17 @@ function extractRawChannelStrip(
  * - Automatically skips duplicate blank-silica flat-fielding on pre-flat-fielded `uni_linint_corrected_*` images.
  * - Optionally follows curved/drifting lanes when `automiddleEnabled` is turned on.
  */
+function getProfileCacheSignature(set: TlcSet): string {
+  return `${getBlankSilicaSignature()}|${channelAlignCacheSuffix(set, ['UV254', 'UV366', 'White'])}`;
+}
+
 export function extractLaneProfile2d(
   set: TlcSet,
   key: TlcChannelKey,
   lane: TlcLane,
   coreFraction: number = 0.35
 ): number[] {
-  const bSig = getBlankSilicaSignature();
+  const bSig = getProfileCacheSignature(set);
   if ((set as any)._blankSig !== bSig) {
     if (set.imgs?.[key]?.bmp || set.imgs?.[key]?.floatRgb) {
       set.prof = {};
@@ -511,11 +540,14 @@ export function extractLaneProfile2d(
     sharedBlankScratchCanvas.height = L;
     const bCtx = sharedBlankScratchCanvas.getContext('2d', { willReadFrequently: true });
     if (bCtx) {
+      const refDim = getReferenceDimensions(set, key);
+      const refW = refDim?.width ?? blankRef.bmp.width;
+      const refH = refDim?.height ?? blankRef.bmp.height;
       bCtx.setTransform(1, 0, 0, 1, 0, 0);
       bCtx.clearRect(0, 0, W, L);
-      const bm = laneMatrix(lane, blankRef.bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+      const bm = laneMatrix(lane, refW / (set.frameW || LANE_FRAME_WIDTH), 1);
       bCtx.setTransform(bm[0], bm[1], bm[2], bm[3], bm[4], bm[5]);
-      bCtx.drawImage(blankRef.bmp, 0, 0);
+      drawAlignedChannelImage(bCtx, set, key, blankRef.bmp, refW, refH);
       const blankData = bCtx.getImageData(0, 0, W, L);
       stripRgba = applyFlatFieldCorrection(stripRgba, blankData.data, W, L, key);
     }
@@ -575,7 +607,7 @@ export function getLane2dMetrics(
   lane: TlcLane,
   coreFraction: number = 0.35
 ): Lane2dMetrics | undefined {
-  const bSig = getBlankSilicaSignature();
+  const bSig = getProfileCacheSignature(set);
   if ((set as any)._blankSig !== bSig && (set.imgs?.[key]?.bmp || set.imgs?.[key]?.floatRgb)) {
     set.prof = {};
     (set as any)._prof2d = {};
@@ -3158,7 +3190,7 @@ export function extractDensitogram(
   };
 }
 
-function autoCacheSignature(set: TlcSet): string {
+export function autoCacheSignature(set: TlcSet): string {
   const imgSig = Object.entries(set.imgs || {})
     .map(([k, im]) => `${k}:${im.name}`)
     .sort()
@@ -3172,7 +3204,52 @@ function autoCacheSignature(set: TlcSet): string {
     : 'off';
   const l0 = set.cfg?.lanes[0];
   const laneSig = set.cfg ? `${set.cfg.lanes.length}_${l0?.x0 ?? 0}_${l0?.y0 ?? 0}_${l0?.length ?? 0}` : 'none';
-  return `${imgSig}|pre:${preSig}|${laneSig}|${getBlankSilicaSignature()}`;
+  return `${imgSig}|pre:${preSig}|${laneSig}|${getProfileCacheSignature(set)}`;
+}
+
+/**
+ * Surgically invalidates cached profiles and per-lane auto baselines for a single edited lane,
+ * keeping the other 53 lanes' extracted pixels, 2D metrics, histograms, and front-band caches warm.
+ */
+export function pruneLaneProfileCaches(
+  nextSlice: TlcSet,
+  laneId: number,
+  geometryChanged: boolean
+): Partial<TlcSet> & Record<string, any> {
+  const nextAutoSig = autoCacheSignature(nextSlice);
+  if (!geometryChanged) {
+    return { _autoCacheSig: nextAutoSig };
+  }
+
+  const needle = `:${laneId}:`;
+  const nextProf: Record<string, number[]> = {};
+  if (nextSlice.prof) {
+    for (const k of Object.keys(nextSlice.prof)) {
+      if (!k.includes(needle)) nextProf[k] = nextSlice.prof[k];
+    }
+  }
+
+  const prev2d = (nextSlice as any)._prof2d as Record<string, Lane2dMetrics> | undefined;
+  const next2d: Record<string, Lane2dMetrics> = {};
+  if (prev2d) {
+    for (const k of Object.keys(prev2d)) {
+      if (!k.includes(needle)) next2d[k] = prev2d[k];
+    }
+  }
+
+  const nextOriginByLane = nextSlice.originAutoByLane ? { ...nextSlice.originAutoByLane } : {};
+  delete nextOriginByLane[laneId];
+
+  const nextFrontByLane = nextSlice.frontAutoByLane ? { ...nextSlice.frontAutoByLane } : {};
+  delete nextFrontByLane[laneId];
+
+  return {
+    prof: nextProf,
+    _prof2d: next2d,
+    originAutoByLane: nextOriginByLane,
+    frontAutoByLane: nextFrontByLane,
+    _autoCacheSig: nextAutoSig,
+  };
 }
 
 function detectDiffuseChannelFront(
@@ -5911,18 +5988,23 @@ export function renderFalseColorLane(
   const ctx = c1.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
 
-  const extractChannelBytes = (bmp: ImageBitmap): Uint8ClampedArray => {
+  const refDim = getReferenceDimensions(set);
+
+  const extractChannelBytes = (bmp: ImageBitmap, chKey: TlcChannelKey): Uint8ClampedArray => {
+    const refW = refDim?.width ?? bmp.width;
+    const refH = refDim?.height ?? bmp.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, W, L);
-    const m = laneMatrix(lane, bmp.width / (set.frameW || LANE_FRAME_WIDTH), 1);
+    ctx.fillStyle = chKey === 'White' ? '#ffffff' : chKey === 'UV254' ? '#00ff00' : '#000000';
+    ctx.fillRect(0, 0, W, L);
+    const m = laneMatrix(lane, refW / (set.frameW || LANE_FRAME_WIDTH), 1);
     ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-    ctx.drawImage(bmp, 0, 0);
+    drawAlignedChannelImage(ctx, set, chKey, bmp, refW, refH);
     return ctx.getImageData(0, 0, W, L).data;
   };
 
-  const data254 = im254?.bmp ? extractChannelBytes(im254.bmp) : null;
-  const data366 = im366?.bmp ? extractChannelBytes(im366.bmp) : null;
-  const dataWhite = imWhite?.bmp ? extractChannelBytes(imWhite.bmp) : null;
+  const data254 = im254?.bmp ? extractChannelBytes(im254.bmp, 'UV254') : null;
+  const data366 = im366?.bmp ? extractChannelBytes(im366.bmp, 'UV366') : null;
+  const dataWhite = imWhite?.bmp ? extractChannelBytes(imWhite.bmp, 'White') : null;
 
   const compositeBytes = computeFalseColorComposite(data254, data366, W, L, gain, dataWhite);
   const imgData = ctx.createImageData(W, L);

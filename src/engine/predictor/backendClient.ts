@@ -2,6 +2,8 @@
 import type { WellPredictionResult } from './types';
 
 const STORAGE_KEY = 'robowski_python_rdkit_url';
+const DISABLED_SENTINEL = '__OFF__';
+export const DEFAULT_LAB_BACKEND_URL = 'https://91474-p02.tail4c9e6a.ts.net';
 
 export interface PythonBackendStatus {
   connected: boolean;
@@ -34,18 +36,36 @@ export interface ReagentInspectionResult {
 export function getPythonBackendUrl(): string {
   try {
     if (typeof window === 'undefined' || !window.localStorage) return '';
-    return (window.localStorage.getItem(STORAGE_KEY) || '').trim().replace(/\/+$/, '');
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored === null) return DEFAULT_LAB_BACKEND_URL;
+    if (stored === DISABLED_SENTINEL) return '';
+    return stored.trim().replace(/\/+$/, '');
   } catch {
-    return '';
+    return DEFAULT_LAB_BACKEND_URL;
   }
 }
 
+export function normalizePythonBackendUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  // Shorthand Cloudflare tunnel words (e.g. "happy-blue-tiger" -> "https://happy-blue-tiger.trycloudflare.com")
+  if (/^[a-z0-9]+(?:-[a-z0-9]+){1,}$/i.test(trimmed) && !/^localhost$/i.test(trimmed)) {
+    return `https://${trimmed.toLowerCase()}.trycloudflare.com`;
+  }
+  // Localhost or raw IPv4 address -> http://
+  if (/^(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$/i.test(trimmed)) {
+    return `http://${trimmed}`;
+  }
+  return `https://${trimmed}`;
+}
+
 export function setPythonBackendUrl(url: string): string {
-  const clean = (url || '').trim().replace(/\/+$/, '');
+  const clean = normalizePythonBackendUrl(url);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       if (clean) window.localStorage.setItem(STORAGE_KEY, clean);
-      else window.localStorage.removeItem(STORAGE_KEY);
+      else window.localStorage.setItem(STORAGE_KEY, DISABLED_SENTINEL);
     }
   } catch {}
   return clean;
@@ -62,7 +82,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 export async function testPythonBackend(rawUrl: string): Promise<PythonBackendStatus> {
-  const url = (rawUrl || '').trim().replace(/\/+$/, '');
+  const url = normalizePythonBackendUrl(rawUrl);
   if (!url) {
     return { connected: false, url: '', error: 'No URL configured.' };
   }

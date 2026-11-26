@@ -113,6 +113,7 @@ export type ChemicalAlertKind =
   | 'uv_invisible_product'
   | 'python_3d_strain'
   | 'tlc_history'
+  | 'dmso_reactivity'
   | 'search_truncated'
   | 'blank_likely';
 

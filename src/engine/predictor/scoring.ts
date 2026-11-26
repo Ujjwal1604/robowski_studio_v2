@@ -70,6 +70,11 @@ export function conditionGate(
   acidBase: AcidBaseSummary,
   cond: WellConditionConfig
 ): number {
+  const isDmso = !cond.solvent || /dmso|dimethyl\s*sulfoxide/i.test(cond.solvent);
+  if (rule.requiresSolvent === 'dmso' && !isDmso) {
+    return 0.0;
+  }
+
   if (rule.requiresFreeAcid) {
     if (acidBase.freeAcidEq < 0.05) return 0.0;
     return Math.min(1.0, acidBase.acidBlend * Math.min(1.0, acidBase.freeAcidEq * 2.5));
@@ -81,6 +86,16 @@ export function conditionGate(
       acidBase.baseBlend * rule.baseFactor +
       acidBase.neutralBlend * rule.neutralFactor) /
     denom;
+
+  if (isDmso && rule.dmsoBoost && rule.dmsoBoost > 1) {
+    blend *= rule.dmsoBoost;
+  }
+
+  // Krapcho decarbalkoxylation in DMSO benefits from trace water (moist DMSO)
+  if (rule.id === 'DC_krapcho_dmso') {
+    const water = Math.max(0, Number(cond.waterPct) || 0);
+    if (water < 0.05) blend *= 0.65;
+  }
 
   // Water retardation on dehydrations
   if (rule.waterSensitiveReverse) {
@@ -179,8 +194,14 @@ export function estimateElectronicFactor(
   const electrophile = reactantSmiles[0] || '';
 
   if (rdkit) {
-    if (rule.stepLabel === 'SN(N)' || rule.stepLabel === 'SN(S)' || rule.stepLabel === 'SN(O)') {
-      if (rule.id.includes('sulfonate')) {
+    if (
+      rule.stepLabel === 'SN(N)' ||
+      rule.stepLabel === 'SN(S)' ||
+      rule.stepLabel === 'SN(O)' ||
+      rule.stepLabel === 'SN(C)' ||
+      rule.id.startsWith('OX_kornblum')
+    ) {
+      if (rule.id.includes('sulfonate') || rule.id.includes('tosylate')) {
         if (countSubstruct(rdkit, electrophile, SN2_SULFONATE) > 0) factor *= 1.04;
       } else if (!rule.id.includes('epoxide') && !rule.id.includes('sulfonyl_halide')) {
         if (countSubstruct(rdkit, electrophile, SN2_I) > 0) factor *= 1.08;
@@ -249,19 +270,25 @@ export function estimateElectronicFactor(
       }
     }
 
-    // Deactivate Friedel-Crafts / Mannich EA on 5-membered pyrrole/indole rings bearing strong conjugating EWGs (e.g. 2-trichloroacetylpyrrole, 2-formylpyrrole, 3-acylindole)
-    if (rule.stepLabel === 'EA') {
+    // Deactivate Friedel-Crafts / Mannich EA and DMSO Pummerer electrophilic attack on 5-membered pyrrole/indole rings bearing strong conjugating EWGs
+    if (
+      rule.stepLabel === 'EA' ||
+      rule.id === 'OX_dmso_pummerer_sme' ||
+      rule.id === 'OX_dmso_methylene_bisindole'
+    ) {
+      const fiveRingSub =
+        rule.id === 'EA_bis_indole_pyrrole' ? reactantSmiles[1] || '' : electrophile;
       const ewgOnFiveRing = countSubstruct(
         rdkit,
-        electrophile,
+        fiveRingSub,
         '[c;r5;$(c([CX3]=O)),$(c(C#N)),$(c([NX3+](=O)[O-])),$(c(S(=O)=O)),$(c(C(F)(F)F))]'
       );
       if (ewgOnFiveRing > 0) {
         // Strong ring deactivation (especially -COCCl3, -CHO, -NO2, -CN on pyrrole/indole)
         const hasTrichloroOrNitro =
-          countSubstruct(rdkit, electrophile, '[c;r5]C(=O)C(Cl)(Cl)Cl') > 0 ||
-          countSubstruct(rdkit, electrophile, '[c;r5][NX3+](=O)[O-]') > 0;
-        factor *= hasTrichloroOrNitro ? 0.28 : 0.42;
+          countSubstruct(rdkit, fiveRingSub, '[c;r5]C(=O)C(Cl)(Cl)Cl') > 0 ||
+          countSubstruct(rdkit, fiveRingSub, '[c;r5][NX3+](=O)[O-]') > 0;
+        factor *= hasTrichloroOrNitro ? 0.22 : 0.38;
       }
     }
 
@@ -278,7 +305,7 @@ export function estimateElectronicFactor(
     }
   }
 
-  return Math.max(0.22, Math.min(1.15, factor));
+  return Math.max(0.2, Math.min(1.15, factor));
 }
 
 // Equilibrium constants of reversible step types:

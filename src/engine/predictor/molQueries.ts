@@ -53,14 +53,16 @@ export function parseFormula(formula: string): Record<string, number> {
 }
 
 /**
- * Atom bookkeeping for one reaction step. Hydrogen and oxygen may move (water, hydroxide), but every other
- * element must be conserved exactly (or, for steps that shed a leaving group, never increase), and oxygen
- * may never be created. Stops templates that silently delete unmapped atoms from entering the pool.
+ * Atom bookkeeping for one reaction step. Hydrogen may move (proton transfers), and oxygen may decrease
+ * (dehydration). Every other element must be conserved exactly (or never increase for leaving-group steps),
+ * except when a rule explicitly declares solvent-donated atoms via `allowedSolventGain` (e.g., `{ O: 1 }`
+ * for DMSO Kornblum oxidation or `{ C: 1, S: 1 }` for DMSO Pummerer methylthiolation).
  */
 export function stepIsAtomBalanced(
   reactantFormulas: string[],
   productFormulas: string[],
-  allowLeavingGroup = false
+  allowLeavingGroup = false,
+  allowedSolventGain?: Record<string, number>
 ): boolean {
   const sum = (fs: string[]) => {
     const t: Record<string, number> = {};
@@ -77,11 +79,18 @@ export function stepIsAtomBalanced(
     if (el === 'H') continue;
     const a = r[el] || 0;
     const b = p[el] || 0;
+    const maxGain = allowedSolventGain?.[el] || 0;
     if (el === 'O') {
-      if (b > a) return false;
+      if (b > a + maxGain) return false;
       continue;
     }
-    if (allowLeavingGroup ? b > a : a !== b) return false;
+    if (allowLeavingGroup) {
+      if (b > a + maxGain) return false;
+    } else if (maxGain > 0) {
+      if (b < a || b > a + maxGain) return false;
+    } else if (a !== b) {
+      return false;
+    }
   }
   return true;
 }

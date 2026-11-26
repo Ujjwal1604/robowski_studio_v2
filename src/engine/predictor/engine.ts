@@ -183,7 +183,6 @@ function getUnmodeledReactiveQueries(rdkit: any): Array<{ label: string; qmol: a
     ['ketene (C=C=O)', '[CX3]=[CX2]=[OX1]'],
     ['aziridine (3-membered N-ring)', '[CX4]1[NX3][CX4]1'],
     ['diazonium salt ([N+]#N)', '[#6][NX2+]#[NX1]'],
-    ['chloroformate (RO-CO-Cl)', '[OX2][CX3](=[OX1])Cl'],
     ['boronic acid/ester (requires Pd/Cu catalyst)', '[#6][BX3]([OX2])[OX2]'],
     ['phosphorochloridate / P–Cl reagent', '[PX4,PX3]Cl'],
     ['organic peroxide (O–O)', '[OX2][OX2]'],
@@ -464,6 +463,7 @@ const LEAVING_GROUP_STEPS = new Set([
   'SN(N)',
   'SN(S)',
   'SN(O)',
+  'SN(C)',
   'AR',
   'AS(N)',
   'AS(O)',
@@ -830,7 +830,8 @@ export function predictWellReactions(
               !stepIsAtomBalanced(
                 pair.map((p) => p.meta.formula),
                 prodFormulas,
-                LEAVING_GROUP_STEPS.has(rule.stepLabel)
+                LEAVING_GROUP_STEPS.has(rule.stepLabel),
+                rule.allowedSolventGain
               )
             ) {
               continue;
@@ -1176,6 +1177,8 @@ export function predictWellReactions(
       message: `Gas evolution predicted: ${Array.from(releasedGases).join(', ')}`,
     });
   }
+  const isDmsoSolvent =
+    !effectiveCondition.solvent || /dmso|dimethyl\s*sulfoxide/i.test(effectiveCondition.solvent);
   for (const sub of activeSubs) {
     const unmodeled = detectUnmodeledSubstrateGroups(rdkit, sub.neutralSmiles);
     if (unmodeled.length > 0) {
@@ -1184,6 +1187,23 @@ export function predictWellReactions(
         severity: 'warn',
         message: `${sub.code} contains reactive group(s) not modeled by rules: ${unmodeled.join(', ')}`,
       });
+    }
+    if (isDmsoSolvent) {
+      const hasAcylHalide = countSubstruct(rdkit, sub.neutralSmiles, '[CX3](=[OX1])[Cl,Br]') > 0;
+      const hasSulfonylHalide = countSubstruct(rdkit, sub.neutralSmiles, '[SX4](=[OX1])(=[OX1])[Cl,Br]') > 0;
+      if (hasAcylHalide || hasSulfonylHalide) {
+        const grp =
+          hasAcylHalide && hasSulfonylHalide
+            ? 'acyl/sulfonyl halide'
+            : hasAcylHalide
+            ? 'acyl halide / chloroformate'
+            : 'sulfonyl halide';
+        wellAlerts.push({
+          kind: 'dmso_reactivity',
+          severity: 'warn',
+          message: `DMSO incompatibility: ${sub.code} (${grp}) reacts rapidly with DMSO itself (Swern/Pummerer activation → Me₂S⁺–Cl / DMS + HX), which can consume the reagent or oxidize alcohols.`,
+        });
+      }
     }
   }
   if (truncated) {

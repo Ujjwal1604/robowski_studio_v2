@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, Server } from 'lucide-react';
+import { Link2, RefreshCw, Server } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { DEFAULT_LAB_BACKEND_URL } from '../../engine/predictor/backendClient';
 
 export const Header: React.FC = () => {
   const {
@@ -22,24 +23,38 @@ export const Header: React.FC = () => {
     toast,
   } = useApp();
 
-  const [urlDraft, setUrlDraft] = useState<string>(() => backendUrl || 'http://localhost:8000');
+  const [urlDraft, setUrlDraft] = useState<string>(() => backendUrl || DEFAULT_LAB_BACKEND_URL);
   const [testing, setTesting] = useState<boolean>(false);
 
   useEffect(() => {
     if (backendUrl) setUrlDraft(backendUrl);
   }, [backendUrl]);
 
-  const handleTestAndSave = async () => {
-    const trimmed = urlDraft.trim();
+  const handleTestAndSave = async (overrideUrl?: string) => {
+    const trimmed = (overrideUrl ?? urlDraft).trim();
     if (!trimmed) {
-      toast('Enter your Lab PC server address first (e.g. http://localhost:8000).');
+      toast(`Enter your Lab PC server address first (e.g. ${DEFAULT_LAB_BACKEND_URL}).`);
       return;
     }
+    setUrlDraft(trimmed);
     setTesting(true);
     const st = await connectBackend(trimmed);
     setTesting(false);
     if (st.connected) {
       setUrlDraft(st.url);
+    }
+  };
+
+  const handleCopyConnectLink = async () => {
+    const target = (backendUrl || urlDraft).trim();
+    if (!target) return;
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set('lab', target);
+      await navigator.clipboard.writeText(u.toString());
+      toast('Copied 1-click bookmark link — open it on the robot PC to connect automatically.');
+    } catch {
+      toast('Could not copy link automatically.');
     }
   };
 
@@ -252,7 +267,7 @@ export const Header: React.FC = () => {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') handleTestAndSave();
                 }}
-                placeholder="http://localhost:8000 or https://....trycloudflare.com"
+                placeholder="Just the tunnel words (e.g. happy-blue-tiger), localhost:8000, or full URL"
                 className="mono"
                 style={{
                   flex: '1 1 280px',
@@ -270,21 +285,33 @@ export const Header: React.FC = () => {
                 type="button"
                 className="btn sm pri"
                 disabled={testing}
-                onClick={handleTestAndSave}
+                onClick={() => handleTestAndSave()}
               >
                 {testing ? 'Connecting…' : 'Test & Save'}
               </button>
               {isConnected && (
-                <button
-                  type="button"
-                  className="btn sm"
-                  disabled={backendSyncing}
-                  onClick={() => syncWithBackend()}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
-                >
-                  <RefreshCw size={12} />
-                  <span>{backendSyncing ? 'Syncing…' : 'Sync Now'}</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={backendSyncing}
+                    onClick={() => syncWithBackend()}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                  >
+                    <RefreshCw size={12} />
+                    <span>{backendSyncing ? 'Syncing…' : 'Sync Now'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={handleCopyConnectLink}
+                    title="Copy a 1-click auto-connect link to bookmark or send to the robot PC"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                  >
+                    <Link2 size={12} />
+                    <span>Copy Link</span>
+                  </button>
+                </>
               )}
               {backendUrl && (
                 <button type="button" className="btn sm" onClick={disconnectBackend}>
@@ -326,10 +353,27 @@ export const Header: React.FC = () => {
               </div>
             )}
 
-            <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>
-              On your personal lab PC inside <span className="mono">python_backend/</span>, run:{' '}
-              <span className="mono">uv run app.py</span> · To access from the public robot PC (or HTTPS), also run:{' '}
-              <span className="mono">cloudflared tunnel --url http://127.0.0.1:8000</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '11.5px', color: 'var(--mut)' }}>
+              <span>Quick select:</span>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={testing}
+                onClick={() => handleTestAndSave(DEFAULT_LAB_BACKEND_URL)}
+                style={{ padding: '2px 8px', fontSize: '11px' }}
+              >
+                Default ({DEFAULT_LAB_BACKEND_URL.replace(/^https?:\/\//, '')})
+              </button>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={testing}
+                onClick={() => handleTestAndSave('http://localhost:8000')}
+                style={{ padding: '2px 8px', fontSize: '11px' }}
+              >
+                This PC (localhost:8000)
+              </button>
+              <span>· Or paste any custom URL / Cloudflare words to override.</span>
             </div>
           </div>
         </div>

@@ -708,22 +708,46 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     toast('Disconnected Lab PC — using local browser storage and built-in predictor.');
   }, [toast]);
 
-  // Silently check saved Lab PC backend and sync once on startup
+  // Auto-connect from ?lab=... bookmark link, or silently check saved Lab PC backend on startup
   useEffect(() => {
-    const saved = Core.getPythonBackendUrl();
-    if (!saved) return;
+    let fromQuery = '';
+    try {
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        fromQuery = (params.get('lab') || params.get('backend') || '').trim();
+        if (fromQuery) {
+          params.delete('lab');
+          params.delete('backend');
+          const qs = params.toString();
+          const cleanPath = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
+          window.history.replaceState({}, '', cleanPath);
+        }
+      }
+    } catch {}
+
+    const target = fromQuery ? Core.normalizePythonBackendUrl(fromQuery) : Core.getPythonBackendUrl();
+    if (!target) return;
     let active = true;
-    Core.testPythonBackend(saved).then((st) => {
+    Core.testPythonBackend(target).then((st) => {
       if (!active) return;
       setBackendStatus(st);
       if (st.connected) {
-        void syncWithBackend(saved, { silent: true });
+        if (fromQuery) {
+          const saved = Core.setPythonBackendUrl(st.url);
+          setBackendUrl(saved);
+          setBackendRevision((v) => v + 1);
+          toast(`Connected to Lab PC via link — runs & library synced.`);
+        }
+        void syncWithBackend(st.url, { silent: true });
+      } else if (fromQuery) {
+        setBackendPanelOpen(true);
+        toast(st.error || 'Could not reach Lab PC link.');
       }
     });
     return () => {
       active = false;
     };
-  }, [syncWithBackend]);
+  }, [syncWithBackend, toast]);
 
   // Run library & Reagent Library Storage Helpers
   const putRun = useCallback(

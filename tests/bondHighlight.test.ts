@@ -20,7 +20,9 @@ beforeAll(async () => {
 describe('New-Bond Highlighting in Cascade Products', () => {
   it('compiles RHS SMARTS cleanly for every reaction and tautomer rule', () => {
     for (const rule of [...REACTION_RULES, ...TAUTOMER_RULES]) {
-      const rhs = rule.smarts.split('>>')[1].split('.')[0].replace(/:\d+(?=\])/g, '');
+      const rawRhs = rule.smarts.split('>>')[1].trim();
+      const unwrapped = rawRhs.startsWith('(') && rawRhs.endsWith(')') ? rawRhs.slice(1, -1) : rawRhs;
+      const rhs = unwrapped.split('.')[0].replace(/:\d+(?=\])/g, '');
       const qmol = rdkit.get_qmol(rhs);
       expect(qmol, `Rule ${rule.id} RHS failed`).toBeTruthy();
       qmol.delete();

@@ -160,7 +160,12 @@ function getRuleBondDiff(rule: ReactionRuleDef): RuleBondDiff | null {
     return null;
   }
   const [lhs, rhsAll] = parts;
-  const rhs = rhsAll.split('.')[0];
+  const trimmedRhs = rhsAll.trim();
+  const unwrappedRhs =
+    trimmedRhs.startsWith('(') && trimmedRhs.endsWith(')')
+      ? trimmedRhs.slice(1, -1)
+      : trimmedRhs;
+  const rhs = unwrappedRhs.split('.')[0];
   const L = parseSmartsBonds(lhs);
   const R = parseSmartsBonds(rhs);
 

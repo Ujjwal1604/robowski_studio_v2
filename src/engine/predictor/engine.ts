@@ -27,7 +27,7 @@ import {
   temperatureGate,
 } from './scoring';
 import { stepIsAtomBalanced, countSubstruct } from './molQueries';
-import { hasAntiBredtDoubleBond } from './rdkitGraph';
+import { hasAntiBredtDoubleBond, hasImpossibleBridgedAromaticRing } from './rdkitGraph';
 import { analyzeTlcVisibility } from './tlcVisibility';
 
 const PROTON_MASS = 1.00727647;
@@ -843,8 +843,9 @@ export function predictWellReactions(
           // Intramolecular cyclizations must form at least one new ring
           if (rule.intramolecular && mainMeta.numRings <= pair[0].meta.numRings) continue;
 
-          // Guard against physically impossible anti-Bredt bridgehead double bonds and unintentional dearomatization
+          // Guard against physically impossible anti-Bredt bridgehead double bonds, meta/para-bridged aromatic cages, and unintentional dearomatization
           if (mainMeta.numRings >= 2 && hasAntiBredtDoubleBond(rdkit, mainMeta.smiles)) continue;
+          if (mainMeta.numRings >= 2 && mainMeta.numAromaticRings >= 1 && hasImpossibleBridgedAromaticRing(rdkit, mainMeta.smiles)) continue;
           const parentAromSum = pair.reduce((acc, p) => acc + p.meta.numAromaticRings, 0);
           if (
             !LEAVING_GROUP_STEPS.has(rule.stepLabel) &&
@@ -1022,7 +1023,7 @@ export function predictWellReactions(
     }
     const last = sp.chain[sp.chain.length - 1];
     const hasRingOrAromaticLock = sp.chain.some(
-      (st) => st.ringFactor > 1.15 || st.stepLabel === 'AO' || st.stepLabel === 'PC' || st.stepLabel === 'DC'
+      (st) => (!st.reversible && st.ringFactor > 1.15) || st.stepLabel === 'AO' || st.stepLabel === 'PC' || st.stepLabel === 'DC'
     );
     // If the terminal step is reversible AND hasn't reached an irreversible lock (e.g. hemiaminal, uncyclized imine, simple enamine, open aza-Michael), treat as transient
     const isTransient = Boolean(last && last.reversible && !hasRingOrAromaticLock && last.stepLabel !== 'DH');

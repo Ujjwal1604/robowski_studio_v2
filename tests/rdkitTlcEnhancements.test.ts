@@ -4,6 +4,7 @@ import {
   parseSubstrateAndSalts,
   analyzeTlcVisibility,
   hasAntiBredtDoubleBond,
+  hasImpossibleBridgedAromaticRing,
   PredictorSubstrateInput,
   WellConditionConfig,
 } from '../src/engine/predictor';
@@ -98,6 +99,53 @@ describe('RDKit graph intelligence: local pKa shifts, Hammett electronics, ortho
     // 2-Cyclopenten-1-one and indene -> valid!
     expect(hasAntiBredtDoubleBond(rdkit, 'O=C1CCC=C1')).toBe(false);
     expect(hasAntiBredtDoubleBond(rdkit, 'C1=Cc2ccccc2C1')).toBe(false);
+  });
+
+  it('rejects impossible short-tether meta/para-bridged aromatic cages while permitting ortho/peri-fused aromatics', () => {
+    // 1,3-bridged pyrrole cage (exact impossible topology from #13 in user screenshot) -> REJECT!
+    expect(
+      hasImpossibleBridgedAromaticRing(
+        rdkit,
+        'OC1(C(Cl)(Cl)Cl)c2cc(c[nH]2)C(c2c[nH]cn2)N1c1ccc2[nH]cnc2c1'
+      )
+    ).toBe(true);
+    // Short 1,3-bridged benzene (meta-cyclophane with 3-atom bridge) -> REJECT!
+    expect(hasImpossibleBridgedAromaticRing(rdkit, 'c1cc2CCCc(c1)c2')).toBe(true);
+    // Legitimate ortho-fused & peri-fused aromatics -> PERMIT!
+    expect(hasImpossibleBridgedAromaticRing(rdkit, 'c1ccc2[nH]ccc2c1')).toBe(false); // indole
+    expect(hasImpossibleBridgedAromaticRing(rdkit, 'c1ccc2[nH]cnc2c1')).toBe(false); // benzimidazole
+    expect(hasImpossibleBridgedAromaticRing(rdkit, 'c1ccc2c(c1)[nH]c1ccccc21')).toBe(false); // carbazole
+    expect(hasImpossibleBridgedAromaticRing(rdkit, 'C1Cc2cccc3cccc1c23')).toBe(false); // acenaphthene
+  });
+
+  it('predicts trichloroacetyl amidation (CHCl3 leaving group), downgrades deactivated pyrrole EA, and forbids bridged pyrrole hemiaminal', () => {
+    const res = predictWellReactions(
+      rdkit,
+      [
+        S('A', 'O=Cc1c[nH]cn1'), // 1H-imidazole-4-carbaldehyde
+        S('B', 'Nc1ccc2[nH]cnc2c1'), // 5-aminobenzimidazole
+        S('C', 'O=C(C(Cl)(Cl)Cl)c1ccc[nH]1'), // 2-(trichloroacetyl)pyrrole
+      ],
+      COND({ medium: 'acid', additiveName: 'TsOH', additiveEquiv: 0.2, additivePka: 0.9, temperatureC: 60 }),
+      { includeSpeculative: true }
+    );
+
+    // 1. No species may contain an impossible bridged aromatic cage
+    for (const sp of res.species) {
+      expect(hasImpossibleBridgedAromaticRing(rdkit, sp.smiles)).toBe(false);
+    }
+
+    // 2. Real trichloroacetyl amidation product: N-(1H-benzimidazol-5-yl)-1H-pyrrole-2-carboxamide (C12H10N4O)
+    const amide = res.species.find((s) => s.formula === 'C12H10N4O');
+    expect(amide).toBeDefined();
+    expect(amide!.score).toBeGreaterThanOrEqual(0.45);
+    expect(amide!.status).toBe('sink');
+
+    // 3. Deactivated 2-(trichloroacetyl)pyrrole Mannich product (C17H13Cl3N6O) must be downgraded below Medium (< 0.28)
+    const mannich = res.species.find((s) => s.formula === 'C17H13Cl3N6O');
+    if (mannich) {
+      expect(mannich.score).toBeLessThan(0.28);
+    }
   });
 });
 

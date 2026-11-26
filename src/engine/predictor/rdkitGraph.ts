@@ -187,6 +187,41 @@ export function hasAntiBredtDoubleBond(rdkit: any, smiles: string): boolean {
   return false;
 }
 
+/**
+ * Rejects physically impossible short-tether bridged aromatic cages (meta/para-cyclophanes where a new
+ * ring of size <= 9 bridges across >= 3 atoms of a single planar 5- or 6-membered aromatic ring).
+ * Legitimate ortho-fused and peri-fused aromatics (indole, benzimidazole, quinoline, pyrene, etc.)
+ * share at most 2 atoms with any single aromatic SSSR ring and are unaffected.
+ */
+export function hasImpossibleBridgedAromaticRing(rdkit: any, smiles: string): boolean {
+  const g = parseMolGraph(rdkit, smiles);
+  if (!g || g.numAromaticRings === 0 || g.atomRings.length < 2) return false;
+
+  const isAromRing = g.atomRings.map(
+    (r) => (r.length === 5 || r.length === 6) && r.every((a) => g.atoms[a]?.isAromatic)
+  );
+
+  for (let i = 0; i < g.atomRings.length; i++) {
+    if (!isAromRing[i]) continue;
+    const aromRing = g.atomRings[i];
+    const aromSet = new Set(aromRing);
+    for (let j = 0; j < g.atomRings.length; j++) {
+      if (i === j) continue;
+      const other = g.atomRings[j];
+      let shared = 0;
+      for (const a of other) {
+        if (aromSet.has(a)) shared++;
+      }
+      // Bridging across >= 3 atoms of one planar aromatic ring requires a long macrocyclic tether (>= 6 extra atoms)
+      if (shared >= 3 && (other.length <= 9 || other.length - shared <= 5)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 export interface LocalRingSubstituents {
   ewgStrength: number; // positive = electron-withdrawing (ortho/para NO2, CN, CF3, C=O, SO2, ring-N, halogens)
   edgStrength: number; // positive = electron-donating (ortho/para NR2, OR, OH, alkyl)

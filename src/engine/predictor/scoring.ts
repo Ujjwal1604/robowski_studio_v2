@@ -249,6 +249,22 @@ export function estimateElectronicFactor(
       }
     }
 
+    // Deactivate Friedel-Crafts / Mannich EA on 5-membered pyrrole/indole rings bearing strong conjugating EWGs (e.g. 2-trichloroacetylpyrrole, 2-formylpyrrole, 3-acylindole)
+    if (rule.stepLabel === 'EA') {
+      const ewgOnFiveRing = countSubstruct(
+        rdkit,
+        electrophile,
+        '[c;r5;$(c([CX3]=O)),$(c(C#N)),$(c([NX3+](=O)[O-])),$(c(S(=O)=O)),$(c(C(F)(F)F))]'
+      );
+      if (ewgOnFiveRing > 0) {
+        // Strong ring deactivation (especially -COCCl3, -CHO, -NO2, -CN on pyrrole/indole)
+        const hasTrichloroOrNitro =
+          countSubstruct(rdkit, electrophile, '[c;r5]C(=O)C(Cl)(Cl)Cl') > 0 ||
+          countSubstruct(rdkit, electrophile, '[c;r5][NX3+](=O)[O-]') > 0;
+        factor *= hasTrichloroOrNitro ? 0.28 : 0.42;
+      }
+    }
+
     // Ketimines from aryl ketones are thermodynamically & kinetically disfavored vs aldimines
     if (rule.id === 'DH_imine') {
       if (countSubstruct(rdkit, electrophile, '[CX4;H0]([OX2H1])([NX3;H2,H1])(c)[#6]') > 0) {
@@ -262,7 +278,7 @@ export function estimateElectronicFactor(
     }
   }
 
-  return Math.max(0.35, Math.min(1.15, factor));
+  return Math.max(0.22, Math.min(1.15, factor));
 }
 
 // Equilibrium constants of reversible step types:

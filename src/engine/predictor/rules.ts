@@ -62,8 +62,8 @@ const NUC_N =
 // Broad N including primary amidine/guanidine NH2/NH (non-acylated)
 const NUC_N_BROAD =
   '[NX3;H3,H2,H1;!$(N-C(=O)-[#6,O,N]);!$(N-C(=S)-[#6,O,N]);!$(N-S=O);!$(N-N);!$(N-C-[OX2H]);!$([N+]):3]';
-// Electrophilic aldehyde or ketone C=O (excludes esters, amides, acids, ureas)
-const ALDEHYDE_OR_KETONE = '[CX3;$([CH1](=O)[#6]),$([CH2]=O),$(C(=O)([#6])[#6]):1]=[OX1:2]';
+// Electrophilic aldehyde or ketone C=O (excludes esters, amides, acids, ureas, and trichloroacetyl acylating reagents)
+const ALDEHYDE_OR_KETONE = '[CX3;!$([CX3](=O)[CX4](Cl)(Cl)Cl);$([CH1](=O)[#6]),$([CH2]=O),$(C(=O)([#6])[#6]):1]=[OX1:2]';
 // Activated carbon acid C-H: dual EWG (1,3-dicarbonyl, malononitrile, cyanoester, etc.) OR single strong EWG (ketone, nitro, 2-methylazine)
 const CARBON_ACID_DUAL =
   '[CX4;H2,H1;!$(C-C-[OX2H]);$(C(C=O)C=O),$(C(C#N)C#N),$(C(C=O)C#N),$(C(S(=O)=O)C=O),$(C(S(=O)=O)C#N):3]';
@@ -1363,6 +1363,50 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     confidenceClass: 'A',
     releasesReactiveFragment: true,
     reactiveSiteKind: 'amine_nuc',
+    stericRule: 'nucleophile_crowding',
+  },
+  {
+    id: 'AS_N_trichloroacetyl',
+    stepLabel: 'AS(N)',
+    name: 'Trichloroacetyl amidation (releases CHCl3)',
+    description: 'Amine attacks trichloroacetyl ketone (e.g. 2-trichloroacetylpyrrole) and expels CHCl3 to form amide',
+    smarts: `[CX3:1](=[OX1:2])[CX4](Cl)(Cl)Cl.${NUC_N_BROAD}>>[C:1](=[O:2])[N:3]`,
+    intramolecular: false,
+    numReactants: 2,
+    acidFactor: 0.45,
+    baseFactor: 0.95,
+    neutralFactor: 0.88,
+    t50: 35,
+    width: 18,
+    prior: 0.88,
+    reversible: false,
+    kClass: 'favorable',
+    thermoBonus: 0.22,
+    confidenceClass: 'A',
+    releasesReactiveFragment: false,
+    reactiveSiteKind: 'amine_nuc',
+    stericRule: 'nucleophile_crowding',
+  },
+  {
+    id: 'AS_O_trichloroacetyl',
+    stepLabel: 'AS(O)',
+    name: 'Trichloroacetyl esterification (releases CHCl3)',
+    description: 'Alcohol attacks trichloroacetyl ketone and expels CHCl3 to form ester',
+    smarts: `[CX3:1](=[OX1:2])[CX4](Cl)(Cl)Cl.[OX2H1;!$(O-C=O);!$(O-c):3]>>[C:1](=[O:2])[O:3]`,
+    intramolecular: false,
+    numReactants: 2,
+    acidFactor: 0.4,
+    baseFactor: 0.92,
+    neutralFactor: 0.5,
+    t50: 55,
+    width: 20,
+    prior: 0.72,
+    reversible: false,
+    kClass: 'favorable',
+    thermoBonus: 0.16,
+    confidenceClass: 'A',
+    releasesReactiveFragment: false,
+    reactiveSiteKind: 'alcohol',
     stericRule: 'nucleophile_crowding',
   },
   {

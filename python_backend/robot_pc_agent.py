@@ -1054,11 +1054,26 @@ class RobotPcAgent:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
+                self._last_post_error = ""
                 return json.loads(raw) if raw else {}
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        except urllib.error.HTTPError as exc:
+            self._last_post_error = f"HTTP {exc.code} {exc.reason}"
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            self._last_post_error = str(exc)
             return None
 
     def run_forever(self) -> None:
+        self._last_post_error = ""
+        pid_file = SCRIPT_DIR / "robot_helper.pid"
+        stop_flag = SCRIPT_DIR / "stop_helper.flag"
+        try:
+            if stop_flag.exists():
+                stop_flag.unlink()
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+
         print(f"[Robowski Helper] Robot: {self.robot_name}")
         print(f"[Robowski Helper] Robowski main.py folder: {self._find_zeus_dir() or 'Not found yet (set ROBOWSKI_MAIN_FOLDER in .bat if using hardware buttons)'}")
         print(f"[Robowski Helper] Data folder: {self._data_dir() or 'Not set (log-tracking still works)'}")
@@ -1069,46 +1084,89 @@ class RobotPcAgent:
             print("[Robowski Helper] Hardware buttons: ENABLED")
         else:
             print("[Robowski Helper] Hardware buttons: Safe read-only mode (add robot_pin.txt to unlock with a PIN)")
-        print("[Robowski Helper] Running quietly in background. Press Ctrl+C to stop.")
+        print("[Robowski Helper] Running! You can minimize this window — close it (or run stop_robot_helper_windows.bat) to stop.")
 
         was_offline = False
-        while True:
-            try:
-                status = self.collect_status()
-                reply = self._post_json("/api/robot/relay/push", {"status": status})
-                if reply is None:
-                    if not was_offline:
-                        print("[Robowski Helper] Personal PC is offline/sleeping — will keep retrying quietly...")
-                        was_offline = True
+        ever_connected = False
+        try:
+            while True:
+                if stop_flag.exists():
+                    print("[Robowski Helper] Stop requested — shutting down cleanly.")
+                    break
+                try:
+                    status = self.collect_status()
+                    reply = self._post_json("/api/robot/relay/push", {"status": status})
+                    if reply is None:
+                        if not was_offline:
+                            reason = f" ({self._last_post_error})" if self._last_post_error else ""
+                            print(f"[Robowski Helper] Waiting for personal PC{reason} — will keep retrying quietly...")
+                            was_offline = True
+                        for _ in range(int(max(10.0, self.interval_sec))):
+                            if stop_flag.exists():
+                                break
+                            time.sleep(1.0)
+                        continue
+
+                    if not ever_connected:
+                        print(f"[Robowski Helper] Connected! Live updates are now flowing to {self.server_url}")
+                        ever_connected = True
+                        was_offline = False
+                    elif was_offline:
+                        print("[Robowski Helper] Reconnected to personal PC!")
+                        was_offline = False
+
+                    req_path = reply.get("requestedRunPath")
+                    if isinstance(req_path, str) and req_path.strip():
+                        self.requested_run_path = req_path.strip()
+
+                    pending = reply.get("pendingCommand")
+                    if isinstance(pending, dict) and pending.get("id") and pending.get("command"):
+                        res = self.execute_command(
+                            str(pending["id"]),
+                            str(pending["command"]),
+                            pending.get("params") if isinstance(pending.get("params"), dict) else {},
+                            str(pending.get("pin") or ""),
+                        )
+                        self._post_json("/api/robot/relay/result", res, timeout=10.0)
+                        self._post_json("/api/robot/relay/push", {"status": self.collect_status()})
+
+                    for _ in range(max(1, int(self.interval_sec))):
+                        if stop_flag.exists():
+                            break
+                        time.sleep(1.0)
+                except KeyboardInterrupt:
+                    print("\n[Robowski Helper] Stopped cleanly.")
+                    break
+                except Exception as exc:
+                    print(f"[Robowski Helper] Temporary issue: {exc}")
                     time.sleep(max(10.0, self.interval_sec))
-                    continue
+        finally:
+            if self.hw.get("connected"):
+                try:
+                    if self.hw.get("pt") is not None and hasattr(self.hw["pt"], "close_ports_and_zeus"):
+                        self.hw["pt"].close_ports_and_zeus()
+                    if self.hw.get("gt") is not None and hasattr(self.hw["gt"], "close_gantry"):
+                        self.hw["gt"].close_gantry()
+                except Exception:
+                    pass
+            for f in (pid_file, stop_flag):
+                try:
+                    if f.exists():
+                        f.unlink()
+                except OSError:
+                    pass
 
-                if was_offline:
-                    print("[Robowski Helper] Reconnected to personal PC!")
-                    was_offline = False
 
-                req_path = reply.get("requestedRunPath")
-                if isinstance(req_path, str) and req_path.strip():
-                    self.requested_run_path = req_path.strip()
-
-                pending = reply.get("pendingCommand")
-                if isinstance(pending, dict) and pending.get("id") and pending.get("command"):
-                    res = self.execute_command(
-                        str(pending["id"]),
-                        str(pending["command"]),
-                        pending.get("params") if isinstance(pending.get("params"), dict) else {},
-                        str(pending.get("pin") or ""),
-                    )
-                    self._post_json("/api/robot/relay/result", res, timeout=10.0)
-                    self._post_json("/api/robot/relay/push", {"status": self.collect_status()})
-
-                time.sleep(self.interval_sec)
-            except KeyboardInterrupt:
-                print("\n[Robowski Helper] Stopped cleanly.")
-                break
-            except Exception as exc:
-                print(f"[Robowski Helper] Temporary issue: {exc}")
-                time.sleep(max(10.0, self.interval_sec))
+def _setup_background_log(force_log: bool = False) -> None:
+    if not force_log and sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log_path = SCRIPT_DIR / "robot_helper.log"
+        log_fp = open(log_path, "w", encoding="utf-8", buffering=1)
+        sys.stdout = log_fp  # type: ignore[assignment]
+        sys.stderr = log_fp  # type: ignore[assignment]
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -1121,20 +1179,29 @@ def main() -> None:
         default=os.environ.get("ROBOWSKI_ENABLE_HARDWARE", "0").strip() in {"1", "true", "yes"},
         help="Optional flag (not needed if you create robot_pin.txt)",
     )
-    parser.add_argument("--repo", default="", help="Optional path to robowski folder (auto-detected if placed inside robowski)")
+    parser.add_argument("--repo", default="", help="Optional path to robowski folder (auto-detected automatically)")
     parser.add_argument("--token", default="", help="Optional shared secret if ROBOWSKI_RELAY_TOKEN is set on personal PC")
     parser.add_argument("--pin", default="", help="Optional PIN (easier: just save it in robot_pin.txt)")
+    parser.add_argument("--background", action="store_true", help="Write status and errors to robot_helper.log")
     args = parser.parse_args()
 
-    agent = RobotPcAgent(
-        server_url=args.server,
-        interval_sec=args.interval,
-        enable_hardware=args.enable_hardware,
-        repo_path=args.repo,
-        relay_token=args.token,
-        control_pin=args.pin,
-    )
-    agent.run_forever()
+    _setup_background_log(force_log=args.background)
+    try:
+        agent = RobotPcAgent(
+            server_url=args.server,
+            interval_sec=args.interval,
+            enable_hardware=args.enable_hardware,
+            repo_path=args.repo,
+            relay_token=args.token,
+            control_pin=args.pin,
+        )
+        agent.run_forever()
+    except Exception as exc:
+        import traceback
+
+        print(f"[Robowski Helper] Startup error: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

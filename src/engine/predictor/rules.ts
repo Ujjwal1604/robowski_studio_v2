@@ -218,7 +218,8 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     stepLabel: 'NA(N)',
     name: 'Azole NH addition to aldehyde carbonyl',
     description: 'Imidazole, benzimidazole, or pyrazole NH reversibly adds to aldehyde to form N,O-hemiaminal',
-    smarts: `[CX3;$([CH1](=O)[#6]),$([CH2]=O):1]=[OX1:2].${AZOLE_NH}>>[C:1]([OX2H1:2])[n:3]`,
+    smarts:
+      '[CX3;$([CH1](=O)[#6]),$([CH2]=O):1]=[OX1:2].[nX3H1;r5;$([nH]1[c,n][c,n][n,o,s][c,n]1),$([nH]1[n,o,s][c,n][c,n][c,n]1):3]>>[C:1]([OX2H1:2])[n:3]',
     intramolecular: false,
     numReactants: 2,
     acidFactor: 0.35,
@@ -1811,7 +1812,7 @@ export const REACTION_RULES: ReactionRuleDef[] = [
     stepLabel: 'EA',
     name: 'Intramolecular Pictet-Spengler / Friedel-Crafts cyclization',
     description: 'Tethered electron-rich arene/indole closes onto imine or activated alkene',
-    smarts: '([cX3;H1;$(c1[nH]c2ccccc12),$(c(c[OX2,NX3])):3].[CX3:1]=[NX2:2])>>[c:3][C:1][NH1:2]',
+    smarts: '([cX3;H1;$(c1[nH,n]c2ccccc2c1),$(c1c[nH,n]c2ccccc12),$(c(c[OX2,NX3])):3].[CX3:1]=[NX2:2])>>[c:3][C:1][NH1:2]',
     intramolecular: true,
     numReactants: 1,
     acidFactor: 0.98,

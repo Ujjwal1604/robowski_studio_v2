@@ -199,4 +199,38 @@ describe('Expanded core chemistry rules & regioselectivity', () => {
     expect(benzim).toBeDefined();
     expect(benzim!.score).toBeGreaterThanOrEqual(0.45);
   });
+
+  it('completes carbinolamine -> imine dehydration and Pictet-Spengler cyclization in dense multi-component and buffered wells', () => {
+    // 4-component well where bimolecular expansion hits maxSpecies: unimolecular maturation must still produce the imine & Pictet-Spengler product
+    const fourSub = predictWellReactions(
+      rdkit,
+      [
+        S('A', 'O=Cc1ncc[nH]1', 1.0, 50),
+        S('B', 'O=C(CBr)c1ccccc1', 2.0, 100),
+        S('C', 'NCCc1c[nH]c2ccccc12', 1.0, 50),
+        S('D', 'Clc1ccc2[nH]cnc2c1', 1.0, 50),
+      ],
+      COND({ temperatureC: 120, waterPct: 2.04, solvent: 'DMSO' })
+    );
+    const imine4 = fourSub.species.find((s) => s.smiles === 'O=C(C=NCCc1c[nH]c2ccccc12)c1ccccc1');
+    const ps4 = fourSub.species.find((s) => s.smiles === 'O=C(c1ccccc1)C1NCCc2c1[nH]c1ccccc21');
+    expect(imine4).toBeDefined();
+    expect(imine4!.score).toBeGreaterThanOrEqual(0.35);
+    expect(ps4).toBeDefined();
+    expect(ps4!.bestChain.some((st) => st.ruleId === 'EA_pictet_spengler_intra')).toBe(true);
+
+    // Buffered acidic well (1 eq TsOH + tryptamine + phenacyl bromide): imine & Pictet-Spengler stay strong
+    const buffered = predictWellReactions(
+      rdkit,
+      [S('B', 'O=C(CBr)c1ccccc1', 1.0, 50), S('C', 'NCCc1c[nH]c2ccccc12', 1.0, 50)],
+      COND({ medium: 'acid', additiveName: 'TsOH', additiveEquiv: 1.0, additivePka: 0.9, temperatureC: 120, waterPct: 2.04, solvent: 'DMSO' })
+    );
+    const imineBuf = buffered.species.find((s) => s.smiles === 'O=C(C=NCCc1c[nH]c2ccccc12)c1ccccc1');
+    const psBuf = buffered.species.find((s) => s.smiles === 'O=C(c1ccccc1)C1NCCc2c1[nH]c1ccccc21');
+    expect(imineBuf).toBeDefined();
+    expect(imineBuf!.score).toBeGreaterThanOrEqual(0.3);
+    expect(psBuf).toBeDefined();
+    expect(psBuf!.score).toBeGreaterThanOrEqual(0.35);
+  }, 20000);
 });
+

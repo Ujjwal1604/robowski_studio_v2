@@ -96,6 +96,12 @@ export interface RunState {
   deckPlates: DeckConfig | null;
   stockVolumeCheck: boolean;
   newTipEveryTransfer: boolean;
+  /** True = main_auto_liquid_height.py (0 probe tips); false = legacy main.py volume probing */
+  autoLiquidHeight?: boolean;
+  /** Pipetting order in main.py: 'by_solvent' (default) or 'by_vial' */
+  pipettingStrategy?: 'by_solvent' | 'by_vial';
+  /** Optional wait time (seconds) after each substance addition (main.py ask_time_delays) */
+  substanceDelaySec?: number;
   reagents: Reagent[];
   sets?: VialSet[];
   tri?: TripletSetup;
@@ -209,6 +215,8 @@ export interface TipCounts {
   stockCheck: boolean;
   newTipEach: boolean;
   stockCheckTips: number;
+  autoLiquidHeight?: boolean;
+  pipettingStrategy?: 'by_solvent' | 'by_vial';
 }
 
 export interface RuntimeEstimate {
@@ -222,7 +230,49 @@ export interface RuntimeEstimate {
   tipChanges: number;
   plates: number;
   stockBottles: number;
+  delaySeconds?: number;
+  pipettingStrategy?: 'by_solvent' | 'by_vial';
   calibrationNote: string;
+}
+
+export interface PreFlightContainerCheck {
+  substance: string;
+  isSolvent: boolean;
+  plate: number;
+  containerId: number;
+  containerKind: 'bottle' | 'jar';
+  bottleSizeLabel: string;
+  solvent: string;
+  preparedUl: number;
+  neededUl: number;
+  deadVolumeUl: number;
+  deadVolumeMeasured: boolean;
+  marginUl: number;
+  surfaceHeightZ: number;
+  bottomZ: number;
+  mmAboveBottom: number;
+  heightValid: boolean;
+  prewetUlByTip: { 50: number; 300: number; 1000: number };
+  status: 'ok' | 'warn' | 'block';
+  summary: string;
+}
+
+export type RobotProfileId = 'roboski2' | 'roboski1';
+
+export interface RobotProfile {
+  id: RobotProfileId;
+  pipetterName: string;
+  label: string;
+  hood: 'left' | 'right';
+  arduinoPort: string;
+  balancePort: string;
+  trashXy: [number, number];
+  idleXy: [number, number];
+  traverseZ: number;
+  tipPickZ: number;
+  tipDepositZ: number;
+  corruptedLiquidClasses: number[];
+  notes: string;
 }
 
 export interface RunResult {
@@ -261,6 +311,8 @@ export interface RunResult {
   solventConsumptionMl: number;
   solventRecommendedMl: number;
   maxPlates: number;
+  robotProfile?: RobotProfileId;
+  preFlight?: PreFlightContainerCheck[];
 }
 
 export interface LibraryReagent {

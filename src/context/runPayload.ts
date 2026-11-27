@@ -30,7 +30,10 @@ export function exampleState(): RunState {
     randomSeed: 20261018,
     solventAfter: 0,
     deckPlates: null,
-    stockVolumeCheck: true,
+    stockVolumeCheck: false,
+    autoLiquidHeight: true,
+    pipettingStrategy: 'by_solvent',
+    substanceDelaySec: 0,
     newTipEveryTransfer: false,
     reagents: [blankR('AA'), blankR('BB'), blankR('CC')],
     eln: {

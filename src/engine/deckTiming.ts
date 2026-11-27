@@ -1,6 +1,25 @@
-// Robowski Studio - Deck Geometry, Tip Counting, and Timing Models
-import { DeckConfig, DeckLayout, RunRow, RuntimeEstimate, TipCounts } from '../types';
-import { num, defaultPlates, PLATE_CAPACITY, TIP_RACK_CAPACITY } from './constants';
+// Robowski Studio - Deck Geometry, Pre-Flight Validation, Tip Counting, and Timing Models
+// Synced with zeus-pipetter/breadboard.py, main.py, and main_auto_liquid_height.py
+import {
+  DeckConfig,
+  DeckLayout,
+  PreFlightContainerCheck,
+  RunResult,
+  RunRow,
+  RuntimeEstimate,
+  TipCounts,
+} from '../types';
+import {
+  BOTTLE_CAPACITY_ML,
+  BOTTLE_MAX_ML,
+  CONTAINER_GEOMETRY,
+  JAR_CAPACITY_ML,
+  PLATE_CAPACITY,
+  PREWET_MAX_DEPTH,
+  TIP_RACK_CAPACITY,
+  defaultPlates,
+  num,
+} from './constants';
 
 export function assignDeckPositions(
   hood: 'left' | 'right',
@@ -9,7 +28,6 @@ export function assignDeckPositions(
 ): DeckLayout {
   const c = { ...defaultPlates(hood), ...(cfg || {}) };
   // Only allocate deck positions for stocks that the robot will actually aspirate from.
-  // Intermediate hand-diluted stocks (prepared only to feed subsequent dilutions like N -> N2) have 0 direct consumption.
   const rows = Object.values(stocks).filter((s) => {
     if (
       s.direct_consumption_ml === 0 &&
@@ -61,9 +79,161 @@ export function assignDeckPositions(
   };
 }
 
+/**
+ * Exact Zeus z-coordinate (0.1 mm units) of the liquid surface from volume (µL),
+ * matching main_auto_liquid_height.py liquid_surface_height_from_volume() and breadboard.py.
+ */
 export function surfaceHeight(kind: string, uL: number): number {
-  const g = kind === 'jar' ? { bottom: 2120, area: 2123.7 } : { bottom: 2190, area: 512.8205 };
+  const g =
+    kind === 'jar'
+      ? CONTAINER_GEOMETRY.jar
+      : kind === 'vial'
+      ? CONTAINER_GEOMETRY.vial
+      : CONTAINER_GEOMETRY.bottle;
   return Math.round(g.bottom - (uL / g.area) * 10);
+}
+
+/** Exact float liquid surface height (0.1 mm units) */
+export function surfaceHeightExact(kind: 'bottle' | 'jar' | 'vial', uL: number): number {
+  const g = CONTAINER_GEOMETRY[kind];
+  return g.bottom - (uL / g.area) * 10;
+}
+
+/** Inverse of surfaceHeightExact: volume in µL from Zeus z height (0.1 mm units) */
+export function volumeFromSurfaceHeight(kind: 'bottle' | 'jar' | 'vial', heightZ: number): number {
+  const g = CONTAINER_GEOMETRY[kind];
+  return ((g.bottom - heightZ) / 10) * g.area;
+}
+
+/**
+ * Matches main_auto_liquid_height.py prewet_volume_ul():
+ * Caps prewet volume so the tip stays within PREWET_MAX_DEPTH (5.0 mm) below the surface.
+ */
+export function prewetVolumeUl(kind: 'bottle' | 'jar' | 'vial', tipVolumeUl: number): number {
+  const g = CONTAINER_GEOMETRY[kind];
+  const depthForVolume = PREWET_MAX_DEPTH - g.immersionDepth;
+  if (depthForVolume <= 0) return 0;
+  const volumeLimit = (depthForVolume / 10) * g.area;
+  return Math.floor(Math.min(tipVolumeUl, volumeLimit));
+}
+
+/**
+ * Builds the main_auto_liquid_height.py pre-flight confirmation table in plain English.
+ */
+export function computePreFlightChecks(
+  run: Pick<
+    RunResult,
+    'stocks' | 'deck' | 'reactionSolvent' | 'solventConsumptionMl' | 'solventRecommendedMl'
+  >
+): PreFlightContainerCheck[] {
+  const checks: PreFlightContainerCheck[] = [];
+
+  const evaluateContainer = (
+    substance: string,
+    isSolvent: boolean,
+    plate: number,
+    containerId: number,
+    kind: 'bottle' | 'jar',
+    solvent: string,
+    preparedUl: number,
+    neededUl: number
+  ): PreFlightContainerCheck => {
+    const g = CONTAINER_GEOMETRY[kind];
+    const zExact = surfaceHeightExact(kind, preparedUl);
+    const zRounded = Math.round(zExact);
+    const topZ = surfaceHeightExact(kind, g.volumeMaxUl);
+    const heightValid = preparedUl > 0 && preparedUl <= g.volumeMaxUl && zExact >= topZ - 1e-6 && zExact < g.bottom;
+    const mmAboveBottom = Math.max(0, (g.bottom - zExact) / 10);
+    const marginUl = Math.round(preparedUl - (neededUl + g.deadVolumeUl));
+
+    let bottleSizeLabel = '100 mL jar';
+    if (kind === 'bottle') {
+      const ml = preparedUl / 1000;
+      if (ml > BOTTLE_MAX_ML) bottleSizeLabel = 'Over 40 mL max!';
+      else if (ml > BOTTLE_CAPACITY_ML) bottleSizeLabel = '40 mL bottle';
+      else bottleSizeLabel = '20 mL bottle';
+    } else if (preparedUl / 1000 > JAR_CAPACITY_ML) {
+      bottleSizeLabel = 'Over 100 mL max!';
+    }
+
+    let status: 'ok' | 'warn' | 'block' = 'ok';
+    let summary = `Ready (+${(marginUl / 1000).toFixed(2)} mL spare above ${(g.deadVolumeUl / 1000).toFixed(1)} mL dead volume)`;
+
+    if (!heightValid || preparedUl > g.volumeMaxUl) {
+      status = 'block';
+      summary =
+        preparedUl > g.volumeMaxUl
+          ? `Too full (${(preparedUl / 1000).toFixed(1)} mL exceeds ${(g.volumeMaxUl / 1000).toFixed(0)} mL container max — robot will reject)`
+          : `Empty or invalid liquid height (z=${zRounded}, bottom=${g.bottom})`;
+    } else if (marginUl < 0) {
+      status = 'warn';
+      summary = `Short by ${(Math.abs(marginUl) / 1000).toFixed(2)} mL after ${(g.deadVolumeUl / 1000).toFixed(1)} mL dead volume — add more liquid so the tip never sucks air`;
+    } else if (kind === 'bottle' && preparedUl / 1000 > BOTTLE_CAPACITY_ML) {
+      status = 'warn';
+      summary = `Use a 40 mL bottle in this slot (+${(marginUl / 1000).toFixed(2)} mL spare above 1.0 mL dead volume)`;
+    }
+
+    return {
+      substance,
+      isSolvent,
+      plate,
+      containerId,
+      containerKind: kind,
+      bottleSizeLabel,
+      solvent,
+      preparedUl: Math.round(preparedUl),
+      neededUl: Math.round(neededUl),
+      deadVolumeUl: g.deadVolumeUl,
+      deadVolumeMeasured: g.deadVolumeMeasured,
+      marginUl,
+      surfaceHeightZ: zRounded,
+      bottomZ: g.bottom,
+      mmAboveBottom: Number(mmAboveBottom.toFixed(1)),
+      heightValid,
+      prewetUlByTip: {
+        50: prewetVolumeUl(kind, 50),
+        300: prewetVolumeUl(kind, 300),
+        1000: prewetVolumeUl(kind, 1000),
+      },
+      status,
+      summary,
+    };
+  };
+
+  // Solvent container first
+  checks.push(
+    evaluateContainer(
+      'solvent',
+      true,
+      run.deck.solvent_plate,
+      run.deck.solvent_container,
+      run.deck.solvent_kind,
+      run.reactionSolvent,
+      run.solventRecommendedMl * 1000,
+      run.solventConsumptionMl * 1000
+    )
+  );
+
+  // Stock bottles on deck
+  for (const s of Object.values(run.stocks)) {
+    if (s.source_only || (s.direct_consumption_ml === 0 && s.consumption_uL === 0 && s.additional_dilution_source_ml > 0)) {
+      continue;
+    }
+    checks.push(
+      evaluateContainer(
+        s.substance,
+        false,
+        s.breadboard_plate_id,
+        s.container_id,
+        'bottle',
+        s.solvent,
+        s.prep_volume_ml * 1000,
+        s.consumption_uL
+      )
+    );
+  }
+
+  return checks;
 }
 
 export function tipSize(v: number): 50 | 300 | 1000 | null {
@@ -74,12 +244,23 @@ export function tipSize(v: number): 50 | 300 | 1000 | null {
   return null;
 }
 
+export interface TipAndRuntimeOptions {
+  autoLiquidHeight?: boolean;
+  pipettingStrategy?: 'by_solvent' | 'by_vial';
+  substanceDelaySec?: number;
+}
+
 export function calculateTipCounts(
   rows: RunRow[],
   stocks: Record<string, any>,
   stockCheck = true,
-  newTipEach = false
+  newTipEach = false,
+  opts?: TipAndRuntimeOptions
 ): TipCounts {
+  const autoLiquidHeight = opts?.autoLiquidHeight ?? false;
+  const strategy = opts?.pipettingStrategy || 'by_solvent';
+  const effectiveStockCheck = autoLiquidHeight ? false : stockCheck;
+
   const counts = { 50: 0, 300: 0, 1000: 0 };
   const perPlate: Array<{
     plate: number;
@@ -87,28 +268,43 @@ export function calculateTipCounts(
     transfers: number;
   }> = [];
   const stockKeys = Object.keys(stocks);
+  const allKeys = [...stockKeys, 'solvent'];
   const plateCount = Math.ceil(rows.length / PLATE_CAPACITY);
 
   for (let p = 0; p < plateCount; p++) {
     const plateRows = rows.slice(p * PLATE_CAPACITY, (p + 1) * PLATE_CAPACITY);
     const detail = { 50: 0, 300: 0, 1000: 0 };
-    for (const key of [...stockKeys, 'solvent']) {
-      const col = key === 'solvent' ? 'vol#solvent' : `vol#${key}`;
-      const volumes = plateRows.map((r: any) => num(r[col])).filter((v) => v >= 0.5);
-      if (!volumes.length) continue;
-      if (newTipEach) {
-        for (const v of volumes) {
+
+    if (strategy === 'by_vial') {
+      // Vial-by-vial changes substance on every addition within each vial -> each active transfer needs a clean tip
+      for (const row of plateRows) {
+        for (const key of allKeys) {
+          const col = key === 'solvent' ? 'vol#solvent' : `vol#${key}`;
+          const v = num((row as any)[col]);
           const s = tipSize(v);
           if (s) detail[s]++;
         }
-      } else {
-        for (const s of [...new Set(volumes.map(tipSize).filter(Boolean))].sort(
-          (a, b) => (a as number) - (b as number)
-        )) {
-          if (s) detail[s as 50 | 300 | 1000]++;
+      }
+    } else {
+      for (const key of allKeys) {
+        const col = key === 'solvent' ? 'vol#solvent' : `vol#${key}`;
+        const volumes = plateRows.map((r: any) => num(r[col])).filter((v) => v >= 0.5);
+        if (!volumes.length) continue;
+        if (newTipEach) {
+          for (const v of volumes) {
+            const s = tipSize(v);
+            if (s) detail[s]++;
+          }
+        } else {
+          for (const s of [...new Set(volumes.map(tipSize).filter(Boolean))].sort(
+            (a, b) => (a as number) - (b as number)
+          )) {
+            if (s) detail[s as 50 | 300 | 1000]++;
+          }
         }
       }
     }
+
     perPlate.push({
       plate: p,
       counts: detail,
@@ -123,7 +319,7 @@ export function calculateTipCounts(
     for (const size of [50, 300, 1000] as const) counts[size] += detail[size];
   }
 
-  if (stockCheck) counts[300] += stockKeys.length + 1;
+  if (effectiveStockCheck) counts[300] += stockKeys.length + 1;
 
   return {
     50: counts[50],
@@ -136,9 +332,11 @@ export function calculateTipCounts(
       1000: Math.ceil(counts[1000] / TIP_RACK_CAPACITY),
     },
     perPlate,
-    stockCheck,
+    stockCheck: effectiveStockCheck,
     newTipEach,
-    stockCheckTips: stockCheck ? stockKeys.length + 1 : 0,
+    stockCheckTips: effectiveStockCheck ? stockKeys.length + 1 : 0,
+    autoLiquidHeight,
+    pipettingStrategy: strategy,
   };
 }
 
@@ -159,8 +357,14 @@ export function estimateRuntime(
   rows: RunRow[],
   tipCounts: TipCounts,
   stockCheck = true,
-  newTipEach = false
+  newTipEach = false,
+  opts?: TipAndRuntimeOptions
 ): RuntimeEstimate {
+  const autoLiquidHeight = opts?.autoLiquidHeight ?? tipCounts.autoLiquidHeight ?? false;
+  const strategy = opts?.pipettingStrategy || tipCounts.pipettingStrategy || 'by_solvent';
+  const delayPerSubstance = Math.max(0, num(opts?.substanceDelaySec, 0));
+  const effectiveStockCheck = autoLiquidHeight ? false : stockCheck;
+
   const TR: Record<number, [number, number, number]> = {
     50: [12.8, 12, 15],
     300: [13, 12, 14],
@@ -173,7 +377,9 @@ export function estimateRuntime(
   const t = [0, 0, 0];
   let transfers = 0,
     cycles = 0,
-    tipChanges = 0;
+    tipChanges = 0,
+    delaySeconds = 0;
+
   const colSet = new Set<string>();
   rows.forEach((r: any) =>
     Object.keys(r).forEach((k) => {
@@ -185,23 +391,47 @@ export function estimateRuntime(
 
   for (let p = 0; p < plates; p++) {
     const plateRows = rows.slice(p * PLATE_CAPACITY, (p + 1) * PLATE_CAPACITY);
-    for (const col of cols) {
-      const vols = plateRows
-        .map((r: any) => num(r[col]))
-        .filter((v) => v >= 0.5)
-        .sort((a, b) => b - a);
-      let cur: number | null = null;
-      for (const v of vols) {
-        const s = tipSize(v) || 1000;
-        if (newTipEach || s !== cur) {
+    if (strategy === 'by_vial') {
+      for (const row of plateRows) {
+        for (const col of cols) {
+          const v = num((row as any)[col]);
+          if (v < 0.5) continue;
+          const s = tipSize(v) || 1000;
           tipChanges++;
           for (let i = 0; i < 3; i++) t[i] += TC[i];
-          cur = s;
+          const cyc = Math.max(1, Math.ceil(v / MAX[s] - 1e-9));
+          transfers++;
+          cycles += cyc;
+          for (let i = 0; i < 3; i++) t[i] += TR[s][i] + (cyc - 1) * XC[i];
         }
-        const cyc = Math.max(1, Math.ceil(v / MAX[s] - 1e-9));
-        transfers++;
-        cycles += cyc;
-        for (let i = 0; i < 3; i++) t[i] += TR[s][i] + (cyc - 1) * XC[i];
+      }
+    } else {
+      let activeSubstancesThisPlate = 0;
+      for (const col of cols) {
+        const vols = plateRows
+          .map((r: any) => num(r[col]))
+          .filter((v) => v >= 0.5)
+          .sort((a, b) => b - a);
+        if (!vols.length) continue;
+        activeSubstancesThisPlate++;
+        let cur: number | null = null;
+        for (const v of vols) {
+          const s = tipSize(v) || 1000;
+          if (newTipEach || s !== cur) {
+            tipChanges++;
+            for (let i = 0; i < 3; i++) t[i] += TC[i];
+            cur = s;
+          }
+          const cyc = Math.max(1, Math.ceil(v / MAX[s] - 1e-9));
+          transfers++;
+          cycles += cyc;
+          for (let i = 0; i < 3; i++) t[i] += TR[s][i] + (cyc - 1) * XC[i];
+        }
+      }
+      if (delayPerSubstance > 0 && activeSubstancesThisPlate > 1) {
+        const d = delayPerSubstance * (activeSubstancesThisPlate - 1);
+        delaySeconds += d;
+        for (let i = 0; i < 3; i++) t[i] += d;
       }
     }
     for (let i = 0; i < 3; i++) t[i] += PE;
@@ -217,8 +447,14 @@ export function estimateRuntime(
     cycles,
     tipChanges,
     plates,
-    stockBottles: stockCheck ? tipCounts.stockCheckTips : 0,
+    stockBottles: effectiveStockCheck ? tipCounts.stockCheckTips : 0,
+    delaySeconds,
+    pipettingStrategy: strategy,
     calibrationNote:
-      'Fitted to three logged runs of 2026-10-12 (about 13 s per transfer plus 30 s per tip change). The 9 s per extra aspirate/dispense cycle is an assumption. Homing, rack reloads, manual pauses and the optional stock-volume check are not included.',
+      `Fitted to logged Robowski runs (~13 s/transfer + 30 s/tip change). Mode: ${
+        strategy === 'by_vial' ? 'vial-by-vial' : 'by-reagent'
+      }${autoLiquidHeight ? ', auto liquid height (0 probe tips)' : ''}${
+        delaySeconds > 0 ? `, includes ${formatDuration(delaySeconds)} inter-reagent waits` : ''
+      }.`,
   };
 }

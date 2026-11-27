@@ -36,3 +36,22 @@ Everything stays cleanly inside `python_backend/data/`:
 - `robowski_studio.db` — All saved runs, reagent library, and TLC hit-rate memory (SQLite)
 - `tlc_images/` — Full-resolution TLC plate photos synced from the TLC tab
 - `archives/` — One-click `.robowski` experiment archives saved from the Export tab
+
+## Optional: Live Robot Status (when the robot is on a separate Robot PC)
+
+Because the robot's USB cables and Excel/log files live on the **Robot PC**, copy just two tiny files onto the Robot PC:
+- `robot_pc_agent.py`
+- `start_robot_helper_windows.bat`
+
+1. Double-click `start_robot_helper_windows.bat` on the Robot PC.
+   - It reads `ROBOCHEM_DATA_PATH` and `PIPETTER_NAME` from Windows automatically (no folder paths to type, no Tailscale needed on the Robot PC).
+   - It runs silently in the background and quietly sends live vial progress, tip counts, and logs to your personal PC every 5 seconds.
+   - If your personal PC is turned off, it waits quietly and reconnects automatically when you turn it back on.
+2. **To make it start automatically every time Windows boots** (so you never have to remember):
+   - Press `Win + R`, type `shell:startup`, and press Enter.
+   - Copy a shortcut to `start_robot_helper_windows.bat` into that folder.
+3. **Optional live buttons (Home, Park, Pick Tip, Move, Balance) — PIN only, no commands:**
+   - Create a simple 1-line text file named `robot_pin.txt` next to `robot_pc_agent.py` with your chosen PIN (for example `4829`).
+   - Double-click `start_robot_helper_windows.bat` as usual, and enter that same PIN in the **Robot** tab in your browser.
+   - *(You can keep these helper files in any folder — the helper automatically finds where `main.py` lives on your PC, or you can paste its folder path into `ROBOWSKI_MAIN_FOLDER` at the top of `start_robot_helper_windows.bat`.)*
+

@@ -9,7 +9,9 @@ import {
 } from '../types';
 import {
   BOTTLE_CAPACITY_ML,
+  BOTTLE_MAX_ML,
   COLORS,
+  CONTAINER_GEOMETRY,
   JAR_CAPACITY_ML,
   MAX_REACTION_SLOTS,
   PLATE_CAPACITY,
@@ -19,11 +21,18 @@ import {
   SUPPORTED_SOLVENTS,
   canonicalSolvent,
   num,
+  robotProfileForHood,
   round,
   truthy,
 } from './constants';
 import { targetCombinations } from './combinations';
-import { assignDeckPositions, calculateTipCounts, estimateRuntime } from './deckTiming';
+import {
+  assignDeckPositions,
+  calculateTipCounts,
+  computePreFlightChecks,
+  estimateRuntime,
+  tipSize,
+} from './deckTiming';
 
 export function flaskPrep(v: number, flasks?: number[]): number {
   const fl = (flasks && flasks.length ? flasks : [2, 5, 10, 20, 50, 100]).slice().sort((a, b) => a - b);
@@ -483,7 +492,8 @@ export function buildRun(data: any): RunResult {
     }
   }
 
-  // Warnings check for underprepared or oversize stocks
+  // Warnings check for underprepared, dead-volume, or oversize stocks (20 mL vs 40 mL bottle_20ml slots)
+  const bottleDeadMl = CONTAINER_GEOMETRY.bottle.deadVolumeUl / 1000;
   for (const [key, s] of Object.entries(stocks)) {
     if (s.prep_volume_ml + 1e-9 < s.recommended_volume_ml && s.dilution_level === 0) {
       issues.push({
@@ -495,14 +505,33 @@ export function buildRun(data: any): RunResult {
         )} mL is below the ${s.recommended_volume_ml.toFixed(2)} mL recommendation.`,
       });
     }
-    if (s.prep_volume_ml > BOTTLE_CAPACITY_ML) {
+    if (s.direct_consumption_ml > 0 && s.prep_volume_ml + 1e-9 < s.direct_consumption_ml + bottleDeadMl) {
+      issues.push({
+        severity: 'warning',
+        type: 'dead-volume-shortage',
+        code: key,
+        message: `${key}: ${s.prep_volume_ml.toFixed(2)} mL prepared is below ${(
+          s.direct_consumption_ml + bottleDeadMl
+        ).toFixed(2)} mL needed including the ${bottleDeadMl.toFixed(1)} mL measured bottle dead volume.`,
+      });
+    }
+    if (s.prep_volume_ml > BOTTLE_MAX_ML) {
       issues.push({
         severity: 'warning',
         type: 'oversize-stock',
         code: key,
         message: `${key}: the ${s.prep_volume_ml.toFixed(
           0
-        )} mL flask volume is above a ${BOTTLE_CAPACITY_ML} mL bottle's nominal capacity.`,
+        )} mL flask volume exceeds the ${BOTTLE_MAX_ML} mL max bottle size that fits a bottle_20ml slot.`,
+      });
+    } else if (s.prep_volume_ml > BOTTLE_CAPACITY_ML) {
+      issues.push({
+        severity: 'warning',
+        type: 'use-40ml-bottle',
+        code: key,
+        message: `${key}: ${s.prep_volume_ml.toFixed(
+          0
+        )} mL needs a 40 mL bottle (fits the same bottle_20ml rack position; 1.0 mL dead volume).`,
       });
     }
   }
@@ -511,18 +540,28 @@ export function buildRun(data: any): RunResult {
     rows.reduce((sum, row) => sum + Math.max(0, num(row['vol#solvent'])), 0) / 1000;
   const solventRecommendedMl = round(solventConsumptionMl + leftover, 6);
   const deck = assignDeckPositions(hood, stocks, data.deckPlates);
+  const robotProfile = robotProfileForHood(hood);
 
   if (!deck.positions_fit) {
     issues.push({ severity: 'block', type: 'deck-capacity', message: deck.positions_message });
   }
-  if (deck.solvent_kind === 'bottle' && solventRecommendedMl > BOTTLE_CAPACITY_ML) {
+  if (deck.solvent_kind === 'bottle' && solventRecommendedMl > BOTTLE_MAX_ML) {
     issues.push({
       severity: 'warning',
       type: 'oversize-solvent',
       code: 'solvent',
       message: `Solvent: ${solventRecommendedMl.toFixed(
         1
-      )} mL including leftover is more than a ${BOTTLE_CAPACITY_ML} mL solvent bottle holds. Use fewer vials per run, a smaller leftover, or the solvent jar.`,
+      )} mL including leftover exceeds the ${BOTTLE_MAX_ML} mL max bottle capacity. Switch to a 100 mL jar on plate6 or plate7.`,
+    });
+  } else if (deck.solvent_kind === 'bottle' && solventRecommendedMl > BOTTLE_CAPACITY_ML) {
+    issues.push({
+      severity: 'warning',
+      type: 'use-40ml-bottle',
+      code: 'solvent',
+      message: `Solvent: ${solventRecommendedMl.toFixed(
+        1
+      )} mL needs a 40 mL bottle (fits the same bottle slot) or a 100 mL jar on plate6/plate7.`,
     });
   }
   if (deck.solvent_kind === 'jar' && solventRecommendedMl > JAR_CAPACITY_ML) {
@@ -536,10 +575,44 @@ export function buildRun(data: any): RunResult {
     });
   }
 
-  const stockCheck = truthy(data.stockVolumeCheck ?? true);
+  // Advisory for Roboski#1 corrupted Zeus liquid class 0 (water / DMSO 50 uL empty)
+  if (robotProfile.corruptedLiquidClasses.includes(0)) {
+    const affected: string[] = [];
+    const uses50 = (col: string) => rows.some((r: any) => tipSize(num(r[col])) === 50);
+    if ((reactionSolvent === 'water' || reactionSolvent === 'DMSO') && uses50('vol#solvent')) {
+      affected.push(`solvent (${reactionSolvent})`);
+    }
+    for (const [k, s] of Object.entries(stocks)) {
+      if ((s.solvent === 'water' || s.solvent === 'DMSO') && (s.pipetting_mode || 'empty') === 'empty' && uses50(`vol#${k}`)) {
+        affected.push(`${k} (${s.solvent})`);
+      }
+    }
+    if (affected.length > 0) {
+      issues.push({
+        severity: 'warning',
+        type: 'roboski1-lc0',
+        message: `Roboski#1 note: ${affected.join(', ')} uses 50 µL empty mode, which maps to corrupted liquid class 0 on Roboski#1 (confirm config.py maps it to class 21).`,
+      });
+    }
+  }
+
+  const autoLiquidHeight = truthy(data.autoLiquidHeight ?? false);
+  const pipettingStrategy: 'by_solvent' | 'by_vial' =
+    data.pipettingStrategy === 'by_vial' ? 'by_vial' : 'by_solvent';
+  const substanceDelaySec = Math.max(0, num(data.substanceDelaySec, 0));
+  const stockCheck = autoLiquidHeight ? false : truthy(data.stockVolumeCheck ?? true);
   const newTip = truthy(data.newTipEveryTransfer ?? data.newTip ?? false);
-  const tipCounts = calculateTipCounts(rows, stocks, stockCheck, newTip);
-  const runtime = estimateRuntime(rows, tipCounts, stockCheck, newTip);
+  const timingOpts = { autoLiquidHeight, pipettingStrategy, substanceDelaySec };
+  const tipCounts = calculateTipCounts(rows, stocks, stockCheck, newTip, timingOpts);
+  const runtime = estimateRuntime(rows, tipCounts, stockCheck, newTip, timingOpts);
+
+  const preFlight = computePreFlightChecks({
+    stocks,
+    deck,
+    reactionSolvent,
+    solventConsumptionMl: round(solventConsumptionMl, 3),
+    solventRecommendedMl: round(solventRecommendedMl, 3),
+  });
 
   if (Math.ceil(rows.length / PLATE_CAPACITY) > MAX_REACTION_SLOTS) {
     issues.push({
@@ -637,5 +710,7 @@ export function buildRun(data: any): RunResult {
     solventConsumptionMl: round(solventConsumptionMl, 3),
     solventRecommendedMl: round(solventRecommendedMl, 3),
     maxPlates: Math.floor(num(data.maxPlates, 3)),
+    robotProfile: robotProfile.id,
+    preFlight,
   };
 }

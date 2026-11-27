@@ -8,6 +8,7 @@ import {
   CombinationsView,
   PredictionView,
   DeckView,
+  RobotView,
   ExportView,
   TlcView,
   ElnView,
@@ -64,6 +65,7 @@ export const App: React.FC = () => {
           </div>
         )}
         {view === 'deck' && <DeckView />}
+        {view === 'robot' && <RobotView />}
         <div style={{ display: view === 'tlc' ? 'block' : 'none' }}>
           <TlcView />
         </div>

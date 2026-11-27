@@ -3,6 +3,7 @@ export * from './constants';
 export * from './conditions';
 export * from './combinations';
 export * from './deckTiming';
+export * from './robotDiluter';
 export * from './dilution';
 export * from './autoFix';
 export * from './triplet';

@@ -6,6 +6,7 @@ const TABS: [string, string][] = [
   ['combos', 'Combinations'],
   ['predict', 'Predict'],
   ['deck', 'Deck'],
+  ['robot', 'Robot'],
   ['tlc', 'TLC Map'],
   ['eln', 'HTE Notebook'],
   ['export', 'Export'],
@@ -29,6 +30,9 @@ export const StepsNav: React.FC = () => {
     }
     if (id === 'deck') {
       return !run ? '' : !run.deck.positions_fit ? 'warn' : visited.deck ? (platesOk() ? 'done' : 'warn') : '';
+    }
+    if (id === 'robot') {
+      return visited.robot ? 'done' : '';
     }
     if (id === 'tlc') {
       return visited.tlc ? 'done' : '';

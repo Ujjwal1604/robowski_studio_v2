@@ -81,7 +81,7 @@ export const Header: React.FC = () => {
           </button>
         </h1>
 
-        <div className="seg" role="group" aria-label="Active hood">
+        <div className="seg" role="group" aria-label="Active robot hood">
           {(['left', 'right'] as const).map((h) => (
             <button
               key={h}
@@ -91,6 +91,11 @@ export const Header: React.FC = () => {
                 setPath('deckPlates', null);
               }}
               className={state.hood === h ? 'on' : ''}
+              title={
+                h === 'left'
+                  ? 'Robowski#2 (Left hood · 100 mL jar on plate6, bottles on plate3–5)'
+                  : 'Roboski#1 (Right hood · 20/40 mL bottles on plate3–5)'
+              }
             >
               <span
                 className="hdot"
@@ -98,7 +103,7 @@ export const Header: React.FC = () => {
                   background: state.hood === h ? '#1F9D6B' : '#AEB5AC',
                 }}
               />
-              {h === 'left' ? 'Left' : 'Right'} hood
+              {h === 'left' ? 'Robowski#2 (Left)' : 'Roboski#1 (Right)'}
             </button>
           ))}
         </div>

@@ -1,6 +1,18 @@
 import React from 'react';
+import { AlertTriangle, CheckCircle2, Clock, FlaskConical, Gauge, XCircle } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { PAL, defaultPlates, getVialTipHtml, getStockTipHtml, getSolventTipHtml } from '../../engine';
+import {
+  PAL,
+  BOTTLE_CAPACITY_ML,
+  BOTTLE_MAX_ML,
+  JAR_CAPACITY_ML,
+  defaultPlates,
+  formatDuration,
+  getVialTipHtml,
+  getStockTipHtml,
+  getSolventTipHtml,
+  robotProfileForHood,
+} from '../../engine';
 
 export const DeckView: React.FC = () => {
   const {
@@ -37,7 +49,11 @@ export const DeckView: React.FC = () => {
   }
 
   const left = state.hood === 'left';
+  const profile = robotProfileForHood(state.hood);
   const factor = +state.dilutionFactor || 5;
+  const autoHeight = state.autoLiquidHeight !== false && !state.stockVolumeCheck;
+  const pipettingStrategy = state.pipettingStrategy || 'by_solvent';
+  const substanceDelaySec = Math.max(0, Number(state.substanceDelaySec) || 0);
 
   const codeColor = (code: string) => {
     const i = state.reagents.findIndex((r) => r.code === code);
@@ -58,9 +74,19 @@ export const DeckView: React.FC = () => {
     run.issues.filter((x) => x.severity === 'block' && x.row != null).map((x) => x.row as number)
   );
 
+  const robotProfileWarnings = run.issues.filter(
+    (x) =>
+      x.type === 'roboski1-lc0' ||
+      x.type === 'dead-volume-shortage' ||
+      x.type === 'use-40ml-bottle' ||
+      x.type === 'oversize-stock'
+  );
+
   const dp = state.deckPlates || defaultPlates(state.hood);
   const isConfirmed = platesOk();
   const t = run.tipCounts;
+  const rt = run.runtime;
+  const preFlight = run.preFlight || [];
 
   return (
     <div className="wrap">
@@ -76,14 +102,28 @@ export const DeckView: React.FC = () => {
           }}
         >
           <div>
-            <h2>Deck · {left ? 'Left' : 'Right'} hood</h2>
-            <p className="sub" style={{ margin: 0 }}>
-              Positions are assigned automatically. Bars show how full each bottle will be (of 20
+            <h2>
+              Deck · {profile.label}
+            </h2>
+            <p className="sub" style={{ margin: '2px 0 0 0' }}>
+              {profile.notes} Bars show bottle fill (20 mL standard, 40 mL tall bottle when &gt; 20
               mL).
             </p>
+            <div
+              className="mono"
+              style={{
+                marginTop: '6px',
+                fontSize: '11.5px',
+                color: 'var(--mut)',
+              }}
+            >
+              Arduino {profile.arduinoPort} · Balance {profile.balancePort} · Trash (
+              {profile.trashXy[0]}, {profile.trashXy[1]}) · Park ({profile.idleXy[0]},{' '}
+              {profile.idleXy[1]}) · Breadboard: plate0–2 vials · plate3–5 bottles · plate6–7 jars
+            </div>
           </div>
 
-          <div className="seg" role="group" aria-label="Hood">
+          <div className="seg" role="group" aria-label="Active robot profile">
             <button
               type="button"
               className={left ? 'on' : ''}
@@ -92,7 +132,7 @@ export const DeckView: React.FC = () => {
                 setPath('deckPlates', null);
               }}
             >
-              Left hood
+              Robowski#2 (Left)
             </button>
             <button
               type="button"
@@ -102,7 +142,7 @@ export const DeckView: React.FC = () => {
                 setPath('deckPlates', null);
               }}
             >
-              Right hood
+              Roboski#1 (Right)
             </button>
           </div>
         </div>
@@ -110,6 +150,20 @@ export const DeckView: React.FC = () => {
         {!run.deck.positions_fit && (
           <div className="issue bad" style={{ marginTop: '12px' }}>
             <span>{run.deck.positions_message}</span>
+          </div>
+        )}
+
+        {robotProfileWarnings.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
+            {robotProfileWarnings.map((w, idx) => (
+              <div
+                key={`${w.code}-${idx}`}
+                className={`issue ${w.severity === 'block' ? 'bad' : 'warn'}`}
+              >
+                <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: '1px' }} />
+                <span>{w.message}</span>
+              </div>
+            ))}
           </div>
         )}
 
@@ -133,7 +187,7 @@ export const DeckView: React.FC = () => {
                           style={{
                             height: `${Math.min(
                               100,
-                              (100 * run.solventRecommendedMl) / 100
+                              (100 * run.solventRecommendedMl) / JAR_CAPACITY_ML
                             )}%`,
                           }}
                         />
@@ -145,13 +199,17 @@ export const DeckView: React.FC = () => {
                 );
               }
 
-              // Bottle Plate (2x4 = 8 wells)
+              // Bottle Plate (2x4 = 8 wells; supports 20 mL or 40 mL tall bottles)
               return (
                 <div key={pn} className="plate">
-                  <div className="pt">plate{pn} · Bottle 20 mL (2×4)</div>
+                  <div className="pt">plate{pn} · Bottle 20/40 mL (2×4)</div>
                   <div className="wells8">
                     {Array.from({ length: 8 }, (_, c) => {
                       if (isSolventPlate && c === run.deck.solvent_container) {
+                        const solvCap =
+                          run.solventRecommendedMl > BOTTLE_CAPACITY_ML
+                            ? BOTTLE_MAX_ML
+                            : BOTTLE_CAPACITY_ML;
                         return (
                           <div
                             key={c}
@@ -164,18 +222,23 @@ export const DeckView: React.FC = () => {
                               style={{
                                 height: `${Math.min(
                                   100,
-                                  (100 * run.solventRecommendedMl) / 20
+                                  (100 * run.solventRecommendedMl) / solvCap
                                 )}%`,
                               }}
                             />
-                            <span>solv</span>
+                            <span>
+                              solv
+                              {solvCap === BOTTLE_MAX_ML ? ' (40mL)' : ''}
+                            </span>
                           </div>
                         );
                       }
 
                       const stock = byPos[`${pn}:${c}`];
                       if (!stock) return <div key={c} className="well e" />;
-                      const pct = Math.min(100, (100 * stock.ml) / 20);
+                      const use40 = stock.ml > BOTTLE_CAPACITY_ML;
+                      const cap = use40 ? BOTTLE_MAX_ML : BOTTLE_CAPACITY_ML;
+                      const pct = Math.min(100, (100 * stock.ml) / cap);
                       const displayKey = stock.key
                         .replace('_N2', '×' + +(factor ** 2).toPrecision(4))
                         .replace('_N', '×' + +factor.toPrecision(4));
@@ -188,7 +251,10 @@ export const DeckView: React.FC = () => {
                           data-tip={getStockTipHtml(stock, pn, c, displayKey)}
                         >
                           <div className="bar" style={{ height: `${pct}%` }} />
-                          <span>{displayKey}</span>
+                          <span>
+                            {displayKey}
+                            {use40 ? ' · 40mL' : ''}
+                          </span>
                         </div>
                       );
                     })}
@@ -274,11 +340,153 @@ export const DeckView: React.FC = () => {
         )}
       </div>
 
-      {/* 2. Plate numbers configuration card */}
+      {/* 2. Pre-Flight Check (synced with main_auto_liquid_height.py) */}
+      {preFlight.length > 0 && (
+        <div className="card" style={{ marginBottom: '20px' }}>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: '12px',
+              flexWrap: 'wrap',
+              marginBottom: '10px',
+            }}
+          >
+            <div>
+              <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Gauge size={18} />
+                Pre-Flight Liquid Check
+              </h2>
+              <p className="sub" style={{ margin: '2px 0 0 0' }}>
+                Matches <span className="mono">main_auto_liquid_height.py</span> container math:
+                verifies every bottle and jar has enough liquid above its dead volume (1.0 mL per
+                bottle, 7.4 mL per 100 mL jar) and predicts starting liquid height.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                setVisited((v) => ({ ...v, robot: true }));
+                setView('robot');
+                window.scrollTo(0, 0);
+              }}
+            >
+              Open Live Robot Monitor →
+            </button>
+          </div>
+
+          <div style={{ overflowX: 'auto' }}>
+            <table
+              style={{
+                width: '100%',
+                borderCollapse: 'collapse',
+                fontSize: '12.5px',
+              }}
+            >
+              <thead>
+                <tr
+                  style={{
+                    borderBottom: '1px solid var(--line)',
+                    textAlign: 'left',
+                    color: 'var(--mut)',
+                    fontSize: '11.5px',
+                  }}
+                >
+                  <th style={{ padding: '8px 10px 8px 0' }}>Liquid</th>
+                  <th style={{ padding: '8px 10px' }}>Position</th>
+                  <th style={{ padding: '8px 10px' }}>Container</th>
+                  <th style={{ padding: '8px 10px', textAlign: 'right' }}>Fill</th>
+                  <th style={{ padding: '8px 10px', textAlign: 'right' }}>Needed + Dead</th>
+                  <th style={{ padding: '8px 10px', textAlign: 'right' }}>Start Surface Z</th>
+                  <th style={{ padding: '8px 0 8px 10px' }}>Check</th>
+                </tr>
+              </thead>
+              <tbody>
+                {preFlight.map((row) => {
+                  const statusColor =
+                    row.status === 'ok'
+                      ? 'var(--ok)'
+                      : row.status === 'warn'
+                      ? 'var(--warn)'
+                      : 'var(--bad)';
+                  const statusLabel =
+                    row.status === 'ok'
+                      ? 'Ready'
+                      : row.status === 'warn'
+                      ? row.marginUl < 0
+                        ? 'Low liquid'
+                        : 'Use 40 mL bottle'
+                      : 'Over max / invalid';
+                  return (
+                    <tr
+                      key={`${row.substance}-${row.plate}-${row.containerId}`}
+                      style={{ borderBottom: '1px solid var(--line2)' }}
+                    >
+                      <td style={{ padding: '8px 10px 8px 0', fontWeight: 600 }}>
+                        {row.isSolvent ? `${row.solvent} (solvent)` : row.substance}
+                      </td>
+                      <td className="mono" style={{ padding: '8px 10px', color: 'var(--fg2)' }}>
+                        plate{row.plate} · pos {row.containerId}
+                      </td>
+                      <td style={{ padding: '8px 10px', color: 'var(--fg2)' }}>
+                        {row.bottleSizeLabel}
+                      </td>
+                      <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
+                        {nf(row.preparedUl / 1000, 1)} mL
+                      </td>
+                      <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
+                        {nf((row.neededUl + row.deadVolumeUl) / 1000, 2)} mL
+                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
+                          {' '}
+                          ({nf(row.deadVolumeUl / 1000, 1)} dead)
+                        </span>
+                      </td>
+                      <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
+                        {row.surfaceHeightZ}
+                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
+                          {' '}
+                          ({row.mmAboveBottom} mm)
+                        </span>
+                      </td>
+                      <td style={{ padding: '8px 0 8px 10px' }}>
+                        <span
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '5px',
+                            color: statusColor,
+                            fontWeight: 600,
+                          }}
+                          title={row.summary}
+                        >
+                          {row.status === 'ok' ? (
+                            <CheckCircle2 size={14} />
+                          ) : row.status === 'warn' ? (
+                            <AlertTriangle size={14} />
+                          ) : (
+                            <XCircle size={14} />
+                          )}
+                          <span>{statusLabel}</span>
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* 3. Plate numbers configuration card */}
       <div className="card" style={{ marginBottom: '20px' }}>
         <h2>Plate numbers</h2>
         <p className="sub">
-          Which deck plates hold the stocks and the solvent. Change these if your deck differs; the Excel follows.
+          Which deck plates hold the stocks and the solvent. On both hoods,{' '}
+          <span className="mono">plate3–5</span> are 8-bottle holders and{' '}
+          <span className="mono">plate6–7</span> are 2-jar holders.
         </p>
 
         {/* Plate confirmation banner */}
@@ -328,12 +536,26 @@ export const DeckView: React.FC = () => {
             <label className="lbl">Solvent container</label>
             <select
               value={run.deck.solvent_kind}
-              onChange={(e) =>
-                setPath('deckPlates', { ...dp, solventKind: e.target.value as 'jar' | 'bottle' })
-              }
+              onChange={(e) => {
+                const kind = e.target.value as 'jar' | 'bottle';
+                const nextPlate =
+                  kind === 'jar'
+                    ? run.deck.solvent_plate >= 6
+                      ? run.deck.solvent_plate
+                      : 6
+                    : run.deck.solvent_plate <= 5
+                    ? run.deck.solvent_plate
+                    : 3;
+                setPath('deckPlates', {
+                  ...dp,
+                  solventKind: kind,
+                  solventPlate: nextPlate,
+                  solventPos: kind === 'jar' ? Math.min(1, dp.solventPos || 0) : dp.solventPos || 0,
+                });
+              }}
             >
-              <option value="jar">Jar 100 mL</option>
-              <option value="bottle">Bottle 20 mL</option>
+              <option value="jar">Jar 100 mL (plate6–7)</option>
+              <option value="bottle">Bottle 20/40 mL (plate3–5)</option>
             </select>
           </div>
 
@@ -347,7 +569,7 @@ export const DeckView: React.FC = () => {
             >
               {[3, 4, 5, 6, 7].map((p) => (
                 <option key={p} value={p}>
-                  {p}
+                  plate{p} ({p >= 6 ? 'jar' : 'bottle'})
                 </option>
               ))}
             </select>
@@ -362,9 +584,9 @@ export const DeckView: React.FC = () => {
                 setPath('deckPlates', { ...dp, solventPos: +e.target.value })
               }
             >
-              {[0, 1, 2, 3, 4, 5, 6, 7].map((p) => (
+              {(run.deck.solvent_kind === 'jar' ? [0, 1] : [0, 1, 2, 3, 4, 5, 6, 7]).map((p) => (
                 <option key={p} value={p}>
-                  {p}
+                  pos {p}
                 </option>
               ))}
             </select>
@@ -375,7 +597,7 @@ export const DeckView: React.FC = () => {
           <span className="lbl">Bottle plates for stocks (filled in this order)</span>
           <div className="seg" role="group" aria-label="Stock plates">
             {[3, 4, 5, 6].map((p) => {
-              const curPlates = dp.stockPlates || [3, 4, 5, 6];
+              const curPlates = dp.stockPlates || [3, 4, 5];
               const on = run.deck.plates.includes(p);
               return (
                 <button
@@ -399,11 +621,14 @@ export const DeckView: React.FC = () => {
         </div>
       </div>
 
-      {/* 3 & 4: Load list + Tips to load side-by-side */}
+      {/* 4 & 5: Load list + Tips & Execution Timing side-by-side */}
       <div className="grid eq">
         {/* Load List Card */}
         <div className="card" style={{ minWidth: 0 }}>
-          <h2>Load list</h2>
+          <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <FlaskConical size={18} />
+            Load list
+          </h2>
           <p className="sub">
             What goes where, and how to prepare it. Volume is rounded up to a volumetric flask and
             includes {state.leftoverMl} mL leftover.
@@ -496,10 +721,46 @@ export const DeckView: React.FC = () => {
           </div>
         </div>
 
-        {/* Tips to load Card */}
+        {/* Tips & Robot Run Settings Card */}
         <div className="card" style={{ minWidth: 0 }}>
-          <h2>Tips to load</h2>
-          <p className="sub">Count how many you need, then refill racks before you start.</p>
+          <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Clock size={18} />
+            Tips &amp; robot timing
+          </h2>
+          <p className="sub">
+            Count how many tips to load and match how <span className="mono">main_auto_liquid_height.py</span>{' '}
+            will execute this run.
+          </p>
+
+          {/* Runtime headline */}
+          <div
+            style={{
+              padding: '10px 12px',
+              borderRadius: '8px',
+              background: 'var(--soft)',
+              border: '1px solid var(--line)',
+              marginBottom: '12px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+              flexWrap: 'wrap',
+              gap: '8px',
+            }}
+          >
+            <div>
+              <div style={{ fontSize: '11.5px', color: 'var(--mut)' }}>Estimated robot run time</div>
+              <div className="mono" style={{ fontSize: '20px', fontWeight: 700 }}>
+                {rt.label}
+              </div>
+            </div>
+            <div className="mono" style={{ fontSize: '12px', color: 'var(--fg2)', textAlign: 'right' }}>
+              Range {formatDuration(rt.lowSeconds)} – {formatDuration(rt.highSeconds)}
+              <br />
+              {rt.transfers} transfers · {rt.tipChanges} tip changes
+              {rt.delaySeconds ? ` · +${formatDuration(rt.delaySeconds)} waits` : ''}
+            </div>
+          </div>
+
           {([50, 300, 1000] as const).map((size) => (
             <div
               key={size}
@@ -524,30 +785,98 @@ export const DeckView: React.FC = () => {
             </div>
           ))}
 
-          <label className="chk" style={{ marginTop: '12px', display: 'flex', gap: '8px', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={!!state.stockVolumeCheck}
-              onChange={(e) => setPath('stockVolumeCheck', e.target.checked)}
-            />
-            <span>
-              Check stock volumes (one 300 µL tip per stock
-              {t.stockCheck ? `, ${t.stockCheckTips} here` : ''})
-            </span>
-          </label>
+          {/* Execution mode controls synced with main_auto_liquid_height.py */}
+          <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--line2)' }}>
+            <label className="chk" style={{ display: 'flex', gap: '8px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={autoHeight}
+                onChange={(e) => {
+                  const useAuto = e.target.checked;
+                  setPath('autoLiquidHeight', useAuto);
+                  setPath('stockVolumeCheck', !useAuto);
+                }}
+              />
+              <span>
+                Auto liquid height (<span className="mono">main_auto_liquid_height.py</span> — 0
+                probe tips)
+              </span>
+            </label>
 
-          <label className="chk" style={{ marginTop: '6px', display: 'flex', gap: '8px', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={!!state.newTipEveryTransfer}
-              onChange={(e) => setPath('newTipEveryTransfer', e.target.checked)}
-            />
-            <span>New tip after every pipetting</span>
-          </label>
+            {!autoHeight && (
+              <div className="hint" style={{ marginTop: '4px', marginLeft: '22px' }}>
+                Legacy liquid-level probing active: uses {t.stockCheckTips} extra 300 µL tip
+                {t.stockCheckTips === 1 ? '' : 's'} to measure each bottle before starting.
+              </div>
+            )}
 
-          <div className="hint" style={{ marginTop: '8px' }}>
-            A new tip is taken only when the tip size or the substance changes, unless the box above
-            is ticked.
+            <label
+              className="chk"
+              style={{ marginTop: '8px', display: 'flex', gap: '8px', cursor: 'pointer' }}
+            >
+              <input
+                type="checkbox"
+                checked={!!state.newTipEveryTransfer}
+                onChange={(e) => setPath('newTipEveryTransfer', e.target.checked)}
+              />
+              <span>New tip after every pipetting</span>
+            </label>
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr auto',
+                gap: '12px',
+                alignItems: 'end',
+                marginTop: '12px',
+              }}
+            >
+              <div>
+                <span className="lbl">Pipetting order</span>
+                <div className="seg" role="group" aria-label="Pipetting order">
+                  <button
+                    type="button"
+                    className={pipettingStrategy === 'by_solvent' ? 'on' : ''}
+                    onClick={() => setPath('pipettingStrategy', 'by_solvent')}
+                    title="Default in main_auto_liquid_height.py: finish one reagent across all vials before switching"
+                  >
+                    By reagent
+                  </button>
+                  <button
+                    type="button"
+                    className={pipettingStrategy === 'by_vial' ? 'on' : ''}
+                    onClick={() => setPath('pipettingStrategy', 'by_vial')}
+                    title="Complete all reagents inside each vial before moving to the next vial (uses more tips)"
+                  >
+                    Vial by vial
+                  </button>
+                </div>
+              </div>
+
+              <div className="fld" style={{ margin: 0, width: '135px' }}>
+                <label className="lbl" htmlFor="substance-delay-sec">
+                  Wait / reagent (s)
+                </label>
+                <input
+                  id="substance-delay-sec"
+                  type="number"
+                  min={0}
+                  max={7200}
+                  step={10}
+                  className="mono"
+                  value={substanceDelaySec}
+                  onChange={(e) =>
+                    setPath('substanceDelaySec', Math.max(0, Number(e.target.value) || 0))
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="hint" style={{ marginTop: '8px' }}>
+              &ldquo;By reagent&rdquo; matches Robowski&apos;s default and reuses one tip per
+              reagent &amp; tip size. &ldquo;Wait / reagent&rdquo; models{' '}
+              <span className="mono">ask_time_delays</span> pauses between reagent additions.
+            </div>
           </div>
         </div>
       </div>

@@ -537,3 +537,173 @@ export async function submitTlcFeedback(
 
   return { savedTo: 'failed' };
 }
+
+// ---------------------------------------------------------------------------
+// 6. Live Robot Status, Run Progress & Hardware Command Bridge
+// ---------------------------------------------------------------------------
+export interface RobotTipRackSummary {
+  tipType: '50ul' | '300ul' | '1000ul';
+  remaining: number;
+  total: number;
+  used: number;
+}
+
+export interface RobotActivityEntry {
+  timestamp: string;
+  level: 'info' | 'warning' | 'error';
+  summary: string;
+  raw: string;
+}
+
+export interface RobotSubstanceProgress {
+  substance: string;
+  completed: number;
+  total: number;
+  percent: number;
+}
+
+export interface RobotStockLiveLevel {
+  substance: string;
+  plate: number;
+  containerId: number;
+  solvent: string;
+  initialVolumeUl: number;
+  remainingVolumeUl: number;
+  surfaceHeightZ: number | null;
+  percentRemaining: number;
+}
+
+export interface RobotRunProgress {
+  fileName: string;
+  relativePath: string;
+  updatedIso: string;
+  totalVials: number;
+  completedVials: number;
+  inProgressVials: number;
+  notStartedVials: number;
+  percentComplete: number;
+  plateBarcode?: string | null;
+  dilutionBarcodes?: string[];
+  reactionDurationHours?: number | null;
+  substances: RobotSubstanceProgress[];
+  wellStates: Array<'completed' | 'in_progress' | 'not_started'>;
+  stocks: RobotStockLiveLevel[];
+}
+
+export interface RobotHardwareState {
+  controlEnabled: boolean;
+  pinProtected?: boolean;
+  connected: boolean;
+  busy: boolean;
+  currentTip: string;
+  currentPosition: string;
+  currentZ?: number | null;
+  lastCommand?: string | null;
+  lastCommandAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface RobotLiveStatus {
+  ok: boolean;
+  robotName: string;
+  state: 'running' | 'waiting_user' | 'idle' | 'error' | 'not_configured';
+  headline: string;
+  detail: string;
+  lastUpdatedIso?: string | null;
+  secondsAgo?: number | null;
+  dataPathConfigured: boolean;
+  logFileName?: string | null;
+  tipRacks: RobotTipRackSummary[];
+  activeRun: RobotRunProgress | null;
+  availableRuns: Array<{ fileName: string; relativePath: string; updatedIso: string }>;
+  recentActivity: RobotActivityEntry[];
+  rawLogTail: string[];
+  hardware: RobotHardwareState;
+  relaySource?: string;
+  agentOnline?: boolean;
+  agentLastSeenSecondsAgo?: number;
+}
+
+export interface RobotCommandResult {
+  ok: boolean;
+  executed: boolean;
+  command: string;
+  humanMessage: string;
+  pythonSnippet: string;
+  data?: Record<string, any>;
+  hardware?: RobotHardwareState;
+  error?: string;
+}
+
+export async function fetchRobotLiveStatus(
+  runPath?: string,
+  overrideUrl?: string
+): Promise<RobotLiveStatus | null> {
+  const url = (overrideUrl ?? getPythonBackendUrl()).trim().replace(/\/+$/, '');
+  if (!url) return null;
+  try {
+    const qs = runPath ? `?run_path=${encodeURIComponent(runPath)}` : '';
+    const resp = await fetchWithTimeout(`${url}/api/robot/status${qs}`, { method: 'GET' }, 7000);
+    if (!resp.ok) return null;
+    return (await resp.json()) as RobotLiveStatus;
+  } catch {
+    return null;
+  }
+}
+
+export async function sendRobotCommand(
+  command: string,
+  params: Record<string, any> = {},
+  overrideUrl?: string,
+  controlPin?: string
+): Promise<RobotCommandResult> {
+  const url = (overrideUrl ?? getPythonBackendUrl()).trim().replace(/\/+$/, '');
+  if (!url) {
+    return {
+      ok: false,
+      executed: false,
+      command,
+      humanMessage: 'Lab PC server is not connected. Connect it in the top bar first.',
+      pythonSnippet: '',
+      error: 'Not connected',
+    };
+  }
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (controlPin) headers['X-Robowski-Pin'] = controlPin;
+    const resp = await fetchWithTimeout(
+      `${url}/api/robot/command`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ command, params }),
+      },
+      25000
+    );
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      return {
+        ok: false,
+        executed: false,
+        command,
+        humanMessage: data?.detail || data?.humanMessage || `Command failed (HTTP ${resp.status}).`,
+        pythonSnippet: data?.pythonSnippet || '',
+        error: data?.detail || `HTTP ${resp.status}`,
+      };
+    }
+    return data as RobotCommandResult;
+  } catch (err: any) {
+    return {
+      ok: false,
+      executed: false,
+      command,
+      humanMessage:
+        err?.name === 'AbortError'
+          ? 'The robot command is taking longer than expected — check the hood and live status.'
+          : 'Could not reach the Lab PC server.',
+      pythonSnippet: '',
+      error: err?.message || 'Request failed',
+    };
+  }
+}
+

@@ -10,6 +10,7 @@ export { SetupView } from './views/SetupView';
 export { CombinationsView } from './views/CombinationsView';
 export { PredictionView } from './views/PredictionView';
 export { DeckView } from './views/DeckView';
+export { RobotView } from './views/RobotView';
 export { ExportView } from './views/ExportView';
 export { TlcView } from './views/TlcView';
 export { ElnView } from './views/ElnView';

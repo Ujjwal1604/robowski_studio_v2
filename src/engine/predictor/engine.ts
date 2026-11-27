@@ -246,6 +246,9 @@ interface InternalSpecies {
   priorityScore: number; // greedy frontier priority before final sink/transient adjustment
   cumulativeThermo: number;
   expanded: boolean;
+  uniExpanded: boolean;
+  createdSeq: number;
+  expandedAtSeq: number;
   tautomerHops: number;
   alerts: ChemicalAlert[];
   tplMatchMap: Map<string, boolean[]>; // rule.id -> [matchesTpl0, matchesTpl1?]
@@ -527,9 +530,18 @@ function classifyFragmentName(smi: string): string {
   return map[smi] || smi;
 }
 
+const ACID_CATALYZED_AMINE_ADDITION_RULES = new Set([
+  'NA_N_carbonyl',
+  'NA_N_carbonyl_hydrazine',
+  'NA_N_carbonyl_intra',
+  'NA_N_imine_intra',
+  'PC_paal_knorr',
+]);
+
 function estimateSubstrateFreeFraction(
   rule: ReactionRuleDef,
-  substrateSites: Array<{ kind: string; label: string; freeFraction: number }>
+  substrateSites: Array<{ kind: string; label: string; freeFraction: number }>,
+  effectiveMedium?: string
 ): number {
   if (!rule.reactiveSiteKind || rule.reactiveSiteKind === 'none' || rule.reactiveSiteKind === 'electrophile') {
     return 1.0;
@@ -541,6 +553,13 @@ function estimateSubstrateFreeFraction(
     const nucBases = baseSites.filter((s) => !/Pyridine/i.test(s.label));
     const list = nucBases.length > 0 ? nucBases : baseSites;
     const maxFree = Math.max(...list.map((s) => s.freeFraction));
+    // Carbonyl/imine condensations benefit from general-acid carbonyl activation (bell-shaped pH profile:
+    // fast in buffered/mildly acidic media even when most amine is protonated, slower only in strong excess acid).
+    if (ACID_CATALYZED_AMINE_ADDITION_RULES.has(rule.id)) {
+      const floor = effectiveMedium === 'free_acid' ? 0.34 : 0.56;
+      const exp = effectiveMedium === 'free_acid' ? 0.22 : 0.14;
+      return Math.max(floor, Math.min(1.0, Math.pow(Math.max(1e-6, maxFree), exp)));
+    }
     // Even small free equilibrium fraction (e.g. 0.05) drives heated reactions slowly
     return Math.max(0.12, Math.min(1.0, Math.pow(maxFree, 0.4)));
   }
@@ -634,7 +653,9 @@ export function predictWellReactions(
   const allRules = includeTautomers ? [...REACTION_RULES, ...TAUTOMER_RULES] : [...REACTION_RULES];
   const rulesById = new Map(allRules.map((r) => [r.id, r]));
 
-  // Pre-filter active rules by condition & temperature gates BEFORE building species applicability index
+  // Pre-filter active rules by condition & temperature gates BEFORE building species applicability index.
+  // Order unimolecular rules first and descending by intrinsic rate (prior * cGate * tGate) so fast
+  // dehydrations, oxidations, and cyclizations always run before speculative low-prior side-reactions.
   const activeRuleStates = allRules
     .map((rule) => {
       const cGate = conditionGate(rule, acidBase, effectiveCondition);
@@ -642,7 +663,11 @@ export function predictWellReactions(
       const entry = cGate * tGate >= 0.02 ? getCompiledRule(rdkit, rule) : null;
       return entry ? { rule, cGate, tGate, entry } : null;
     })
-    .filter((x): x is { rule: ReactionRuleDef; cGate: number; tGate: number; entry: CompiledRuleEntry } => x !== null);
+    .filter((x): x is { rule: ReactionRuleDef; cGate: number; tGate: number; entry: CompiledRuleEntry } => x !== null)
+    .sort((a, b) => {
+      if (a.rule.numReactants !== b.rule.numReactants) return a.rule.numReactants - b.rule.numReactants;
+      return b.rule.prior * b.cGate * b.tGate - a.rule.prior * a.cGate * a.tGate;
+    });
 
   const molCache = new Map<string, MolMeta | null>();
   const tplMatchMemo = new Map<string, Map<string, boolean[]>>();
@@ -665,6 +690,8 @@ export function predictWellReactions(
   // Deduplicate identical neutral starting substrates into inventory slots
   const speciesMap = new Map<string, InternalSpecies>();
   const siteInfoBySmiles = new Map<string, Array<{ kind: string; label: string; freeFraction: number }>>();
+
+  let speciesSeq = 0;
 
   activeSubs.forEach((sub, idx) => {
     const meta = inspectMol(rdkit, sub.neutralSmiles, molCache);
@@ -693,6 +720,9 @@ export function predictWellReactions(
         priorityScore: 1.0,
         cumulativeThermo: 0,
         expanded: false,
+        uniExpanded: false,
+        createdSeq: ++speciesSeq,
+        expandedAtSeq: 0,
         tautomerHops: 0,
         alerts: [],
         tplMatchMap: getTplMatch(meta.smiles),
@@ -702,6 +732,252 @@ export function predictWellReactions(
 
   const releasedGases = new Set<string>();
   const releasedFragmentKeys = new Set<string>();
+
+  const applyRuleToPairs = (
+    rule: ReactionRuleDef,
+    cGate: number,
+    tGate: number,
+    rxn: any,
+    partnerLists: InternalSpecies[][],
+    speciesCap: number
+  ) => {
+    for (const pair of partnerLists) {
+      if (speciesMap.size >= speciesCap) break;
+
+      // Re-check combined inventory for unimolecular vs bimolecular
+      const combinedInv = new Array(activeSubs.length).fill(0);
+      let overLimit = false;
+      for (let k = 0; k < activeSubs.length; k++) {
+        combinedInv[k] = pair.reduce((acc, p) => acc + p.inventory[k], 0);
+        if (combinedInv[k] > maxCopies[k]) {
+          overLimit = true;
+          break;
+        }
+      }
+      if (overLimit) continue;
+
+      const combinedFragUses = pair.reduce(
+        (acc, p) => acc + p.fragmentUses + (p.isSmallFragment ? 1 : 0),
+        0
+      );
+      if (combinedFragUses > 1) continue;
+
+      // Avoid repeating the exact same rule consecutively on tautomer / reversible steps
+      const lastStep = pair[0].chain[pair[0].chain.length - 1];
+      if (rule.stepLabel === 'Tautomer' && lastStep?.stepLabel === 'Tautomer') continue;
+
+      const reactantSmis = pair.map((p) => p.meta.smiles);
+      const prodSets = runRxnSingle(rdkit, rxn, reactantSmis, 10);
+      if (prodSets.length === 0) continue;
+
+      const stericFactor = estimateStericFactor(rule, reactantSmis, rdkit);
+      const elecFactor = estimateElectronicFactor(rule, reactantSmis, rdkit);
+
+      // Substrate free-fraction factor (when an original substrate is participating directly)
+      let fFree = 1.0;
+      for (const p of pair) {
+        const sites = siteInfoBySmiles.get(p.meta.smiles);
+        if (sites && sites.length > 0) {
+          fFree = Math.min(fFree, estimateSubstrateFreeFraction(rule, sites, acidBase.effectiveMedium));
+        }
+      }
+
+      const parentRings = pair.map((p) => p.meta.ringSizes);
+
+      for (const prodSmis of prodSets) {
+        // Product 0 is primary product; Product 1 (if present & releasesReactiveFragment) is released small fragment
+        const mainRaw = prodSmis[0];
+        const mainMeta = inspectMol(rdkit, mainRaw, molCache);
+        if (!mainMeta) continue;
+        if (mainMeta.amw > maxMw || mainMeta.numHeavyAtoms < 2) continue;
+
+        // Atom bookkeeping: prevent SMARTS rules from silently creating or deleting heavy atoms
+        {
+          const prodFormulas = [mainMeta.formula];
+          for (const extra of prodSmis.slice(1)) {
+            const em = inspectMol(rdkit, extra, molCache);
+            if (em) prodFormulas.push(em.formula);
+          }
+          if (
+            !stepIsAtomBalanced(
+              pair.map((p) => p.meta.formula),
+              prodFormulas,
+              LEAVING_GROUP_STEPS.has(rule.stepLabel),
+              rule.allowedSolventGain
+            )
+          ) {
+            continue;
+          }
+        }
+
+        // Skip no-op where product equals one of its parents
+        if (pair.some((p) => p.key === mainMeta.smiles)) continue;
+
+        // Intramolecular cyclizations must form at least one new ring
+        if (rule.intramolecular && mainMeta.numRings <= pair[0].meta.numRings) continue;
+
+        // Guard against physically impossible anti-Bredt bridgehead double bonds, meta/para-bridged aromatic cages, and unintentional dearomatization
+        if (mainMeta.numRings >= 2 && hasAntiBredtDoubleBond(rdkit, mainMeta.smiles)) continue;
+        if (
+          mainMeta.numRings >= 2 &&
+          mainMeta.numAromaticRings >= 1 &&
+          hasImpossibleBridgedAromaticRing(rdkit, mainMeta.smiles)
+        ) {
+          continue;
+        }
+        const parentAromSum = pair.reduce((acc, p) => acc + p.meta.numAromaticRings, 0);
+        if (
+          !LEAVING_GROUP_STEPS.has(rule.stepLabel) &&
+          mainMeta.numAromaticRings < parentAromSum &&
+          rule.stepLabel !== 'Tautomer'
+        ) {
+          continue;
+        }
+
+        // Ring-size / strain / effective-molarity check
+        const ringEval = evaluateNewRingFactor(parentRings, mainMeta.ringSizes);
+        if (ringEval.reject) continue;
+
+        const baseWeight = rule.prior * cGate * tGate * stericFactor * elecFactor * fFree;
+        const stepWeight = Math.max(0.01, Math.min(1.12, baseWeight * Math.min(1.28, ringEval.factor)));
+
+        const releasedFragRaw = rule.releasesReactiveFragment && prodSmis[1] ? prodSmis[1] : null;
+        let releasedFragMeta: MolMeta | null = null;
+        if (releasedFragRaw) {
+          releasedFragMeta = inspectMol(rdkit, releasedFragRaw, molCache);
+        }
+
+        if (rule.releasesGas) {
+          releasedGases.add(rule.releasesGas);
+        }
+
+        const stepEvt: StepEvent = {
+          ruleId: rule.id,
+          stepLabel: rule.stepLabel,
+          description: rule.name,
+          reactantSmiles: reactantSmis,
+          stepWeight: Math.round(stepWeight * 1000) / 1000,
+          bottleneckFactor: Math.round(baseWeight * 1000) / 1000,
+          conditionFactor: Math.round(cGate * 1000) / 1000,
+          tempFactor: Math.round(tGate * 1000) / 1000,
+          stericFactor: Math.round(stericFactor * 1000) / 1000,
+          ringFactor: Math.round(ringEval.factor * 1000) / 1000,
+          electronicFactor: Math.round(elecFactor * 1000) / 1000,
+          reversible: rule.reversible,
+          releasedFragment: releasedFragMeta ? classifyFragmentName(releasedFragMeta.smiles) : null,
+          releasedGas: rule.releasesGas || null,
+          productSmiles: mainMeta.smiles,
+        };
+
+        // Merge both parents' upstream StepEvents (preserving order, deduplicating shared ancestors)
+        const seenSteps = new Set<StepEvent>();
+        const mergedParentChain: StepEvent[] = [];
+        for (const p of pair) {
+          for (const st of p.chain) {
+            if (!seenSteps.has(st)) {
+              seenSteps.add(st);
+              mergedParentChain.push(st);
+            }
+          }
+        }
+        const newChain = [...mergedParentChain, stepEvt];
+        if (newChain.length > maxDepth) continue;
+
+        const extraRingThermo = ringEval.addedSizes.some((sz) => sz === 5 || sz === 6) ? 0.14 : 0;
+        const extraAromThermo =
+          mainMeta.numAromaticRings > Math.max(0, ...pair.map((p) => p.meta.numAromaticRings))
+            ? 0.16
+            : 0;
+        const newCumThermo =
+          pair.reduce((acc, p) => acc + p.cumulativeThermo, 0) +
+          rule.thermoBonus +
+          extraRingThermo +
+          extraAromThermo;
+
+        // Frontier priority (kept optimistic so multi-step cyclizations aren't pruned before completing!)
+        const minStep = Math.min(...newChain.map((s) => s.stepWeight));
+        const geom = Math.exp(
+          newChain.reduce((acc, s) => acc + Math.log(Math.max(0.02, s.stepWeight)), 0) /
+            newChain.length
+        );
+        const priority =
+          Math.pow(minStep, 0.4) *
+          Math.pow(geom, 0.6) *
+          Math.pow(0.96, Math.max(0, newChain.length - 1)) *
+          (0.9 + Math.min(0.25, newCumThermo * 0.35));
+
+        if (priority < minFrontierScore) continue;
+
+        const existing = speciesMap.get(mainMeta.smiles);
+        if (existing) {
+          if (!existing.isSubstrate && priority > existing.priorityScore + 0.01) {
+            existing.altChains.push(existing.chain);
+            existing.chain = newChain;
+            existing.priorityScore = priority;
+            existing.cumulativeThermo = newCumThermo;
+            existing.inventory = combinedInv;
+            existing.fragmentUses = combinedFragUses;
+            existing.expanded = false; // re-expand improved path
+            existing.uniExpanded = false;
+            existing.createdSeq = ++speciesSeq;
+          } else if (!existing.isSubstrate && existing.altChains.length < 3) {
+            existing.altChains.push(newChain);
+          }
+        } else {
+          speciesMap.set(mainMeta.smiles, {
+            key: mainMeta.smiles,
+            meta: mainMeta,
+            inventory: combinedInv,
+            fragmentUses: combinedFragUses,
+            isSubstrate: false,
+            isSmallFragment: false,
+            chain: newChain,
+            altChains: [],
+            priorityScore: priority,
+            cumulativeThermo: newCumThermo,
+            expanded: false,
+            uniExpanded: false,
+            createdSeq: ++speciesSeq,
+            expandedAtSeq: 0,
+            tautomerHops:
+              Math.max(...pair.map((p) => p.tautomerHops)) + (rule.stepLabel === 'Tautomer' ? 1 : 0),
+            alerts: [],
+            tplMatchMap: getTplMatch(mainMeta.smiles),
+          });
+        }
+
+        // Keep released small reactive fragment active in the well pool (e.g. MeOH, EtOH, NH3)
+        if (
+          releasedFragMeta &&
+          releasedFragMeta.amw <= 130 &&
+          releasedFragMeta.smiles !== 'O' && // water is tracked via waterPct
+          !speciesMap.has(releasedFragMeta.smiles)
+        ) {
+          releasedFragmentKeys.add(releasedFragMeta.smiles);
+          speciesMap.set(releasedFragMeta.smiles, {
+            key: releasedFragMeta.smiles,
+            meta: releasedFragMeta,
+            inventory: new Array(activeSubs.length).fill(0),
+            fragmentUses: 0,
+            isSubstrate: false,
+            isSmallFragment: true,
+            releasedFragmentName: classifyFragmentName(releasedFragMeta.smiles),
+            chain: [stepEvt],
+            altChains: [],
+            priorityScore: Math.max(0.28, priority * 0.72),
+            cumulativeThermo: 0,
+            expanded: false,
+            uniExpanded: false,
+            createdSeq: ++speciesSeq,
+            expandedAtSeq: 0,
+            tautomerHops: 0,
+            alerts: [],
+            tplMatchMap: getTplMatch(releasedFragMeta.smiles),
+          });
+        }
+      }
+    }
+  };
 
   // 3. Best-First Priority Expansion Loop
   let expansions = 0;
@@ -720,14 +996,22 @@ export function predictWellReactions(
     if (!bestCandidate) break;
 
     bestCandidate.expanded = true;
+    bestCandidate.uniExpanded = true;
+    bestCandidate.expandedAtSeq = ++speciesSeq;
     expansions++;
 
     const currentPool = Array.from(speciesMap.values());
+    const crowdedBimolecular = speciesMap.size >= Math.floor(maxSpecies * 0.55);
 
     for (const { rule, cGate, tGate, entry } of activeRuleStates) {
       const rxn = entry.rxn;
       if (rule.stepLabel === 'Tautomer' && bestCandidate.tautomerHops >= 1) continue;
       if (rule.requireSingleSub && bestCandidate.chain.length > 0) continue;
+      // When the pool is filling up in dense multi-component wells, prevent low-prior
+      // speculative bimolecular rules (e.g. uncatalyzed AR_het_broad) from starving real cascades.
+      if (crowdedBimolecular && rule.numReactants === 2 && rule.prior * cGate * tGate < 0.18) {
+        continue;
+      }
 
       const candFlags = bestCandidate.tplMatchMap.get(rule.id) || [];
 
@@ -745,6 +1029,17 @@ export function predictWellReactions(
         for (const partner of currentPool) {
           if (bestCandidate.isSmallFragment && partner.isSmallFragment) continue;
           if (bestCandidate.fragmentUses + partner.fragmentUses > 1) continue;
+          // Skip bimolecular pairs that were already evaluated when `partner` expanded earlier
+          if (
+            partner.key !== bestCandidate.key &&
+            partner.expanded &&
+            bestCandidate.createdSeq < partner.expandedAtSeq
+          ) {
+            continue;
+          }
+          if (crowdedBimolecular && !partner.isSubstrate && partner.priorityScore < 0.18) {
+            continue;
+          }
 
           // Stoichiometric pre-check
           let over = false;
@@ -770,227 +1065,7 @@ export function predictWellReactions(
       }
 
       if (partnerLists.length === 0) continue;
-
-      for (const pair of partnerLists) {
-        if (speciesMap.size >= maxSpecies) break;
-
-        // Re-check combined inventory for unimolecular vs bimolecular
-        const combinedInv = new Array(activeSubs.length).fill(0);
-        let overLimit = false;
-        for (let k = 0; k < activeSubs.length; k++) {
-          combinedInv[k] = pair.reduce((acc, p) => acc + p.inventory[k], 0);
-          if (combinedInv[k] > maxCopies[k]) {
-            overLimit = true;
-            break;
-          }
-        }
-        if (overLimit) continue;
-
-        const combinedFragUses =
-          pair.reduce((acc, p) => acc + p.fragmentUses + (p.isSmallFragment ? 1 : 0), 0);
-        if (combinedFragUses > 1) continue;
-
-        // Avoid repeating the exact same rule consecutively on tautomer / reversible steps
-        const lastStep = pair[0].chain[pair[0].chain.length - 1];
-        if (rule.stepLabel === 'Tautomer' && lastStep?.stepLabel === 'Tautomer') continue;
-
-        const reactantSmis = pair.map((p) => p.meta.smiles);
-        const prodSets = runRxnSingle(rdkit, rxn, reactantSmis, 10);
-        if (prodSets.length === 0) continue;
-
-        const stericFactor = estimateStericFactor(rule, reactantSmis, rdkit);
-        const elecFactor = estimateElectronicFactor(rule, reactantSmis, rdkit);
-
-        // Substrate free-fraction factor (when an original substrate is participating directly)
-        let fFree = 1.0;
-        for (const p of pair) {
-          const sites = siteInfoBySmiles.get(p.meta.smiles);
-          if (sites && sites.length > 0) {
-            fFree = Math.min(fFree, estimateSubstrateFreeFraction(rule, sites));
-          }
-        }
-
-        const parentRings = pair.map((p) => p.meta.ringSizes);
-
-        for (const prodSmis of prodSets) {
-          // Product 0 is primary product; Product 1 (if present & releasesReactiveFragment) is released small fragment
-          const mainRaw = prodSmis[0];
-          const mainMeta = inspectMol(rdkit, mainRaw, molCache);
-          if (!mainMeta) continue;
-          if (mainMeta.amw > maxMw || mainMeta.numHeavyAtoms < 2) continue;
-
-          // Atom bookkeeping: prevent SMARTS rules from silently creating or deleting heavy atoms
-          {
-            const prodFormulas = [mainMeta.formula];
-            for (const extra of prodSmis.slice(1)) {
-              const em = inspectMol(rdkit, extra, molCache);
-              if (em) prodFormulas.push(em.formula);
-            }
-            if (
-              !stepIsAtomBalanced(
-                pair.map((p) => p.meta.formula),
-                prodFormulas,
-                LEAVING_GROUP_STEPS.has(rule.stepLabel),
-                rule.allowedSolventGain
-              )
-            ) {
-              continue;
-            }
-          }
-
-          // Skip no-op where product equals one of its parents
-          if (pair.some((p) => p.key === mainMeta.smiles)) continue;
-
-          // Intramolecular cyclizations must form at least one new ring
-          if (rule.intramolecular && mainMeta.numRings <= pair[0].meta.numRings) continue;
-
-          // Guard against physically impossible anti-Bredt bridgehead double bonds, meta/para-bridged aromatic cages, and unintentional dearomatization
-          if (mainMeta.numRings >= 2 && hasAntiBredtDoubleBond(rdkit, mainMeta.smiles)) continue;
-          if (mainMeta.numRings >= 2 && mainMeta.numAromaticRings >= 1 && hasImpossibleBridgedAromaticRing(rdkit, mainMeta.smiles)) continue;
-          const parentAromSum = pair.reduce((acc, p) => acc + p.meta.numAromaticRings, 0);
-          if (
-            !LEAVING_GROUP_STEPS.has(rule.stepLabel) &&
-            mainMeta.numAromaticRings < parentAromSum &&
-            rule.stepLabel !== 'Tautomer'
-          ) {
-            continue;
-          }
-
-          // Ring-size / strain / effective-molarity check
-          const ringEval = evaluateNewRingFactor(parentRings, mainMeta.ringSizes);
-          if (ringEval.reject) continue;
-
-          const baseWeight = rule.prior * cGate * tGate * stericFactor * elecFactor * fFree;
-          const stepWeight = Math.max(0.01, Math.min(1.12, baseWeight * Math.min(1.28, ringEval.factor)));
-
-          const releasedFragRaw = rule.releasesReactiveFragment && prodSmis[1] ? prodSmis[1] : null;
-          let releasedFragMeta: MolMeta | null = null;
-          if (releasedFragRaw) {
-            releasedFragMeta = inspectMol(rdkit, releasedFragRaw, molCache);
-          }
-
-          if (rule.releasesGas) {
-            releasedGases.add(rule.releasesGas);
-          }
-
-          const stepEvt: StepEvent = {
-            ruleId: rule.id,
-            stepLabel: rule.stepLabel,
-            description: rule.name,
-            reactantSmiles: reactantSmis,
-            stepWeight: Math.round(stepWeight * 1000) / 1000,
-            bottleneckFactor: Math.round(baseWeight * 1000) / 1000,
-            conditionFactor: Math.round(cGate * 1000) / 1000,
-            tempFactor: Math.round(tGate * 1000) / 1000,
-            stericFactor: Math.round(stericFactor * 1000) / 1000,
-            ringFactor: Math.round(ringEval.factor * 1000) / 1000,
-            electronicFactor: Math.round(elecFactor * 1000) / 1000,
-            reversible: rule.reversible,
-            releasedFragment: releasedFragMeta ? classifyFragmentName(releasedFragMeta.smiles) : null,
-            releasedGas: rule.releasesGas || null,
-            productSmiles: mainMeta.smiles,
-          };
-
-          // Merge both parents' upstream StepEvents (preserving order, deduplicating shared ancestors)
-          const seenSteps = new Set<StepEvent>();
-          const mergedParentChain: StepEvent[] = [];
-          for (const p of pair) {
-            for (const st of p.chain) {
-              if (!seenSteps.has(st)) {
-                seenSteps.add(st);
-                mergedParentChain.push(st);
-              }
-            }
-          }
-          const newChain = [...mergedParentChain, stepEvt];
-          if (newChain.length > maxDepth) continue;
-
-          const extraRingThermo = ringEval.addedSizes.some((sz) => sz === 5 || sz === 6) ? 0.14 : 0;
-          const extraAromThermo =
-            mainMeta.numAromaticRings > Math.max(0, ...pair.map((p) => p.meta.numAromaticRings))
-              ? 0.16
-              : 0;
-          const newCumThermo =
-            pair.reduce((acc, p) => acc + p.cumulativeThermo, 0) +
-            rule.thermoBonus +
-            extraRingThermo +
-            extraAromThermo;
-
-          // Frontier priority (kept optimistic so multi-step cyclizations aren't pruned before completing!)
-          const minStep = Math.min(...newChain.map((s) => s.stepWeight));
-          const geom = Math.exp(
-            newChain.reduce((acc, s) => acc + Math.log(Math.max(0.02, s.stepWeight)), 0) /
-              newChain.length
-          );
-          const priority =
-            Math.pow(minStep, 0.4) *
-            Math.pow(geom, 0.6) *
-            Math.pow(0.96, Math.max(0, newChain.length - 1)) *
-            (0.9 + Math.min(0.25, newCumThermo * 0.35));
-
-          if (priority < minFrontierScore) continue;
-
-          const existing = speciesMap.get(mainMeta.smiles);
-          if (existing) {
-            if (!existing.isSubstrate && priority > existing.priorityScore + 0.01) {
-              existing.altChains.push(existing.chain);
-              existing.chain = newChain;
-              existing.priorityScore = priority;
-              existing.cumulativeThermo = newCumThermo;
-              existing.inventory = combinedInv;
-              existing.fragmentUses = combinedFragUses;
-              existing.expanded = false; // re-expand improved path
-            } else if (!existing.isSubstrate && existing.altChains.length < 3) {
-              existing.altChains.push(newChain);
-            }
-          } else {
-            speciesMap.set(mainMeta.smiles, {
-              key: mainMeta.smiles,
-              meta: mainMeta,
-              inventory: combinedInv,
-              fragmentUses: combinedFragUses,
-              isSubstrate: false,
-              isSmallFragment: false,
-              chain: newChain,
-              altChains: [],
-              priorityScore: priority,
-              cumulativeThermo: newCumThermo,
-              expanded: false,
-              tautomerHops:
-                Math.max(...pair.map((p) => p.tautomerHops)) + (rule.stepLabel === 'Tautomer' ? 1 : 0),
-              alerts: [],
-              tplMatchMap: getTplMatch(mainMeta.smiles),
-            });
-          }
-
-          // Keep released small reactive fragment active in the well pool (e.g. MeOH, EtOH, NH3)
-          if (
-            releasedFragMeta &&
-            releasedFragMeta.amw <= 130 &&
-            releasedFragMeta.smiles !== 'O' && // water is tracked via waterPct
-            !speciesMap.has(releasedFragMeta.smiles)
-          ) {
-            releasedFragmentKeys.add(releasedFragMeta.smiles);
-            speciesMap.set(releasedFragMeta.smiles, {
-              key: releasedFragMeta.smiles,
-              meta: releasedFragMeta,
-              inventory: new Array(activeSubs.length).fill(0),
-              fragmentUses: 0,
-              isSubstrate: false,
-              isSmallFragment: true,
-              releasedFragmentName: classifyFragmentName(releasedFragMeta.smiles),
-              chain: [stepEvt],
-              altChains: [],
-              priorityScore: Math.max(0.28, priority * 0.72),
-              cumulativeThermo: 0,
-              expanded: false,
-              tautomerHops: 0,
-              alerts: [],
-              tplMatchMap: getTplMatch(releasedFragMeta.smiles),
-            });
-          }
-        }
-      }
+      applyRuleToPairs(rule, cGate, tGate, rxn, partnerLists, maxSpecies);
     }
   }
 
@@ -1009,6 +1084,44 @@ export function predictWellReactions(
     : hitExpansionCap
     ? 'max_expansions'
     : null;
+
+  // 3b. Unimolecular Cascade Maturation Pass:
+  // Even when a dense multi-component well reaches maxSpecies/maxExpansions during bimolecular
+  // exploration, finish fast O(1) unimolecular follow-ups (carbinolamine -> imine dehydration,
+  // Pictet-Spengler & intramolecular ring closures, oxidative aromatizations, decarboxylations)
+  // on the top unexpanded intermediates so reversible adducts never get stranded before dehydrating.
+  const unimolecularRules = activeRuleStates.filter(
+    ({ rule }) => rule.numReactants === 1 && rule.stepLabel !== 'Tautomer'
+  );
+  if (unimolecularRules.length > 0 && hasRemainingFrontier) {
+    const uniSpeciesCap = maxSpecies + 60;
+    let uniExpansions = 0;
+    const maxUniExpansions = 45;
+
+    while (uniExpansions < maxUniExpansions && speciesMap.size < uniSpeciesCap) {
+      let bestUni: InternalSpecies | null = null;
+      for (const sp of speciesMap.values()) {
+        if (sp.uniExpanded) continue;
+        if (sp.chain.length >= maxDepth) continue;
+        if (sp.priorityScore < 0.12) continue;
+        if (!bestUni || sp.priorityScore > bestUni.priorityScore) {
+          bestUni = sp;
+        }
+      }
+      if (!bestUni) break;
+
+      bestUni.uniExpanded = true;
+      uniExpansions++;
+
+      for (const { rule, cGate, tGate, entry } of unimolecularRules) {
+        if (rule.requireSingleSub && bestUni.chain.length > 0) continue;
+        const candFlags = bestUni.tplMatchMap.get(rule.id) || [];
+        if (candFlags.length === 0 || candFlags.every(Boolean)) {
+          applyRuleToPairs(rule, cGate, tGate, entry.rxn, [[bestUni]], uniSpeciesCap);
+        }
+      }
+    }
+  }
 
   // 4. Final Classification (Sink vs Transient vs Byproduct) & Competition Adjustment
   const nonSubSpecies = Array.from(speciesMap.values()).filter((s) => !s.isSubstrate);

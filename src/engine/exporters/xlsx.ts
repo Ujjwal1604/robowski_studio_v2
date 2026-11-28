@@ -112,6 +112,20 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
     ]),
   ];
 
+  const measuredZMap: Record<string, number> =
+    (data?.state?.measuredSurfaceZ && typeof data.state.measuredSurfaceZ === 'object'
+      ? data.state.measuredSurfaceZ
+      : data?.measuredSurfaceZ && typeof data.measuredSurfaceZ === 'object'
+      ? data.measuredSurfaceZ
+      : {}) || {};
+  const pickSurfaceZ = (key: string, fallbackKind: string, fallbackUl: number): number => {
+    const raw = measuredZMap[key];
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 500 && raw <= 2200) {
+      return Math.round(raw);
+    }
+    return surfaceHeight(fallbackKind, fallbackUl);
+  };
+
   const stockRows = [
     [
       'substance',
@@ -132,7 +146,7 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
           run.reactionSolvent,
           SOLVENT_DENSITIES[run.reactionSolvent] || 1,
           Math.round(run.solventRecommendedMl * 1000),
-          surfaceHeight(run.deck.solvent_kind, run.solventRecommendedMl * 1000),
+          pickSurfaceZ('solvent', run.deck.solvent_kind, run.solventRecommendedMl * 1000),
           'empty',
         ];
       }
@@ -144,7 +158,7 @@ export function workbookSheets(run: RunResult, data?: any): Array<{ name: string
         s.solvent,
         s.density,
         Math.round(s.prep_volume_ml * 1000),
-        surfaceHeight('bottle', s.prep_volume_ml * 1000),
+        pickSurfaceZ(k, 'bottle', s.prep_volume_ml * 1000),
         s.pipetting_mode,
       ];
     }),

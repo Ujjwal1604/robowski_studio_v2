@@ -130,7 +130,14 @@ export const ExportView: React.FC = () => {
     [
       'xlsx',
       exportFilenameForKind('xlsx', runTitle, exportDate),
-      'The input workbook for the robot: reactions_with_run_info and stock_solutions sheets, plus reference sheets.',
+      (() => {
+        const measuredCount = Object.values(state.measuredSurfaceZ || {}).filter(
+          (v) => typeof v === 'number' && Number.isFinite(v) && v >= 500 && v <= 2200
+        ).length;
+        return measuredCount > 0
+          ? `The input workbook for the robot: reactions_with_run_info and stock_solutions sheets (includes ${measuredCount} manually measured liquid height${measuredCount === 1 ? '' : 's'} from the Robot tab).`
+          : 'The input workbook for the robot: reactions_with_run_info and stock_solutions sheets, plus reference sheets.';
+      })(),
     ],
     [
       'bench',

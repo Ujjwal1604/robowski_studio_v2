@@ -102,6 +102,8 @@ export interface RunState {
   pipettingStrategy?: 'by_solvent' | 'by_vial';
   /** Optional wait time (seconds) after each substance addition (main.py ask_time_delays) */
   substanceDelaySec?: number;
+  /** Manually measured Zeus liquid surface Z heights (0.1 mm units) keyed by 'solvent' or stock key */
+  measuredSurfaceZ?: Record<string, number>;
   reagents: Reagent[];
   sets?: VialSet[];
   tri?: TripletSetup;

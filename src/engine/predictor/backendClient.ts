@@ -590,17 +590,74 @@ export interface RobotRunProgress {
   stocks: RobotStockLiveLevel[];
 }
 
+export interface RobotPlatePreset {
+  id: string;
+  name: string;
+  plateSlot: 0 | 1 | 2;
+  rows: number;
+  cols: number;
+  cornerA1: [number, number];
+  cornerTopRight: [number, number];
+  cornerBottomLeft: [number, number];
+  defaultZ: number;
+  colPitchMm: number;
+  rowPitchMm: number;
+  angleDeg: number;
+  updatedAt?: string;
+}
+
+export interface RobotPlateTransferState {
+  active: boolean;
+  state: 'idle' | 'running' | 'completed' | 'stopped' | 'error';
+  srcPlate: number;
+  dstPlate: number;
+  srcPresetId?: string;
+  dstPresetId?: string;
+  srcPresetName?: string;
+  dstPresetName?: string;
+  srcRows?: number;
+  srcCols?: number;
+  dstRows?: number;
+  dstCols?: number;
+  volumeUl: number;
+  solvent: string;
+  tipType: string;
+  changeTipEachVial: boolean;
+  totalWells: number;
+  completedWells: number;
+  currentWell: number | null;
+  currentPair?: [number, number] | null;
+  failedWell: number | null;
+  failedPair?: [number, number] | null;
+  wells: number[];
+  pairs?: Array<[number, number]>;
+  completedList: number[];
+  completedPairs?: Array<[number, number]>;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  message: string;
+  error?: string | null;
+}
+
 export interface RobotHardwareState {
   controlEnabled: boolean;
   pinProtected?: boolean;
   connected: boolean;
+  nanodropConnected?: boolean;
+  nanodropId?: string;
+  nanodropLidClosed?: boolean;
   busy: boolean;
   currentTip: string;
   currentPosition: string;
+  currentXY?: [number, number] | null;
   currentZ?: number | null;
   lastCommand?: string | null;
   lastCommandAt?: string | null;
   lastError?: string | null;
+  idleReleaseSeconds?: number;
+  idleSecondsRemaining?: number | null;
+  plateTransfer?: RobotPlateTransferState | null;
+  platePresets?: RobotPlatePreset[];
 }
 
 export interface RobotLiveStatus {
@@ -671,6 +728,11 @@ export async function sendRobotCommand(
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (controlPin) headers['X-Robowski-Pin'] = controlPin;
+    const isLongCmd =
+      command === 'nanodrop_wash_cycle' ||
+      command === 'nanodrop_flush' ||
+      command === 'nanodrop_dry' ||
+      command === 'single_transfer';
     const resp = await fetchWithTimeout(
       `${url}/api/robot/command`,
       {
@@ -678,7 +740,7 @@ export async function sendRobotCommand(
         headers,
         body: JSON.stringify({ command, params }),
       },
-      25000
+      isLongCmd ? 70000 : 25000
     );
     const data = await resp.json().catch(() => null);
     if (!resp.ok) {

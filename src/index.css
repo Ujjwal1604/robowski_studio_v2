@@ -2596,3 +2596,108 @@
       flex: 0 1 205px;
     }
 
+    /* Robot tab responsive layout (PC, tablet, and phone) */
+    .robot-page {
+      overflow-x: clip;
+    }
+
+    .robot-page button,
+    .robot-page .btn {
+      touch-action: manipulation;
+    }
+
+    .robot-mobile-dock {
+      display: none;
+    }
+
+    @media (max-width: 960px) {
+      .robot-page .grid.eq {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .robot-page {
+        padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+      }
+
+      .robot-page .card {
+        padding: 14px;
+        margin-bottom: 14px !important;
+      }
+
+      .robot-page .card h2 {
+        font-size: 16px;
+      }
+
+      .robot-page .btn.sm {
+        min-height: 40px;
+        padding: 0 12px;
+        font-size: 13px;
+      }
+
+      .robot-page input:not([type="checkbox"]):not([type="radio"]),
+      .robot-page select {
+        min-height: 40px !important;
+        font-size: 16px !important;
+      }
+
+      .robot-page .robot-banner-actions {
+        width: 100%;
+        justify-content: flex-start !important;
+      }
+
+      .robot-page .robot-pin-row {
+        width: 100%;
+      }
+
+      .robot-page .robot-pin-row input {
+        flex: 1 1 140px;
+        width: auto !important;
+      }
+
+      .robot-page .robot-select-full {
+        width: 100% !important;
+        max-width: 100% !important;
+      }
+
+      .robot-page .robot-vial-cell {
+        height: 30px !important;
+        font-size: 9.5px !important;
+      }
+
+      .robot-page .row {
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .robot-page .row > .fld {
+        width: 100%;
+        min-width: 0;
+      }
+
+      .robot-mobile-dock {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 900;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px max(12px, env(safe-area-inset-right, 0px)) max(10px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+        background: var(--panel);
+        border-top: 1px solid var(--line);
+        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.08);
+      }
+
+      .robot-mobile-dock .btn {
+        min-height: 42px;
+        padding: 0 12px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+    }
+
+

@@ -405,50 +405,68 @@ export const DeckView: React.FC = () => {
               </thead>
               <tbody>
                 {preFlight.map((row) => {
-                  const statusColor =
-                    row.status === 'ok'
-                      ? 'var(--ok)'
-                      : row.status === 'warn'
-                      ? 'var(--warn)'
-                      : 'var(--bad)';
-                  const statusLabel =
-                    row.status === 'ok'
-                      ? 'Ready'
-                      : row.status === 'warn'
-                      ? row.marginUl < 0
-                        ? 'Low liquid'
-                        : 'Use 40 mL bottle'
-                      : 'Over max / invalid';
+                  const notRequired = row.neededUl <= 0;
+                  const statusColor = notRequired
+                    ? 'var(--mut)'
+                    : row.status === 'ok'
+                    ? 'var(--ok)'
+                    : row.status === 'warn'
+                    ? 'var(--warn)'
+                    : 'var(--bad)';
+                  const statusLabel = notRequired
+                    ? 'Not needed'
+                    : row.status === 'ok'
+                    ? 'Ready'
+                    : row.status === 'warn'
+                    ? row.marginUl < 0
+                      ? 'Low liquid'
+                      : 'Use 40 mL bottle'
+                    : 'Over max / invalid';
                   return (
                     <tr
                       key={`${row.substance}-${row.plate}-${row.containerId}`}
-                      style={{ borderBottom: '1px solid var(--line2)' }}
+                      style={{
+                        borderBottom: '1px solid var(--line2)',
+                        opacity: notRequired ? 0.72 : 1,
+                      }}
                     >
                       <td style={{ padding: '8px 10px 8px 0', fontWeight: 600 }}>
                         {row.isSolvent ? `${row.solvent} (solvent)` : row.substance}
                       </td>
                       <td className="mono" style={{ padding: '8px 10px', color: 'var(--fg2)' }}>
-                        plate{row.plate} · pos {row.containerId}
+                        {notRequired ? '—' : `plate${row.plate} · pos ${row.containerId}`}
                       </td>
                       <td style={{ padding: '8px 10px', color: 'var(--fg2)' }}>
                         {row.bottleSizeLabel}
                       </td>
                       <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
-                        {nf(row.preparedUl / 1000, 1)} mL
+                        {notRequired ? '0 mL' : `${nf(row.preparedUl / 1000, 1)} mL`}
                       </td>
                       <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
-                        {nf((row.neededUl + row.deadVolumeUl) / 1000, 2)} mL
-                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
-                          {' '}
-                          ({nf(row.deadVolumeUl / 1000, 1)} dead)
-                        </span>
+                        {notRequired ? (
+                          <span style={{ color: 'var(--mut)' }}>0 mL (not required)</span>
+                        ) : (
+                          <>
+                            {nf((row.neededUl + row.deadVolumeUl) / 1000, 2)} mL
+                            <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
+                              {' '}
+                              ({nf(row.deadVolumeUl / 1000, 1)} dead)
+                            </span>
+                          </>
+                        )}
                       </td>
                       <td className="mono" style={{ padding: '8px 10px', textAlign: 'right' }}>
-                        {row.surfaceHeightZ}
-                        <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
-                          {' '}
-                          ({row.mmAboveBottom} mm)
-                        </span>
+                        {notRequired ? (
+                          <span style={{ color: 'var(--mut)' }}>—</span>
+                        ) : (
+                          <>
+                            {row.surfaceHeightZ}
+                            <span style={{ color: 'var(--mut)', fontSize: '11px' }}>
+                              {' '}
+                              ({row.mmAboveBottom} mm)
+                            </span>
+                          </>
+                        )}
                       </td>
                       <td style={{ padding: '8px 0 8px 10px' }}>
                         <span
@@ -563,9 +581,20 @@ export const DeckView: React.FC = () => {
             <label className="lbl">Solvent plate</label>
             <select
               value={run.deck.solvent_plate}
-              onChange={(e) =>
-                setPath('deckPlates', { ...dp, solventPlate: +e.target.value })
-              }
+              onChange={(e) => {
+                const nextPlate = +e.target.value;
+                const nextKind: 'jar' | 'bottle' = nextPlate >= 6 ? 'jar' : 'bottle';
+                const nextPos =
+                  nextKind === 'jar'
+                    ? Math.min(1, dp.solventPos || 0)
+                    : Math.min(7, dp.solventPos || 0);
+                setPath('deckPlates', {
+                  ...dp,
+                  solventPlate: nextPlate,
+                  solventKind: nextKind,
+                  solventPos: nextPos,
+                });
+              }}
             >
               {[3, 4, 5, 6, 7].map((p) => (
                 <option key={p} value={p}>

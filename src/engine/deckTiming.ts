@@ -26,7 +26,19 @@ export function assignDeckPositions(
   stocks: Record<string, any>,
   cfg?: Partial<DeckConfig> | null
 ): DeckLayout {
-  const c = { ...defaultPlates(hood), ...(cfg || {}) };
+  const rawCfg = { ...defaultPlates(hood), ...(cfg || {}) };
+  // Enforce physical deck holder type: plate3-5 hold 20/40 mL bottles, plate6-7 hold 100 mL jars.
+  const normalizedSolventKind: 'jar' | 'bottle' =
+    rawCfg.solventPlate >= 6 ? 'jar' : 'bottle';
+  const normalizedSolventPos =
+    normalizedSolventKind === 'jar'
+      ? Math.max(0, Math.min(1, Number(rawCfg.solventPos) || 0))
+      : Math.max(0, Math.min(7, Number(rawCfg.solventPos) || 0));
+  const c = {
+    ...rawCfg,
+    solventKind: normalizedSolventKind,
+    solventPos: normalizedSolventPos,
+  };
   // Only allocate deck positions for stocks that the robot will actually aspirate from.
   const rows = Object.values(stocks).filter((s) => {
     if (
@@ -139,38 +151,48 @@ export function computePreFlightChecks(
     neededUl: number
   ): PreFlightContainerCheck => {
     const g = CONTAINER_GEOMETRY[kind];
-    const zExact = surfaceHeightExact(kind, preparedUl);
+    const notRequired = neededUl <= 0;
+    const effectiveDeadUl = notRequired ? 0 : g.deadVolumeUl;
+    const zExact = notRequired ? g.bottom : surfaceHeightExact(kind, preparedUl);
     const zRounded = Math.round(zExact);
     const topZ = surfaceHeightExact(kind, g.volumeMaxUl);
-    const heightValid = preparedUl > 0 && preparedUl <= g.volumeMaxUl && zExact >= topZ - 1e-6 && zExact < g.bottom;
-    const mmAboveBottom = Math.max(0, (g.bottom - zExact) / 10);
-    const marginUl = Math.round(preparedUl - (neededUl + g.deadVolumeUl));
+    const heightValid = notRequired
+      ? true
+      : preparedUl > 0 && preparedUl <= g.volumeMaxUl && zExact >= topZ - 1e-6 && zExact < g.bottom;
+    const mmAboveBottom = notRequired ? 0 : Math.max(0, (g.bottom - zExact) / 10);
+    const marginUl = notRequired ? Math.round(preparedUl) : Math.round(preparedUl - (neededUl + effectiveDeadUl));
 
-    let bottleSizeLabel = '100 mL jar';
-    if (kind === 'bottle') {
-      const ml = preparedUl / 1000;
-      if (ml > BOTTLE_MAX_ML) bottleSizeLabel = 'Over 40 mL max!';
-      else if (ml > BOTTLE_CAPACITY_ML) bottleSizeLabel = '40 mL bottle';
-      else bottleSizeLabel = '20 mL bottle';
-    } else if (preparedUl / 1000 > JAR_CAPACITY_ML) {
-      bottleSizeLabel = 'Over 100 mL max!';
+    let bottleSizeLabel = notRequired ? 'Not needed' : '100 mL jar';
+    if (!notRequired) {
+      if (kind === 'bottle') {
+        const ml = preparedUl / 1000;
+        if (ml > BOTTLE_MAX_ML) bottleSizeLabel = 'Over 40 mL max!';
+        else if (ml > BOTTLE_CAPACITY_ML) bottleSizeLabel = '40 mL bottle';
+        else bottleSizeLabel = '20 mL bottle';
+      } else if (preparedUl / 1000 > JAR_CAPACITY_ML) {
+        bottleSizeLabel = 'Over 100 mL max!';
+      }
     }
 
     let status: 'ok' | 'warn' | 'block' = 'ok';
-    let summary = `Ready (+${(marginUl / 1000).toFixed(2)} mL spare above ${(g.deadVolumeUl / 1000).toFixed(1)} mL dead volume)`;
+    let summary = notRequired
+      ? 'Not used in this run (0 mL needed) — dead volume does not apply and no container is required.'
+      : `Ready (+${(marginUl / 1000).toFixed(2)} mL spare above ${(effectiveDeadUl / 1000).toFixed(1)} mL dead volume)`;
 
-    if (!heightValid || preparedUl > g.volumeMaxUl) {
-      status = 'block';
-      summary =
-        preparedUl > g.volumeMaxUl
-          ? `Too full (${(preparedUl / 1000).toFixed(1)} mL exceeds ${(g.volumeMaxUl / 1000).toFixed(0)} mL container max — robot will reject)`
-          : `Empty or invalid liquid height (z=${zRounded}, bottom=${g.bottom})`;
-    } else if (marginUl < 0) {
-      status = 'warn';
-      summary = `Short by ${(Math.abs(marginUl) / 1000).toFixed(2)} mL after ${(g.deadVolumeUl / 1000).toFixed(1)} mL dead volume — add more liquid so the tip never sucks air`;
-    } else if (kind === 'bottle' && preparedUl / 1000 > BOTTLE_CAPACITY_ML) {
-      status = 'warn';
-      summary = `Use a 40 mL bottle in this slot (+${(marginUl / 1000).toFixed(2)} mL spare above 1.0 mL dead volume)`;
+    if (!notRequired) {
+      if (!heightValid || preparedUl > g.volumeMaxUl) {
+        status = 'block';
+        summary =
+          preparedUl > g.volumeMaxUl
+            ? `Too full (${(preparedUl / 1000).toFixed(1)} mL exceeds ${(g.volumeMaxUl / 1000).toFixed(0)} mL container max — robot will reject)`
+            : `Empty or invalid liquid height (z=${zRounded}, bottom=${g.bottom})`;
+      } else if (marginUl < 0) {
+        status = 'warn';
+        summary = `Short by ${(Math.abs(marginUl) / 1000).toFixed(2)} mL after ${(effectiveDeadUl / 1000).toFixed(1)} mL dead volume — add more liquid so the tip never sucks air`;
+      } else if (kind === 'bottle' && preparedUl / 1000 > BOTTLE_CAPACITY_ML) {
+        status = 'warn';
+        summary = `Use a 40 mL bottle in this slot (+${(marginUl / 1000).toFixed(2)} mL spare above 1.0 mL dead volume)`;
+      }
     }
 
     return {
@@ -183,7 +205,7 @@ export function computePreFlightChecks(
       solvent,
       preparedUl: Math.round(preparedUl),
       neededUl: Math.round(neededUl),
-      deadVolumeUl: g.deadVolumeUl,
+      deadVolumeUl: effectiveDeadUl,
       deadVolumeMeasured: g.deadVolumeMeasured,
       marginUl,
       surfaceHeightZ: zRounded,

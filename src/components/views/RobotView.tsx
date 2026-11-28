@@ -53,6 +53,13 @@ import { ClickableDeckMap } from '../robot/ClickableDeckMap';
 import { NanoDropPanel } from '../robot/NanoDropPanel';
 import { PreRunChecklist } from '../robot/PreRunChecklist';
 import { QuickTransferCard } from '../robot/QuickTransferCard';
+import { RobotSimulatorStage } from '../robot/RobotSimulatorStage';
+import {
+  RobotSimulator,
+  buildPlannedReactionSteps,
+  type SimSnapshot,
+  type SimSpeed,
+} from '../../engine/robotSimulator';
 
 const STATUS_META: Record<
   RobotLiveStatus['state'] | 'disconnected',
@@ -226,6 +233,167 @@ export const RobotView: React.FC = () => {
   const [keyboardMode, setKeyboardMode] = useState<boolean>(false);
   const [remoteOpen, setRemoteOpen] = useState<boolean>(false);
 
+  // 1-to-1 Interactive Robot Simulation Mode (works offline with zero hardware contact)
+  const [simMode, setSimMode] = useState<boolean>(false);
+  const [simSpeed, setSimSpeed] = useState<SimSpeed>(5);
+  const simSpeedRef = useRef<SimSpeed>(5);
+  useEffect(() => {
+    simSpeedRef.current = simSpeed;
+  }, [simSpeed]);
+  const simRef = useRef<RobotSimulator | null>(null);
+  if (!simRef.current) {
+    simRef.current = new RobotSimulator(run, state.hood);
+  }
+  const [simSnapshot, setSimSnapshot] = useState<SimSnapshot>(() => simRef.current!.getSnapshot());
+  const [replayingPlan, setReplayingPlan] = useState<boolean>(false);
+  const [replayProgress, setReplayProgress] = useState<{ done: number; total: number; label: string } | null>(null);
+  const replayAbortRef = useRef<boolean>(false);
+
+  const syncSimState = useCallback(() => {
+    if (simRef.current) {
+      setSimSnapshot(simRef.current.getSnapshot());
+    }
+  }, []);
+
+  // Copy any saved custom plate presets from live robot status into the simulator when available
+  useEffect(() => {
+    if (liveStatus?.hardware?.platePresets && simRef.current) {
+      simRef.current.syncPresetsFromExternal(liveStatus.hardware.platePresets);
+      if (simMode) syncSimState();
+    }
+  }, [liveStatus?.hardware?.platePresets, simMode, syncSimState]);
+
+  const simDelay = useCallback(async () => {
+    const s = simSpeedRef.current;
+    const ms = s === 0 ? 0 : s === 20 ? 35 : s === 5 ? 130 : 420;
+    if (ms > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+  }, []);
+
+  const handleToggleSimMode = useCallback(() => {
+    setSimMode((prev) => {
+      const next = !prev;
+      if (next && simRef.current) {
+        simRef.current.reset(run, state.hood, true);
+        if (liveStatus?.hardware?.platePresets) {
+          simRef.current.syncPresetsFromExternal(liveStatus.hardware.platePresets);
+        }
+        setSimSnapshot(simRef.current.getSnapshot());
+        setReplayProgress(null);
+        setReplayingPlan(false);
+        replayAbortRef.current = false;
+        toast('Simulation Mode ON — all buttons now control the virtual deck only (no hardware motion).');
+      } else {
+        replayAbortRef.current = true;
+        setReplayingPlan(false);
+        setReplayProgress(null);
+        toast('Exited Simulation Mode.');
+      }
+      return next;
+    });
+  }, [run, state.hood, liveStatus?.hardware?.platePresets, toast]);
+
+  const handleResetSimDeck = useCallback(() => {
+    replayAbortRef.current = true;
+    setReplayingPlan(false);
+    setReplayProgress(null);
+    if (simRef.current) {
+      simRef.current.reset(run, state.hood, true);
+      setSimSnapshot(simRef.current.getSnapshot());
+      toast('Virtual deck reset from your current plan.');
+    }
+  }, [run, state.hood, toast]);
+
+  const handleClearSimLog = useCallback(() => {
+    if (simRef.current) {
+      simRef.current.clearLogAndAccidents();
+      setSimSnapshot(simRef.current.getSnapshot());
+    }
+  }, []);
+
+  const handleStartPlanReplay = useCallback(async () => {
+    if (!run || !simRef.current) {
+      toast('Create a reaction plan first to replay it on the virtual deck.');
+      return;
+    }
+    const steps = buildPlannedReactionSteps(run, state.measuredSurfaceZ);
+    if (steps.length === 0) {
+      toast('No liquid transfer steps found in the current plan.');
+      return;
+    }
+    replayAbortRef.current = false;
+    setReplayingPlan(true);
+    const sim = simRef.current;
+
+    // Auto-connect & home if disconnected and no tip is stuck
+    const curHw = sim.getHardwareSnapshot();
+    if (!curHw.connected || !curHw.homed) {
+      const homeRes = sim.executeCommand('init_hardware', {});
+      syncSimState();
+      if (!homeRes.ok) {
+        setReplayingPlan(false);
+        toast(homeRes.humanMessage);
+        return;
+      }
+      await simDelay();
+    }
+
+    for (let i = 0; i < steps.length; i += 1) {
+      if (replayAbortRef.current || sim.isPlateTransferStopRequested()) {
+        setReplayProgress({ done: i, total: steps.length, label: `Replay stopped at step ${i}/${steps.length}.` });
+        setReplayingPlan(false);
+        syncSimState();
+        return;
+      }
+      const st = steps[i];
+      setReplayProgress({ done: i + 1, total: steps.length, label: st.label });
+      const res = sim.executeSingleTransferStep(
+        {
+          src_plate: st.srcPlate,
+          src_slot: st.srcSlot,
+          dst_plate: st.dstPlate,
+          dst_slot: st.dstSlot,
+          volume_ul: st.volumeUl,
+          solvent: st.solvent,
+          tip_type: st.tipType,
+          src_z: st.srcZ,
+          dst_z: st.dstZ,
+          pick_tip: st.pickTip,
+          drop_tip: st.dropTip,
+        },
+        'plan_replay'
+      );
+      syncSimState();
+      if (!res.ok) {
+        setReplayProgress({
+          done: i + 1,
+          total: steps.length,
+          label: `Halted at step ${i + 1}: ${res.error || res.message}`,
+        });
+        setReplayingPlan(false);
+        toast(`Simulation halted at step ${i + 1} — check the Accident Log.`);
+        return;
+      }
+      await simDelay();
+    }
+
+    setReplayProgress({
+      done: steps.length,
+      total: steps.length,
+      label: `Planned run complete (${steps.length} transfers simulated).`,
+    });
+    setReplayingPlan(false);
+    syncSimState();
+    toast(`Simulated all ${steps.length} planned transfers — check the Accident Log for any hazards.`);
+  }, [run, state.measuredSurfaceZ, simDelay, syncSimState, toast]);
+
+  const handleStopPlanReplay = useCallback(() => {
+    replayAbortRef.current = true;
+    setReplayingPlan(false);
+    toast('Stopped planned run replay.');
+  }, [toast]);
+
   // diluter.py planner state (synced strictly with zeus-pipetter/diluter.py)
   const [diluterInput, setDiluterInput] = useState<DiluterPlanInput>(() => ({
     vialCount: Math.min(54, run?.reactions || 54),
@@ -288,6 +456,63 @@ export const RobotView: React.FC = () => {
 
   const runCommand = useCallback(
     async (command: string, params: Record<string, any> = {}): Promise<RobotCommandResult> => {
+      // Simulation Mode: route EVERY command through the 1-to-1 virtual robot (zero hardware contact)
+      if (simMode && simRef.current) {
+        const sim = simRef.current;
+        if (command === 'plate_transfer_start') {
+          const started = sim.initPlateTransferJob(params);
+          syncSimState();
+          if (!started.ok || !started.pairs) {
+            const failRes: RobotCommandResult = {
+              ok: false,
+              executed: false,
+              command,
+              humanMessage: `[SIM] ${started.error || 'Could not start virtual plate transfer.'}`,
+              pythonSnippet: '# Virtual simulation — command blocked',
+              error: started.error,
+              hardware: sim.getHardwareSnapshot(),
+            };
+            setLastCmdResult(failRes);
+            toast(failRes.humanMessage);
+            return failRes;
+          }
+          const startRes: RobotCommandResult = {
+            ok: true,
+            executed: true,
+            command,
+            humanMessage: `[SIM] Started virtual plate transfer (${started.pairs.length} wells).`,
+            pythonSnippet: '# Virtual simulation — plate transfer',
+            hardware: sim.getHardwareSnapshot(),
+          };
+          setLastCmdResult(startRes);
+          toast(startRes.humanMessage);
+
+          // Animated async loop across well pairs
+          void (async () => {
+            const pairs = started.pairs!;
+            for (let idx = 0; idx < pairs.length; idx += 1) {
+              await simDelay();
+              const { continueJob } = sim.advancePlateTransferPair(pairs[idx], idx, pairs.length, started.config);
+              syncSimState();
+              if (!continueJob) return;
+            }
+            sim.finishPlateTransfer(
+              'completed',
+              `[SIM] Completed all ${pairs.length} wells (plate${started.config.srcPlate} → plate${started.config.dstPlate}).`
+            );
+            syncSimState();
+          })();
+
+          return startRes;
+        }
+
+        const res = sim.executeCommand(command, params);
+        setLastCmdResult(res);
+        syncSimState();
+        toast(res.humanMessage);
+        return res;
+      }
+
       setCmdBusy(true);
       const res = await sendRobotCommand(command, params, backendUrl || undefined, controlPin || undefined);
       setLastCmdResult(res);
@@ -310,11 +535,20 @@ export const RobotView: React.FC = () => {
       }
       return res;
     },
-    [backendUrl, controlPin, refreshStatus, toast]
+    [simMode, simDelay, syncSimState, backendUrl, controlPin, refreshStatus, toast]
   );
 
   // Pre-emptive 1-tap Software Stop: never blocked by cmdBusy so it can interrupt an active move immediately.
   const sendSoftwareStop = useCallback(async (): Promise<RobotCommandResult> => {
+    if (simMode && simRef.current) {
+      replayAbortRef.current = true;
+      setReplayingPlan(false);
+      const res = simRef.current.requestEmergencyStop();
+      setLastCmdResult(res);
+      syncSimState();
+      toast(res.humanMessage);
+      return res;
+    }
     const res = await sendRobotCommand('emergency_stop', {}, backendUrl || undefined, controlPin || undefined);
     setLastCmdResult(res);
     if (res.hardware) {
@@ -323,7 +557,7 @@ export const RobotView: React.FC = () => {
     toast(res.humanMessage || (res.ok ? 'Software Stop sent to the robot.' : 'Software Stop failed — use the physical E-stop switch!'));
     refreshStatus(true);
     return res;
-  }, [backendUrl, controlPin, refreshStatus, toast]);
+  }, [simMode, syncSimState, backendUrl, controlPin, refreshStatus, toast]);
 
   const handleCancelQueuedCommand = useCallback(
     async (commandId: string) => {
@@ -622,22 +856,35 @@ export const RobotView: React.FC = () => {
     }
   };
 
-  const stateKey: RobotLiveStatus['state'] | 'disconnected' = !isConnected
+  const effectiveStatus: RobotLiveStatus | null = useMemo(() => {
+    if (simMode && simRef.current) {
+      return simRef.current.toLiveStatus();
+    }
+    return liveStatus;
+  }, [simMode, simSnapshot, liveStatus]);
+
+  const stateKey: RobotLiveStatus['state'] | 'disconnected' = simMode
+    ? effectiveStatus?.state || 'idle'
+    : !isConnected
     ? 'disconnected'
-    : liveStatus?.state || 'idle';
+    : effectiveStatus?.state || 'idle';
   const statusStyle = STATUS_META[stateKey];
 
-  const headline = !isConnected
+  const headline = simMode
+    ? effectiveStatus?.headline || 'Simulation Mode active (virtual deck)'
+    : !isConnected
     ? 'Connect your Lab PC to watch the robot live'
-    : liveStatus?.headline || 'Checking robot status…';
+    : effectiveStatus?.headline || 'Checking robot status…';
 
-  const detail = !isConnected
-    ? 'The Dilution Planner below still works offline. Click "Connect Lab PC" to see live progress, remaining tips, and send commands.'
-    : liveStatus?.detail || 'Reading the latest run spreadsheet, tip racks, and activity log from your Lab PC.';
+  const detail = simMode
+    ? 'Every button, transfer, and calibration move runs on the 1-to-1 virtual deck below — zero real hardware contact.'
+    : !isConnected
+    ? 'Try Simulation Mode to test runs offline, or click "Connect Lab PC" to see live progress, remaining tips, and send commands.'
+    : effectiveStatus?.detail || 'Reading the latest run spreadsheet, tip racks, and activity log from your Lab PC.';
 
-  const activeRun = liveStatus?.activeRun || null;
-  const hw = liveStatus?.hardware;
-  const tipRacks = liveStatus?.tipRacks || [
+  const activeRun = effectiveStatus?.activeRun || null;
+  const hw = effectiveStatus?.hardware;
+  const tipRacks = effectiveStatus?.tipRacks || [
     { tipType: '50ul' as const, remaining: 96, total: 96, used: 0 },
     { tipType: '300ul' as const, remaining: 96, total: 96, used: 0 },
     { tipType: '1000ul' as const, remaining: 96, total: 96, used: 0 },
@@ -749,7 +996,9 @@ export const RobotView: React.FC = () => {
               <span>·</span>
               <span>
                 <strong>Control mode:</strong>{' '}
-                {hw?.controlEnabled
+                {simMode
+                  ? 'Virtual Simulator (no hardware motion)'
+                  : hw?.controlEnabled
                   ? hw?.pinProtected
                     ? 'PIN-protected live buttons'
                     : 'Live buttons enabled'
@@ -775,6 +1024,22 @@ export const RobotView: React.FC = () => {
             className="robot-banner-actions"
             style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}
           >
+            <button
+              type="button"
+              className={simMode ? 'btn sm pri' : 'btn sm'}
+              onClick={handleToggleSimMode}
+              title="Practice commands, transfers, and full runs on a 1-to-1 virtual deck with crash and overflow detection"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px',
+                borderColor: simMode ? 'var(--acc)' : undefined,
+              }}
+            >
+              <FlaskConical size={13} />
+              <span>{simMode ? 'Exit Simulation' : 'Simulation Mode'}</span>
+            </button>
+
             {!isConnected ? (
               <button
                 type="button"
@@ -918,6 +1183,26 @@ export const RobotView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* 1B. INTERACTIVE 1-TO-1 VIRTUAL ROBOT SIMULATOR STAGE (when Simulation Mode is active) */}
+      {simMode && (
+        <RobotSimulatorStage
+          snapshot={simSnapshot}
+          speed={simSpeed}
+          onChangeSpeed={setSimSpeed}
+          hasPlannedRun={Boolean(run && run.rows && run.rows.length > 0)}
+          replayingPlan={replayingPlan}
+          replayProgress={replayProgress}
+          onStartPlanReplay={handleStartPlanReplay}
+          onStopPlanReplay={handleStopPlanReplay}
+          onResetDeck={handleResetSimDeck}
+          onClearLog={handleClearSimLog}
+          onSelectDeckSlot={(pl, sl) => {
+            setTargetPlate(pl);
+            setTargetSlot(sl);
+          }}
+        />
+      )}
 
       {/* 2. LIVE EXPERIMENT PROGRESS & TIP RACKS */}
       <div className="grid eq" style={{ marginBottom: '20px' }}>

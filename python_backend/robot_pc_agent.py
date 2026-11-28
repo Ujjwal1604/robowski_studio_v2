@@ -123,6 +123,189 @@ def _read_optional_folder_list(filename: str) -> List[Path]:
     return folders
 
 
+class _SimContainer:
+    def __init__(self, x: float, y: float, bottom_z: int = 2180) -> None:
+        self.xy = [round(x, 3), round(y, 3)]
+        self.x = self.xy[0]
+        self.y = self.xy[1]
+        self.liquid_surface_height = 1900
+        self.bottom_z = bottom_z
+        self.containerGeometryTableIndex = 1
+
+
+class _SimPlate:
+    def __init__(self, count: int, origin_x: float, origin_y: float, cols: int, pitch: float, bottom_z: int) -> None:
+        self.containers = [
+            _SimContainer(origin_x + (i % cols) * pitch, origin_y - (i // cols) * pitch, bottom_z=bottom_z)
+            for i in range(count)
+        ]
+
+
+class _SimBreadboard:
+    def __init__(self) -> None:
+        self.plate_list = [
+            _SimPlate(54, -264.0, -325.0, 9, 12.2, 2190),
+            _SimPlate(54, -129.0, -325.0, 9, 12.2, 2190),
+            _SimPlate(54, -264.0, -225.0, 9, 12.2, 2190),
+            _SimPlate(8, -124.0, -240.0, 4, 29.0, 2180),
+            _SimPlate(8, -259.0, -140.0, 4, 29.0, 2180),
+            _SimPlate(8, -124.0, -140.0, 4, 29.0, 2180),
+            _SimPlate(2, -240.0, -61.0, 2, 48.0, 2120),
+            _SimPlate(2, -105.0, -61.0, 2, 48.0, 2120),
+        ]
+        self.trash = _SimContainer(-380.0, -160.0)
+        self.balance_location = _SimContainer(-335.0, -359.0)
+        self.nanodrop_pedestal = _SimContainer(-335.0, -314.0)
+
+
+class _SimZeus:
+    ZeusTraversePosition = 880
+
+    def __init__(self) -> None:
+        self.pos = 880
+        self.tip_on_zeus = ""
+        self.emergency_stopped = False
+
+    def getTipPresenceStatus(self) -> bool:
+        return bool(self.tip_on_zeus)
+
+    def setEmergencyStop(self, value: int) -> None:
+        self.emergency_stopped = bool(value)
+
+    def move_zeus_to_traverse_height(self) -> None:
+        self.pos = self.ZeusTraversePosition
+
+    def moveZDrive(self, z: int) -> None:
+        z_int = int(z)
+        if not (500 <= z_int <= 2200):
+            raise RuntimeError(f"[SIM] Z={z_int} outside safe 500–2200 range.")
+        self.pos = z_int
+
+    def move_z(self, z: int) -> None:
+        self.moveZDrive(z)
+
+    def getAbsoluteZPosition(self) -> int:
+        return int(self.pos)
+
+    def getZPosition(self) -> int:
+        return int(self.pos)
+
+
+class _SimGantry:
+    def __init__(self, zm: _SimZeus) -> None:
+        self.zm = zm
+        self.xy = [0.0, 0.0]
+
+    def _check_safe_xy(self, x: float, y: float, ensure_traverse_height: bool = False) -> None:
+        if ensure_traverse_height:
+            self.zm.move_zeus_to_traverse_height()
+        if self.zm.pos > 950:
+            raise RuntimeError(
+                f"[SIM] Sideways XY crash prevented: Z={self.zm.pos} is below safe traverse height (880). Lift arm first."
+            )
+        if not (-440.0 <= x <= 10.0 and -420.0 <= y <= 10.0):
+            raise RuntimeError(f"[SIM] Target ({x:.1f}, {y:.1f} mm) is outside safe deck bounds.")
+
+    def home_xy(self) -> None:
+        self.zm.move_zeus_to_traverse_height()
+        self.xy = [0.0, 0.0]
+
+    def kill_alarm(self) -> None:
+        self.zm.emergency_stopped = False
+
+    def move_xy(self, xy: Any, ensure_traverse_height: bool = True) -> None:
+        nx, ny = float(xy[0]), float(xy[1])
+        self._check_safe_xy(nx, ny, ensure_traverse_height=ensure_traverse_height)
+        self.xy = [round(nx, 3), round(ny, 3)]
+
+    def move_to_xy(self, xy: Any) -> None:
+        self.move_xy(xy, ensure_traverse_height=True)
+
+    def move_xy_relative(self, dx: float, dy: float) -> None:
+        nx, ny = self.xy[0] + float(dx), self.xy[1] + float(dy)
+        self._check_safe_xy(nx, ny, ensure_traverse_height=False)
+        self.xy = [round(nx, 3), round(ny, 3)]
+
+    def move_xy_rel(self, delta: Any) -> None:
+        self.move_xy_relative(float(delta[0]), float(delta[1]))
+
+    def move_to_trash_bin(self) -> None:
+        self.move_xy([-380.0, -160.0], ensure_traverse_height=True)
+
+    def get_xy(self) -> List[float]:
+        return [self.xy[0], self.xy[1]]
+
+
+class _SimPipetter:
+    def __init__(self, zeus: _SimZeus, gantry: _SimGantry) -> None:
+        self.zm = zeus
+        self.gt = gantry
+        self.balance = None
+
+    def pick_tip(self, tip_type: str) -> None:
+        if self.zm.tip_on_zeus:
+            raise RuntimeError(f"[SIM] Double tip-pick prevented: {self.zm.tip_on_zeus} tip already attached.")
+        self.zm.move_zeus_to_traverse_height()
+        self.zm.tip_on_zeus = tip_type
+
+    def discard_tip(self) -> None:
+        self.gt.move_to_trash_bin()
+        self.zm.tip_on_zeus = ""
+
+    def change_tip(self, tip_type: str) -> None:
+        if self.zm.tip_on_zeus:
+            self.discard_tip()
+        self.pick_tip(tip_type)
+
+    def move_to_container(self, container: Any) -> None:
+        self.gt.move_xy(container.xy, ensure_traverse_height=True)
+
+    def move_to_idle_position(self) -> None:
+        self.gt.move_xy([-300.0, -390.0], ensure_traverse_height=True)
+
+    def move_to_balance(self) -> None:
+        self.gt.move_xy([-335.0, -359.0], ensure_traverse_height=True)
+
+    def transfer_liquid(self, transfer_event: Any, purpose: str = "reaction", use_calibration: bool = False) -> None:
+        src = transfer_event.source_container
+        dst = transfer_event.destination_container
+        if int(getattr(src, "liquid_surface_height", 1900)) > int(getattr(src, "bottom_z", 2190)):
+            raise RuntimeError("[SIM] Source Z exceeds container bottom floor.")
+        if int(getattr(dst, "liquid_surface_height", 2100)) > int(getattr(dst, "bottom_z", 2190)):
+            raise RuntimeError("[SIM] Destination Z exceeds container bottom floor.")
+        self.gt.move_xy(src.xy, ensure_traverse_height=True)
+        self.zm.moveZDrive(int(getattr(src, "liquid_surface_height", 1900)))
+        self.zm.move_zeus_to_traverse_height()
+        self.gt.move_xy(dst.xy, ensure_traverse_height=True)
+        self.zm.moveZDrive(int(getattr(dst, "liquid_surface_height", 2100)))
+        self.zm.move_zeus_to_traverse_height()
+
+
+class _SimNanoDrop:
+    def __init__(self, nd_id: str = "nd_2000c") -> None:
+        self.nd_id = nd_id
+        self.serial = object()
+        self.lid_closed = True
+
+    def open_lid(self) -> None:
+        self.lid_closed = False
+
+    def close_lid(self) -> None:
+        self.lid_closed = True
+
+    def half_open_lid(self) -> None:
+        self.lid_closed = False
+
+    def flush(self) -> None:
+        pass
+
+    def dry(self) -> None:
+        pass
+
+    def close_all(self) -> None:
+        self.lid_closed = True
+
+
 class RobotPcAgent:
     def __init__(
         self,
@@ -132,9 +315,13 @@ class RobotPcAgent:
         repo_path: str = "",
         relay_token: str = "",
         control_pin: str = "",
+        simulate: bool = False,
     ) -> None:
         self.server_url = (server_url or "").strip().rstrip("/")
         self.interval_sec = max(2.0, float(interval_sec))
+        self.simulate = bool(
+            simulate or os.environ.get("ROBOWSKI_SIMULATE", "0").strip().lower() in {"1", "true", "yes"}
+        )
         self.control_pin = (
             control_pin.strip()
             or os.environ.get("ROBOWSKI_CONTROL_PIN", "").strip()
@@ -148,7 +335,7 @@ class RobotPcAgent:
         # Never allow unauthenticated live hardware control: requires either a relay_token
         # (for signed commands verified by the personal PC's PIN) or a local control_pin.
         has_auth = bool(self.control_pin or self.relay_token)
-        self.enable_hardware = bool((enable_hardware or self.control_pin) and has_auth)
+        self.enable_hardware = bool((enable_hardware or self.control_pin or self.simulate) and has_auth)
         self.repo_path = (
             repo_path.strip()
             or os.environ.get("ROBOWSKI_MAIN_FOLDER", "").strip()
@@ -158,7 +345,8 @@ class RobotPcAgent:
         ).strip('"').strip("'")
         self._zeus_dir_checked = False
         self._cached_zeus_dir: Optional[Path] = None
-        self.robot_name = os.environ.get("PIPETTER_NAME", "Robowski#2").strip() or "Robowski#2"
+        base_name = os.environ.get("PIPETTER_NAME", "Robowski#2").strip() or "Robowski#2"
+        self.robot_name = f"{base_name} (Dry-Run Simulator)" if self.simulate else base_name
         self.requested_run_path: Optional[str] = None
         try:
             self.idle_release_sec = max(0, int(os.environ.get("ROBOWSKI_IDLE_RELEASE_SEC", "300").strip() or "300"))
@@ -736,6 +924,7 @@ class RobotPcAgent:
         pt_snap = copy.deepcopy(pt_job) if isinstance(pt_job, dict) else None
         return {
             "controlEnabled": self.enable_hardware,
+            "simulated": self.simulate,
             "pinProtected": bool(self.control_pin or self.relay_token),
             "relayTokenConfigured": bool(self.relay_token),
             "connected": bool(self.hw["connected"]),
@@ -984,6 +1173,27 @@ class RobotPcAgent:
         """
         if self.hw["connected"] and self.hw["pt"] is not None:
             return
+        if self.simulate:
+            brb = _SimBreadboard()
+            zm = _SimZeus()
+            gt = _SimGantry(zm=zm)
+            pt = _SimPipetter(zeus=zm, gantry=gt)
+            self.hw.update(
+                {
+                    "zm": zm,
+                    "gt": gt,
+                    "pt": pt,
+                    "brb": brb,
+                    "connected": True,
+                    "homed": False,
+                    "currentTip": "",
+                    "currentPosition": "[SIM] Connected (not homed yet)",
+                    "currentXY": [0.0, 0.0],
+                    "currentZ": zm.pos,
+                    "lastError": None,
+                }
+            )
+            return
         zeus_dir = self._find_zeus_dir()
         if zeus_dir is not None:
             if str(zeus_dir) not in sys.path:
@@ -1093,6 +1303,14 @@ class RobotPcAgent:
             if self.hw.get("nanodropId") == clean_id:
                 return self.hw["nd"]
             self._disconnect_nanodrop()
+
+        if self.simulate:
+            nd = _SimNanoDrop(clean_id)
+            self.hw["nd"] = nd
+            self.hw["nanodropConnected"] = True
+            self.hw["nanodropId"] = clean_id
+            self.hw["nanodropLidClosed"] = True
+            return nd
 
         zeus_dir = self._find_zeus_dir()
         if zeus_dir is not None:
@@ -2209,6 +2427,12 @@ def main() -> None:
     parser.add_argument("--repo", default="", help="Optional path to robowski folder (auto-detected automatically)")
     parser.add_argument("--token", default="", help="Shared relay token (easier: save in relay_token.txt)")
     parser.add_argument("--pin", default="", help="Optional PIN (easier: save in robot_pin.txt)")
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        default=os.environ.get("ROBOWSKI_SIMULATE", "0").strip().lower() in {"1", "true", "yes"},
+        help="Dry-run mode using virtual Zeus/gantry hardware (never opens USB/CAN ports)",
+    )
     parser.add_argument("--background", action="store_true", help="Write status and errors to robot_helper.log")
     args = parser.parse_args()
 
@@ -2221,6 +2445,7 @@ def main() -> None:
             repo_path=args.repo,
             relay_token=args.token,
             control_pin=args.pin,
+            simulate=args.simulate,
         )
         agent.run_forever()
     except Exception as exc:

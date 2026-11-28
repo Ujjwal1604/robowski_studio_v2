@@ -538,7 +538,8 @@ export function buildRun(data: any): RunResult {
 
   const solventConsumptionMl =
     rows.reduce((sum, row) => sum + Math.max(0, num(row['vol#solvent'])), 0) / 1000;
-  const solventRecommendedMl = round(solventConsumptionMl + leftover, 6);
+  const solventRecommendedMl =
+    solventConsumptionMl > 0 ? round(solventConsumptionMl + leftover, 6) : 0;
   const deck = assignDeckPositions(hood, stocks, data.deckPlates);
   const robotProfile = robotProfileForHood(hood);
 

@@ -448,6 +448,47 @@ class TestRobotPcAgentSafety(unittest.TestCase):
         self.assertFalse(r_good["ok"])
         self.assertEqual(r_good.get("error"), "PIN locked")
 
+    def test_simulate_dry_run_mode_works_without_real_hardware(self) -> None:
+        agent = self._make_agent(simulate=True, relay_token="dry-run-secret")
+        self.assertTrue(agent.simulate)
+        self.assertTrue(agent.enable_hardware)
+        self.assertIn("Dry-Run Simulator", agent.robot_name)
+
+        # Unhomed move refused even in dry-run mode
+        r0 = agent.execute_command("s0", "move_to_container", {"plate_id": 3, "container_id": 0}, verified_relay=True)
+        self.assertFalse(r0["ok"])
+
+        # Connect & Home succeeds using built-in virtual hardware (no USB/CAN modules needed)
+        r1 = agent.execute_command("s1", "init_hardware", {}, verified_relay=True)
+        self.assertTrue(r1["ok"])
+        self.assertTrue(r1["hardware"]["simulated"])
+        self.assertTrue(r1["hardware"]["homed"])
+
+        # Single transfer succeeds cleanly against virtual breadboard/pipetter
+        r2 = agent.execute_command(
+            "s2",
+            "single_transfer",
+            {
+                "src_plate": 3,
+                "src_slot": 0,
+                "dst_plate": 0,
+                "dst_slot": 0,
+                "volume_ul": 120,
+                "solvent": "ethanol",
+                "tip_type": "auto",
+                "src_z": 1900,
+                "dst_z": 2100,
+            },
+            verified_relay=True,
+        )
+        self.assertTrue(r2["ok"], r2.get("humanMessage"))
+
+        # Sideways XY jog while Z is lowered is blocked as crash prevention
+        self.assertTrue(agent.execute_command("s3", "move_z", {"z": 1600}, verified_relay=True)["ok"])
+        r4 = agent.execute_command("s4", "move_xy_rel", {"dx": 10, "dy": 0}, verified_relay=True)
+        self.assertFalse(r4["ok"])
+        self.assertIn("crash", r4["humanMessage"].lower())
+
 
 class TestBackendRelayHardening(unittest.TestCase):
     """Tests app.py relay endpoints directly when FastAPI is installed in the test Python env."""

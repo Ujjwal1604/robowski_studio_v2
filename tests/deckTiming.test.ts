@@ -222,4 +222,67 @@ describe('Deck Geometry & Timing Models', () => {
     expect(plan.tips[1000]).toBe(3); // 3 bulk solvent steps (1 tip each)
     expect(plan.ok).toBe(true);
   });
+
+  it('auto-corrects bottle plates (plate3-5) to bottle kind and ignores dead volume when 0 mL solvent is required', () => {
+    const layout = assignDeckPositions('left', {}, {
+      solventPlate: 4,
+      solventKind: 'jar', // stale jar setting on a bottle plate
+      solventPos: 0,
+      stockPlates: [3, 4, 5],
+    });
+    expect(layout.solvent_kind).toBe('bottle');
+
+    const checks = computePreFlightChecks({
+      stocks: {},
+      deck: {
+        solvent_plate: 6,
+        solvent_container: 0,
+        solvent_kind: 'jar',
+      } as any,
+      reactionSolvent: 'DMSO',
+      solventConsumptionMl: 0,
+      solventRecommendedMl: 0,
+    });
+    const sCheck = checks.find((c) => c.isSolvent);
+    expect(sCheck?.deadVolumeUl).toBe(0);
+    expect(sCheck?.status).toBe('ok');
+    expect(sCheck?.bottleSizeLabel).toBe('Not needed');
+
+    // Full run where two reagents fill 100% of vial -> 0 solvent needed -> 0 solventRecommendedMl, no Low liquid warning
+    const run = buildRun({
+      hood: 'left',
+      vialVolume: 500,
+      threshold: 10,
+      dilutionFactor: 5,
+      leftoverMl: 2,
+      reactionSolvent: 'DMSO',
+      reagents: [
+        {
+          code: 'A',
+          name: 'SubA',
+          molarMass: 100,
+          solvent: 'DMSO',
+          stock: 100,
+          min: 50,
+          step: 10,
+          max: 50,
+        },
+        {
+          code: 'B',
+          name: 'SubB',
+          molarMass: 100,
+          solvent: 'DMSO',
+          stock: 100,
+          min: 50,
+          step: 10,
+          max: 50,
+        },
+      ],
+    });
+    expect(run.solventConsumptionMl).toBe(0);
+    expect(run.solventRecommendedMl).toBe(0);
+    const runSolventCheck = run.preFlight.find((c) => c.isSolvent);
+    expect(runSolventCheck?.status).toBe('ok');
+    expect(runSolventCheck?.deadVolumeUl).toBe(0);
+  });
 });

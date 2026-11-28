@@ -6,6 +6,11 @@ REM ============================================================================
 REM Double-click to start the Robowski Status Helper silently in the background.
 REM This window briefly confirms it started without errors, then closes itself.
 REM Use stop_robot_helper_windows.bat whenever you want to stop it.
+REM
+REM 1-time setup files in this same folder:
+REM   - server_url.txt  : Your Personal Lab PC URL (e.g. https://your-pc.ts.net)
+REM   - relay_token.txt : Shared secret matching relay_token.txt on Personal PC
+REM   - robot_pin.txt   : Save your 6+ character PIN on your Personal PC
 REM ============================================================================
 
 REM Optional: paste the folder where your main.py lives inside the quotes below

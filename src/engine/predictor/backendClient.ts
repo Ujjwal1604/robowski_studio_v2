@@ -3,7 +3,11 @@ import type { WellPredictionResult } from './types';
 
 const STORAGE_KEY = 'robowski_python_rdkit_url';
 const DISABLED_SENTINEL = '__OFF__';
-export const DEFAULT_LAB_BACKEND_URL = 'https://91474-p02.tail4c9e6a.ts.net';
+export const DEFAULT_LAB_BACKEND_URL = String(
+  (import.meta as any).env?.VITE_ROBOWSKI_BACKEND_URL || ''
+)
+  .trim()
+  .replace(/\/+$/, '');
 
 export interface PythonBackendStatus {
   connected: boolean;
@@ -642,7 +646,9 @@ export interface RobotPlateTransferState {
 export interface RobotHardwareState {
   controlEnabled: boolean;
   pinProtected?: boolean;
+  relayTokenConfigured?: boolean;
   connected: boolean;
+  homed?: boolean;
   nanodropConnected?: boolean;
   nanodropId?: string;
   nanodropLidClosed?: boolean;
@@ -658,6 +664,15 @@ export interface RobotHardwareState {
   idleSecondsRemaining?: number | null;
   plateTransfer?: RobotPlateTransferState | null;
   platePresets?: RobotPlatePreset[];
+}
+
+export interface RobotActiveCommandState {
+  id: string;
+  command: string;
+  description: string;
+  state: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  createdAt?: string | null;
+  startedAt?: string | null;
 }
 
 export interface RobotLiveStatus {
@@ -676,6 +691,7 @@ export interface RobotLiveStatus {
   recentActivity: RobotActivityEntry[];
   rawLogTail: string[];
   hardware: RobotHardwareState;
+  activeCommand?: RobotActiveCommandState | null;
   relaySource?: string;
   agentOnline?: boolean;
   agentLastSeenSecondsAgo?: number;
@@ -684,6 +700,9 @@ export interface RobotLiveStatus {
 export interface RobotCommandResult {
   ok: boolean;
   executed: boolean;
+  pending?: boolean;
+  commandId?: string;
+  state?: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   command: string;
   humanMessage: string;
   pythonSnippet: string;
@@ -761,7 +780,7 @@ export async function sendRobotCommand(
       command,
       humanMessage:
         err?.name === 'AbortError'
-          ? 'The robot command is taking longer than expected — check the hood and live status.'
+          ? 'The command may still be running on the Robot PC — check the live status banner instead of clicking again.'
           : 'Could not reach the Lab PC server.',
       pythonSnippet: '',
       error: err?.message || 'Request failed',
@@ -769,3 +788,36 @@ export async function sendRobotCommand(
   }
 }
 
+export async function cancelQueuedRobotCommand(
+  commandId: string,
+  overrideUrl?: string,
+  controlPin?: string
+): Promise<{ ok: boolean; cancelled?: boolean; humanMessage: string }> {
+  const url = (overrideUrl ?? getPythonBackendUrl()).trim().replace(/\/+$/, '');
+  if (!url) {
+    return { ok: false, humanMessage: 'Lab PC server is not connected.' };
+  }
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (controlPin) headers['X-Robowski-Pin'] = controlPin;
+    const resp = await fetchWithTimeout(
+      `${url}/api/robot/command/${encodeURIComponent(commandId)}/cancel`,
+      { method: 'POST', headers },
+      8000
+    );
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      return {
+        ok: false,
+        humanMessage: data?.detail || data?.humanMessage || `Could not cancel command (HTTP ${resp.status}).`,
+      };
+    }
+    return {
+      ok: true,
+      cancelled: Boolean(data?.cancelled),
+      humanMessage: data?.humanMessage || 'Cancelled queued command.',
+    };
+  } catch {
+    return { ok: false, humanMessage: 'Could not reach the Lab PC server to cancel.' };
+  }
+}

@@ -4,10 +4,11 @@ Robowski Studio — Tiny Robot PC Background Helper
 =================================================
 Run this single file on the ROBOT PC (just double-click start_robot_helper_windows.bat).
 
-How PIN unlock works (no command-line flags needed!):
-  - Create a 1-line text file named `robot_pin.txt` right next to this file containing your chosen PIN (e.g. `4829`).
-  - Hardware buttons are then automatically unlocked whenever you type that same PIN in the Robot tab in your browser.
-  - Without `robot_pin.txt` (or `ROBOWSKI_CONTROL_PIN`), the helper stays in safe read-only monitor mode.
+Required 1-time setup files (save next to this script):
+  - `server_url.txt`  : Your Personal Lab PC backend URL (e.g. https://your-pc.ts.net or http://192.168.1.50:8000)
+  - `relay_token.txt` : A shared secret phrase (must match `relay_token.txt` / `ROBOWSKI_RELAY_TOKEN` on your Personal PC)
+  - `robot_pin.txt`   : Optional on Robot PC if you unlock via Personal PC PIN + signed relay token;
+                        keep `robot_pin.txt` on your Personal PC (6+ characters recommended).
 
 How it finds your active Excel run:
   1. Automatically reads the exact `.xlsx` file Robowski itself just opened from `main_roboski2.log`
@@ -41,9 +42,43 @@ except ImportError:
     openpyxl = None  # type: ignore
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-DEFAULT_BACKEND_URL = os.environ.get(
-    "ROBOWSKI_BACKEND_URL", "https://91474-p02.tail4c9e6a.ts.net"
+from robot_safety import (  # noqa: E402
+    ALLOWED_COMMANDS as _ALLOWED_COMMANDS,
+    ALLOWED_SOLVENTS as _ALLOWED_SOLVENTS,
+    COMMANDS_ALLOWED_WITHOUT_HOMING as _COMMANDS_ALLOWED_WITHOUT_HOMING,
+    MAX_CUSTOM_PRESETS as _MAX_CUSTOM_PRESETS,
+    PinRateLimiter,
+    apply_custom_xy_to_container as _apply_custom_xy_to_container,
+    compute_preset_well_xy as _compute_preset_well_xy,
+    format_well_name as _format_well_name,
+    normalize_plate_preset as _normalize_plate_preset,
+    resolve_and_validate_tip_and_volume,
+    validate_robot_command_params,
+    validate_solvent,
+    verify_relay_command,
+)
+
+
+def _read_optional_text_file(filename: str) -> str:
+    p = SCRIPT_DIR / filename
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            clean = line.strip()
+            if clean and not clean.startswith("#"):
+                return clean
+    except OSError:
+        return ""
+    return ""
+
+
+DEFAULT_BACKEND_URL = (
+    os.environ.get("ROBOWSKI_BACKEND_URL", "").strip()
+    or _read_optional_text_file("server_url.txt")
 ).strip().rstrip("/")
 
 _BOTTLE_BOTTOM_Z = 2180.0
@@ -51,195 +86,6 @@ _BOTTLE_AREA_MM2 = (24.6 ** 2) * 3.14 / 4.0  # 475.0506 mm^2 (breadboard.py)
 _JAR_BOTTOM_Z = 2120.0
 _JAR_AREA_MM2 = 2122.0
 
-_ALLOWED_COMMANDS = {
-    "init_hardware",
-    "disconnect_hardware",
-    "home_xy",
-    "move_idle",
-    "move_z_traverse",
-    "kill_alarm",
-    "emergency_stop",
-    "pick_tip",
-    "discard_tip",
-    "change_tip",
-    "check_tip_status",
-    "reload_tip_rack",
-    "mark_tips_used",
-    "move_to_container",
-    "move_to_trash",
-    "move_to_balance",
-    "move_to_nanodrop",
-    "move_xy_rel",
-    "move_z",
-    "move_z_rel",
-    "check_liquid_level",
-    "single_transfer",
-    "plate_transfer_start",
-    "plate_transfer_stop",
-    "save_plate_preset",
-    "delete_plate_preset",
-    "move_to_plate_well",
-    "read_xy_position",
-    "balance_door_open",
-    "balance_door_close",
-    "balance_tare",
-    "balance_read",
-    "read_instrument_status",
-    "nanodrop_connect",
-    "nanodrop_disconnect",
-    "nanodrop_lid_open",
-    "nanodrop_lid_close",
-    "nanodrop_lid_half_open",
-    "nanodrop_flush",
-    "nanodrop_dry",
-    "nanodrop_wash_cycle",
-    "nanodrop_close_all",
-}
-
-_WELL_ROW_LETTERS = "ABCDEFGHIJKLMNOP"
-_MAX_CUSTOM_PRESETS = 50
-
-
-def _format_well_name(well_idx: int, cols: int) -> str:
-    safe_cols = max(1, int(cols))
-    r = well_idx // safe_cols
-    c = (well_idx % safe_cols) + 1
-    row_lbl = _WELL_ROW_LETTERS[r] if 0 <= r < len(_WELL_ROW_LETTERS) else f"R{r + 1}"
-    return f"{row_lbl}{c}"
-
-
-def _parse_xy_pair(raw: Any, label: str) -> List[float]:
-    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-        raise RuntimeError(f"{label} must be an [X, Y] coordinate pair in mm.")
-    x = float(raw[0])
-    y = float(raw[1])
-    if not (math.isfinite(x) and math.isfinite(y)):
-        raise RuntimeError(f"{label} must contain valid numbers.")
-    if not (-600.0 <= x <= 600.0 and -600.0 <= y <= 600.0):
-        raise RuntimeError(f"{label} ({x}, {y}) is outside the safe deck range (-600 to 600 mm).")
-    return [round(x, 3), round(y, 3)]
-
-
-def _normalize_plate_preset(raw: Dict[str, Any]) -> Dict[str, Any]:
-    name = str(raw.get("name", "")).strip()
-    if not name or len(name) > 60:
-        raise RuntimeError("Preset name must be between 1 and 60 characters.")
-    plate_slot = int(raw.get("plate_slot", raw.get("plateSlot", 0)))
-    if plate_slot not in {0, 1, 2}:
-        raise RuntimeError("plate_slot must be 0, 1, or 2 (plate0, plate1, or plate2).")
-    rows = int(raw.get("rows", 8))
-    cols = int(raw.get("cols", 12))
-    if not (1 <= rows <= 16 and 1 <= cols <= 24) or (rows * cols > 384):
-        raise RuntimeError("Grid dimensions must be 1–16 rows × 1–24 columns (max 384 wells).")
-    a1 = _parse_xy_pair(raw.get("corner_a1", raw.get("cornerA1")), "Corner A1")
-    tr = _parse_xy_pair(raw.get("corner_top_right", raw.get("cornerTopRight")), "Top-Right corner")
-    bl = _parse_xy_pair(raw.get("corner_bottom_left", raw.get("cornerBottomLeft")), "Bottom-Left corner")
-    default_z = int(raw.get("default_z", raw.get("defaultZ", 1900)))
-    if not (880 <= default_z <= 2190):
-        raise RuntimeError("default_z must be between 880 and 2190.")
-
-    col_pitch = 0.0
-    if cols > 1:
-        col_span = math.hypot(tr[0] - a1[0], tr[1] - a1[1])
-        col_pitch = col_span / float(cols - 1)
-        if not (2.0 <= col_pitch <= 80.0):
-            raise RuntimeError(
-                f"Detected column spacing ({col_pitch:.2f} mm) is outside the safe 2–80 mm range. Check A1 and Top-Right."
-            )
-    row_pitch = 0.0
-    if rows > 1:
-        row_span = math.hypot(bl[0] - a1[0], bl[1] - a1[1])
-        row_pitch = row_span / float(rows - 1)
-        if not (2.0 <= row_pitch <= 80.0):
-            raise RuntimeError(
-                f"Detected row spacing ({row_pitch:.2f} mm) is outside the safe 2–80 mm range. Check A1 and Bottom-Left."
-            )
-
-    angle_deg = 0.0
-    if cols > 1:
-        dx, dy = tr[0] - a1[0], tr[1] - a1[1]
-        if abs(dx) >= abs(dy):
-            angle_deg = math.degrees(math.atan2(dy, abs(dx)))
-        else:
-            angle_deg = math.degrees(math.atan2(dx, abs(dy)))
-
-    raw_id = str(raw.get("id", "")).strip()
-    if raw_id:
-        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)[:64]
-    else:
-        base = re.sub(r"[^a-zA-Z0-9]+", "_", name.lower()).strip("_")[:36] or "plate"
-        slug = f"p{plate_slot}_{rows}x{cols}_{base}"
-    if not slug or slug == "default_54":
-        slug = f"p{plate_slot}_{rows}x{cols}_custom"
-
-    return {
-        "id": slug,
-        "name": name,
-        "plateSlot": plate_slot,
-        "rows": rows,
-        "cols": cols,
-        "cornerA1": a1,
-        "cornerTopRight": tr,
-        "cornerBottomLeft": bl,
-        "defaultZ": default_z,
-        "colPitchMm": round(col_pitch, 3),
-        "rowPitchMm": round(row_pitch, 3),
-        "angleDeg": round(angle_deg, 2),
-        "updatedAt": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _compute_preset_well_xy(preset: Dict[str, Any], well_idx: int) -> Tuple[float, float]:
-    rows = int(preset["rows"])
-    cols = int(preset["cols"])
-    if not (0 <= well_idx < rows * cols):
-        raise RuntimeError(f"Well index {well_idx} is out of range for {rows}×{cols} plate.")
-    r = well_idx // cols
-    c = well_idx % cols
-    a1 = preset["cornerA1"]
-    tr = preset["cornerTopRight"]
-    bl = preset["cornerBottomLeft"]
-    u = float(c) / float(cols - 1) if cols > 1 else 0.0
-    v = float(r) / float(rows - 1) if rows > 1 else 0.0
-    x = float(a1[0]) + u * (float(tr[0]) - float(a1[0])) + v * (float(bl[0]) - float(a1[0]))
-    y = float(a1[1]) + u * (float(tr[1]) - float(a1[1])) + v * (float(bl[1]) - float(a1[1]))
-    return (round(x, 3), round(y, 3))
-
-
-def _apply_custom_xy_to_container(container: Any, xy: Tuple[float, float]) -> Any:
-    orig_xy = getattr(container, "xy", None)
-    if isinstance(orig_xy, list):
-        container.xy = [xy[0], xy[1]]
-    else:
-        container.xy = (xy[0], xy[1])
-    if hasattr(container, "x"):
-        try:
-            container.x = xy[0]
-        except Exception:
-            pass
-    if hasattr(container, "y"):
-        try:
-            container.y = xy[1]
-        except Exception:
-            pass
-    return container
-
-_ALLOWED_SOLVENTS = {
-    "water",
-    "ethanol",
-    "DMF",
-    "Dioxane",
-    "DCE",
-    "MeCN",
-    "CHCl3",
-    "DMSO",
-    "glycerin",
-    "TolueneMix",
-    "serum",
-    "hbrhac1v1",
-    "waterft",
-    "ethanolft",
-}
 
 _FALLBACK_LIQUID_CLASS: Dict[tuple[str, str], int] = {
     ("water", "50ul"): 0, ("water", "300ul"): 1, ("water", "1000ul"): 2,
@@ -257,20 +103,6 @@ _FALLBACK_LIQUID_CLASS: Dict[tuple[str, str], int] = {
     ("waterft", "50ul"): 40, ("waterft", "300ul"): 41, ("waterft", "1000ul"): 42,
     ("ethanolft", "50ul"): 43, ("ethanolft", "300ul"): 44, ("ethanolft", "1000ul"): 45,
 }
-
-
-def _read_optional_text_file(filename: str) -> str:
-    p = SCRIPT_DIR / filename
-    if not p.exists() or not p.is_file():
-        return ""
-    try:
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-            clean = line.strip()
-            if clean and not clean.startswith("#"):
-                return clean
-    except OSError:
-        return ""
-    return ""
 
 
 def _read_optional_folder_list(filename: str) -> List[Path]:
@@ -301,15 +133,22 @@ class RobotPcAgent:
         relay_token: str = "",
         control_pin: str = "",
     ) -> None:
-        self.server_url = server_url.strip().rstrip("/")
+        self.server_url = (server_url or "").strip().rstrip("/")
         self.interval_sec = max(2.0, float(interval_sec))
         self.control_pin = (
             control_pin.strip()
             or os.environ.get("ROBOWSKI_CONTROL_PIN", "").strip()
             or _read_optional_text_file("robot_pin.txt")
         )
-        # Setting a PIN automatically enables PIN-protected live hardware control (no CLI flag needed!)
-        self.enable_hardware = bool(enable_hardware or self.control_pin)
+        self.relay_token = (
+            relay_token.strip()
+            or os.environ.get("ROBOWSKI_RELAY_TOKEN", "").strip()
+            or _read_optional_text_file("relay_token.txt")
+        )
+        # Never allow unauthenticated live hardware control: requires either a relay_token
+        # (for signed commands verified by the personal PC's PIN) or a local control_pin.
+        has_auth = bool(self.control_pin or self.relay_token)
+        self.enable_hardware = bool((enable_hardware or self.control_pin) and has_auth)
         self.repo_path = (
             repo_path.strip()
             or os.environ.get("ROBOWSKI_MAIN_FOLDER", "").strip()
@@ -319,15 +158,19 @@ class RobotPcAgent:
         ).strip('"').strip("'")
         self._zeus_dir_checked = False
         self._cached_zeus_dir: Optional[Path] = None
-        self.relay_token = relay_token.strip() or os.environ.get("ROBOWSKI_RELAY_TOKEN", "").strip()
         self.robot_name = os.environ.get("PIPETTER_NAME", "Robowski#2").strip() or "Robowski#2"
         self.requested_run_path: Optional[str] = None
         try:
             self.idle_release_sec = max(0, int(os.environ.get("ROBOWSKI_IDLE_RELEASE_SEC", "300").strip() or "300"))
         except ValueError:
             self.idle_release_sec = 300
+        self._pin_limiter = PinRateLimiter(max_attempts=5, lockout_sec=300.0)
+        self._hw_lock = threading.Lock()
+        self._emergency_stop_flag = threading.Event()
         self._plate_transfer_stop = threading.Event()
         self._plate_transfer_thread: Optional[threading.Thread] = None
+        self._cmd_thread: Optional[threading.Thread] = None
+        self._active_cmd_id: Optional[str] = None
         self.hw: Dict[str, Any] = {
             "zm": None,
             "gt": None,
@@ -335,6 +178,7 @@ class RobotPcAgent:
             "brb": None,
             "nd": None,
             "connected": False,
+            "homed": False,
             "nanodropConnected": False,
             "nanodropId": "nd_2000c",
             "nanodropLidClosed": True,
@@ -861,6 +705,7 @@ class RobotPcAgent:
                 "pt": None,
                 "brb": None,
                 "connected": False,
+                "homed": False,
                 "currentPosition": position_label,
                 "lastActivityMono": 0.0,
                 "lastError": None,
@@ -891,8 +736,10 @@ class RobotPcAgent:
         pt_snap = copy.deepcopy(pt_job) if isinstance(pt_job, dict) else None
         return {
             "controlEnabled": self.enable_hardware,
-            "pinProtected": bool(self.control_pin),
+            "pinProtected": bool(self.control_pin or self.relay_token),
+            "relayTokenConfigured": bool(self.relay_token),
             "connected": bool(self.hw["connected"]),
+            "homed": bool(self.hw.get("homed", False)),
             "nanodropConnected": bool(self.hw.get("nanodropConnected")),
             "nanodropId": str(self.hw.get("nanodropId") or "nd_2000c"),
             "nanodropLidClosed": bool(self.hw.get("nanodropLidClosed", True)),
@@ -1130,7 +977,11 @@ class RobotPcAgent:
 
         return None
 
-    def _ensure_hardware(self) -> None:
+    def _connect_hardware_only(self) -> None:
+        """
+        Connects to Zeus, Gantry, and Pipetter WITHOUT automatically calling home_xy().
+        Homing must be triggered explicitly via Connect & Home / Home XY after checking tip presence.
+        """
         if self.hw["connected"] and self.hw["pt"] is not None:
             return
         zeus_dir = self._find_zeus_dir()
@@ -1139,7 +990,6 @@ class RobotPcAgent:
                 sys.path.insert(0, str(zeus_dir))
             if zeus_dir.name.lower() == "zeus-pipetter" and str(zeus_dir.parent) not in sys.path:
                 sys.path.insert(0, str(zeus_dir.parent))
-            # Robowski's breadboard.py reads relative paths like 'config//roboski2//brb.json'
             work_dir = zeus_dir
             if not (zeus_dir / "config").is_dir() and (zeus_dir.parent / "config").is_dir():
                 work_dir = zeus_dir.parent
@@ -1160,7 +1010,6 @@ class RobotPcAgent:
 
         zm = zeus.ZeusModule(id=1)
         gt = pipetter.Gantry(zeus=zm)
-        gt.home_xy()
         pt = pipetter.Pipetter(zeus=zm, gantry=gt)
         self.hw.update(
             {
@@ -1169,13 +1018,74 @@ class RobotPcAgent:
                 "pt": pt,
                 "brb": brb,
                 "connected": True,
+                "homed": False,
                 "currentTip": getattr(zm, "tip_on_zeus", "") or "",
-                "currentPosition": "Home (0, 0)",
-                "currentXY": [0.0, 0.0],
+                "currentPosition": "Connected (not homed yet)",
                 "currentZ": getattr(zm, "pos", getattr(zm, "ZeusTraversePosition", 880)),
                 "lastError": None,
             }
         )
+
+    def _safe_home_xy(self, zm: Any, gt: Any) -> None:
+        """
+        Raises Z to traverse height and verifies no pipette tip is attached before homing XY.
+        """
+        if hasattr(zm, "move_zeus_to_traverse_height"):
+            zm.move_zeus_to_traverse_height()
+        tip_present = False
+        try:
+            if hasattr(zm, "getTipPresenceStatus"):
+                tip_present = bool(zm.getTipPresenceStatus())
+        except Exception:
+            tip_present = False
+        if tip_present or bool(getattr(zm, "tip_on_zeus", "")):
+            raise RuntimeError(
+                "Cannot home while a pipette tip is attached! "
+                "Click 'Drop Tip' first (or remove the tip manually), then click 'Connect & Home'."
+            )
+        gt.home_xy()
+        self.hw["homed"] = True
+        self.hw["currentPosition"] = "Home (0, 0)"
+        self.hw["currentXY"] = [0.0, 0.0]
+        self.hw["currentZ"] = int(getattr(zm, "pos", None) or getattr(zm, "ZeusTraversePosition", 880))
+
+    def trigger_emergency_stop(self, cmd_id: str = "") -> Dict[str, Any]:
+        """
+        Pre-emptive software stop: signals all running loops immediately and calls
+        zm.setEmergencyStop(1) without waiting for the worker thread or hardware lock.
+        Does NOT replace a physical E-stop switch on the hardware.
+        """
+        self._emergency_stop_flag.set()
+        self._plate_transfer_stop.set()
+        zm = self.hw.get("zm")
+        hw_stopped = False
+        stop_err: Optional[str] = None
+        if zm is not None and hasattr(zm, "setEmergencyStop"):
+            try:
+                zm.setEmergencyStop(1)
+                hw_stopped = True
+            except Exception as exc:
+                stop_err = str(exc)
+        job = self.hw.get("plateTransfer")
+        if isinstance(job, dict) and job.get("active"):
+            job["message"] = "Software Stop triggered — halting transfer immediately."
+        self.hw["lastCommand"] = "emergency_stop"
+        self.hw["lastCommandAt"] = datetime.now(timezone.utc).isoformat()
+        if stop_err:
+            msg = f"Software Stop flag set, but Zeus reported: {stop_err}. Use the physical E-stop if the arm is still moving."
+        elif hw_stopped:
+            msg = "Software Stop sent immediately to Zeus pipetter (and all queued moves halted)."
+        else:
+            msg = "Software Stop flag set (Zeus was not connected)."
+        return {
+            "commandId": cmd_id,
+            "ok": stop_err is None,
+            "executed": True,
+            "command": "emergency_stop",
+            "humanMessage": msg,
+            "error": stop_err,
+            "hardware": self._hardware_snapshot(),
+        }
 
     def _ensure_nanodrop(self, nd_id: str = "nd_2000c") -> Any:
         clean_id = "nd_2000" if nd_id == "nd_2000" else "nd_2000c"
@@ -1230,30 +1140,72 @@ class RobotPcAgent:
             pass
         return _FALLBACK_LIQUID_CLASS.get((solvent, tip_type), _FALLBACK_LIQUID_CLASS.get(("ethanol", tip_type), 13))
 
-    def execute_command(self, cmd_id: str, cmd: str, params: Dict[str, Any], supplied_pin: str = "") -> Dict[str, Any]:
+    def execute_command(
+        self,
+        cmd_id: str,
+        cmd: str,
+        params: Dict[str, Any],
+        supplied_pin: str = "",
+        verified_relay: bool = False,
+    ) -> Dict[str, Any]:
         if not self.enable_hardware or cmd not in _ALLOWED_COMMANDS:
             return {
                 "commandId": cmd_id,
                 "ok": False,
                 "executed": False,
                 "command": cmd,
-                "humanMessage": "Live robot buttons are locked. Add your PIN in robot_pin.txt on the robot PC to unlock them.",
+                "humanMessage": (
+                    "Live robot buttons are locked. Configure relay_token.txt (on both PCs) "
+                    "and robot_pin.txt on your Personal PC to unlock live control."
+                ),
                 "hardware": self._hardware_snapshot(),
             }
 
-        if self.control_pin:
-            if not hmac.compare_digest(supplied_pin.strip(), self.control_pin):
+        # Direct (non-relayed) invocation still enforces PIN + 5-try / 5-min lockout
+        if not verified_relay:
+            if not self.control_pin:
                 return {
                     "commandId": cmd_id,
                     "ok": False,
                     "executed": False,
                     "command": cmd,
-                    "humanMessage": "Wrong or missing PIN. Type the PIN from robot_pin.txt into the PIN box at the top right of Robot Commands.",
+                    "humanMessage": "Direct hardware execution requires a configured PIN or a signed relay command.",
+                    "error": "Authentication required",
+                    "hardware": self._hardware_snapshot(),
+                }
+            locked_sec = self._pin_limiter.check_locked("direct")
+            if locked_sec is not None:
+                return {
+                    "commandId": cmd_id,
+                    "ok": False,
+                    "executed": False,
+                    "command": cmd,
+                    "humanMessage": f"Too many wrong PIN attempts. Locked for {locked_sec}s.",
+                    "error": "PIN locked",
+                    "hardware": self._hardware_snapshot(),
+                }
+            if not hmac.compare_digest((supplied_pin or "").strip(), self.control_pin):
+                _tries, lock_now = self._pin_limiter.record_failure("direct")
+                if lock_now is not None:
+                    err_msg = f"Too many wrong PIN attempts. Locked for {lock_now}s."
+                else:
+                    err_msg = "Wrong or missing PIN. Type your PIN into the PIN box at the top right of Robot Commands."
+                return {
+                    "commandId": cmd_id,
+                    "ok": False,
+                    "executed": False,
+                    "command": cmd,
+                    "humanMessage": err_msg,
                     "error": "Invalid PIN",
                     "hardware": self._hardware_snapshot(),
                 }
+            self._pin_limiter.record_success("direct")
 
-        # Handle stop signal immediately even while a background plate transfer is active
+        # Software stop pre-empts EVERYTHING immediately without waiting for any lock
+        if cmd == "emergency_stop":
+            return self.trigger_emergency_stop(cmd_id)
+
+        # Handle plate transfer graceful stop immediately even while transfer worker is active
         if cmd == "plate_transfer_stop":
             job = self.hw.get("plateTransfer")
             if isinstance(job, dict) and job.get("active"):
@@ -1277,18 +1229,44 @@ class RobotPcAgent:
                 "hardware": self._hardware_snapshot(),
             }
 
-        active_job = self.hw.get("plateTransfer")
-        if isinstance(active_job, dict) and active_job.get("active") and cmd not in {"emergency_stop"}:
+        # Validate parameters strictly with shared safety module BEFORE touching hardware
+        try:
+            params = validate_robot_command_params(cmd, params)
+        except ValueError as exc:
             return {
                 "commandId": cmd_id,
                 "ok": False,
                 "executed": False,
                 "command": cmd,
-                "humanMessage": "A plate-to-plate transfer is currently running. Click 'Stop After Current Vial' before sending other moves.",
+                "humanMessage": str(exc),
+                "error": str(exc),
+                "hardware": self._hardware_snapshot(),
+            }
+
+        active_job = self.hw.get("plateTransfer")
+        if isinstance(active_job, dict) and active_job.get("active"):
+            return {
+                "commandId": cmd_id,
+                "ok": False,
+                "executed": False,
+                "command": cmd,
+                "humanMessage": "A plate-to-plate transfer is currently running. Click 'Stop After Current Vial' or 'Software Stop' before sending other moves.",
                 "error": "Plate transfer active",
                 "hardware": self._hardware_snapshot(),
             }
 
+        if not self._hw_lock.acquire(blocking=False):
+            return {
+                "commandId": cmd_id,
+                "ok": False,
+                "executed": False,
+                "command": cmd,
+                "humanMessage": "The robot is currently executing another command. Wait for it to finish or click Software Stop.",
+                "error": "Robot busy",
+                "hardware": self._hardware_snapshot(),
+            }
+
+        self._emergency_stop_flag.clear()
         self.hw["busy"] = True
         self.hw["lastCommand"] = cmd
         self.hw["lastCommandAt"] = datetime.now(timezone.utc).isoformat()
@@ -1354,15 +1332,15 @@ class RobotPcAgent:
                 if rack_path is None:
                     raise RuntimeError("tip_rack.json not found on the robot PC.")
                 rack_data = json.loads(rack_path.read_text(encoding="utf-8"))
-                tt = str(params.get("tip_type", "300ul"))
-                if tt not in {"50ul", "300ul", "1000ul"} or tt not in rack_data:
+                tt = str(params["tip_type"])
+                if tt not in rack_data:
                     raise RuntimeError(f"Invalid tip rack '{tt}'.")
                 if cmd == "reload_tip_rack":
                     for tip in rack_data[tt]["tips"]:
                         tip["exists"] = True
                     msg = f"Marked {tt.replace('ul', ' µL')} tip rack as full (96/96)."
                 else:
-                    cnt = max(1, min(96, int(params.get("count", 1))))
+                    cnt = int(params["count"])
                     marked = 0
                     for tip in rack_data[tt]["tips"]:
                         if marked >= cnt:
@@ -1394,9 +1372,7 @@ class RobotPcAgent:
                     f"— spacing {preset['colPitchMm']:.2f} × {preset['rowPitchMm']:.2f} mm, default Z={preset['defaultZ']}."
                 )
             elif cmd == "delete_plate_preset":
-                pid = str(params.get("id", "")).strip()
-                if not pid or not re.match(r"^[a-zA-Z0-9_-]{1,64}$", pid):
-                    raise RuntimeError("Invalid plate preset ID.")
+                pid = str(params["id"])
                 presets = self._load_plate_presets()
                 new_presets = [p for p in presets if p.get("id") != pid]
                 if len(new_presets) == len(presets):
@@ -1405,14 +1381,22 @@ class RobotPcAgent:
                 result_data["platePresets"] = new_presets
                 msg = f"Deleted plate preset '{pid}'."
             else:
-                self._ensure_hardware()
+                # Safe reconnect & homing guard: never silently home on an arbitrary motion command
+                if cmd in _COMMANDS_ALLOWED_WITHOUT_HOMING:
+                    self._connect_hardware_only()
+                else:
+                    if not self.hw["connected"] or not self.hw.get("homed"):
+                        raise RuntimeError(
+                            "Robot is not connected & homed yet (or was released after being idle). "
+                            "Make sure the deck is clear and no tip is stuck, then click 'Connect & Home' first."
+                        )
+
                 zm, gt, pt, brb = self.hw["zm"], self.hw["gt"], self.hw["pt"], self.hw["brb"]
                 if cmd == "init_hardware":
+                    self._safe_home_xy(zm, gt)
                     msg = f"Connected to {self.robot_name} and homed arm to (0, 0)."
                 elif cmd == "home_xy":
-                    gt.home_xy()
-                    self.hw["currentPosition"] = "Home (0, 0)"
-                    self.hw["currentXY"] = [0.0, 0.0]
+                    self._safe_home_xy(zm, gt)
                     msg = "Moved arm back to home (0, 0)."
                 elif cmd == "move_idle":
                     gt.move_to_idle_position()
@@ -1426,11 +1410,8 @@ class RobotPcAgent:
                 elif cmd == "kill_alarm":
                     gt.kill_alarm()
                     msg = "Cleared gantry alarm lock."
-                elif cmd == "emergency_stop":
-                    zm.setEmergencyStop(1)
-                    msg = "Emergency stop triggered on Zeus pipetter."
                 elif cmd == "pick_tip":
-                    tt = str(params.get("tip_type", "300ul"))
+                    tt = str(params["tip_type"])
                     pt.pick_tip(tt)
                     self.hw["currentTip"] = tt
                     msg = f"Picked up a fresh {tt.replace('ul', ' µL')} tip."
@@ -1440,7 +1421,7 @@ class RobotPcAgent:
                     self.hw["currentPosition"] = "Trash bin"
                     msg = "Dropped pipette tip into the waste bin."
                 elif cmd == "change_tip":
-                    tt = str(params.get("tip_type", "300ul"))
+                    tt = str(params["tip_type"])
                     pt.change_tip(tt)
                     self.hw["currentTip"] = tt
                     msg = f"Switched to a fresh {tt.replace('ul', ' µL')} tip."
@@ -1449,18 +1430,17 @@ class RobotPcAgent:
                     result_data["tipPresent"] = present
                     msg = "Tip sensor: a tip IS attached." if present else "Tip sensor: no tip attached."
                 elif cmd == "reload_tip_rack":
-                    tt = str(params.get("tip_type", "300ul"))
+                    tt = str(params["tip_type"])
                     brb.load_new_tip_rack(tt)
                     msg = f"Reset {tt.replace('ul', ' µL')} tip rack to full (96/96)."
                 elif cmd == "mark_tips_used":
-                    tt = str(params.get("tip_type", "300ul"))
-                    cnt = max(1, min(96, int(params.get("count", 1))))
+                    tt = str(params["tip_type"])
+                    cnt = int(params["count"])
                     brb.mark_next_n_tip_as_used(tt, cnt)
                     msg = f"Skipped {cnt} used tip(s) in {tt.replace('ul', ' µL')} rack."
                 elif cmd == "move_to_container":
-                    pl = max(0, min(7, int(params.get("plate_id", 0))))
-                    max_c = 53 if pl <= 2 else (7 if pl <= 5 else 1)
-                    ct = max(0, min(max_c, int(params.get("container_id", 0))))
+                    pl = int(params["plate_id"])
+                    ct = int(params["container_id"])
                     c = brb.plate_list[pl].containers[ct]
                     gt.move_xy(c.xy, ensure_traverse_height=True)
                     try:
@@ -1472,8 +1452,8 @@ class RobotPcAgent:
                     result_data["xy"] = self.hw.get("currentXY")
                     msg = f"Moved arm over plate{pl}, position {ct}."
                 elif cmd == "move_to_plate_well":
-                    pl = max(0, min(2, int(params.get("plate_id", 0))))
-                    well_idx = max(0, min(383, int(params.get("well_index", 0))))
+                    pl = int(params["plate_id"])
+                    well_idx = int(params["well_index"])
                     preset_id = str(params.get("preset_id", "")).strip()
                     if params.get("corner_a1") is not None and params.get("corner_top_right") is not None and params.get("corner_bottom_left") is not None:
                         tmp_preset = _normalize_plate_preset(
@@ -1546,32 +1526,30 @@ class RobotPcAgent:
                     self.hw["currentZ"] = int(getattr(zm, "pos", None) or getattr(zm, "ZeusTraversePosition", 880))
                     msg = "Moved pipetter arm safely over the NanoDrop pedestal."
                 elif cmd == "single_transfer":
-                    src_plate = max(0, min(7, int(params.get("src_plate", 3))))
-                    dst_plate = max(0, min(7, int(params.get("dst_plate", 0))))
-                    src_preset_id = str(params.get("src_preset_id", "default_54")).strip() or "default_54"
-                    dst_preset_id = str(params.get("dst_preset_id", "default_54")).strip() or "default_54"
-                    src_slot = max(0, min(383, int(params.get("src_slot", 0))))
-                    dst_slot = max(0, min(383, int(params.get("dst_slot", 0))))
-                    vol_ul = max(1.0, min(2000.0, float(params.get("volume_ul", 100.0))))
-                    solvent = str(params.get("solvent", "ethanol")).strip()
-                    if solvent not in _ALLOWED_SOLVENTS:
-                        solvent = "ethanol"
-                    raw_tip = str(params.get("tip_type", "auto")).strip()
-                    if raw_tip in {"50ul", "300ul", "1000ul"}:
-                        tip_type = raw_tip
-                    else:
-                        tip_type = "50ul" if vol_ul <= 50.0 else ("300ul" if vol_ul <= 300.0 else "1000ul")
-                    src_z = max(880, min(2190, int(params.get("src_z", 1900))))
-                    dst_z = max(880, min(2190, int(params.get("dst_z", 2100))))
-                    pick_tip = bool(params.get("pick_tip", True))
-                    prewet = bool(params.get("prewet", False))
-                    mix_after = bool(params.get("mix_after", False))
-                    drop_tip = bool(params.get("drop_tip", True))
+                    src_plate = int(params["src_plate"])
+                    dst_plate = int(params["dst_plate"])
+                    src_preset_id = str(params["src_preset_id"])
+                    dst_preset_id = str(params["dst_preset_id"])
+                    src_slot = int(params["src_slot"])
+                    dst_slot = int(params["dst_slot"])
+                    solvent = validate_solvent(params["solvent"])
+                    vol_ul, _tip_setting, tip_type = resolve_and_validate_tip_and_volume(
+                        params["volume_ul"], params["tip_type"]
+                    )
+                    src_z = int(params["src_z"])
+                    dst_z = int(params["dst_z"])
+                    pick_tip = bool(params["pick_tip"])
+                    prewet = bool(params["prewet"])
+                    mix_after = bool(params["mix_after"])
+                    drop_tip = bool(params["drop_tip"])
 
                     src_c, src_lbl, _sr, _sc, _spn = self._resolve_plate_container(brb, src_plate, src_slot, src_preset_id)
                     dst_c, dst_lbl, _dr, _dc, _dpn = self._resolve_plate_container(brb, dst_plate, dst_slot, dst_preset_id)
                     src_c.liquid_surface_height = src_z
                     dst_c.liquid_surface_height = dst_z
+
+                    if self._emergency_stop_flag.is_set():
+                        raise RuntimeError("Aborted by Software Stop.")
 
                     if pick_tip:
                         cur_tip = getattr(zm, "tip_on_zeus", "") or ""
@@ -1582,6 +1560,11 @@ class RobotPcAgent:
                         self.hw["currentTip"] = tip_type
                     elif not (getattr(zm, "tip_on_zeus", "") or ""):
                         raise RuntimeError("No pipette tip attached. Enable 'Pick fresh tip' or pick a tip first.")
+                    else:
+                        attached_tip = str(getattr(zm, "tip_on_zeus", ""))
+                        if attached_tip in {"50ul", "300ul", "1000ul"}:
+                            resolve_and_validate_tip_and_volume(vol_ul, attached_tip)
+                            tip_type = attached_tip
 
                     deck_idx = {"50ul": 3, "300ul": 0, "1000ul": 1}[tip_type]
                     lc_idx = self._resolve_liquid_class_index(solvent, tip_type)
@@ -1611,13 +1594,17 @@ class RobotPcAgent:
                         disp_mixCycles=3 if mix_after else 0,
                     )
 
+                    if self._emergency_stop_flag.is_set():
+                        raise RuntimeError("Aborted by Software Stop.")
                     if prewet and hasattr(pt, "prewet_new_tip"):
                         pt.prewet_new_tip(zm=zm, pt=pt, pipetting_event=ev, use_calibration=False)
 
+                    if self._emergency_stop_flag.is_set():
+                        raise RuntimeError("Aborted by Software Stop.")
                     pt.transfer_liquid(transfer_event=ev, purpose="reaction", use_calibration=False)
                     zm.move_zeus_to_traverse_height()
 
-                    if drop_tip:
+                    if drop_tip and not self._emergency_stop_flag.is_set():
                         pt.discard_tip()
                         self.hw["currentTip"] = ""
                         self.hw["currentPosition"] = "Trash bin"
@@ -1636,13 +1623,10 @@ class RobotPcAgent:
                         f"{', tip dropped' if drop_tip else ''})."
                     )
                 elif cmd == "plate_transfer_start":
-                    src_plate = max(0, min(2, int(params.get("src_plate", 0))))
-                    dst_plate = max(0, min(2, int(params.get("dst_plate", 1))))
-                    if src_plate == dst_plate:
-                        raise RuntimeError("Source plate and destination plate must be different (e.g. plate0 → plate1).")
-
-                    src_preset_id = str(params.get("src_preset_id", "default_54")).strip() or "default_54"
-                    dst_preset_id = str(params.get("dst_preset_id", "default_54")).strip() or "default_54"
+                    src_plate = int(params["src_plate"])
+                    dst_plate = int(params["dst_plate"])
+                    src_preset_id = str(params["src_preset_id"])
+                    dst_preset_id = str(params["dst_preset_id"])
 
                     src_preset = self._get_preset_by_id(src_preset_id)
                     dst_preset = self._get_preset_by_id(dst_preset_id)
@@ -1670,44 +1654,28 @@ class RobotPcAgent:
                     src_name = str(src_preset["name"]) if src_preset else "54-vial (6×9)"
                     dst_name = str(dst_preset["name"]) if dst_preset else "54-vial (6×9)"
 
-                    raw_pairs = params.get("pairs")
                     pairs: List[List[int]] = []
-                    if isinstance(raw_pairs, list) and len(raw_pairs) > 0:
-                        seen_pairs: set[tuple[int, int]] = set()
-                        for item in raw_pairs:
-                            if isinstance(item, (list, tuple)) and len(item) == 2:
-                                sw, dw = int(item[0]), int(item[1])
-                                if 0 <= sw < src_total and 0 <= dw < dst_total and (sw, dw) not in seen_pairs:
-                                    seen_pairs.add((sw, dw))
-                                    pairs.append([sw, dw])
-                    else:
-                        raw_wells = params.get("wells")
-                        if not isinstance(raw_wells, list) or len(raw_wells) == 0:
-                            limit = min(src_total, dst_total)
-                            pairs = [[i, i] for i in range(limit)]
-                        else:
-                            for w in sorted({int(w) for w in raw_wells if isinstance(w, (int, float))}):
-                                if 0 <= w < src_total and 0 <= w < dst_total:
-                                    pairs.append([w, w])
+                    for item in params["pairs"]:
+                        sw, dw = int(item[0]), int(item[1])
+                        if not (0 <= sw < src_total and 0 <= dw < dst_total):
+                            raise RuntimeError(
+                                f"Transfer pair ({sw} → {dw}) is out of range for {src_name} ({src_total} wells) → {dst_name} ({dst_total} wells)."
+                            )
+                        pairs.append([sw, dw])
                     if not pairs or len(pairs) > 384:
                         raise RuntimeError("Select between 1 and 384 valid well transfers.")
 
                     wells = [p[0] for p in pairs]
-                    vol_ul = max(1.0, min(2000.0, float(params.get("volume_ul", 50.0))))
-                    solvent = str(params.get("solvent", "ethanol")).strip()
-                    if solvent not in _ALLOWED_SOLVENTS:
-                        solvent = "ethanol"
-                    raw_tip = str(params.get("tip_type", "auto")).strip()
-                    if raw_tip in {"50ul", "300ul", "1000ul"}:
-                        tip_type = raw_tip
-                    else:
-                        tip_type = "50ul" if vol_ul <= 50.0 else ("300ul" if vol_ul <= 300.0 else "1000ul")
-                    src_z = max(880, min(2190, int(params.get("src_z", src_preset["defaultZ"] if src_preset else 2100))))
-                    dst_z = max(880, min(2190, int(params.get("dst_z", dst_preset["defaultZ"] if dst_preset else 2100))))
-                    change_tip_each = bool(params.get("change_tip_each_vial", True))
-                    prewet = bool(params.get("prewet", False))
-                    mix_after = bool(params.get("mix_after", False))
-                    drop_tip_at_end = bool(params.get("drop_tip_at_end", True))
+                    solvent = validate_solvent(params["solvent"])
+                    vol_ul, _tip_setting, tip_type = resolve_and_validate_tip_and_volume(
+                        params["volume_ul"], params["tip_type"]
+                    )
+                    src_z = int(params["src_z"])
+                    dst_z = int(params["dst_z"])
+                    change_tip_each = bool(params["change_tip_each_vial"])
+                    prewet = bool(params["prewet"])
+                    mix_after = bool(params["mix_after"])
+                    drop_tip_at_end = bool(params["drop_tip_at_end"])
 
                     self._plate_transfer_stop.clear()
                     job_state: Dict[str, Any] = {
@@ -1754,6 +1722,10 @@ class RobotPcAgent:
                         mix_vol_01 = min(int(round(vol_ul)), max_tip_vol) * 10 if mix_after else 0
                         try:
                             if not change_tip_each:
+                                if self._plate_transfer_stop.is_set() or self._emergency_stop_flag.is_set():
+                                    job_state["state"] = "stopped"
+                                    job_state["message"] = "Stopped before first well."
+                                    return
                                 cur_tip = getattr(zm, "tip_on_zeus", "") or ""
                                 if not cur_tip:
                                     pt.pick_tip(tip_type)
@@ -1762,10 +1734,10 @@ class RobotPcAgent:
                                 self.hw["currentTip"] = tip_type
 
                             for idx_i, pair in enumerate(pairs):
-                                if self._plate_transfer_stop.is_set():
+                                if self._plate_transfer_stop.is_set() or self._emergency_stop_flag.is_set():
                                     job_state["state"] = "stopped"
                                     job_state["message"] = (
-                                        f"Stopped cleanly after {job_state['completedWells']} of {len(pairs)} wells."
+                                        f"Stopped after {job_state['completedWells']} of {len(pairs)} wells."
                                     )
                                     break
 
@@ -1787,6 +1759,13 @@ class RobotPcAgent:
                                     else:
                                         pt.pick_tip(tip_type)
                                     self.hw["currentTip"] = tip_type
+
+                                if self._emergency_stop_flag.is_set():
+                                    job_state["state"] = "stopped"
+                                    job_state["message"] = (
+                                        f"Halted by Software Stop at {src_code} → {dst_code}."
+                                    )
+                                    break
 
                                 src_c, _sl, _sr2, _sc2, _sn2 = self._resolve_plate_container(
                                     brb, src_plate, src_w, src_preset_id
@@ -1823,6 +1802,11 @@ class RobotPcAgent:
                                 if prewet and hasattr(pt, "prewet_new_tip") and (change_tip_each or idx_i == 0):
                                     pt.prewet_new_tip(zm=zm, pt=pt, pipetting_event=ev, use_calibration=False)
 
+                                if self._emergency_stop_flag.is_set():
+                                    job_state["state"] = "stopped"
+                                    job_state["message"] = f"Halted by Software Stop at {src_code} → {dst_code}."
+                                    break
+
                                 pt.transfer_liquid(transfer_event=ev, purpose="reaction", use_calibration=False)
                                 zm.move_zeus_to_traverse_height()
 
@@ -1851,13 +1835,14 @@ class RobotPcAgent:
                                     f"plate{src_plate} {src_name} → plate{dst_plate} {dst_name})."
                                 )
 
-                            if drop_tip_at_end and (getattr(zm, "tip_on_zeus", "") or ""):
+                            if drop_tip_at_end and not self._emergency_stop_flag.is_set() and (getattr(zm, "tip_on_zeus", "") or ""):
                                 pt.discard_tip()
                                 self.hw["currentTip"] = ""
                                 self.hw["currentPosition"] = "Trash bin"
                         except Exception as exc:
                             try:
-                                zm.move_zeus_to_traverse_height()
+                                if not self._emergency_stop_flag.is_set():
+                                    zm.move_zeus_to_traverse_height()
                             except Exception:
                                 pass
                             job_state["state"] = "error"
@@ -1882,8 +1867,8 @@ class RobotPcAgent:
                         f"from plate{src_plate} ({src_name}) → plate{dst_plate} ({dst_name})."
                     )
                 elif cmd == "move_xy_rel":
-                    dx = max(-100.0, min(100.0, float(params.get("dx", 0))))
-                    dy = max(-100.0, min(100.0, float(params.get("dy", 0))))
+                    dx = float(params["dx"])
+                    dy = float(params["dy"])
                     gt.move_xy_rel((dx, dy))
                     cur_xy = self.hw.get("currentXY")
                     if isinstance(cur_xy, list) and len(cur_xy) == 2:
@@ -1893,13 +1878,13 @@ class RobotPcAgent:
                     self.hw["currentPosition"] = f"Jogged ({dx:+.1f}, {dy:+.1f}) mm"
                     msg = f"Moved arm by X {dx:+.1f} mm, Y {dy:+.1f} mm."
                 elif cmd == "move_z":
-                    z = max(500, min(2200, int(params.get("z", 880))))
+                    z = int(params["z"])
                     zm.move_z(z)
                     self.hw["currentZ"] = z
                     result_data["zPosition"] = z
                     msg = f"Moved pipette height to z = {z} ({z / 10:.1f} mm)."
                 elif cmd == "move_z_rel":
-                    dz = max(-300, min(300, int(params.get("dz", 0))))
+                    dz = int(params["dz"])
                     cur_z = int(getattr(zm, "pos", None) or self.hw.get("currentZ") or getattr(zm, "ZeusTraversePosition", 880))
                     new_z = max(500, min(2200, cur_z + dz))
                     zm.move_z(new_z)
@@ -1908,9 +1893,8 @@ class RobotPcAgent:
                     direction = "Lowered" if dz > 0 else "Raised"
                     msg = f"{direction} tip to z = {new_z} ({new_z / 10:.1f} mm)."
                 elif cmd == "check_liquid_level":
-                    pl = max(0, min(7, int(params.get("plate_id", 3))))
-                    max_c = 53 if pl <= 2 else (7 if pl <= 5 else 1)
-                    ct = max(0, min(max_c, int(params.get("container_id", 0))))
+                    pl = int(params["plate_id"])
+                    ct = int(params["container_id"])
                     c = brb.plate_list[pl].containers[ct]
                     res = pt.check_volume_in_container(c)
                     surf = res[0] if isinstance(res, tuple) and len(res) >= 1 else getattr(c, "liquid_surface_height", None)
@@ -1978,6 +1962,33 @@ class RobotPcAgent:
                 self.hw["busy"] = False
             if self.hw.get("connected") or self.hw.get("nanodropConnected"):
                 self.hw["lastActivityMono"] = time.monotonic()
+            self._hw_lock.release()
+
+    def _is_worker_busy(self) -> bool:
+        cmd_alive = self._cmd_thread is not None and self._cmd_thread.is_alive()
+        pt_active = isinstance(self.hw.get("plateTransfer"), dict) and bool(self.hw["plateTransfer"].get("active"))
+        return bool(cmd_alive or pt_active or self.hw.get("busy"))
+
+    def _verify_signed_relay_item(self, item: Dict[str, Any]) -> Tuple[bool, str]:
+        return verify_relay_command(
+            relay_token=self.relay_token,
+            cmd_id=str(item.get("id") or ""),
+            command=str(item.get("command") or ""),
+            params=item.get("params") if isinstance(item.get("params"), dict) else {},
+            issued_at=float(item.get("issuedAt") or 0.0),
+            signature=str(item.get("signature") or ""),
+        )
+
+    def _run_command_worker(self, cmd_id: str, cmd: str, params: Dict[str, Any]) -> None:
+        self._active_cmd_id = cmd_id
+        try:
+            self._post_json("/api/robot/relay/ack", {"commandId": cmd_id, "state": "running"}, timeout=5.0)
+            res = self.execute_command(cmd_id, cmd, params, verified_relay=True)
+            self._post_json("/api/robot/relay/result", res, timeout=10.0)
+            self._post_json("/api/robot/relay/push", {"status": self.collect_status()}, timeout=8.0)
+        finally:
+            if self._active_cmd_id == cmd_id:
+                self._active_cmd_id = None
 
     def _post_json(self, path: str, body: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
         url = f"{self.server_url}{path}"
@@ -1999,6 +2010,17 @@ class RobotPcAgent:
             return None
 
     def run_forever(self) -> None:
+        if not self.server_url:
+            raise RuntimeError(
+                "Personal PC backend URL is not configured. Save it in server_url.txt next to robot_pc_agent.py "
+                "(e.g. https://your-pc.ts.net), set ROBOWSKI_BACKEND_URL, or pass --server."
+            )
+        if not self.relay_token:
+            raise RuntimeError(
+                "Relay token is required for security. Create relay_token.txt next to robot_pc_agent.py "
+                "(matching relay_token.txt / ROBOWSKI_RELAY_TOKEN on your Personal PC) or pass --token."
+            )
+
         self._last_post_error = ""
         pid_file = SCRIPT_DIR / "robot_helper.pid"
         stop_flag = SCRIPT_DIR / "stop_helper.flag"
@@ -2012,14 +2034,12 @@ class RobotPcAgent:
         print(f"[Robowski Helper] Robot: {self.robot_name}")
         print(f"[Robowski Helper] Robowski main.py folder: {self._find_zeus_dir() or 'Not found yet (set ROBOWSKI_MAIN_FOLDER in .bat if using hardware buttons)'}")
         print(f"[Robowski Helper] Data folder: {self._data_dir() or 'Not set (log-tracking still works)'}")
-        print(f"[Robowski Helper] Sending status every {self.interval_sec:.0f}s to: {self.server_url}")
-        if self.control_pin:
-            print("[Robowski Helper] Hardware buttons: PIN-PROTECTED (type your PIN in the browser to move the robot)")
-        elif self.enable_hardware:
-            print("[Robowski Helper] Hardware buttons: ENABLED")
+        print(f"[Robowski Helper] Sending status every {self.interval_sec:.0f}s (0.5s while moving) to: {self.server_url}")
+        if self.enable_hardware:
+            print("[Robowski Helper] Hardware buttons: SIGNED-RELAY PROTECTED (PIN verified on personal PC; commands HMAC-signed)")
         else:
-            print("[Robowski Helper] Hardware buttons: Safe read-only mode (add robot_pin.txt to unlock with a PIN)")
-        print("[Robowski Helper] Running! You can minimize this window — close it (or run stop_robot_helper_windows.bat) to stop.")
+            print("[Robowski Helper] Hardware buttons: Safe read-only mode (add robot_pin.txt or pass --enable-hardware with relay_token.txt)")
+        print("[Robowski Helper] Running! Close this window (or run stop_robot_helper_windows.bat) to stop.")
 
         was_offline = False
         ever_connected = False
@@ -2054,21 +2074,93 @@ class RobotPcAgent:
                     if isinstance(req_path, str) and req_path.strip():
                         self.requested_run_path = req_path.strip()
 
+                    # Priority 1: Handle stop signals immediately on the main polling thread
+                    stop_sig = reply.get("stopSignal")
+                    if isinstance(stop_sig, dict) and stop_sig.get("id") and stop_sig.get("command"):
+                        s_id = str(stop_sig["id"])
+                        s_cmd = str(stop_sig["command"])
+                        sig_ok, sig_err = self._verify_signed_relay_item(stop_sig)
+                        if not sig_ok:
+                            self._post_json(
+                                "/api/robot/relay/result",
+                                {
+                                    "commandId": s_id,
+                                    "ok": False,
+                                    "executed": False,
+                                    "command": s_cmd,
+                                    "humanMessage": sig_err,
+                                    "error": sig_err,
+                                    "hardware": self._hardware_snapshot(),
+                                },
+                                timeout=8.0,
+                            )
+                        elif s_cmd == "emergency_stop":
+                            res = self.trigger_emergency_stop(s_id)
+                            self._post_json("/api/robot/relay/result", res, timeout=8.0)
+                        else:
+                            res = self.execute_command(
+                                s_id,
+                                s_cmd,
+                                stop_sig.get("params") if isinstance(stop_sig.get("params"), dict) else {},
+                                verified_relay=True,
+                            )
+                            self._post_json("/api/robot/relay/result", res, timeout=8.0)
+
+                    # Priority 2: Launch regular commands in a worker thread so the poller stays free for Stop
                     pending = reply.get("pendingCommand")
                     if isinstance(pending, dict) and pending.get("id") and pending.get("command"):
-                        res = self.execute_command(
-                            str(pending["id"]),
-                            str(pending["command"]),
-                            pending.get("params") if isinstance(pending.get("params"), dict) else {},
-                            str(pending.get("pin") or ""),
-                        )
-                        self._post_json("/api/robot/relay/result", res, timeout=10.0)
-                        self._post_json("/api/robot/relay/push", {"status": self.collect_status()})
+                        p_id = str(pending["id"])
+                        p_cmd = str(pending["command"])
+                        p_params = pending.get("params") if isinstance(pending.get("params"), dict) else {}
+                        sig_ok, sig_err = self._verify_signed_relay_item(pending)
+                        if not sig_ok:
+                            self._post_json(
+                                "/api/robot/relay/result",
+                                {
+                                    "commandId": p_id,
+                                    "ok": False,
+                                    "executed": False,
+                                    "command": p_cmd,
+                                    "humanMessage": sig_err,
+                                    "error": sig_err,
+                                    "hardware": self._hardware_snapshot(),
+                                },
+                                timeout=8.0,
+                            )
+                        elif p_cmd == "emergency_stop":
+                            res = self.trigger_emergency_stop(p_id)
+                            self._post_json("/api/robot/relay/result", res, timeout=8.0)
+                        elif self._cmd_thread is not None and self._cmd_thread.is_alive():
+                            self._post_json(
+                                "/api/robot/relay/result",
+                                {
+                                    "commandId": p_id,
+                                    "ok": False,
+                                    "executed": False,
+                                    "command": p_cmd,
+                                    "humanMessage": "Robot is already executing another command.",
+                                    "error": "Robot busy",
+                                    "hardware": self._hardware_snapshot(),
+                                },
+                                timeout=8.0,
+                            )
+                        else:
+                            self._cmd_thread = threading.Thread(
+                                target=self._run_command_worker,
+                                args=(p_id, p_cmd, p_params),
+                                daemon=True,
+                            )
+                            self._cmd_thread.start()
 
-                    for _ in range(max(1, int(self.interval_sec))):
+                    # Fast 0.5s polling while moving so Software Stop arrives immediately
+                    wait_sec = 0.5 if self._is_worker_busy() else self.interval_sec
+                    steps = max(1, int(round(wait_sec / 0.5)))
+                    for _ in range(steps):
                         if stop_flag.exists():
                             break
-                        time.sleep(1.0)
+                        time.sleep(0.5)
+                        if wait_sec > 0.5 and self._is_worker_busy():
+                            break
                 except KeyboardInterrupt:
                     print("\n[Robowski Helper] Stopped cleanly.")
                     break
@@ -2076,9 +2168,12 @@ class RobotPcAgent:
                     print(f"[Robowski Helper] Temporary issue: {exc}")
                     time.sleep(max(10.0, self.interval_sec))
         finally:
+            self._emergency_stop_flag.set()
             self._plate_transfer_stop.set()
             if self._plate_transfer_thread is not None and self._plate_transfer_thread.is_alive():
                 self._plate_transfer_thread.join(timeout=8.0)
+            if self._cmd_thread is not None and self._cmd_thread.is_alive():
+                self._cmd_thread.join(timeout=5.0)
             if self.hw.get("connected") or self.hw.get("nanodropConnected"):
                 self._disconnect_hardware("Stopped cleanly (USB free)")
             for f in (pid_file, stop_flag):
@@ -2103,17 +2198,17 @@ def _setup_background_log(force_log: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Robowski Studio tiny Robot PC background helper")
-    parser.add_argument("--server", default=DEFAULT_BACKEND_URL, help="Your personal PC Robowski backend URL")
-    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between status updates (default: 5)")
+    parser.add_argument("--server", default=DEFAULT_BACKEND_URL, help="Your personal PC Robowski backend URL (or save in server_url.txt)")
+    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between idle status updates (default: 5)")
     parser.add_argument(
         "--enable-hardware",
         action="store_true",
         default=os.environ.get("ROBOWSKI_ENABLE_HARDWARE", "0").strip() in {"1", "true", "yes"},
-        help="Optional flag (not needed if you create robot_pin.txt)",
+        help="Enable live hardware commands (requires relay_token.txt or robot_pin.txt)",
     )
     parser.add_argument("--repo", default="", help="Optional path to robowski folder (auto-detected automatically)")
-    parser.add_argument("--token", default="", help="Optional shared secret if ROBOWSKI_RELAY_TOKEN is set on personal PC")
-    parser.add_argument("--pin", default="", help="Optional PIN (easier: just save it in robot_pin.txt)")
+    parser.add_argument("--token", default="", help="Shared relay token (easier: save in relay_token.txt)")
+    parser.add_argument("--pin", default="", help="Optional PIN (easier: save in robot_pin.txt)")
     parser.add_argument("--background", action="store_true", help="Write status and errors to robot_helper.log")
     args = parser.parse_args()
 

@@ -33,7 +33,9 @@ export const Header: React.FC = () => {
   const handleTestAndSave = async (overrideUrl?: string) => {
     const trimmed = (overrideUrl ?? urlDraft).trim();
     if (!trimmed) {
-      toast(`Enter your Lab PC server address first (e.g. ${DEFAULT_LAB_BACKEND_URL}).`);
+      toast(
+        `Enter your Lab PC server address first (e.g. ${DEFAULT_LAB_BACKEND_URL || 'http://localhost:8000 or https://your-lab-pc.ts.net'}).`
+      );
       return;
     }
     setUrlDraft(trimmed);
@@ -360,15 +362,17 @@ export const Header: React.FC = () => {
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '11.5px', color: 'var(--mut)' }}>
               <span>Quick select:</span>
-              <button
-                type="button"
-                className="btn sm"
-                disabled={testing}
-                onClick={() => handleTestAndSave(DEFAULT_LAB_BACKEND_URL)}
-                style={{ padding: '2px 8px', fontSize: '11px' }}
-              >
-                Default ({DEFAULT_LAB_BACKEND_URL.replace(/^https?:\/\//, '')})
-              </button>
+              {DEFAULT_LAB_BACKEND_URL && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={testing}
+                  onClick={() => handleTestAndSave(DEFAULT_LAB_BACKEND_URL)}
+                  style={{ padding: '2px 8px', fontSize: '11px' }}
+                >
+                  Default ({DEFAULT_LAB_BACKEND_URL.replace(/^https?:\/\//, '')})
+                </button>
+              )}
               <button
                 type="button"
                 className="btn sm"

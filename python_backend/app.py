@@ -77,6 +77,25 @@ app.add_middleware(
 # Local disk paths & SQLite database
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from robot_safety import (  # noqa: E402
+    ALLOWED_COMMANDS as _ALLOWED_COMMANDS,
+    ALLOWED_SOLVENTS as _ALLOWED_SOLVENTS,
+    COMMANDS_ALLOWED_WITHOUT_HOMING as _COMMANDS_ALLOWED_WITHOUT_HOMING,
+    MAX_CUSTOM_PRESETS as _MAX_CUSTOM_PRESETS,
+    PinRateLimiter,
+    apply_custom_xy_to_container as _apply_custom_xy_to_container,
+    compute_preset_well_xy as _compute_preset_well_xy,
+    format_well_name as _format_well_name,
+    normalize_plate_preset as _normalize_plate_preset_raw,
+    resolve_and_validate_tip_and_volume,
+    sign_relay_command,
+    validate_robot_command_params,
+    validate_solvent,
+)
+
 DATA_DIR = Path(os.environ.get("ROBOWSKI_DATA_DIR", str(BASE_DIR / "data")))
 TLC_IMG_DIR = DATA_DIR / "tlc_images"
 ARCHIVE_DIR = DATA_DIR / "archives"
@@ -1174,6 +1193,20 @@ def api_export_tlc_csv() -> str:
 # ---------------------------------------------------------------------------
 # 9. Live Robot Status Monitor, Excel Progress & Safe Hardware Command Bridge
 # ---------------------------------------------------------------------------
+def _read_optional_config_file(filename: str) -> str:
+    p = BASE_DIR / filename
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            clean = line.strip()
+            if clean and not clean.startswith("#"):
+                return clean
+    except OSError:
+        return ""
+    return ""
+
+
 ROBOT_NAME = os.environ.get("PIPETTER_NAME", "Robowski#2").strip() or "Robowski#2"
 ROBOCHEM_DATA_ENV = os.environ.get("ROBOCHEM_DATA_PATH", "").strip()
 ROBOWSKI_REPO_ENV = os.environ.get("ROBOWSKI_REPO_PATH", "").strip()
@@ -1185,7 +1218,12 @@ ROBOWSKI_ENABLE_HARDWARE = os.environ.get("ROBOWSKI_ENABLE_HARDWARE", "0").strip
     "yes",
     "on",
 }
-ROBOWSKI_CONTROL_PIN = os.environ.get("ROBOWSKI_CONTROL_PIN", "").strip()
+ROBOWSKI_CONTROL_PIN = (
+    os.environ.get("ROBOWSKI_CONTROL_PIN", "").strip()
+    or _read_optional_config_file("robot_pin.txt")
+)
+_PIN_RATE_LIMITER = PinRateLimiter(max_attempts=5, lockout_sec=300.0)
+_LOCAL_EMERGENCY_STOP = threading.Event()
 
 _BOTTLE_BOTTOM_Z = 2180.0
 _BOTTLE_AREA_MM2 = (24.6 ** 2) * 3.14 / 4.0  # 475.0506 mm^2 (breadboard.py)
@@ -1196,23 +1234,6 @@ try:
     ROBOWSKI_IDLE_RELEASE_SEC = max(0, int(os.environ.get("ROBOWSKI_IDLE_RELEASE_SEC", "300").strip() or "300"))
 except ValueError:
     ROBOWSKI_IDLE_RELEASE_SEC = 300
-
-_ALLOWED_SOLVENTS = {
-    "water",
-    "ethanol",
-    "DMF",
-    "Dioxane",
-    "DCE",
-    "MeCN",
-    "CHCl3",
-    "DMSO",
-    "glycerin",
-    "TolueneMix",
-    "serum",
-    "hbrhac1v1",
-    "waterft",
-    "ethanolft",
-}
 
 _FALLBACK_LIQUID_CLASS: Dict[tuple[str, str], int] = {
     ("water", "50ul"): 0, ("water", "300ul"): 1, ("water", "1000ul"): 2,
@@ -1247,6 +1268,7 @@ _ROBOT_HW: Dict[str, Any] = {
     "brb": None,
     "nd": None,
     "connected": False,
+    "homed": False,
     "nanodropConnected": False,
     "nanodropId": "nd_2000c",
     "nanodropLidClosed": True,
@@ -1262,101 +1284,14 @@ _ROBOT_HW: Dict[str, Any] = {
     "plateTransfer": None,
 }
 
-_WELL_ROW_LETTERS = "ABCDEFGHIJKLMNOP"
-_MAX_CUSTOM_PRESETS = 50
 _CUSTOM_PLATES_PATH = DATA_DIR / "custom_plates.json"
 
 
-def _format_well_name(well_idx: int, cols: int) -> str:
-    safe_cols = max(1, int(cols))
-    r = well_idx // safe_cols
-    c = (well_idx % safe_cols) + 1
-    row_lbl = _WELL_ROW_LETTERS[r] if 0 <= r < len(_WELL_ROW_LETTERS) else f"R{r + 1}"
-    return f"{row_lbl}{c}"
-
-
-def _parse_xy_pair(raw: Any, label: str) -> List[float]:
-    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-        raise HTTPException(status_code=400, detail=f"{label} must be an [X, Y] coordinate pair in mm.")
-    try:
-        x = float(raw[0])
-        y = float(raw[1])
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"{label} must contain valid numbers.")
-    if not (math.isfinite(x) and math.isfinite(y)):
-        raise HTTPException(status_code=400, detail=f"{label} must contain finite numbers.")
-    if not (-600.0 <= x <= 600.0 and -600.0 <= y <= 600.0):
-        raise HTTPException(status_code=400, detail=f"{label} ({x}, {y}) is outside safe deck bounds (-600 to 600 mm).")
-    return [round(x, 3), round(y, 3)]
-
-
 def _normalize_plate_preset_input(raw: Dict[str, Any]) -> Dict[str, Any]:
-    name = str(raw.get("name", "")).strip()
-    if not name or len(name) > 60:
-        raise HTTPException(status_code=400, detail="Preset name must be between 1 and 60 characters.")
     try:
-        plate_slot = int(raw.get("plate_slot", raw.get("plateSlot", 0)))
-        rows = int(raw.get("rows", 8))
-        cols = int(raw.get("cols", 12))
-        default_z = int(raw.get("default_z", raw.get("defaultZ", 1900)))
-    except Exception:
-        raise HTTPException(status_code=400, detail="plate_slot, rows, cols, and default_z must be integers.")
-    if plate_slot not in {0, 1, 2}:
-        raise HTTPException(status_code=400, detail="plate_slot must be 0, 1, or 2.")
-    if not (1 <= rows <= 16 and 1 <= cols <= 24) or (rows * cols > 384):
-        raise HTTPException(status_code=400, detail="Grid dimensions must be 1–16 rows × 1–24 columns (max 384 wells).")
-    if not (880 <= default_z <= 2190):
-        raise HTTPException(status_code=400, detail="default_z must be between 880 and 2190.")
-    a1 = _parse_xy_pair(raw.get("corner_a1", raw.get("cornerA1")), "Corner A1")
-    tr = _parse_xy_pair(raw.get("corner_top_right", raw.get("cornerTopRight")), "Top-Right corner")
-    bl = _parse_xy_pair(raw.get("corner_bottom_left", raw.get("cornerBottomLeft")), "Bottom-Left corner")
-
-    col_pitch = 0.0
-    if cols > 1:
-        col_pitch = math.hypot(tr[0] - a1[0], tr[1] - a1[1]) / float(cols - 1)
-        if not (2.0 <= col_pitch <= 80.0):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Detected column spacing ({col_pitch:.2f} mm) is outside the safe 2–80 mm range.",
-            )
-    row_pitch = 0.0
-    if rows > 1:
-        row_pitch = math.hypot(bl[0] - a1[0], bl[1] - a1[1]) / float(rows - 1)
-        if not (2.0 <= row_pitch <= 80.0):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Detected row spacing ({row_pitch:.2f} mm) is outside the safe 2–80 mm range.",
-            )
-
-    angle_deg = 0.0
-    if cols > 1:
-        dx, dy = tr[0] - a1[0], tr[1] - a1[1]
-        angle_deg = math.degrees(math.atan2(dy, abs(dx))) if abs(dx) >= abs(dy) else math.degrees(math.atan2(dx, abs(dy)))
-
-    raw_id = str(raw.get("id", "")).strip()
-    if raw_id:
-        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)[:64]
-    else:
-        base = re.sub(r"[^a-zA-Z0-9]+", "_", name.lower()).strip("_")[:36] or "plate"
-        slug = f"p{plate_slot}_{rows}x{cols}_{base}"
-    if not slug or slug == "default_54":
-        slug = f"p{plate_slot}_{rows}x{cols}_custom"
-
-    return {
-        "id": slug,
-        "name": name,
-        "plateSlot": plate_slot,
-        "rows": rows,
-        "cols": cols,
-        "cornerA1": a1,
-        "cornerTopRight": tr,
-        "cornerBottomLeft": bl,
-        "defaultZ": default_z,
-        "colPitchMm": round(col_pitch, 3),
-        "rowPitchMm": round(row_pitch, 3),
-        "angleDeg": round(angle_deg, 2),
-        "updatedAt": datetime.now(timezone.utc).isoformat(),
-    }
+        return _normalize_plate_preset_raw(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _load_local_plate_presets() -> List[Dict[str, Any]]:
@@ -1385,23 +1320,6 @@ def _get_local_preset(preset_id: str) -> Optional[Dict[str, Any]]:
         if p.get("id") == pid:
             return p
     return None
-
-
-def _compute_preset_well_xy(preset: Dict[str, Any], well_idx: int) -> Tuple[float, float]:
-    rows = int(preset["rows"])
-    cols = int(preset["cols"])
-    if not (0 <= well_idx < rows * cols):
-        raise RuntimeError(f"Well index {well_idx} is out of range for {rows}×{cols} plate.")
-    r = well_idx // cols
-    c = well_idx % cols
-    a1 = preset["cornerA1"]
-    tr = preset["cornerTopRight"]
-    bl = preset["cornerBottomLeft"]
-    u = float(c) / float(cols - 1) if cols > 1 else 0.0
-    v = float(r) / float(rows - 1) if rows > 1 else 0.0
-    x = float(a1[0]) + u * (float(tr[0]) - float(a1[0])) + v * (float(bl[0]) - float(a1[0]))
-    y = float(a1[1]) + u * (float(tr[1]) - float(a1[1])) + v * (float(bl[1]) - float(a1[1]))
-    return (round(x, 3), round(y, 3))
 
 
 def _resolve_local_plate_container(
@@ -1461,13 +1379,19 @@ def _read_local_gantry_xy(gt: Any) -> Optional[List[float]]:
 
 # Remote Robot PC Relay (allows tiny robot_pc_agent.py on the robot PC to push live status
 # to this personal PC backend without installing Tailscale on the robot PC)
-ROBOWSKI_RELAY_TOKEN = os.environ.get("ROBOWSKI_RELAY_TOKEN", "").strip()
+ROBOWSKI_RELAY_TOKEN = (
+    os.environ.get("ROBOWSKI_RELAY_TOKEN", "").strip()
+    or _read_optional_config_file("relay_token.txt")
+)
 _RELAY_LOCK = threading.Lock()
 _RELAY_STATE: Dict[str, Any] = {
     "status": None,
     "pushedAt": 0.0,
     "requestedRunPath": None,
-    "pendingCommand": None,  # {"id": str, "command": str, "params": dict, "createdAt": float}
+    "pendingCommand": None,  # signed dict: id, command, params, issuedAt, signature, createdAt, description
+    "stopSignal": None,      # high-priority signed dict for emergency_stop / plate_transfer_stop
+    "activeCommandId": None,
+    "commands": {},          # id -> {"id", "command", "description", "state", "createdAt", "startedAt", "finishedAt", "result"}
     "waiters": {},           # command_id -> {"event": threading.Event, "result": dict | None}
 }
 
@@ -1900,6 +1824,7 @@ def _disconnect_robot_hardware(position_label: str = "Disconnected (USB free for
             "pt": None,
             "brb": None,
             "connected": False,
+            "homed": False,
             "currentPosition": position_label,
             "lastActivityMono": 0.0,
             "lastError": None,
@@ -1932,8 +1857,11 @@ def _hardware_state_snapshot() -> Dict[str, Any]:
         idle_rem = max(0, int(round(ROBOWSKI_IDLE_RELEASE_SEC - elapsed)))
     pt_job = _ROBOT_HW.get("plateTransfer")
     return {
-        "controlEnabled": ROBOWSKI_ENABLE_HARDWARE,
+        "controlEnabled": bool(ROBOWSKI_ENABLE_HARDWARE and ROBOWSKI_CONTROL_PIN),
+        "pinProtected": bool(ROBOWSKI_CONTROL_PIN),
+        "relayTokenConfigured": bool(ROBOWSKI_RELAY_TOKEN),
         "connected": bool(_ROBOT_HW["connected"]),
+        "homed": bool(_ROBOT_HW.get("homed", False)),
         "nanodropConnected": bool(_ROBOT_HW.get("nanodropConnected")),
         "nanodropId": str(_ROBOT_HW.get("nanodropId") or "nd_2000c"),
         "nanodropLidClosed": bool(_ROBOT_HW.get("nanodropLidClosed", True)),
@@ -1952,15 +1880,97 @@ def _hardware_state_snapshot() -> Dict[str, Any]:
     }
 
 
+def _client_key(request: Request) -> str:
+    try:
+        if request.client and request.client.host:
+            return str(request.client.host)
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _verify_control_pin(request: Request) -> None:
+    if not ROBOWSKI_CONTROL_PIN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Control PIN is not configured on this Personal PC. "
+                "Save a PIN (6+ characters recommended) in python_backend/robot_pin.txt "
+                "or set ROBOWSKI_CONTROL_PIN to unlock live robot commands."
+            ),
+        )
+    ck = _client_key(request)
+    locked_sec = _PIN_RATE_LIMITER.check_locked(ck)
+    if locked_sec is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many wrong PIN attempts. Locked for {locked_sec} seconds.",
+        )
+    supplied = (request.headers.get("X-Robowski-Pin") or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, ROBOWSKI_CONTROL_PIN):
+        tries, lock_now = _PIN_RATE_LIMITER.record_failure(ck)
+        if lock_now is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many wrong PIN attempts. Locked for {lock_now} seconds.",
+            )
+        remaining = max(0, _PIN_RATE_LIMITER.max_attempts - tries)
+        raise HTTPException(
+            status_code=403,
+            detail=f"Wrong or missing control PIN ({remaining} attempt(s) left before 5-minute lockout).",
+        )
+    _PIN_RATE_LIMITER.record_success(ck)
+
+
 def _verify_relay_token(request: Request) -> None:
-    if ROBOWSKI_RELAY_TOKEN:
-        supplied = (request.headers.get("X-Robowski-Agent-Token") or "").strip()
-        if not hmac.compare_digest(supplied, ROBOWSKI_RELAY_TOKEN):
-            raise HTTPException(status_code=403, detail="Invalid Robot PC helper token.")
+    if not ROBOWSKI_RELAY_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Relay token is not configured on this Personal PC backend. "
+                "Save a shared secret in python_backend/relay_token.txt or set ROBOWSKI_RELAY_TOKEN."
+            ),
+        )
+    supplied = (request.headers.get("X-Robowski-Agent-Token") or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, ROBOWSKI_RELAY_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid Robot PC helper token.")
+
+
+def _prune_relay_commands_locked() -> None:
+    cmds = _RELAY_STATE["commands"]
+    if len(cmds) <= 50:
+        return
+    ordered = sorted(cmds.items(), key=lambda kv: float(kv[1].get("_createdTs", 0.0)))
+    for old_id, _rec in ordered[:-50]:
+        if old_id != _RELAY_STATE.get("activeCommandId"):
+            cmds.pop(old_id, None)
+
+
+def _active_command_snapshot_locked() -> Optional[Dict[str, Any]]:
+    cid = _RELAY_STATE.get("activeCommandId")
+    if not cid:
+        return None
+    rec = _RELAY_STATE["commands"].get(cid)
+    if not isinstance(rec, dict) or rec.get("state") not in {"queued", "running"}:
+        _RELAY_STATE["activeCommandId"] = None
+        return None
+    return {
+        "id": rec["id"],
+        "command": rec["command"],
+        "description": rec["description"],
+        "state": rec["state"],
+        "createdAt": rec["createdAt"],
+        "startedAt": rec["startedAt"],
+    }
 
 
 class RelayPushPayload(BaseModel):
     status: Dict[str, Any]
+
+
+class RelayAckPayload(BaseModel):
+    commandId: str
+    state: str = "running"
 
 
 class RelayCommandResultPayload(BaseModel):
@@ -1980,41 +1990,169 @@ def api_robot_relay_push(payload: RelayPushPayload, request: Request) -> Dict[st
     """Receives periodic live status snapshots pushed by robot_pc_agent.py on the robot PC."""
     _verify_relay_token(request)
     now = datetime.now(timezone.utc).timestamp()
+    now_iso = datetime.now(timezone.utc).isoformat()
     pending_out = None
+    stop_out = None
     with _RELAY_LOCK:
         _RELAY_STATE["status"] = payload.status
         _RELAY_STATE["pushedAt"] = now
         req_run = _RELAY_STATE["requestedRunPath"]
+
+        # Priority 1: high-priority signed stop signal (never contains PIN)
+        stop_sig = _RELAY_STATE.get("stopSignal")
+        if stop_sig is not None:
+            if now - float(stop_sig.get("createdAt", 0.0)) <= 60.0:
+                stop_out = {
+                    "id": stop_sig["id"],
+                    "command": stop_sig["command"],
+                    "params": stop_sig["params"],
+                    "issuedAt": stop_sig["issuedAt"],
+                    "signature": stop_sig["signature"],
+                }
+            _RELAY_STATE["stopSignal"] = None
+
+        # Priority 2: queued normal command (signed with HMAC, NEVER includes PIN)
         pending = _RELAY_STATE["pendingCommand"]
         if pending is not None:
-            # Hand command to the robot PC agent once (drop if expired > 30s)
-            if now - float(pending.get("createdAt", 0.0)) <= 30.0:
+            cid = pending["id"]
+            if now - float(pending.get("createdAt", 0.0)) <= 60.0:
                 pending_out = {
-                    "id": pending["id"],
+                    "id": cid,
                     "command": pending["command"],
                     "params": pending["params"],
-                    "pin": pending.get("pin", ""),
+                    "issuedAt": pending["issuedAt"],
+                    "signature": pending["signature"],
                 }
+                rec = _RELAY_STATE["commands"].get(cid)
+                if isinstance(rec, dict) and rec.get("state") == "queued":
+                    rec["state"] = "running"
+                    rec["startedAt"] = now_iso
+            else:
+                rec = _RELAY_STATE["commands"].get(cid)
+                if isinstance(rec, dict) and rec.get("state") == "queued":
+                    rec["state"] = "failed"
+                    rec["finishedAt"] = now_iso
+                    rec["result"] = {
+                        "commandId": cid,
+                        "ok": False,
+                        "executed": False,
+                        "command": pending["command"],
+                        "humanMessage": "Queued command expired before the Robot PC picked it up.",
+                        "error": "Command expired",
+                    }
+                if _RELAY_STATE.get("activeCommandId") == cid:
+                    _RELAY_STATE["activeCommandId"] = None
             _RELAY_STATE["pendingCommand"] = None
+
     return {
         "ok": True,
         "requestedRunPath": req_run,
         "pendingCommand": pending_out,
+        "stopSignal": stop_out,
     }
+
+
+@app.post("/api/robot/relay/ack")
+def api_robot_relay_ack(payload: RelayAckPayload, request: Request) -> Dict[str, Any]:
+    """Marks a handed-off command as actively running on the Robot PC."""
+    _verify_relay_token(request)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _RELAY_LOCK:
+        rec = _RELAY_STATE["commands"].get(payload.commandId)
+        if isinstance(rec, dict) and rec.get("state") in {"queued", "running"}:
+            rec["state"] = "running"
+            if not rec.get("startedAt"):
+                rec["startedAt"] = now_iso
+    return {"ok": True}
 
 
 @app.post("/api/robot/relay/result")
 def api_robot_relay_result(payload: RelayCommandResultPayload, request: Request) -> Dict[str, Any]:
     """Receives execution result for a relayed hardware command from robot_pc_agent.py."""
     _verify_relay_token(request)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    dumped = payload.model_dump()
+    final_state = "completed" if payload.ok else "failed"
+    dumped["state"] = final_state
     with _RELAY_LOCK:
+        rec = _RELAY_STATE["commands"].get(payload.commandId)
+        if isinstance(rec, dict):
+            rec["state"] = final_state
+            rec["finishedAt"] = now_iso
+            rec["result"] = dumped
+        if _RELAY_STATE.get("activeCommandId") == payload.commandId:
+            _RELAY_STATE["activeCommandId"] = None
         waiter = _RELAY_STATE["waiters"].get(payload.commandId)
         if waiter is not None:
-            waiter["result"] = payload.model_dump()
+            waiter["result"] = dumped
             waiter["event"].set()
         if payload.hardware and isinstance(_RELAY_STATE["status"], dict):
             _RELAY_STATE["status"]["hardware"] = payload.hardware
     return {"ok": True}
+
+
+@app.get("/api/robot/command/{command_id}")
+def api_robot_command_state(command_id: str) -> Dict[str, Any]:
+    """Returns the explicit tracked state (queued, running, completed, failed, cancelled) of a command."""
+    with _RELAY_LOCK:
+        rec = _RELAY_STATE["commands"].get(command_id)
+        if not isinstance(rec, dict):
+            raise HTTPException(status_code=404, detail="Command ID not found.")
+        return {
+            "ok": True,
+            "id": rec["id"],
+            "command": rec["command"],
+            "description": rec["description"],
+            "state": rec["state"],
+            "createdAt": rec["createdAt"],
+            "startedAt": rec["startedAt"],
+            "finishedAt": rec["finishedAt"],
+            "result": rec["result"],
+        }
+
+
+@app.post("/api/robot/command/{command_id}/cancel")
+def api_robot_command_cancel(command_id: str, request: Request) -> Dict[str, Any]:
+    """Cancels a queued command before the Robot PC picks it up."""
+    _verify_control_pin(request)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _RELAY_LOCK:
+        rec = _RELAY_STATE["commands"].get(command_id)
+        if not isinstance(rec, dict):
+            raise HTTPException(status_code=404, detail="Command ID not found.")
+        state = rec.get("state")
+        if state != "queued":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot cancel command because it is already '{state}'. Use Software Stop to halt an active move.",
+            )
+        pending = _RELAY_STATE.get("pendingCommand")
+        if isinstance(pending, dict) and pending.get("id") == command_id:
+            _RELAY_STATE["pendingCommand"] = None
+        if _RELAY_STATE.get("activeCommandId") == command_id:
+            _RELAY_STATE["activeCommandId"] = None
+        rec["state"] = "cancelled"
+        rec["finishedAt"] = now_iso
+        cancelled_result = {
+            "commandId": command_id,
+            "ok": False,
+            "executed": False,
+            "command": rec["command"],
+            "state": "cancelled",
+            "humanMessage": f"Cancelled queued command '{rec['description']}' before it reached the robot.",
+        }
+        rec["result"] = cancelled_result
+        waiter = _RELAY_STATE["waiters"].get(command_id)
+        if waiter is not None:
+            waiter["result"] = cancelled_result
+            waiter["event"].set()
+    return {
+        "ok": True,
+        "cancelled": True,
+        "commandId": command_id,
+        "state": "cancelled",
+        "humanMessage": cancelled_result["humanMessage"],
+    }
 
 
 @app.get("/api/robot/status")
@@ -2025,6 +2163,7 @@ def api_robot_status(run_path: Optional[str] = Query(default=None)) -> Dict[str,
             _RELAY_STATE["requestedRunPath"] = run_path.strip() or None
         relayed = copy.deepcopy(_RELAY_STATE["status"]) if _RELAY_STATE["status"] else None
         pushed_at = float(_RELAY_STATE["pushedAt"] or 0.0)
+        active_cmd = _active_command_snapshot_locked()
 
     if relayed is not None and pushed_at > 0:
         age = max(0, int(datetime.now(timezone.utc).timestamp() - pushed_at))
@@ -2032,6 +2171,7 @@ def api_robot_status(run_path: Optional[str] = Query(default=None)) -> Dict[str,
         relayed["relaySource"] = "robot_pc_agent"
         relayed["agentOnline"] = agent_online
         relayed["agentLastSeenSecondsAgo"] = age
+        relayed["activeCommand"] = active_cmd
         if not agent_online:
             relayed["state"] = "not_configured"
             mins = max(1, age // 60)
@@ -2287,275 +2427,14 @@ def _command_snippet(cmd: str, p: Dict[str, Any]) -> tuple[str, str]:
 
 
 def _validate_command_params(cmd: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    clean: Dict[str, Any] = {}
-    if cmd in {"pick_tip", "change_tip", "reload_tip_rack", "mark_tips_used"}:
-        tt = str(params.get("tip_type", "300ul")).strip()
-        if tt not in {"50ul", "300ul", "1000ul"}:
-            raise HTTPException(status_code=400, detail="tip_type must be 50ul, 300ul, or 1000ul")
-        clean["tip_type"] = tt
-    if cmd == "mark_tips_used":
-        try:
-            cnt = int(params.get("count", 1))
-        except Exception:
-            raise HTTPException(status_code=400, detail="count must be an integer between 1 and 96")
-        if cnt < 1 or cnt > 96:
-            raise HTTPException(status_code=400, detail="count must be between 1 and 96")
-        clean["count"] = cnt
-    if cmd in {"move_to_container", "check_liquid_level"}:
-        try:
-            plate_id = int(params.get("plate_id", 0))
-            container_id = int(params.get("container_id", 0))
-        except Exception:
-            raise HTTPException(status_code=400, detail="plate_id and container_id must be integers")
-        if plate_id < 0 or plate_id > 7:
-            raise HTTPException(status_code=400, detail="plate_id must be between 0 and 7")
-        max_c = 53 if plate_id <= 2 else (7 if plate_id <= 5 else 1)
-        if container_id < 0 or container_id > max_c:
-            raise HTTPException(status_code=400, detail=f"container_id for plate{plate_id} must be between 0 and {max_c}")
-        clean["plate_id"] = plate_id
-        clean["container_id"] = container_id
-    if cmd == "move_xy_rel":
-        try:
-            dx = float(params.get("dx", 0))
-            dy = float(params.get("dy", 0))
-        except Exception:
-            raise HTTPException(status_code=400, detail="dx and dy must be numbers")
-        if not (-100.0 <= dx <= 100.0 and -100.0 <= dy <= 100.0):
-            raise HTTPException(status_code=400, detail="Relative jog must stay within ±100 mm per click for safety")
-        clean["dx"] = round(dx, 2)
-        clean["dy"] = round(dy, 2)
-    if cmd == "move_z":
-        try:
-            z = int(params.get("z", 880))
-        except Exception:
-            raise HTTPException(status_code=400, detail="z must be an integer between 500 and 2200")
-        if z < 500 or z > 2200:
-            raise HTTPException(status_code=400, detail="Z height must stay between 500 (top) and 2200 (just above bottom) for safety")
-        clean["z"] = z
-    if cmd == "move_z_rel":
-        try:
-            dz = int(params.get("dz", 0))
-        except Exception:
-            raise HTTPException(status_code=400, detail="dz must be an integer between -300 and +300")
-        if dz < -300 or dz > 300:
-            raise HTTPException(status_code=400, detail="Z step must stay within ±30 mm (±300 units) per click for safety")
-        clean["dz"] = dz
-    if cmd == "single_transfer":
-        try:
-            src_plate = int(params.get("src_plate", 3))
-            src_slot = int(params.get("src_slot", 0))
-            dst_plate = int(params.get("dst_plate", 0))
-            dst_slot = int(params.get("dst_slot", 0))
-            vol_ul = float(params.get("volume_ul", 100.0))
-            src_z = int(params.get("src_z", 1900))
-            dst_z = int(params.get("dst_z", 2100))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid numeric transfer parameters.")
-        if not (0 <= src_plate <= 7 and 0 <= dst_plate <= 7):
-            raise HTTPException(status_code=400, detail="Source and destination plates must be between 0 and 7.")
-        src_preset_id = str(params.get("src_preset_id", "default_54")).strip() or "default_54"
-        dst_preset_id = str(params.get("dst_preset_id", "default_54")).strip() or "default_54"
-        if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", src_preset_id) or not re.match(r"^[a-zA-Z0-9_-]{1,64}$", dst_preset_id):
-            raise HTTPException(status_code=400, detail="Invalid plate preset ID.")
-        src_max = (383 if src_preset_id != "default_54" else 53) if src_plate <= 2 else (7 if src_plate <= 5 else 1)
-        dst_max = (383 if dst_preset_id != "default_54" else 53) if dst_plate <= 2 else (7 if dst_plate <= 5 else 1)
-        if not (0 <= src_slot <= src_max and 0 <= dst_slot <= dst_max):
-            raise HTTPException(status_code=400, detail="Source or destination slot is out of range for that plate.")
-        if not (1.0 <= vol_ul <= 2000.0):
-            raise HTTPException(status_code=400, detail="Transfer volume must be between 1 and 2000 µL.")
-        if not (880 <= src_z <= 2190 and 880 <= dst_z <= 2190):
-            raise HTTPException(status_code=400, detail="Liquid surface Z heights must be between 880 and 2190.")
-        solvent = str(params.get("solvent", "ethanol")).strip()
-        if solvent not in _ALLOWED_SOLVENTS:
-            raise HTTPException(status_code=400, detail=f"Unsupported solvent '{solvent}'.")
-        tip_type = str(params.get("tip_type", "auto")).strip()
-        if tip_type not in {"auto", "50ul", "300ul", "1000ul"}:
-            raise HTTPException(status_code=400, detail="tip_type must be auto, 50ul, 300ul, or 1000ul.")
-        clean.update(
-            {
-                "src_plate": src_plate,
-                "src_slot": src_slot,
-                "src_preset_id": src_preset_id,
-                "dst_plate": dst_plate,
-                "dst_slot": dst_slot,
-                "dst_preset_id": dst_preset_id,
-                "volume_ul": round(vol_ul, 2),
-                "solvent": solvent,
-                "tip_type": tip_type,
-                "src_z": src_z,
-                "dst_z": dst_z,
-                "pick_tip": bool(params.get("pick_tip", True)),
-                "prewet": bool(params.get("prewet", False)),
-                "mix_after": bool(params.get("mix_after", False)),
-                "drop_tip": bool(params.get("drop_tip", True)),
-            }
-        )
-    if cmd == "plate_transfer_start":
-        try:
-            src_plate = int(params.get("src_plate", 0))
-            dst_plate = int(params.get("dst_plate", 1))
-            vol_ul = float(params.get("volume_ul", 50.0))
-            src_z = int(params.get("src_z", 2100))
-            dst_z = int(params.get("dst_z", 2100))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid numeric plate transfer parameters.")
-        if src_plate not in {0, 1, 2} or dst_plate not in {0, 1, 2}:
-            raise HTTPException(status_code=400, detail="Plate-to-plate transfer uses plates 0, 1, or 2.")
-        if src_plate == dst_plate:
-            raise HTTPException(status_code=400, detail="Source plate and destination plate must be different.")
-        src_preset_id = str(params.get("src_preset_id", "default_54")).strip() or "default_54"
-        dst_preset_id = str(params.get("dst_preset_id", "default_54")).strip() or "default_54"
-        if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", src_preset_id) or not re.match(r"^[a-zA-Z0-9_-]{1,64}$", dst_preset_id):
-            raise HTTPException(status_code=400, detail="Invalid plate preset ID.")
-        if not (1.0 <= vol_ul <= 2000.0):
-            raise HTTPException(status_code=400, detail="Transfer volume must be between 1 and 2000 µL.")
-        if not (880 <= src_z <= 2190 and 880 <= dst_z <= 2190):
-            raise HTTPException(status_code=400, detail="Liquid surface Z heights must be between 880 and 2190.")
-
-        raw_pairs = params.get("pairs")
-        pairs: List[List[int]] = []
-        if isinstance(raw_pairs, list) and len(raw_pairs) > 0:
-            if len(raw_pairs) > 384:
-                raise HTTPException(status_code=400, detail="Maximum 384 well transfers per job.")
-            seen_p: set[tuple[int, int]] = set()
-            for item in raw_pairs:
-                if not isinstance(item, (list, tuple)) or len(item) != 2:
-                    raise HTTPException(status_code=400, detail="Each transfer pair must be [srcWell, dstWell].")
-                try:
-                    sw, dw = int(item[0]), int(item[1])
-                except Exception:
-                    raise HTTPException(status_code=400, detail="Well indices must be integers.")
-                if not (0 <= sw <= 383 and 0 <= dw <= 383):
-                    raise HTTPException(status_code=400, detail="Well indices must be between 0 and 383.")
-                if (sw, dw) not in seen_p:
-                    seen_p.add((sw, dw))
-                    pairs.append([sw, dw])
-            wells = [p[0] for p in pairs]
-        else:
-            raw_wells = params.get("wells")
-            if raw_wells is None:
-                wells = list(range(54))
-            elif isinstance(raw_wells, list):
-                wells_set = set()
-                for w in raw_wells:
-                    try:
-                        wi = int(w)
-                    except Exception:
-                        raise HTTPException(status_code=400, detail="Well indices must be integers.")
-                    if wi < 0 or wi > 383:
-                        raise HTTPException(status_code=400, detail="Well indices must be between 0 and 383.")
-                    wells_set.add(wi)
-                wells = sorted(wells_set)
-            else:
-                raise HTTPException(status_code=400, detail="wells must be a list of well indices.")
-            pairs = [[w, w] for w in wells]
-        if not pairs:
-            raise HTTPException(status_code=400, detail="Select at least one well to transfer.")
-        solvent = str(params.get("solvent", "ethanol")).strip()
-        if solvent not in _ALLOWED_SOLVENTS:
-            raise HTTPException(status_code=400, detail=f"Unsupported solvent '{solvent}'.")
-        tip_type = str(params.get("tip_type", "auto")).strip()
-        if tip_type not in {"auto", "50ul", "300ul", "1000ul"}:
-            raise HTTPException(status_code=400, detail="tip_type must be auto, 50ul, 300ul, or 1000ul.")
-        clean.update(
-            {
-                "src_plate": src_plate,
-                "dst_plate": dst_plate,
-                "src_preset_id": src_preset_id,
-                "dst_preset_id": dst_preset_id,
-                "wells": wells,
-                "pairs": pairs,
-                "volume_ul": round(vol_ul, 2),
-                "solvent": solvent,
-                "tip_type": tip_type,
-                "src_z": src_z,
-                "dst_z": dst_z,
-                "change_tip_each_vial": bool(params.get("change_tip_each_vial", True)),
-                "prewet": bool(params.get("prewet", False)),
-                "mix_after": bool(params.get("mix_after", False)),
-                "drop_tip_at_end": bool(params.get("drop_tip_at_end", True)),
-            }
-        )
-    if cmd == "save_plate_preset":
-        norm = _normalize_plate_preset_input(params)
-        clean.update(
-            {
-                "id": norm["id"],
-                "name": norm["name"],
-                "plate_slot": norm["plateSlot"],
-                "rows": norm["rows"],
-                "cols": norm["cols"],
-                "corner_a1": norm["cornerA1"],
-                "corner_top_right": norm["cornerTopRight"],
-                "corner_bottom_left": norm["cornerBottomLeft"],
-                "default_z": norm["defaultZ"],
-            }
-        )
-    if cmd == "delete_plate_preset":
-        pid = str(params.get("id", "")).strip()
-        if not pid or not re.match(r"^[a-zA-Z0-9_-]{1,64}$", pid):
-            raise HTTPException(status_code=400, detail="Invalid plate preset ID.")
-        clean["id"] = pid
-    if cmd == "move_to_plate_well":
-        try:
-            pl = int(params.get("plate_id", 0))
-            wi = int(params.get("well_index", 0))
-        except Exception:
-            raise HTTPException(status_code=400, detail="plate_id and well_index must be integers.")
-        if pl not in {0, 1, 2}:
-            raise HTTPException(status_code=400, detail="plate_id must be 0, 1, or 2.")
-        if not (0 <= wi <= 383):
-            raise HTTPException(status_code=400, detail="well_index must be between 0 and 383.")
-        clean["plate_id"] = pl
-        clean["well_index"] = wi
-        if params.get("corner_a1") is not None and params.get("corner_top_right") is not None and params.get("corner_bottom_left") is not None:
-            norm = _normalize_plate_preset_input(
-                {
-                    "name": "Test preview",
-                    "plate_slot": pl,
-                    "rows": params.get("rows", 8),
-                    "cols": params.get("cols", 12),
-                    "corner_a1": params.get("corner_a1"),
-                    "corner_top_right": params.get("corner_top_right"),
-                    "corner_bottom_left": params.get("corner_bottom_left"),
-                    "default_z": params.get("default_z", 1900),
-                }
-            )
-            if wi >= norm["rows"] * norm["cols"]:
-                raise HTTPException(status_code=400, detail="well_index exceeds rows × cols.")
-            clean.update(
-                {
-                    "rows": norm["rows"],
-                    "cols": norm["cols"],
-                    "corner_a1": norm["cornerA1"],
-                    "corner_top_right": norm["cornerTopRight"],
-                    "corner_bottom_left": norm["cornerBottomLeft"],
-                    "default_z": norm["defaultZ"],
-                }
-            )
-        else:
-            pid = str(params.get("preset_id", "default_54")).strip() or "default_54"
-            if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", pid):
-                raise HTTPException(status_code=400, detail="Invalid preset_id.")
-            clean["preset_id"] = pid
-    if cmd in {
-        "nanodrop_connect",
-        "nanodrop_lid_open",
-        "nanodrop_lid_close",
-        "nanodrop_lid_half_open",
-        "nanodrop_flush",
-        "nanodrop_dry",
-        "nanodrop_wash_cycle",
-        "nanodrop_close_all",
-    }:
-        nd_id = str(params.get("nd_id", "nd_2000c")).strip()
-        if nd_id not in {"nd_2000c", "nd_2000"}:
-            raise HTTPException(status_code=400, detail="nd_id must be nd_2000c or nd_2000.")
-        clean["nd_id"] = nd_id
-    return clean
+    try:
+        return validate_robot_command_params(cmd, params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _ensure_robot_hardware_loaded() -> None:
+def _connect_local_robot_hardware_only() -> None:
+    """Connects to local Zeus/Gantry/Pipetter WITHOUT auto-homing XY."""
     if _ROBOT_HW["connected"] and _ROBOT_HW["pt"] is not None:
         return
     if not ROBOWSKI_REPO_ENV:
@@ -2578,7 +2457,6 @@ def _ensure_robot_hardware_loaded() -> None:
 
     zm = zeus.ZeusModule(id=1)
     gt = pipetter.Gantry(zeus=zm)
-    gt.home_xy()
     pt = pipetter.Pipetter(zeus=zm, gantry=gt)
     _ROBOT_HW.update(
         {
@@ -2587,11 +2465,33 @@ def _ensure_robot_hardware_loaded() -> None:
             "pt": pt,
             "brb": brb,
             "connected": True,
+            "homed": False,
             "currentTip": getattr(zm, "tip_on_zeus", "") or "",
-            "currentPosition": "Home (0, 0)",
+            "currentPosition": "Connected (not homed yet)",
             "lastError": None,
         }
     )
+
+
+def _safe_local_home_xy(zm: Any, gt: Any) -> None:
+    if hasattr(zm, "move_zeus_to_traverse_height"):
+        zm.move_zeus_to_traverse_height()
+    tip_present = False
+    try:
+        if hasattr(zm, "getTipPresenceStatus"):
+            tip_present = bool(zm.getTipPresenceStatus())
+    except Exception:
+        tip_present = False
+    if tip_present or bool(getattr(zm, "tip_on_zeus", "")):
+        raise RuntimeError(
+            "Cannot home while a pipette tip is attached! "
+            "Click 'Drop Tip' first (or remove the tip manually), then click 'Connect & Home'."
+        )
+    gt.home_xy()
+    _ROBOT_HW["homed"] = True
+    _ROBOT_HW["currentPosition"] = "Home (0, 0)"
+    _ROBOT_HW["currentXY"] = [0.0, 0.0]
+    _ROBOT_HW["currentZ"] = int(getattr(zm, "pos", None) or getattr(zm, "ZeusTraversePosition", 880))
 
 
 def _ensure_nanodrop_loaded(nd_id: str = "nd_2000c") -> Any:
@@ -2640,13 +2540,9 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
     clean = _validate_command_params(cmd, req.params or {})
     desc, snippet = _command_snippet(cmd, clean)
 
-    supplied_pin = (request.headers.get("X-Robowski-Pin") or "").strip()
-    if ROBOWSKI_CONTROL_PIN:
-        if not hmac.compare_digest(supplied_pin, ROBOWSKI_CONTROL_PIN):
-            raise HTTPException(status_code=403, detail="Control PIN required to send live robot commands.")
-
-    # If a remote Robot PC helper is actively connected, relay the command to it
+    # Check if a remote Robot PC helper is actively connected
     now = datetime.now(timezone.utc).timestamp()
+    now_iso = datetime.now(timezone.utc).isoformat()
     with _RELAY_LOCK:
         relayed_status = _RELAY_STATE["status"]
         relayed_age = now - float(_RELAY_STATE["pushedAt"] or 0.0)
@@ -2663,52 +2559,103 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
                 "command": cmd,
                 "humanMessage": (
                     f"Safe monitor mode: '{desc}' was not sent to the robot arm. "
-                    "To unlock live buttons with just a PIN, save your PIN in a file called robot_pin.txt next to robot_pc_agent.py on the robot PC."
+                    "Save a shared relay token in relay_token.txt on both PCs and a PIN in robot_pin.txt on your Personal PC to unlock live buttons."
                 ),
                 "pythonSnippet": snippet,
                 "hardware": relayed_status.get("hardware"),
             }
 
+        # Verify user's PIN locally on Personal PC (with 5-try / 5-min lockout) and NEVER send the PIN over the relay
+        _verify_control_pin(request)
+        if not ROBOWSKI_RELAY_TOKEN:
+            raise HTTPException(
+                status_code=503,
+                detail="Relay token is not configured on this Personal PC. Save it in python_backend/relay_token.txt.",
+            )
+
         cmd_id = uuid.uuid4().hex
+        issued_at = round(now, 3)
+        signature = sign_relay_command(ROBOWSKI_RELAY_TOKEN, cmd_id, cmd, clean, issued_at)
         ev = threading.Event()
+        is_stop_cmd = cmd in {"emergency_stop", "plate_transfer_stop"}
+
         with _RELAY_LOCK:
-            if _RELAY_STATE["pendingCommand"] is not None:
-                raise HTTPException(status_code=409, detail="Robot PC is already running the previous command. Wait a moment and try again.")
-            _RELAY_STATE["pendingCommand"] = {
+            if not is_stop_cmd:
+                active_id = _RELAY_STATE.get("activeCommandId")
+                active_rec = _RELAY_STATE["commands"].get(active_id) if active_id else None
+                if (
+                    _RELAY_STATE["pendingCommand"] is not None
+                    or (isinstance(active_rec, dict) and active_rec.get("state") in {"queued", "running"})
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Another robot command is currently queued or running. Wait for it to finish, cancel it, or click Software Stop.",
+                    )
+
+            signed_envelope = {
                 "id": cmd_id,
                 "command": cmd,
                 "params": clean,
-                "pin": supplied_pin,
+                "issuedAt": issued_at,
+                "signature": signature,
                 "createdAt": now,
+                "description": desc,
             }
+            _RELAY_STATE["commands"][cmd_id] = {
+                "id": cmd_id,
+                "command": cmd,
+                "description": desc,
+                "state": "queued",
+                "createdAt": now_iso,
+                "startedAt": None,
+                "finishedAt": None,
+                "result": None,
+                "_createdTs": now,
+            }
+            _prune_relay_commands_locked()
+            if is_stop_cmd:
+                # High-priority channel bypasses normal queue and busy checks
+                _RELAY_STATE["stopSignal"] = signed_envelope
+            else:
+                _RELAY_STATE["pendingCommand"] = signed_envelope
+                _RELAY_STATE["activeCommandId"] = cmd_id
             _RELAY_STATE["waiters"][cmd_id] = {"event": ev, "result": None}
 
-        wait_timeout = 65.0 if cmd in _LONG_ROBOT_COMMANDS else 22.0
+        wait_timeout = 8.0 if is_stop_cmd else (65.0 if cmd in _LONG_ROBOT_COMMANDS else 22.0)
         try:
             finished = ev.wait(timeout=wait_timeout)
             with _RELAY_LOCK:
                 waiter = _RELAY_STATE["waiters"].pop(cmd_id, None)
-                if _RELAY_STATE["pendingCommand"] and _RELAY_STATE["pendingCommand"].get("id") == cmd_id:
-                    _RELAY_STATE["pendingCommand"] = None
+                rec = _RELAY_STATE["commands"].get(cmd_id)
+                cur_state = rec.get("state", "queued") if isinstance(rec, dict) else "queued"
             if finished and waiter and waiter.get("result"):
                 res = waiter["result"]
+                res.setdefault("commandId", cmd_id)
+                res.setdefault("state", cur_state)
                 if not res.get("pythonSnippet"):
                     res["pythonSnippet"] = snippet
                 return res
+            # Explicit tracked pending state instead of a misleading timeout error
             return {
-                "ok": False,
+                "ok": True,
                 "executed": False,
+                "pending": True,
+                "commandId": cmd_id,
                 "command": cmd,
-                "humanMessage": f"The robot PC did not reply within {int(wait_timeout)} seconds — check the hood and live status.",
+                "state": cur_state,
+                "humanMessage": (
+                    f"Software Stop sent (ID #{cmd_id[:6]}) — waiting for Robot PC confirmation."
+                    if is_stop_cmd
+                    else f"'{desc}' is still {cur_state} on the Robot PC (ID #{cmd_id[:6]}). Watch the live status banner instead of clicking again."
+                ),
                 "pythonSnippet": snippet,
-                "error": "Relay timeout",
             }
         except Exception as exc:
             with _RELAY_LOCK:
                 _RELAY_STATE["waiters"].pop(cmd_id, None)
             raise HTTPException(status_code=500, detail=str(exc))
 
-    # Tip-rack JSON helpers can work directly on tip_rack.json if hardware control is enabled
+    # Local direct hardware mode
     if not ROBOWSKI_ENABLE_HARDWARE:
         return {
             "ok": True,
@@ -2716,10 +2663,43 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
             "command": cmd,
             "humanMessage": (
                 f"Read-only monitor mode: '{desc}' was not sent to the physical robot. "
-                "Run robot_pc_agent.py --enable-hardware on the robot PC (or ROBOWSKI_ENABLE_HARDWARE=1 locally) "
+                "Run robot_pc_agent.py on the robot PC (with relay_token.txt + robot_pin.txt) "
                 "to run live commands, or copy the Python snippet below."
             ),
             "pythonSnippet": snippet,
+            "hardware": _hardware_state_snapshot(),
+        }
+
+    # Close PIN-less backdoor: local live hardware ALWAYS requires a configured PIN
+    _verify_control_pin(request)
+
+    # Pre-emptive Software Stop fires immediately WITHOUT waiting for _ROBOT_HW_LOCK
+    if cmd == "emergency_stop":
+        _LOCAL_EMERGENCY_STOP.set()
+        _PLATE_TRANSFER_STOP.set()
+        zm = _ROBOT_HW.get("zm")
+        stop_err: Optional[str] = None
+        if zm is not None and hasattr(zm, "setEmergencyStop"):
+            try:
+                zm.setEmergencyStop(1)
+            except Exception as exc:
+                stop_err = str(exc)
+        job = _ROBOT_HW.get("plateTransfer")
+        if isinstance(job, dict) and job.get("active"):
+            job["message"] = "Software Stop triggered — halting transfer immediately."
+        _ROBOT_HW["lastCommand"] = desc
+        _ROBOT_HW["lastCommandAt"] = now_iso
+        return {
+            "ok": stop_err is None,
+            "executed": True,
+            "command": cmd,
+            "humanMessage": (
+                f"Software Stop flag set, but Zeus reported: {stop_err}. Use the physical E-stop if still moving."
+                if stop_err
+                else "Software Stop sent immediately to Zeus pipetter."
+            ),
+            "pythonSnippet": snippet,
+            "error": stop_err,
             "hardware": _hardware_state_snapshot(),
         }
 
@@ -2747,11 +2727,12 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
         }
 
     if not _ROBOT_HW_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Robot is busy finishing the previous command. Wait a moment and try again.")
+        raise HTTPException(status_code=409, detail="Robot is busy finishing the previous command. Wait a moment or click Software Stop.")
 
+    _LOCAL_EMERGENCY_STOP.clear()
     _ROBOT_HW["busy"] = True
     _ROBOT_HW["lastCommand"] = desc
-    _ROBOT_HW["lastCommandAt"] = datetime.now(timezone.utc).isoformat()
+    _ROBOT_HW["lastCommandAt"] = now_iso
     _ROBOT_HW["lastActivityMono"] = time.monotonic()
     result_data: Dict[str, Any] = {}
     human_msg = f"Completed: {desc}"
@@ -2860,16 +2841,21 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
             result_data["platePresets"] = new_presets
             human_msg = f"Deleted plate preset '{clean['id']}'."
         else:
-            _ensure_robot_hardware_loaded()
+            if cmd in _COMMANDS_ALLOWED_WITHOUT_HOMING:
+                _connect_local_robot_hardware_only()
+            else:
+                if not _ROBOT_HW["connected"] or not _ROBOT_HW.get("homed"):
+                    raise RuntimeError(
+                        "Robot is not connected & homed yet (or was released after being idle). "
+                        "Verify the deck is clear and click 'Connect & Home' first."
+                    )
             zm, gt, pt, brb = _ROBOT_HW["zm"], _ROBOT_HW["gt"], _ROBOT_HW["pt"], _ROBOT_HW["brb"]
 
             if cmd == "init_hardware":
-                _ROBOT_HW["currentXY"] = [0.0, 0.0]
+                _safe_local_home_xy(zm, gt)
                 human_msg = f"Connected to {ROBOT_NAME} and homed arm to (0, 0)."
             elif cmd == "home_xy":
-                gt.home_xy()
-                _ROBOT_HW["currentPosition"] = "Home (0, 0)"
-                _ROBOT_HW["currentXY"] = [0.0, 0.0]
+                _safe_local_home_xy(zm, gt)
                 human_msg = "Moved pipetter arm back to home (0, 0)."
             elif cmd == "move_idle":
                 gt.move_to_idle_position()
@@ -2883,9 +2869,6 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
             elif cmd == "kill_alarm":
                 gt.kill_alarm()
                 human_msg = "Cleared gantry alarm lock."
-            elif cmd == "emergency_stop":
-                zm.setEmergencyStop(1)
-                human_msg = "Emergency stop triggered on Zeus pipetter."
             elif cmd == "pick_tip":
                 pt.pick_tip(clean["tip_type"])
                 _ROBOT_HW["currentTip"] = clean["tip_type"]
@@ -3130,9 +3113,9 @@ def api_robot_command(req: RobotCommandRequest, request: Request) -> Dict[str, A
                             _ROBOT_HW["currentTip"] = tip_type
 
                         for idx_i, pair in enumerate(pairs):
-                            if _PLATE_TRANSFER_STOP.is_set():
+                            if _PLATE_TRANSFER_STOP.is_set() or _LOCAL_EMERGENCY_STOP.is_set():
                                 job_state["state"] = "stopped"
-                                job_state["message"] = f"Stopped cleanly after {job_state['completedWells']} of {len(pairs)} wells."
+                                job_state["message"] = f"Stopped after {job_state['completedWells']} of {len(pairs)} wells."
                                 break
                             src_w, dst_w = pair[0], pair[1]
                             src_code = _format_well_name(src_w, src_cols)

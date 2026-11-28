@@ -42,6 +42,7 @@ import {
   type DiluterPlanInput,
 } from '../../engine';
 import {
+  cancelQueuedRobotCommand,
   fetchRobotLiveStatus,
   sendRobotCommand,
   type RobotCommandResult,
@@ -210,7 +211,6 @@ export const RobotView: React.FC = () => {
   const [controlPin, setControlPin] = useState<string>('');
   const [cmdBusy, setCmdBusy] = useState<boolean>(false);
   const [lastCmdResult, setLastCmdResult] = useState<RobotCommandResult | null>(null);
-  const [confirmEstop, setConfirmEstop] = useState<boolean>(false);
   const [targetPlate, setTargetPlate] = useState<number>(3);
   const [targetSlot, setTargetSlot] = useState<number>(0);
   const [jogStepMm, setJogStepMm] = useState<5 | 20>(5);
@@ -289,7 +289,6 @@ export const RobotView: React.FC = () => {
   const runCommand = useCallback(
     async (command: string, params: Record<string, any> = {}): Promise<RobotCommandResult> => {
       setCmdBusy(true);
-      setConfirmEstop(false);
       const res = await sendRobotCommand(command, params, backendUrl || undefined, controlPin || undefined);
       setLastCmdResult(res);
       setCmdBusy(false);
@@ -297,14 +296,40 @@ export const RobotView: React.FC = () => {
         if (res.hardware) {
           setLiveStatus((prev) => (prev ? { ...prev, hardware: res.hardware! } : prev));
         }
-        toast(res.executed ? res.humanMessage : 'Preview snippet ready (read-only monitor mode).');
-        if (res.executed) {
+        if (res.pending) {
+          toast(res.humanMessage || 'Command is still running on the Robot PC.');
           refreshStatus(true);
+        } else {
+          toast(res.executed ? res.humanMessage : 'Preview snippet ready (read-only monitor mode).');
+          if (res.executed) {
+            refreshStatus(true);
+          }
         }
       } else {
         toast(res.humanMessage || 'Robot command failed.');
       }
       return res;
+    },
+    [backendUrl, controlPin, refreshStatus, toast]
+  );
+
+  // Pre-emptive 1-tap Software Stop: never blocked by cmdBusy so it can interrupt an active move immediately.
+  const sendSoftwareStop = useCallback(async (): Promise<RobotCommandResult> => {
+    const res = await sendRobotCommand('emergency_stop', {}, backendUrl || undefined, controlPin || undefined);
+    setLastCmdResult(res);
+    if (res.hardware) {
+      setLiveStatus((prev) => (prev ? { ...prev, hardware: res.hardware! } : prev));
+    }
+    toast(res.humanMessage || (res.ok ? 'Software Stop sent to the robot.' : 'Software Stop failed — use the physical E-stop switch!'));
+    refreshStatus(true);
+    return res;
+  }, [backendUrl, controlPin, refreshStatus, toast]);
+
+  const handleCancelQueuedCommand = useCallback(
+    async (commandId: string) => {
+      const res = await cancelQueuedRobotCommand(commandId, backendUrl || undefined, controlPin || undefined);
+      toast(res.humanMessage);
+      refreshStatus(true);
     },
     [backendUrl, controlPin, refreshStatus, toast]
   );
@@ -1358,10 +1383,8 @@ export const RobotView: React.FC = () => {
               <span className="mono">zeus.py</span>, and <span className="mono">breadboard.py</span>
               .{' '}
               {hw?.controlEnabled
-                ? hw?.pinProtected
-                  ? 'Live buttons are ready — enter your PIN on the right to move the robot.'
-                  : 'Live hardware mode is ON — buttons move the robot immediately.'
-                : 'Currently in safe monitor mode — save a PIN in robot_pin.txt on the Robot PC to unlock live buttons.'}
+                ? 'Live buttons are ready — enter your PIN on the right to move the robot.'
+                : 'Currently in safe monitor mode — save a shared token in relay_token.txt (both PCs) and a PIN in robot_pin.txt (Personal PC) to unlock live buttons.'}
             </p>
           </div>
 
@@ -1380,17 +1403,16 @@ export const RobotView: React.FC = () => {
               <Smartphone size={13} />
               <span>Phone Remote</span>
             </button>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '1 1 150px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '1 1 160px' }}>
               <Lock size={14} style={{ color: 'var(--mut)', flexShrink: 0 }} />
               <input
                 type="password"
-                inputMode="numeric"
                 value={controlPin}
                 onChange={(e) => setControlPin(e.target.value)}
-                placeholder="Control PIN (if set)"
+                placeholder="Control PIN (6+ chars)"
                 autoComplete="off"
                 style={{
-                  width: '150px',
+                  width: '165px',
                   height: '30px',
                   padding: '0 8px',
                   borderRadius: '6px',
@@ -1403,6 +1425,84 @@ export const RobotView: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* Live Queued / Running Command State Banner */}
+        {liveStatus?.activeCommand &&
+          (liveStatus.activeCommand.state === 'queued' || liveStatus.activeCommand.state === 'running') && (
+            <div
+              style={{
+                marginBottom: '12px',
+                padding: '9px 12px',
+                borderRadius: '8px',
+                background: 'color-mix(in srgb, var(--acc) 10%, var(--panel))',
+                border: '1px solid color-mix(in srgb, var(--acc) 45%, var(--line))',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '10px',
+                flexWrap: 'wrap',
+                fontSize: '12.5px',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span
+                  style={{
+                    fontSize: '11px',
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    padding: '2px 7px',
+                    borderRadius: '4px',
+                    background:
+                      liveStatus.activeCommand.state === 'running' ? 'var(--ok)' : 'var(--warn)',
+                    color: '#ffffff',
+                  }}
+                >
+                  {liveStatus.activeCommand.state === 'running' ? 'Running on Robot' : 'Queued'}
+                </span>
+                <span>
+                  {liveStatus.activeCommand.description || liveStatus.activeCommand.command}
+                </span>
+              </div>
+              {liveStatus.activeCommand.state === 'queued' && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  onClick={() => handleCancelQueuedCommand(liveStatus.activeCommand!.id)}
+                  style={{
+                    color: 'var(--bad)',
+                    borderColor: 'color-mix(in srgb, var(--bad) 55%, var(--line))',
+                  }}
+                >
+                  Cancel Queued
+                </button>
+              )}
+            </div>
+          )}
+
+        {/* Explicit Homing Required Hint */}
+        {hw?.controlEnabled && (!hw?.connected || hw?.homed === false) && (
+          <div
+            style={{
+              marginBottom: '12px',
+              padding: '8px 12px',
+              borderRadius: '8px',
+              background: 'color-mix(in srgb, var(--warn) 10%, var(--panel))',
+              border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--line))',
+              fontSize: '12px',
+              color: 'var(--fg)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+            }}
+          >
+            <AlertTriangle size={14} style={{ color: 'var(--warn)', flexShrink: 0 }} />
+            <span>
+              {!hw?.connected
+                ? 'Robot USB is currently disconnected. Confirm no tip is attached, then click Connect & Home before running moves.'
+                : 'Robot is connected but not homed yet. Make sure no tip is attached (use Drop Tip if needed), then click Connect & Home or Home X/Y.'}
+            </span>
+          </div>
+        )}
 
         {/* 4 Command Groups in a clean responsive grid */}
         <div
@@ -1501,39 +1601,27 @@ export const RobotView: React.FC = () => {
               >
                 Clear Alarm
               </button>
-              {!confirmEstop ? (
-                <button
-                  type="button"
-                  className="btn sm"
-                  disabled={cmdBusy}
-                  onClick={() => setConfirmEstop(true)}
-                  style={{
-                    color: 'var(--bad)',
-                    borderColor: 'color-mix(in srgb, var(--bad) 55%, var(--line))',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                  }}
-                >
-                  <ShieldAlert size={13} />
-                  <span>Emergency Stop</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="btn sm"
-                  disabled={cmdBusy}
-                  onClick={() => runCommand('emergency_stop')}
-                  style={{
-                    background: 'var(--bad)',
-                    color: '#ffffff',
-                    borderColor: 'var(--bad)',
-                    fontWeight: 700,
-                  }}
-                >
-                  Confirm STOP Now
-                </button>
-              )}
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => sendSoftwareStop()}
+                title="Immediately send a pre-emptive software stop to the robot (works even while another command is running). Does not replace a physical E-stop switch."
+                style={{
+                  background: 'var(--bad)',
+                  color: '#ffffff',
+                  borderColor: 'var(--bad)',
+                  fontWeight: 700,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <ShieldAlert size={13} />
+                <span>Software Stop</span>
+              </button>
+            </div>
+            <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--mut)' }}>
+              1-tap Software Stop interrupts active moves within ~0.5 s — always keep a physical E-stop switch accessible.
             </div>
           </div>
 
@@ -2876,6 +2964,7 @@ export const RobotView: React.FC = () => {
         bottleIdx={safeWizardIdx}
         onChangeBottleIdx={setWizardIdx}
         onRunCommand={runCommand}
+        onSoftwareStop={sendSoftwareStop}
         onSaveBottleZ={(bottle, zVal, autoAdv) => {
           const full = calibrationBottles.find((b) => b.key === bottle.key);
           return full ? saveBottleZ(full, zVal, autoAdv) : Promise.resolve();

@@ -305,6 +305,12 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
     return list.sort((a, b) => a.plateId - b.plateId || a.slotId - b.slotId);
   }, [run, measuredSurfaceZ]);
 
+  const TIP_CAPACITY_MAP: Record<'50ul' | '300ul' | '1000ul', number> = {
+    '50ul': 50,
+    '300ul': 300,
+    '1000ul': 1000,
+  };
+
   const effectiveTip =
     tipType !== 'auto'
       ? tipType
@@ -314,6 +320,9 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
       ? '300ul'
       : '1000ul';
 
+  const singleTipCap = TIP_CAPACITY_MAP[effectiveTip];
+  const singleVolumeInvalid = volumeUl > 1000 || (tipType !== 'auto' && volumeUl > singleTipCap);
+
   const ptEffectiveTip: '50ul' | '300ul' | '1000ul' =
     ptTipType !== 'auto'
       ? ptTipType
@@ -322,6 +331,9 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
       : ptVolumeUl <= 300
       ? '300ul'
       : '1000ul';
+
+  const ptTipCap = TIP_CAPACITY_MAP[ptEffectiveTip];
+  const ptVolumeInvalid = ptVolumeUl > 1000 || (ptTipType !== 'auto' && ptVolumeUl > ptTipCap);
 
   const ptHas96OrDenser = srcTotalWells >= 96 || dstTotalWells >= 96;
   const ptTipsNeeded = ptPairs.length === 0 ? 0 : ptChangeTipEach ? ptPairs.length : 1;
@@ -933,11 +945,11 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
                   <input
                     type="number"
                     min={1}
-                    max={2000}
+                    max={1000}
                     step={10}
                     value={volumeUl}
                     onChange={(e) =>
-                      setVolumeUl(Math.max(1, Math.min(2000, Number(e.target.value) || 1)))
+                      setVolumeUl(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))
                     }
                     className="mono"
                     style={{
@@ -999,6 +1011,13 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
                   <option value="1000ul">1000 µL tip</option>
                 </select>
               </div>
+              {singleVolumeInvalid && (
+                <div style={{ fontSize: '11px', color: 'var(--bad)', fontWeight: 600, marginTop: '6px' }}>
+                  {volumeUl > 1000
+                    ? 'Single-pass transfers are limited to 1000 µL max.'
+                    : `Volume (${volumeUl} µL) exceeds the selected ${singleTipCap} µL tip capacity — pick a larger tip or Auto.`}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1035,7 +1054,7 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
             <button
               type="button"
               className="btn sm pri"
-              disabled={cmdBusy || ptActive}
+              disabled={cmdBusy || ptActive || singleVolumeInvalid}
               onClick={handleRunSingle}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
             >
@@ -1422,12 +1441,12 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
                   <input
                     type="number"
                     min={1}
-                    max={2000}
+                    max={1000}
                     step={5}
                     disabled={ptActive}
                     value={ptVolumeUl}
                     onChange={(e) =>
-                      setPtVolumeUl(Math.max(1, Math.min(2000, Number(e.target.value) || 1)))
+                      setPtVolumeUl(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))
                     }
                     className="mono"
                     style={{
@@ -1494,6 +1513,13 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
               {ptHas96OrDenser && ptEffectiveTip === '1000ul' && (
                 <div style={{ fontSize: '11px', color: 'var(--warn)', marginTop: '6px' }}>
                   Note: 96-well openings are narrow — 50 µL or 300 µL tips are safer than 1000 µL.
+                </div>
+              )}
+              {ptVolumeInvalid && (
+                <div style={{ fontSize: '11px', color: 'var(--bad)', fontWeight: 600, marginTop: '6px' }}>
+                  {ptVolumeUl > 1000
+                    ? 'Single-pass plate transfers are limited to 1000 µL per well.'
+                    : `Volume (${ptVolumeUl} µL) exceeds the selected ${ptTipCap} µL tip capacity — pick a larger tip or Auto.`}
                 </div>
               )}
             </div>
@@ -2078,7 +2104,7 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
               <button
                 type="button"
                 className="btn sm pri"
-                disabled={cmdBusy || ptPairs.length === 0}
+                disabled={cmdBusy || ptPairs.length === 0 || ptVolumeInvalid}
                 onClick={() => setPtConfirmStart(true)}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
               >
@@ -2097,7 +2123,7 @@ export const QuickTransferCard: React.FC<QuickTransferCardProps> = ({
                 <button
                   type="button"
                   className="btn sm"
-                  disabled={cmdBusy || ptPairs.length === 0}
+                  disabled={cmdBusy || ptPairs.length === 0 || ptVolumeInvalid}
                   onClick={handleStartPlateTransfer}
                   style={{
                     background: 'var(--ok)',

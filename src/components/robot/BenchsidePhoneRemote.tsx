@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -40,6 +40,7 @@ interface BenchsidePhoneRemoteProps {
   bottleIdx: number;
   onChangeBottleIdx: (idx: number) => void;
   onRunCommand: (command: string, params?: Record<string, any>) => Promise<any>;
+  onSoftwareStop: () => Promise<any>;
   onSaveBottleZ: (bottle: RemoteBottleItem, zValue: number, autoAdvance: boolean) => Promise<void>;
   onCopyZ: (z: number) => void;
   lastFeedback?: string;
@@ -58,12 +59,11 @@ export const BenchsidePhoneRemote: React.FC<BenchsidePhoneRemoteProps> = ({
   bottleIdx,
   onChangeBottleIdx,
   onRunCommand,
+  onSoftwareStop,
   onSaveBottleZ,
   onCopyZ,
   lastFeedback,
 }) => {
-  const [confirmStop, setConfirmStop] = useState<boolean>(false);
-
   if (!open) return null;
 
   const safeIdx = bottles.length > 0 ? Math.min(bottleIdx, bottles.length - 1) : 0;
@@ -457,46 +457,26 @@ export const BenchsidePhoneRemote: React.FC<BenchsidePhoneRemoteProps> = ({
           >
             {hw?.connected ? 'Release USB' : 'Connect & Home'}
           </button>
-          {!confirmStop ? (
-            <button
-              type="button"
-              className="btn"
-              disabled={cmdBusy}
-              onClick={() => setConfirmStop(true)}
-              style={{
-                minHeight: '46px',
-                fontWeight: 700,
-                color: 'var(--bad)',
-                borderColor: 'color-mix(in srgb, var(--bad) 60%, var(--line))',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '6px',
-              }}
-            >
-              <ShieldAlert size={16} />
-              <span>STOP</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn"
-              disabled={cmdBusy}
-              onClick={() => {
-                setConfirmStop(false);
-                onRunCommand('emergency_stop');
-              }}
-              style={{
-                minHeight: '46px',
-                fontWeight: 800,
-                background: 'var(--bad)',
-                borderColor: 'var(--bad)',
-                color: '#ffffff',
-              }}
-            >
-              Tap Again: STOP!
-            </button>
-          )}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onSoftwareStop()}
+            title="Immediately sends Software Stop to Zeus — does not replace a physical E-stop switch"
+            style={{
+              minHeight: '46px',
+              fontWeight: 800,
+              background: 'var(--bad)',
+              borderColor: 'var(--bad)',
+              color: '#ffffff',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '6px',
+            }}
+          >
+            <ShieldAlert size={16} />
+            <span>Software Stop</span>
+          </button>
         </div>
 
         {lastFeedback && (

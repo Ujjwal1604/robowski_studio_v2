@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.*
+!.env.example
 vite.config.js.timestamp-*.mjs
 vite.config.mjs.timestamp-*.mjs
 vite.config.cjs.timestamp-*.mjs
@@ -15,5 +17,16 @@ vitest.config.cts.timestamp-*.mjs
 python_backend/.venv/
 python_backend/data/
 python_backend/__pycache__/
+python_backend/**/__pycache__/
+python_backend/*.pyc
 python_backend/*.db
+python_backend/*.log
 
+# Local lab PC secrets & machine-specific robot settings (never commit)
+python_backend/relay_token.txt
+python_backend/robot_pin.txt
+python_backend/server_url.txt
+python_backend/robowski_folder.txt
+python_backend/robowski_repo.txt
+python_backend/watch_folders.txt
+python_backend/custom_plates.json
